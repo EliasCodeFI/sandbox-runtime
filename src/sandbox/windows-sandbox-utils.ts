@@ -617,6 +617,12 @@ interface RunOpts {
   timeoutMs?: number
   stdin?: string
   srtWin?: SrtWinSpawn
+  /**
+   * Async variant only: kill the child when this aborts. The listener
+   * runs synchronously inside `abort()`, so a process `'exit'` handler
+   * can stop an in-flight call before it runs the sync twin.
+   */
+  signal?: AbortSignal
 }
 
 function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
@@ -687,6 +693,13 @@ function runSrtWinAsync(
             child.kill()
           }, timeoutMs)
         : undefined
+    const onAbort = () => child.kill()
+    if (opts.signal?.aborted) onAbort()
+    else opts.signal?.addEventListener('abort', onAbort, { once: true })
+    const settle = () => {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', onAbort)
+    }
     let stdout = ''
     let stderr = ''
     child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
@@ -694,7 +707,7 @@ function runSrtWinAsync(
     // Swallow EPIPE if the child dies before the stdin write drains.
     child.stdin?.on('error', () => {}).end(opts.stdin)
     child.once('error', e => {
-      clearTimeout(timer)
+      settle()
       reject(
         new WindowsSandboxError(
           'spawn_failed',
@@ -704,7 +717,7 @@ function runSrtWinAsync(
       )
     })
     child.once('close', (status, signal) => {
-      clearTimeout(timer)
+      settle()
       if (timedOut) {
         reject(
           new WindowsSandboxError(
@@ -758,11 +771,10 @@ async function runSrtWinJsonAsync<T>(
  * still surfaces every entry. For best-effort teardown helpers
  * (`acl restore`/`acl revoke`).
  */
-function runSrtWinJsonAllowFail<T>(
+function parseSrtWinJsonAllowFail<T>(
   args: string[],
-  opts: RunOpts,
+  r: RunResult,
 ): { ok: boolean; json: T; stderr: string } {
-  const r = runSrtWin(args, opts)
   let json: T
   try {
     json = JSON.parse(r.stdout) as T
@@ -775,6 +787,20 @@ function runSrtWinJsonAllowFail<T>(
     )
   }
   return { ok: r.status === 0, json, stderr: r.stderr }
+}
+
+function runSrtWinJsonAllowFail<T>(
+  args: string[],
+  opts: RunOpts,
+): { ok: boolean; json: T; stderr: string } {
+  return parseSrtWinJsonAllowFail(args, runSrtWin(args, opts))
+}
+
+async function runSrtWinJsonAllowFailAsync<T>(
+  args: string[],
+  opts: RunOpts,
+): Promise<{ ok: boolean; json: T; stderr: string }> {
+  return parseSrtWinJsonAllowFail(args, await runSrtWinAsync(args, opts))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1780,17 +1806,101 @@ export function parseWindowsSandboxError(
   return undefined
 }
 
-export interface WindowsAclStampOptions {
-  /** Paths the sandboxed child must not read. */
-  denyRead: readonly string[]
-  /** Paths the sandboxed child must not write (read stays allowed). */
-  denyWrite: readonly string[]
+/**
+ * Default budget for each of the four tree-walking ACL operations
+ * (`acl grant` / `stamp` / `revoke` / `restore`). Their cost is linear
+ * in the number of files under the granted roots, and a kill
+ * mid-propagation leaves a half-applied tree that the cleanup
+ * revoke/restore then has to walk in full a second time — so waiting
+ * is cheaper than timing out. Hence ten minutes, not the 15 s the
+ * constant-time `srt-win` calls get. Override per session with
+ * `windows.aclTimeoutMs`.
+ *
+ * It is the default of all eight exported helpers, sync and async.
+ * The one caller that must not use it is a process-exit path:
+ * SandboxManager's exit/signal handler passes its own 60 s bound to
+ * the sync helpers, and an embedder calling them from an exit
+ * handler should pass a `timeoutMs` too.
+ */
+export const DEFAULT_WINDOWS_ACL_TIMEOUT_MS = 600_000
+
+/** Options shared by the four `srt-win acl` session operations. */
+interface WindowsAclCommonOptions {
   /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
+  /**
+   * Budget for the `srt-win` call. Defaults to
+   * {@link DEFAULT_WINDOWS_ACL_TIMEOUT_MS}.
+   */
+  timeoutMs?: number
+}
+
+/** Extra options of the `*Async` ACL variants. */
+interface WindowsAclAsyncOptions {
+  /** Kills the in-flight `srt-win` child when aborted. */
+  signal?: AbortSignal
+}
+
+export interface WindowsAclStampOptions extends WindowsAclCommonOptions {
+  /** Paths the sandboxed child must not read. */
+  denyRead: readonly string[]
+  /** Paths the sandboxed child must not write (read stays allowed). */
+  denyWrite: readonly string[]
+}
+
+/** Options of {@link restoreWindowsAcl} / {@link revokeWindowsAcl}. */
+export type WindowsAclReleaseOptions = WindowsAclCommonOptions
+
+function aclArgs(
+  sub: 'grant' | 'stamp' | 'revoke' | 'restore',
+  opts: WindowsAclCommonOptions,
+): string[] {
+  return [
+    'acl',
+    sub,
+    '--holder-pid',
+    `${opts.holderPid ?? process.pid}`,
+    '--sandbox-user-sid',
+    opts.sandboxUserSid,
+    ...(sub === 'revoke' || sub === 'restore' ? ['--json'] : []),
+  ]
+}
+
+function aclRunOpts(
+  opts: WindowsAclCommonOptions & WindowsAclAsyncOptions,
+  stdin?: string,
+): RunOpts {
+  return {
+    timeoutMs: opts.timeoutMs ?? DEFAULT_WINDOWS_ACL_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+    ...(stdin !== undefined ? { stdin } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  }
+}
+
+function stampStdin(opts: WindowsAclStampOptions): string {
+  return JSON.stringify({
+    denyRead: opts.denyRead,
+    denyWrite: opts.denyWrite,
+  })
+}
+
+function checkAclStamp(r: RunResult): void {
+  logForDebugging(
+    `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'acl_stamp_failed',
+      `srt-win acl stamp exited ${r.status} ` +
+        (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
+        `: ${r.stderr || r.stdout}`,
+    )
+  }
 }
 
 /**
@@ -1804,39 +1914,33 @@ export interface WindowsAclStampOptions {
  * rejects globs). Callers that accept globs should pre-expand via
  * {@link expandWindowsFsPaths}.
  *
+ * `spawnSync`-blocks the event loop for the whole tree walk — prefer
+ * {@link stampWindowsAclAsync} anywhere that can await.
+ *
  * @throws on exit ≠ 0 — including exit 2 (one or more inputs
  *   skipped). srt-win stamps the resolvable inputs before exiting
  *   2, so on throw the caller should call {@link restoreWindowsAcl}
  *   to release whatever WAS stamped.
  */
 export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
-  const holder = opts.holderPid ?? process.pid
-  const stdin = JSON.stringify({
-    denyRead: opts.denyRead,
-    denyWrite: opts.denyWrite,
-  })
-  const r = runSrtWin(
-    [
-      'acl',
-      'stamp',
-      '--holder-pid',
-      `${holder}`,
-      '--sandbox-user-sid',
-      opts.sandboxUserSid,
-    ],
-    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
+  checkAclStamp(
+    runSrtWin(aclArgs('stamp', opts), aclRunOpts(opts, stampStdin(opts))),
   )
-  logForDebugging(
-    `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
+}
+
+/**
+ * Async variant of {@link stampWindowsAcl} — identical argv, stdin
+ * and errors, but the event loop stays live during the walk.
+ */
+export async function stampWindowsAclAsync(
+  opts: WindowsAclStampOptions & WindowsAclAsyncOptions,
+): Promise<void> {
+  checkAclStamp(
+    await runSrtWinAsync(
+      aclArgs('stamp', opts),
+      aclRunOpts(opts, stampStdin(opts)),
+    ),
   )
-  if (r.status !== 0) {
-    throw new WindowsSandboxError(
-      'acl_stamp_failed',
-      `srt-win acl stamp exited ${r.status} ` +
-        (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
-        `: ${r.stderr || r.stdout}`,
-    )
-  }
 }
 
 /**
@@ -1852,99 +1956,114 @@ export interface WindowsAclAceOutcome {
   status: string
 }
 
+type RawAclRestore =
+  | WindowsAclAceOutcome[]
+  | { paths?: WindowsAclAceOutcome[]; parents?: WindowsAclAceOutcome[] }
+
+function mapAclRestore(r: {
+  ok: boolean
+  json: RawAclRestore
+  stderr: string
+}): WindowsAclAceOutcome[] {
+  if (!r.ok) {
+    logForDebugging(
+      `[Sandbox Windows] acl restore exited non-zero (per-path ` +
+        `outcomes preserved): ${r.stderr}`,
+      { level: 'error' },
+    )
+  }
+  // Pre- same-user-removal builds emit `{paths, parents}`; post-
+  // emit a flat array. Flatten either so reset()'s logging loop
+  // is shape-agnostic across the transition.
+  return Array.isArray(r.json)
+    ? r.json
+    : [...(r.json.paths ?? []), ...(r.json.parents ?? [])]
+}
+
+function mapAclRevoke(r: {
+  ok: boolean
+  json: WindowsAclAceOutcome[]
+  stderr: string
+}): WindowsAclAceOutcome[] {
+  if (!r.ok) {
+    logForDebugging(
+      `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
+      { level: 'error' },
+    )
+  }
+  return r.json
+}
+
+// Teardown helpers must not throw — the caller's reset() must
+// complete. Only spawn-fail / timeout / unparseable output lands
+// here → log and return undefined.
+function aclReleaseFailed(sub: 'restore' | 'revoke', e: unknown): undefined {
+  logForDebugging(`[Sandbox Windows] acl ${sub}: ${(e as Error).message}`, {
+    level: 'error',
+  })
+  return undefined
+}
+
 /**
  * Release this holder's deny ACEs and remove the sandbox-user ACE
  * on any path whose refcount falls to zero. Best-effort (does not
  * throw on per-path anomalies); returns per-path outcomes for the
  * caller to surface. Returns `undefined` only when `srt-win`
  * itself failed (no JSON to parse).
+ *
+ * `spawnSync`-blocks the event loop — this is the variant for
+ * contexts that cannot await (a process `'exit'` or signal handler);
+ * everywhere else prefer {@link restoreWindowsAclAsync}.
  */
-export function restoreWindowsAcl(opts: {
-  sandboxUserSid: string
-  holderPid?: number
-  srtWin?: SrtWinSpawn
-}): WindowsAclAceOutcome[] | undefined {
-  const holder = opts.holderPid ?? process.pid
-  // Don't let a teardown helper throw — the caller's reset() must
-  // complete. runSrtWinJsonAllowFail parses stdout before checking
-  // the exit code, so a non-zero exit with the per-path JSON intact
-  // still surfaces every entry to reset()'s loop. Only spawn-fail
-  // / unparseable output throws → log and return undefined.
+export function restoreWindowsAcl(
+  opts: WindowsAclReleaseOptions,
+): WindowsAclAceOutcome[] | undefined {
+  // runSrtWinJsonAllowFail parses stdout before checking the exit
+  // code, so a non-zero exit with the per-path JSON intact still
+  // surfaces every entry to reset()'s loop.
   try {
-    const r = runSrtWinJsonAllowFail<
-      | WindowsAclAceOutcome[]
-      | { paths?: WindowsAclAceOutcome[]; parents?: WindowsAclAceOutcome[] }
-    >(
-      [
-        'acl',
-        'restore',
-        '--holder-pid',
-        `${holder}`,
-        '--sandbox-user-sid',
-        opts.sandboxUserSid,
-        '--json',
-      ],
-      { timeoutMs: 60_000, srtWin: opts.srtWin },
+    return mapAclRestore(
+      runSrtWinJsonAllowFail<RawAclRestore>(
+        aclArgs('restore', opts),
+        aclRunOpts(opts),
+      ),
     )
-    if (!r.ok) {
-      logForDebugging(
-        `[Sandbox Windows] acl restore exited non-zero (per-path ` +
-          `outcomes preserved): ${r.stderr}`,
-        { level: 'error' },
-      )
-    }
-    // Pre- same-user-removal builds emit `{paths, parents}`; post-
-    // emit a flat array. Flatten either so reset()'s logging loop
-    // is shape-agnostic across the transition.
-    return Array.isArray(r.json)
-      ? r.json
-      : [...(r.json.paths ?? []), ...(r.json.parents ?? [])]
   } catch (e) {
-    logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
-      level: 'error',
-    })
-    return undefined
+    return aclReleaseFailed('restore', e)
   }
 }
 
-export interface WindowsAclGrantOptions {
+/**
+ * Async variant of {@link restoreWindowsAcl} — same argv, same
+ * result mapping, never rejects.
+ */
+export async function restoreWindowsAclAsync(
+  opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
+): Promise<WindowsAclAceOutcome[] | undefined> {
+  try {
+    return mapAclRestore(
+      await runSrtWinJsonAllowFailAsync<RawAclRestore>(
+        aclArgs('restore', opts),
+        aclRunOpts(opts),
+      ),
+    )
+  } catch (e) {
+    return aclReleaseFailed('restore', e)
+  }
+}
+
+export interface WindowsAclGrantOptions extends WindowsAclCommonOptions {
   /** Paths to grant `MODIFY_NO_FDC` on (the working tree, `allowWrite`). */
   write: readonly string[]
   /** Paths to grant `FILE_GENERIC_READ|EXECUTE` on (`allowRead`). */
   read: readonly string[]
-  /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
-  sandboxUserSid: string
-  /** Long-lived host PID the holds are tied to. Default: this process. */
-  holderPid?: number
-  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
-  srtWin?: SrtWinSpawn
 }
 
-/**
- * Apply per-session additive `(OI)(CI)` ALLOW ACEs for the sandbox
- * user on each path. The sandbox user has no inherent rights on
- * real-user-owned files; this is what makes the working tree (and
- * explicit `allowRead`/`allowWrite` paths) reachable from the
- * child. Idempotent and refcounted via srt-win's `working_aces`
- * table.
- *
- * @throws on exit ≠ 0. On throw the caller should call
- *   {@link revokeWindowsAcl} to release whatever WAS granted.
- */
-export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
-  const holder = opts.holderPid ?? process.pid
-  const stdin = JSON.stringify({ read: opts.read, write: opts.write })
-  const r = runSrtWin(
-    [
-      'acl',
-      'grant',
-      '--holder-pid',
-      `${holder}`,
-      '--sandbox-user-sid',
-      opts.sandboxUserSid,
-    ],
-    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
-  )
+function grantStdin(opts: WindowsAclGrantOptions): string {
+  return JSON.stringify({ read: opts.read, write: opts.write })
+}
+
+function checkAclGrant(r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1957,42 +2076,126 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
+ * Apply per-session additive `(OI)(CI)` ALLOW ACEs for the sandbox
+ * user on each path. The sandbox user has no inherent rights on
+ * real-user-owned files; this is what makes the working tree (and
+ * explicit `allowRead`/`allowWrite` paths) reachable from the
+ * child. Idempotent and refcounted via srt-win's `working_aces`
+ * table.
+ *
+ * `spawnSync`-blocks the event loop for the whole tree walk (linear
+ * in the file count under each root) — prefer
+ * {@link grantWindowsAclAsync} anywhere that can await.
+ *
+ * @throws on exit ≠ 0. On throw the caller should call
+ *   {@link revokeWindowsAcl} to release whatever WAS granted.
+ */
+export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
+  checkAclGrant(
+    runSrtWin(aclArgs('grant', opts), aclRunOpts(opts, grantStdin(opts))),
+  )
+}
+
+/**
+ * Async variant of {@link grantWindowsAcl} — identical argv, stdin
+ * and errors, but the event loop stays live during the walk.
+ */
+export async function grantWindowsAclAsync(
+  opts: WindowsAclGrantOptions & WindowsAclAsyncOptions,
+): Promise<void> {
+  checkAclGrant(
+    await runSrtWinAsync(
+      aclArgs('grant', opts),
+      aclRunOpts(opts, grantStdin(opts)),
+    ),
+  )
+}
+
+/**
+ * Outcome of a revoke as the session teardown needs it: `complete`
+ * is true only when `srt-win acl revoke` ran to the end and exited 0
+ * — i.e. every grant this holder had is off disk. A timeout, a spawn
+ * failure, unparseable output or a non-zero exit (srt-win exits
+ * non-zero when any path "could not be revoked", and omits those
+ * paths from the per-path list) all leave it false.
+ */
+export interface WindowsAclRevokeResult {
+  complete: boolean
+  outcomes: WindowsAclAceOutcome[] | undefined
+}
+
+function toRevokeResult(r: {
+  ok: boolean
+  json: WindowsAclAceOutcome[]
+  stderr: string
+}): WindowsAclRevokeResult {
+  return { complete: r.ok, outcomes: mapAclRevoke(r) }
+}
+
+/**
+ * {@link revokeWindowsAcl} that also reports whether the revoke
+ * completed. SandboxManager gates the deny restore on this: taking
+ * the DENY stamps off while an ALLOW grant may still be on disk
+ * would open the deny targets to the (shared) sandbox account.
+ */
+export function revokeWindowsAclChecked(
+  opts: WindowsAclReleaseOptions,
+): WindowsAclRevokeResult {
+  try {
+    return toRevokeResult(
+      runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
+        aclArgs('revoke', opts),
+        aclRunOpts(opts),
+      ),
+    )
+  } catch (e) {
+    return { complete: false, outcomes: aclReleaseFailed('revoke', e) }
+  }
+}
+
+/** Async variant of {@link revokeWindowsAclChecked}; never rejects. */
+export async function revokeWindowsAclCheckedAsync(
+  opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
+): Promise<WindowsAclRevokeResult> {
+  try {
+    return toRevokeResult(
+      await runSrtWinJsonAllowFailAsync<WindowsAclAceOutcome[]>(
+        aclArgs('revoke', opts),
+        aclRunOpts(opts),
+      ),
+    )
+  } catch (e) {
+    return { complete: false, outcomes: aclReleaseFailed('revoke', e) }
+  }
+}
+
+/**
  * Release this holder's grants and remove the sandbox-user ACE on
  * any path whose refcount falls to zero. Best-effort (does not
  * throw); logs anomalies.
+ *
+ * `spawnSync`-blocks the event loop — this is the variant for
+ * contexts that cannot await (a process `'exit'` or signal handler);
+ * everywhere else prefer {@link revokeWindowsAclAsync}.
+ *
+ * If you follow it with {@link restoreWindowsAcl}, do so only when
+ * the revoke completed — the returned list does not say (failed
+ * paths are omitted from it, and `undefined` means it did not run).
  */
-export function revokeWindowsAcl(opts: {
-  sandboxUserSid: string
-  holderPid?: number
-  srtWin?: SrtWinSpawn
-}): WindowsAclAceOutcome[] | undefined {
-  const holder = opts.holderPid ?? process.pid
-  try {
-    const r = runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
-      [
-        'acl',
-        'revoke',
-        '--holder-pid',
-        `${holder}`,
-        '--sandbox-user-sid',
-        opts.sandboxUserSid,
-        '--json',
-      ],
-      { timeoutMs: 60_000, srtWin: opts.srtWin },
-    )
-    if (!r.ok) {
-      logForDebugging(
-        `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
-        { level: 'error' },
-      )
-    }
-    return r.json
-  } catch (e) {
-    logForDebugging(`[Sandbox Windows] acl revoke: ${(e as Error).message}`, {
-      level: 'error',
-    })
-    return undefined
-  }
+export function revokeWindowsAcl(
+  opts: WindowsAclReleaseOptions,
+): WindowsAclAceOutcome[] | undefined {
+  return revokeWindowsAclChecked(opts).outcomes
+}
+
+/**
+ * Async variant of {@link revokeWindowsAcl} — same argv, same
+ * result mapping, never rejects.
+ */
+export async function revokeWindowsAclAsync(
+  opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
+): Promise<WindowsAclAceOutcome[] | undefined> {
+  return (await revokeWindowsAclCheckedAsync(opts)).outcomes
 }
 
 // ────────────────────────────────────────────────────────────────────

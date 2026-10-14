@@ -16,6 +16,7 @@ import * as srt from '../src/index.js'
  */
 const PUBLIC_VALUE_EXPORTS = [
   'CredentialsConfigSchema',
+  'DEFAULT_WINDOWS_ACL_TIMEOUT_MS',
   'DEFAULT_WINDOWS_PROXY_PORT_RANGE',
   'FilesystemConfigSchema',
   'GitConfigSchema',
@@ -48,6 +49,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'getWindowsWfpStatusAsync',
   'getWslVersion',
   'grantWindowsAcl',
+  'grantWindowsAclAsync',
   'installWindowsSandbox',
   'installWindowsSandboxAsync',
   'isUncPath',
@@ -55,8 +57,11 @@ const PUBLIC_VALUE_EXPORTS = [
   'parseWindowsSandboxError',
   'resolveSrtWin',
   'restoreWindowsAcl',
+  'restoreWindowsAclAsync',
   'revokeWindowsAcl',
+  'revokeWindowsAclAsync',
   'stampWindowsAcl',
+  'stampWindowsAclAsync',
   'uninstallWindowsSandbox',
   'validateCaPair',
   'verifyWindowsWfpEgress',
