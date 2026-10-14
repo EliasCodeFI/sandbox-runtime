@@ -780,8 +780,12 @@ try {
   }
 
   # ── S3: Disabled + stopped → status disabled; typed exit 18 ────
-  Set-Service seclogon -StartupType Disabled
+  # Stop-Service refuses a service whose start type is Disabled, so
+  # stop it under Manual first and disable it once it is down.
+  Set-Service seclogon -StartupType Manual
   Stop-Service seclogon -Force
+  (Get-Service seclogon).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+  Set-Service seclogon -StartupType Disabled
   $st = Seclogon-State
   if ($st -ne 'disabled') { throw "S3: Disabled+stopped expected seclogon=disabled, got '$st'" }
   $st = (J @('user','status')).seclogon
