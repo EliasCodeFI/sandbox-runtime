@@ -349,7 +349,8 @@ enum AclCmd {
     Recover {
         #[arg(long)]
         force: bool,
-        /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
+        /// Emit `{"deadBrokers": N, "acesRevoked": N,
+        /// "writesResumed": N, "writesPending": N}` on stdout.
         /// (Not the per-path array — recover sweeps by trustee SID
         /// and does not enumerate paths.)
         #[arg(long)]
@@ -404,7 +405,9 @@ struct AceTargets {
 /// [`placeholder_ancestors_of`], any earlier holder's — get
 /// [`SbAce::DenyDelete`], so every holder holds the FULL chain and
 /// releasing any one holder cannot strip an intermediate another
-/// holder still depends on.
+/// holder still depends on. Each intermediate is listed ONCE per
+/// call however many deny targets sit beneath it
+/// ([`push_placeholder_ancestors`]).
 ///
 /// A `Deny` target the broker cannot create (`PermissionDenied` —
 /// e.g. under `Program Files` non-elevated) or that names a UNC
@@ -434,6 +437,8 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    // Placeholder ancestors already listed as `DenyDelete` targets.
+    let mut held_ancestors = std::collections::HashSet::new();
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -516,19 +521,38 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
-        // Full-chain hold (see doc). Duplicates across inputs are
-        // harmless — `apply_aces` is idempotent per
-        // `(path, kind, holder)`.
+        // Full-chain hold (see doc).
         if matches!(ace, SbAce::Deny(_)) {
-            for anc in db.placeholder_ancestors_of(&canon)? {
-                targets.push((anc, SbAce::DenyDelete));
-            }
+            push_placeholder_ancestors(
+                &mut targets,
+                &mut held_ancestors,
+                db.placeholder_ancestors_of(&canon)?,
+            );
         }
     }
     Ok(AceTargets {
         targets,
         bad_inputs,
     })
+}
+
+/// Append `(ancestor, DenyDelete)` for each placeholder ancestor not
+/// already listed by this call (`seen`). Several deny targets under
+/// one placeholder directory (`.claude\a`, `.claude\b`, …) all
+/// report it; the repeat entries would be no-ops on the rows
+/// (`apply_aces` is idempotent per `(path, kind, holder)`) but each
+/// would still re-run the entry and its implied parent-FDC entry, so
+/// they are dropped here, keeping the first.
+fn push_placeholder_ancestors(
+    targets: &mut Vec<(String, srt_win::acl::SbAce)>,
+    seen: &mut std::collections::HashSet<String>,
+    ancestors: Vec<String>,
+) {
+    for anc in ancestors {
+        if seen.insert(anc.clone()) {
+            targets.push((anc, srt_win::acl::SbAce::DenyDelete));
+        }
+    }
 }
 
 /// Build the `user status` JSON object (sandbox-user provisioning
@@ -1348,8 +1372,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })?;
             eprintln!(
                 "srt-win: acl recover — pruned {} dead broker(s), \
-                 revoked {} orphan ACE(s)",
-                report.dead_brokers, report.aces_revoked,
+                 revoked {} orphan ACE(s), finished {} interrupted \
+                 DACL write(s) ({} pending)",
+                report.dead_brokers,
+                report.aces_revoked,
+                report.writes_resumed,
+                report.writes_pending,
             );
             if json {
                 println!(
@@ -1357,6 +1385,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json!({
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
+                        "writesResumed": report.writes_resumed,
+                        "writesPending": report.writes_pending,
                     })
                 );
             }
@@ -1723,6 +1753,35 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two deny targets under one placeholder directory (and a
+    /// nested chain) list each ancestor once, first occurrence kept,
+    /// order otherwise untouched.
+    #[test]
+    fn placeholder_ancestors_listed_once_per_call() {
+        use srt_win::acl::{DenyMask, SbAce};
+        let deny = SbAce::Deny(DenyMask::ReadDeny);
+        let s = |p: &str| p.to_string();
+        let (claude, hooks) = (r"\\?\C:\p\.claude", r"\\?\C:\p\.claude\hooks");
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        targets.push((s(r"\\?\C:\p\.claude\hooks\pre"), deny));
+        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(claude), s(hooks)]);
+        targets.push((s(r"\\?\C:\p\.claude\settings.json"), deny));
+        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(claude)]);
+        targets.push((s(r"\\?\C:\p\.claude\hooks\post"), deny));
+        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(hooks), s(claude)]);
+        assert_eq!(
+            targets,
+            [
+                (s(r"\\?\C:\p\.claude\hooks\pre"), deny),
+                (s(claude), SbAce::DenyDelete),
+                (s(hooks), SbAce::DenyDelete),
+                (s(r"\\?\C:\p\.claude\settings.json"), deny),
+                (s(r"\\?\C:\p\.claude\hooks\post"), deny),
+            ],
+        );
+    }
 
     /// `run_from_args` strips the `argv[1]` sentinel before clap so
     /// the same argv shape works whether the embedder's dispatcher

@@ -42,9 +42,53 @@
 //! record-first: upsert, THEN `SetNamedSecurityInfoW`. A crash
 //! between leaves a row whose ACE hasn't been written; the next
 //! call re-derives and reapplies.
+//!
+//! ## One converge per path per batch
+//!
+//! `SetNamedSecurityInfoW` on a directory re-propagates to every
+//! unprotected descendant, so a converge of a granted project root
+//! costs a walk of the whole tree. One batch routinely touches the
+//! same path several times — every deny target adds a `deny_fdc`
+//! row on its parent, a placeholder directory carries both
+//! `deny_delete` and `deny_fdc` — so the batch loops
+//! ([`Locked::apply_aces`], [`Locked::release_aces`], crash
+//! recovery) run every per-row step exactly as before (capture,
+//! guards, identity gate, row writes) and defer only the
+//! [`recompose_at`] to the path's LAST touch in the batch
+//! ([`last_touches`]). `recompose_at` reads the rows as they then
+//! stand, so the one write lands the same DACL the last of the
+//! repeated writes used to; the skipped ones were intermediate
+//! states holding a subset of those rows. Record-first is
+//! unaffected: a row still always precedes its write, only by more.
+//!
+//! The converge itself skips the write when the path's DACL is
+//! already the composed one AND `converged_dacls` records that our
+//! last write of exactly that DACL ran to completion
+//! ([`ConvergedLedger`]). That table is the one place a row vouches
+//! for disk state, and only ever toward LESS trust: it can veto a
+//! skip the live DACL comparison would allow, never grant one the
+//! comparison refuses, and a missing, stale or unreadable row means
+//! "write".
+//!
+//! ## Write-intent journal
+//!
+//! Record-first covers a killed APPLY: the row outlives the unwritten
+//! ACE. A killed RELEASE is the mirror case and rows cannot cover it:
+//! release drops its `working_aces` row first and walks the tree
+//! second, so a broker killed mid-propagation (the caller's timeout
+//! on a large tree) leaves descendants still carrying the inherited
+//! sandbox ACE with no row anywhere for recovery to find — an ALLOW
+//! the next session never revokes. So every real DACL write is
+//! bracketed by a `write_intents` row ([`record_write_intent`] before
+//! the write, [`clear_write_intent`] once it has returned), and crash
+//! recovery re-runs the converge — forced, from the rows as they now
+//! stand — for each intent that survived ([`recover_write_intents`]).
+//! The journal adds a breadcrumb around the propagation only; no
+//! existing ordering changes.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
@@ -121,6 +165,33 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
 );
+-- Completion record for the converge's write-skip: the DACL
+-- (`acl::dacl_fingerprint`) our last COMPLETED write left on the
+-- object `file_id` at this path. Deleted before every write and
+-- re-inserted only after it returns, so a write killed
+-- mid-propagation leaves no row and the next converge rewrites
+-- (re-propagates) instead of trusting a half-walked subtree. Only
+-- kept while the path carries sandbox ACEs. Additive (`IF NOT
+-- EXISTS`, no schema-version bump): a binary without it neither
+-- reads nor needs it.
+CREATE TABLE IF NOT EXISTS converged_dacls (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  dacl           BLOB NOT NULL
+);
+-- Write-intent journal: a DACL write on the object `file_id` at this
+-- path was started and has not been seen to return. Inserted before
+-- every real `SetNamedSecurityInfoW` of a converge, deleted after it
+-- succeeds; a surviving row is a propagation that may have been cut
+-- short, which crash recovery re-runs from the then-current rows.
+-- Keyed by (path, object) so a write on a substituted path cannot
+-- overwrite the breadcrumb for the object that was there before.
+-- Additive (`IF NOT EXISTS`, no schema-version bump).
+CREATE TABLE IF NOT EXISTS write_intents (
+  canonical_path TEXT NOT NULL,
+  file_id        BLOB NOT NULL,
+  PRIMARY KEY (canonical_path, file_id)
+);
 "#;
 
 /// Outcome of a crash-recovery pass.
@@ -129,6 +200,12 @@ pub struct RecoveryReport {
     pub dead_brokers: u32,
     /// Orphaned `working_aces` rows whose ACE was revoked.
     pub aces_revoked: u32,
+    /// Interrupted DACL writes (`write_intents` rows) whose converge
+    /// was re-run to completion.
+    pub writes_resumed: u32,
+    /// `write_intents` rows still present after this pass (converge
+    /// failed or path unreadable — retried by the next pass).
+    pub writes_pending: u32,
 }
 
 /// RAII guard for the init lock — an exclusive `LockFileEx` range
@@ -665,6 +742,12 @@ impl Locked {
     /// `(path, kind, pid)` dedupes within one holder; refcount
     /// handles cross-holder).
     ///
+    /// Every entry is recorded in order ([`Self::record_ace`]); each
+    /// PATH is converged once, when its last entry in the batch has
+    /// been recorded (module doc, "One converge per path per
+    /// batch"). A failed converge fails every entry recorded on that
+    /// path.
+    ///
     /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
     pub fn apply_aces(
         &self,
@@ -672,44 +755,60 @@ impl Locked {
         targets: &[(String, SbAce)],
     ) -> Result<(Vec<AceWitness>, usize)> {
         self.with_broker_registration(sandbox_sid, |db| {
-            let mut witnesses = Vec::with_capacity(targets.len());
+            let plan = plan_ace_ops(targets);
+            let last = last_touches(plan.iter().map(|op| op.canon.as_str()));
+            // `done[i]`: op `i` recorded (and, once its path has
+            // converged, written). A witness leaves its slot for the
+            // caller only as `Some` — i.e. only once converged.
+            let mut done: Vec<Option<AceWitness>> = Vec::new();
+            done.resize_with(plan.len(), || None);
+            // Recorded, converge still owed: path → op indices.
+            let mut owed: HashMap<&str, Vec<usize>> = HashMap::new();
             let mut failed = 0usize;
-            let mut one = |canon: &str, ace: SbAce| -> bool {
-                match db.ensure_ace(canon, ace, sandbox_sid) {
-                    Ok(w) => {
-                        witnesses.push(w);
-                        true
-                    }
-                    Err(e) => {
-                        eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
-                        failed += 1;
-                        false
-                    }
-                }
-            };
-            for (canon, ace) in targets {
+            for (i, op) in plan.iter().enumerate() {
+                let canon = op.canon.as_str();
                 // Skip the parent-FDC ACE when the file's own
                 // Deny failed (e.g. hardlink refuse) — the batch
                 // is going to roll back anyway (`failed > 0`),
                 // and stamping the parent first just to release
                 // it in the same pass wastes a SetSecurityInfo
                 // round-trip and clutters the failure output.
-                if one(canon, *ace)
-                    && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
-                    && let Some(p) = path_id::canonical_parent_of(canon)
+                if op.implied_by.is_none_or(|t| done[t].is_some()) {
+                    match db.record_ace(canon, op.ace) {
+                        Ok(w) => {
+                            done[i] = Some(w);
+                            owed.entry(canon).or_default().push(i);
+                        }
+                        Err(e) => {
+                            eprintln!("srt-win: {} '{canon}': {e:#}", op.ace.kind());
+                            failed += 1;
+                        }
+                    }
+                }
+                if last[i]
+                    && let Some(ops) = owed.remove(canon)
+                    && let Err(e) = recompose_at(&db.conn, canon, sandbox_sid)
                 {
-                    one(&p, SbAce::DenyFdc);
+                    for k in ops {
+                        eprintln!("srt-win: {} '{canon}': {e:#}", plan[k].ace.kind());
+                        done[k] = None;
+                        failed += 1;
+                    }
                 }
             }
-            Ok((witnesses, failed))
+            Ok((done.into_iter().flatten().collect(), failed))
         })
     }
 
-    /// Disk-first single-ACE converge. Record-first upsert (holder
-    /// row plus `working_aces` row) then [`recompose_at`] so a
-    /// crash between leaves a row whose ACE hasn't been written —
-    /// the next call re-derives and reapplies.
-    fn ensure_ace(&self, canon: &str, want: SbAce, sandbox_sid: &str) -> Result<AceWitness> {
+    /// The record half of a single-ACE converge: capture the path's
+    /// identity, run the guards, then the record-first upserts
+    /// (holder row plus `working_aces` row). The caller OWES a
+    /// [`recompose_at`] on `canon` before its batch ends — a crash
+    /// in between leaves a row whose ACE hasn't been written; the
+    /// next call re-derives and reapplies. The returned witness is
+    /// only handed out of [`Self::apply_aces`] once that converge
+    /// has succeeded.
+    fn record_ace(&self, canon: &str, want: SbAce) -> Result<AceWitness> {
         let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
         // Hardlink guard: NTFS hardlinks share one SD across
@@ -799,7 +898,6 @@ impl Locked {
                 eff.as_str()
             ])
             .context("UPSERT working_aces")?;
-        recompose_at(&self.conn, canon, sandbox_sid)?;
         Ok(AceWitness {
             canon: canon.to_string(),
             ace: eff,
@@ -825,6 +923,18 @@ impl Locked {
             .transpose()
     }
 
+    /// Release one `(canon, kind)` hold and converge the path —
+    /// [`Self::release_row`] plus the [`recompose_at`] it owes. The
+    /// single-row form, for rollback; [`Self::release_aces`] batches
+    /// the converge per path instead.
+    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
+        let (release, converge) = self.release_row(canon, kind, sandbox_sid)?;
+        if converge == Converge::Owed {
+            recompose_at(&self.conn, canon, sandbox_sid)?;
+        }
+        Ok(release)
+    }
+
     /// Release one `(canon, kind)` hold; recompute the effective ACE
     /// from the remaining holders (downgrade if this holder was the
     /// one that escalated it; revoke when zero remain).
@@ -833,7 +943,19 @@ impl Locked {
     /// object is NOT touched — except for `Grant`, where we
     /// best-effort `locate_by_file_id` and revoke at the moved path
     /// so the sandbox user does not keep stale access.
-    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
+    ///
+    /// The row half only: when the identity gate matches, the
+    /// on-disk converge of `canon` is left to the caller
+    /// ([`Converge::Owed`]) so a batch can run it once per path. The
+    /// reported [`AceRelease`] is then provisional on that converge
+    /// succeeding. A relocated grant is converged here, at the path
+    /// it moved to.
+    fn release_row(
+        &self,
+        canon: &str,
+        kind: &str,
+        sandbox_sid: &str,
+    ) -> Result<(AceRelease, Converge)> {
         self.conn
             .prepare_cached(
                 "DELETE FROM ace_holders WHERE canonical_path = ?1 \
@@ -850,7 +972,7 @@ impl Locked {
             .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((fid, stored)) = row else {
-            return Ok(AceRelease::NoRow);
+            return Ok((AceRelease::NoRow, Converge::Done));
         };
         let new_eff = self.effective_ace(canon, kind)?;
         // Row update first (record-first), then converge disk.
@@ -874,14 +996,14 @@ impl Locked {
         };
         let want_id = FileId::from_bytes(&fid)?;
         match identity_gate(canon, want_id) {
-            IdGate::Match => {
-                recompose_at(&self.conn, canon, sandbox_sid)?;
-                Ok(match new_eff {
+            IdGate::Match => Ok((
+                match new_eff {
                     Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                     Some(_) => AceRelease::Downgraded,
                     None => AceRelease::Revoked,
-                })
-            }
+                },
+                Converge::Owed,
+            )),
             IdGate::Mismatch if kind == "grant" => {
                 // The granted object moved. The ALLOW ACE travels
                 // with the inode → the sandbox user still has
@@ -889,7 +1011,7 @@ impl Locked {
                 // revoke there (then re-converge if the new path
                 // happens to be tracked too). DENY/FDC are left in
                 // place on the moved inode (fail-closed).
-                Ok(match path_id::locate_by_file_id(&want_id) {
+                let release = match path_id::locate_by_file_id(&want_id) {
                     Some(at) => {
                         eprintln!(
                             "srt-win: grant '{canon}': file_id moved \
@@ -905,7 +1027,8 @@ impl Locked {
                         );
                         AceRelease::Missing
                     }
-                })
+                };
+                Ok((release, Converge::Done))
             }
             IdGate::Mismatch => {
                 eprintln!(
@@ -913,14 +1036,14 @@ impl Locked {
                      path substituted; not touching ACE on the \
                      foreign object (fail-closed)"
                 );
-                Ok(AceRelease::Mismatch)
+                Ok((AceRelease::Mismatch, Converge::Done))
             }
             IdGate::Unreadable => {
                 eprintln!(
                     "srt-win: {kind} '{canon}': open failed; \
                      dropping row"
                 );
-                Ok(AceRelease::Missing)
+                Ok((AceRelease::Missing, Converge::Done))
             }
         }
     }
@@ -945,26 +1068,60 @@ impl Locked {
     /// `kinds` ([`KIND_GRANT`] for `acl revoke`; [`KIND_DENY`] for
     /// `acl restore --sandbox-user-sid`) and unregister if no holds
     /// of any kind remain. Per-path catch-and-continue.
+    ///
+    /// Every hold's rows are released in order
+    /// ([`Self::release_row`], identity gate included); each PATH is
+    /// converged once, after its last hold in the batch (module doc,
+    /// "One converge per path per batch"). A failed converge fails
+    /// every hold released on that path — their rows are gone and
+    /// the ACE is left in place, as for a single failed release.
     pub fn release_aces(
         &self,
         sandbox_sid: &str,
         kinds: &[&str],
     ) -> Result<(Vec<(String, AceRelease)>, usize)> {
         let holds = self.my_ace_holds(Some(kinds))?;
-        let mut out = Vec::with_capacity(holds.len());
+        let last = last_touches(holds.iter().map(|(canon, _)| canon.as_str()));
+        // Per-hold outcome, in `holds` order; `None` = failed.
+        let mut released: Vec<Option<AceRelease>> = vec![None; holds.len()];
+        // Rows released, converge still owed: path → hold indices.
+        let mut owed: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut failed = 0usize;
-        for (canon, kind) in &holds {
-            match self.release_one_ace(canon, kind, sandbox_sid) {
-                Ok(r) => out.push((canon.clone(), r)),
+        let warn = |kind: &str, canon: &str, e: &anyhow::Error| {
+            eprintln!(
+                "srt-win: WARNING: release {kind} '{canon}': \
+                 {e:#}; ACE left in place"
+            );
+        };
+        for (i, (canon, kind)) in holds.iter().enumerate() {
+            match self.release_row(canon, kind, sandbox_sid) {
+                Ok((r, converge)) => {
+                    released[i] = Some(r);
+                    if converge == Converge::Owed {
+                        owed.entry(canon.as_str()).or_default().push(i);
+                    }
+                }
                 Err(e) => {
-                    eprintln!(
-                        "srt-win: WARNING: release {kind} '{canon}': \
-                         {e:#}; ACE left in place"
-                    );
+                    warn(kind, canon, &e);
+                    failed += 1;
+                }
+            }
+            if last[i]
+                && let Some(rows) = owed.remove(canon.as_str())
+                && let Err(e) = recompose_at(&self.conn, canon, sandbox_sid)
+            {
+                for k in rows {
+                    warn(&holds[k].1, canon, &e);
+                    released[k] = None;
                     failed += 1;
                 }
             }
         }
+        let out: Vec<(String, AceRelease)> = holds
+            .iter()
+            .zip(released)
+            .filter_map(|((canon, _), r)| Some((canon.clone(), r?)))
+            .collect();
         if self
             .my_ace_holds(None)
             .map(|h| h.is_empty())
@@ -1019,6 +1176,12 @@ impl Locked {
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
 fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()> {
+    recompose(conn, canon, sandbox_sid, false)
+}
+
+/// [`recompose_at`], optionally with the write FORCED (never skipped
+/// as already-converged) — the journal recovery's form.
+fn recompose(conn: &Connection, canon: &str, sandbox_sid: &str, force_write: bool) -> Result<()> {
     let rows: Vec<(String, String)> = query_vec(
         conn,
         "SELECT kind, mask FROM working_aces \
@@ -1044,8 +1207,291 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
+    // The object the completion record must be about. Unreadable →
+    // no identity → no skip (the write below reports the real error).
+    let ledger = ConvergedLedger {
+        conn,
+        canon,
+        file_id: path_id::capture_file_id(canon).ok(),
+        // A path left with no sandbox ACE needs no record (and the
+        // table must not grow with every path ever stamped): it is
+        // withdrawn by the write and not restored.
+        keep: !set.is_empty(),
+        force_write,
+    };
+    acl::converge_sandbox_aces(canon, sandbox_sid, set, Some(&ledger))
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
+}
+
+/// [`acl::WriteLedger`] over `converged_dacls` for one path — see
+/// that trait for why the write-skip needs a completion record, and
+/// the table comment for its lifecycle.
+struct ConvergedLedger<'a> {
+    conn: &'a Connection,
+    canon: &'a str,
+    /// The path's current identity; `None` (unreadable) never
+    /// matches and is never recorded.
+    file_id: Option<FileId>,
+    /// Whether a completed write is worth recording.
+    keep: bool,
+    /// Never report completion — the write always happens.
+    force_write: bool,
+}
+
+impl acl::WriteLedger for ConvergedLedger<'_> {
+    fn completed(&self, dacl: &[u8]) -> bool {
+        if self.force_write {
+            return false;
+        }
+        let Some(id) = self.file_id else {
+            return false;
+        };
+        let row: rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> = self
+            .conn
+            .query_row(
+                "SELECT file_id, dacl FROM converged_dacls \
+                 WHERE canonical_path = ?1",
+                params![self.canon],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional();
+        // Same object, same DACL. A read error, a malformed blob or
+        // a substituted path all read as "not completed".
+        matches!(row, Ok(Some((fid, was)))
+            if was == dacl && FileId::from_bytes(&fid).is_ok_and(|f| f == id))
+    }
+
+    fn begin(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM converged_dacls WHERE canonical_path = ?1",
+                params![self.canon],
+            )
+            .context("DELETE converged_dacls")?;
+        // Journal the write (module doc, "Write-intent journal").
+        let Some(id) = self.file_id else {
+            bail!(
+                "'{}': file_id unreadable — cannot journal the DACL write",
+                self.canon
+            );
+        };
+        record_write_intent(self.conn, self.canon, &id)?;
+        // Never on the recovery replay (`force_write`): a recovery
+        // run with the variable still set must be able to finish
+        // the write the hook interrupted.
+        #[cfg(feature = "test-hooks")]
+        if !self.force_write {
+            debug_kill_before_write(self.canon);
+        }
+        Ok(())
+    }
+
+    fn complete(&self, dacl: &[u8]) {
+        // The write returned: retire its journal row. Best-effort — a
+        // row that outlives its write only costs one redundant
+        // forced converge at the next recovery.
+        if let Some(id) = self.file_id {
+            let _ = clear_write_intent(self.conn, self.canon, &id.as_bytes());
+        }
+        let (true, Some(id)) = (self.keep, self.file_id) else {
+            return;
+        };
+        // Best-effort: without the row the next converge just writes.
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO converged_dacls \
+             (canonical_path, file_id, dacl) VALUES (?1, ?2, ?3)",
+            params![self.canon, id.as_bytes().as_slice(), dacl],
+        );
+    }
+}
+
+// ─── Write-intent journal ───────────────────────────────────────────
+
+/// Journal a DACL write about to start on the object `id` at `canon`
+/// (see the `write_intents` table comment). Autocommitted before the
+/// write, like every other row here; idempotent.
+fn record_write_intent(conn: &Connection, canon: &str, id: &FileId) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO write_intents (canonical_path, file_id) \
+         VALUES (?1, ?2)",
+        params![canon, id.as_bytes().as_slice()],
+    )
+    .with_context(|| format!("INSERT write_intents '{canon}'"))?;
+    Ok(())
+}
+
+/// Retire the journal row for `(canon, id)` — its write returned, or
+/// recovery has dealt with it.
+fn clear_write_intent(conn: &Connection, canon: &str, id: &[u8]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM write_intents \
+         WHERE canonical_path = ?1 AND file_id = ?2",
+        params![canon, id],
+    )
+    .with_context(|| format!("DELETE write_intents '{canon}'"))?;
+    Ok(())
+}
+
+/// Test hook for the journal's smoke row — compiled ONLY under the
+/// off-by-default `test-hooks` cargo feature, so no shipped broker
+/// contains it. With `SANDBOX_RUNTIME_WIN_DEBUG` set AND
+/// `SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE` naming a path
+/// suffix, exit hard (no unwinding, like a kill) right after the
+/// intent row for a matching path is committed and before its DACL
+/// write — the state a broker killed at the start of a propagation
+/// leaves behind. Fires at most once per process (it exits) and
+/// never on the recovery replay (see the call site).
+#[cfg(feature = "test-hooks")]
+fn debug_kill_before_write(canon: &str) {
+    if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_none() {
+        return;
+    }
+    if let Ok(suffix) = std::env::var("SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE")
+        && !suffix.is_empty()
+        && canon
+            .to_ascii_lowercase()
+            .ends_with(&suffix.to_ascii_lowercase())
+    {
+        eprintln!("srt-win: debug: killed before dacl write '{canon}'");
+        std::process::exit(86);
+    }
+}
+
+/// Finish every DACL write the journal shows as started and not
+/// returned: re-run the path's converge from the rows that exist NOW
+/// (after a killed release: none, so the sandbox ACEs come off the
+/// whole subtree), with the write forced. The row goes only once that
+/// converge has returned, so a pass that is itself killed, or whose
+/// converge fails, leaves it for the next one; re-running a completed
+/// converge changes nothing, so the pass is idempotent.
+///
+/// Path-anchored and fail-closed, as release is: when `canon` is gone
+/// or now names a different object the journal row is dropped and
+/// nothing is touched — the moved object is NOT chased by file_id
+/// (the journal does not know whether a deny was involved, and
+/// converging a relocated deny target from its new path's rows would
+/// strip the deny). A path that cannot be opened keeps its row for a
+/// later pass unless `force` drops it.
+fn recover_write_intents(
+    conn: &Connection,
+    sandbox_sid: &str,
+    force: bool,
+    report: &mut RecoveryReport,
+) -> Result<()> {
+    let intents: Vec<(String, Vec<u8>)> = query_vec(
+        conn,
+        "SELECT canonical_path, file_id FROM write_intents",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    for (canon, fid) in &intents {
+        let gate = match FileId::from_bytes(fid) {
+            Ok(want) => identity_gate(canon, want),
+            // A malformed identity can never match anything.
+            Err(_) => IdGate::Mismatch,
+        };
+        match gate {
+            IdGate::Match => match recompose(conn, canon, sandbox_sid, true) {
+                Ok(()) => {
+                    clear_write_intent(conn, canon, fid)?;
+                    report.writes_resumed += 1;
+                }
+                Err(e) => eprintln!(
+                    "srt-win: interrupted DACL write '{canon}': \
+                     re-converge failed ({e:#}); will retry"
+                ),
+            },
+            IdGate::Mismatch => {
+                eprintln!(
+                    "srt-win: interrupted DACL write '{canon}': path \
+                     is gone or names a different object; not \
+                     touching it (fail-closed), dropping the journal \
+                     row"
+                );
+                clear_write_intent(conn, canon, fid)?;
+            }
+            IdGate::Unreadable if force => {
+                eprintln!(
+                    "srt-win: interrupted DACL write '{canon}': \
+                     unreadable; dropping the journal row (--force)"
+                );
+                clear_write_intent(conn, canon, fid)?;
+            }
+            IdGate::Unreadable => {} // row kept; identity_gate reported
+        }
+    }
+    report.writes_pending = count_write_intents(conn)?;
+    Ok(())
+}
+
+/// Journal rows outstanding — DACL writes started and not yet seen
+/// to return.
+fn count_write_intents(conn: &Connection) -> Result<u32> {
+    conn.query_row("SELECT count(*) FROM write_intents", [], |r| r.get(0))
+        .context("count write_intents")
+}
+
+/// Whether a row change still needs its path converged on disk
+/// ([`recompose_at`]) by the caller — see [`Locked::release_row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Converge {
+    /// Rows changed and the identity gate matched; the caller must
+    /// `recompose_at` the path (once per path per batch suffices).
+    Owed,
+    /// Nothing left to do on disk at this path.
+    Done,
+}
+
+/// For a batch that touches `paths[i]` at step `i`: `out[i]` is true
+/// iff no LATER step touches the same path — the step after which
+/// that path's deferred converge runs (module doc, "One converge per
+/// path per batch"). Exactly one `true` per distinct path, so each
+/// path is converged once however often the batch touches it.
+/// Paths are compared as the DB keys them: exact canonical strings.
+fn last_touches<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<bool> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut last: Vec<bool> = paths.iter().rev().map(|p| seen.insert(*p)).collect();
+    last.reverse();
+    last
+}
+
+/// One step of an [`Locked::apply_aces`] batch.
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedAce {
+    canon: String,
+    ace: SbAce,
+    /// `Some(i)`: this is the parent-FDC entry implied by step `i`
+    /// (a `Deny`/`DenyDelete` target) and is skipped when step `i`
+    /// did not go through.
+    implied_by: Option<usize>,
+}
+
+/// Expand `targets` into the batch's steps, in order: each target,
+/// followed — for a `Deny`/`DenyDelete` target with a stampable
+/// parent — by the implied `(parent, DenyFdc)`. Repeats are kept:
+/// every step still runs its own capture, guards and upserts; only
+/// the per-path converge is shared.
+fn plan_ace_ops(targets: &[(String, SbAce)]) -> Vec<PlannedAce> {
+    let mut plan = Vec::with_capacity(targets.len());
+    for (canon, ace) in targets {
+        let target = plan.len();
+        plan.push(PlannedAce {
+            canon: canon.clone(),
+            ace: *ace,
+            implied_by: None,
+        });
+        if matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
+            && let Some(parent) = path_id::canonical_parent_of(canon)
+        {
+            plan.push(PlannedAce {
+                canon: parent,
+                ace: SbAce::DenyFdc,
+                implied_by: Some(target),
+            });
+        }
+    }
+    plan
 }
 
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to
@@ -1104,8 +1550,8 @@ impl AceRelease {
 /// Per-path commit: the dead-broker prune is one short tx (pure DB,
 /// CASCADE); then each orphan's (recompose FS mutation + row
 /// delete) is committed independently, so a failure on path Y
-/// leaves path X's recompose+delete durable. `force` is reserved
-/// for a future "force-recompose ignoring file-id mismatch" mode.
+/// leaves path X's recompose+delete durable. `force` drops journal
+/// rows whose path cannot be opened ([`recover_write_intents`]).
 fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     let mut report = RecoveryReport::default();
 
@@ -1162,35 +1608,65 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        for (canon, kind, fid) in orphan_aces {
+        // One converge per path (module doc): each orphan row is
+        // deleted and identity-gated in turn; a path's recompose
+        // runs after its LAST orphan row. An early `?` return below
+        // can only strand a path that still has an undeleted orphan
+        // row (its last touch lies ahead), so the next recovery
+        // converges it.
+        let last = last_touches(orphan_aces.iter().map(|(canon, ..)| canon.as_str()));
+        // Rows deleted + gate matched, converge still owed: path →
+        // kinds.
+        let mut owed: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (i, (canon, kind, fid)) in orphan_aces.iter().enumerate() {
             conn.execute(
                 "DELETE FROM working_aces \
                  WHERE canonical_path = ?1 AND kind = ?2",
-                params![&canon, &kind],
+                params![canon, kind],
             )
             .context("DELETE working_aces (orphan)")?;
-            let want = FileId::from_bytes(&fid)?;
-            match identity_gate(&canon, want) {
-                IdGate::Match => {
-                    if let Err(e) = recompose_at(conn, &canon, &sb) {
-                        eprintln!(
-                            "srt-win: orphaned {kind} '{canon}': \
-                             recompose failed ({e:#})"
-                        );
-                        continue;
-                    }
-                }
+            let want = FileId::from_bytes(fid)?;
+            match identity_gate(canon, want) {
+                IdGate::Match => owed.entry(canon.as_str()).or_default().push(kind.as_str()),
                 IdGate::Mismatch if kind == "grant" => {
                     if let Some(at) = path_id::locate_by_file_id(&want) {
                         let _ = recompose_at(conn, &at, &sb);
                     }
+                    report.aces_revoked += 1;
                 }
-                _ => {} // gone/substituted — nothing on disk to do
+                // gone/substituted — nothing on disk to do
+                _ => report.aces_revoked += 1,
             }
-            report.aces_revoked += 1;
+            if last[i]
+                && let Some(kinds) = owed.remove(canon.as_str())
+            {
+                match recompose_at(conn, canon, &sb) {
+                    Ok(()) => report.aces_revoked += kinds.len() as u32,
+                    Err(e) => {
+                        for kind in kinds {
+                            eprintln!(
+                                "srt-win: orphaned {kind} '{canon}': \
+                                 recompose failed ({e:#})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
-    let _ = force; // reserved for a future "force-recompose" mode
+    // 4. Interrupted DACL writes (module doc, "Write-intent
+    //    journal"). After step 3 on purpose: an orphan converge that
+    //    completes on a journaled path retires that row itself, so
+    //    the tree is walked once, not twice. Same validated identity
+    //    as step 3; without one the rows wait.
+    //    The table is empty unless a write was cut short, so the
+    //    identity read is only paid for then.
+    report.writes_pending = count_write_intents(conn)?;
+    if report.writes_pending > 0
+        && let Some(sb) = crate::install::read_setup()?.map(|s| s.sandbox_user_sid)
+    {
+        recover_write_intents(conn, &sb, force, &mut report)?;
+    }
     Ok(report)
 }
 
@@ -1364,7 +1840,7 @@ mod tests {
     fn second_register_broker_keeps_existing_holds() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            // Two holds via direct INSERT (ensure_ace needs a real
+            // Two holds via direct INSERT (record_ace needs a real
             // file; the CASCADE behavior under test is pure SQL).
             for p in [r"\\?\C:\a", r"\\?\C:\b"] {
                 db.conn
@@ -1384,6 +1860,246 @@ mod tests {
         });
     }
 
+    /// Exactly one converge per distinct path, placed at the path's
+    /// final touch — so it sees every row the batch recorded there.
+    #[test]
+    fn last_touches_marks_one_final_touch_per_path() {
+        assert_eq!(last_touches([]), Vec::<bool>::new());
+        assert_eq!(last_touches(["a"]), [true]);
+        // root touched three times (grant-root FDC from two denied
+        // children + a placeholder): only the third converges it.
+        assert_eq!(
+            last_touches(["f1", "root", "f2", "root", "ph", "root"]),
+            [true, false, true, false, true, true],
+        );
+        // Exact-string identity, as the DB keys paths.
+        assert_eq!(last_touches(["A", "a", "A"]), [false, true, true]);
+        for seq in [vec!["x", "y", "x", "z", "y", "x"], vec!["p"; 5]] {
+            let last = last_touches(seq.iter().copied());
+            let distinct: HashSet<&str> = seq.iter().copied().collect();
+            assert_eq!(last.iter().filter(|l| **l).count(), distinct.len());
+            for (i, p) in seq.iter().enumerate() {
+                assert_eq!(last[i], !seq[i + 1..].contains(p), "step {i}");
+            }
+        }
+    }
+
+    /// Batch composition for the session-init shape: a root-level
+    /// deny plus a deny under a placeholder directory. The root is
+    /// touched twice (parent-FDC of the deny, parent-FDC of the
+    /// placeholder) but is converged once, last — after every row
+    /// destined for it has been recorded.
+    #[test]
+    fn plan_ace_ops_implies_parent_fdc_and_coalesces_root() {
+        use acl::{DenyMask, GrantMask};
+        let root = r"\\?\C:\proj";
+        let p = |rel: &str| format!(r"{root}\{rel}");
+        let deny = SbAce::Deny(DenyMask::WriteDeny);
+        let targets = vec![
+            (p(r".claude\settings.json"), deny),
+            (p(".claude"), SbAce::DenyDelete),
+            (p(".mcp.json"), deny),
+            (root.to_string(), SbAce::Grant(GrantMask::Modify)),
+        ];
+        let plan = plan_ace_ops(&targets);
+        let step = |canon: String, ace, implied_by| PlannedAce {
+            canon,
+            ace,
+            implied_by,
+        };
+        assert_eq!(
+            plan,
+            [
+                step(p(r".claude\settings.json"), deny, None),
+                step(p(".claude"), SbAce::DenyFdc, Some(0)),
+                step(p(".claude"), SbAce::DenyDelete, None),
+                step(root.to_string(), SbAce::DenyFdc, Some(2)),
+                step(p(".mcp.json"), deny, None),
+                step(root.to_string(), SbAce::DenyFdc, Some(4)),
+                // A grant implies no parent entry.
+                step(root.to_string(), SbAce::Grant(GrantMask::Modify), None),
+            ],
+        );
+        let last = last_touches(plan.iter().map(|op| op.canon.as_str()));
+        assert_eq!(last, [true, false, true, false, true, false, true]);
+        // A top-level deny target has no stampable parent.
+        let top = plan_ace_ops(&[(r"\\?\C:\x".to_string(), deny)]);
+        assert_eq!(top.len(), 1);
+    }
+
+    /// The completion record vouches for one (path, object, DACL)
+    /// triple, is withdrawn by `begin`, and is not kept for a path
+    /// left without sandbox ACEs.
+    #[test]
+    fn converged_ledger_records_only_completed_writes() {
+        use acl::WriteLedger;
+        with_mem_db(|db| {
+            let id = |n: u8| FileId {
+                volume_serial: 7,
+                id128: [n; 16],
+            };
+            let ledger = |canon, n, keep| ConvergedLedger {
+                conn: &db.conn,
+                canon,
+                file_id: Some(id(n)),
+                keep,
+                force_write: false,
+            };
+            let (a, b) = (r"\\?\C:\a", r"\\?\C:\b");
+            let l = ledger(a, 1, true);
+            assert!(!l.completed(b"X"), "no record yet");
+            l.begin().unwrap();
+            assert!(!l.completed(b"X"), "begun, not completed");
+            l.complete(b"X");
+            assert!(l.completed(b"X"));
+            // Another DACL, another object at the path, another
+            // path, or an unreadable identity: not completed.
+            assert!(!l.completed(b"Y"));
+            assert!(!ledger(a, 2, true).completed(b"X"));
+            assert!(!ledger(b, 1, true).completed(b"X"));
+            let blind = ConvergedLedger {
+                file_id: None,
+                ..ledger(a, 1, true)
+            };
+            assert!(!blind.completed(b"X"));
+            // The next write withdraws it; killed before `complete`,
+            // it stays withdrawn.
+            l.begin().unwrap();
+            assert!(!l.completed(b"X"));
+            // A converge to "no sandbox ACEs" leaves no row behind.
+            l.complete(b"X");
+            let gone = ledger(a, 1, false);
+            gone.begin().unwrap();
+            gone.complete(b"Z");
+            assert!(!gone.completed(b"Z") && !l.completed(b"X"));
+            blind.complete(b"X");
+            assert!(!l.completed(b"X"), "no identity → nothing recorded");
+            let rows: i64 = db
+                .conn
+                .query_row("SELECT count(*) FROM converged_dacls", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        });
+    }
+
+    fn intents(db: &Locked) -> Vec<(String, Vec<u8>)> {
+        query_vec(
+            &db.conn,
+            "SELECT canonical_path, file_id FROM write_intents \
+             ORDER BY canonical_path, file_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Journal bookkeeping: the row appears at `begin`, survives
+    /// until `complete`, is keyed by (path, object), and a forced
+    /// ledger never reports completion.
+    #[test]
+    fn write_intent_brackets_the_write() {
+        use acl::WriteLedger;
+        with_mem_db(|db| {
+            let id = |n: u8| FileId {
+                volume_serial: 7,
+                id128: [n; 16],
+            };
+            let ledger = |n, keep, force_write| ConvergedLedger {
+                conn: &db.conn,
+                canon: r"\\?\C:\a",
+                file_id: Some(id(n)),
+                keep,
+                force_write,
+            };
+            assert!(intents(db).is_empty());
+            // A release-to-empty write (`keep: false`): journaled all
+            // the same — it is the case rows cannot cover.
+            let l = ledger(1, false, false);
+            l.begin().unwrap();
+            l.begin().unwrap(); // idempotent
+            assert_eq!(
+                intents(db),
+                [(r"\\?\C:\a".to_string(), id(1).as_bytes().to_vec())],
+                "killed here → the intent is what recovery finds",
+            );
+            // Another object at the same path journals separately and
+            // its completion does not retire the first row.
+            let other = ledger(2, true, false);
+            other.begin().unwrap();
+            assert_eq!(intents(db).len(), 2);
+            other.complete(b"X");
+            assert_eq!(intents(db).len(), 1);
+            l.complete(b"");
+            assert!(intents(db).is_empty(), "write returned → row retired");
+            // Forced: a matching completion record does not count.
+            assert!(other.completed(b"X"));
+            assert!(!ledger(2, true, true).completed(b"X"));
+            // No identity → no journal row possible → no write.
+            let blind = ConvergedLedger {
+                file_id: None,
+                ..ledger(1, true, false)
+            };
+            assert!(blind.begin().is_err());
+        });
+    }
+
+    /// Recovery over real paths: a surviving intent on a live
+    /// directory is re-converged from the (empty) rows — stripping
+    /// the sandbox ACE a killed release left — and retired; an intent
+    /// whose path is gone or substituted is dropped untouched; a
+    /// second pass finds nothing.
+    #[test]
+    fn recover_write_intents_finishes_a_killed_release() {
+        const FAKE_SB_SID: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-intent-{}", std::process::id()));
+        let (live, swapped) = (dir.join("live"), dir.join("swapped"));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&swapped).unwrap();
+        let canon =
+            |p: &std::path::Path| path_id::canonicalize_path(p.to_str().unwrap()).unwrap().0;
+        let (live, swapped) = (canon(&live), canon(&swapped));
+        let gone = format!(r"{live}\never-existed");
+        let grant = acl::SbAceSet {
+            grant: Some(acl::GrantMask::Modify),
+            ..Default::default()
+        };
+        // The killed release's residue: ACE on disk, no row.
+        acl::apply_sandbox_aces(&live, FAKE_SB_SID, grant).unwrap();
+        acl::apply_sandbox_aces(&swapped, FAKE_SB_SID, grant).unwrap();
+        let sid = crate::sid::sid_bytes(FAKE_SB_SID).unwrap();
+        // Any EXPLICIT ACE for the stand-in sandbox SID on `p`.
+        let has_ace = |p: &str| {
+            let (_sd, dacl) = acl::read_file_dacl(p).unwrap();
+            let (explicit, ..) = acl::filter_aces(dacl, |hdr, body| {
+                hdr.AceFlags & 0x10 == 0 && acl::ace_sid_is(body, &sid)
+            })
+            .unwrap();
+            !explicit.is_empty()
+        };
+        assert!(has_ace(&live) && has_ace(&swapped));
+        with_mem_db(|db| {
+            let live_id = path_id::capture_file_id(&live).unwrap();
+            record_write_intent(&db.conn, &live, &live_id).unwrap();
+            // `swapped` journaled under another object's identity;
+            // `gone` does not exist.
+            record_write_intent(&db.conn, &swapped, &live_id).unwrap();
+            record_write_intent(&db.conn, &gone, &live_id).unwrap();
+
+            let mut report = RecoveryReport::default();
+            recover_write_intents(&db.conn, FAKE_SB_SID, false, &mut report).unwrap();
+            assert_eq!((report.writes_resumed, report.writes_pending), (1, 0));
+            assert!(intents(db).is_empty());
+            assert!(!has_ace(&live), "interrupted release finished");
+            assert!(has_ace(&swapped), "substituted path not touched");
+
+            let mut again = RecoveryReport::default();
+            recover_write_intents(&db.conn, FAKE_SB_SID, false, &mut again).unwrap();
+            assert_eq!((again.writes_resumed, again.writes_pending), (0, 0));
+        });
+        acl::apply_sandbox_aces(&swapped, FAKE_SB_SID, acl::SbAceSet::default()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn schema_applies_in_memory() {
         // Session schema: bookkeeping tables only — the setup
@@ -1394,14 +2110,15 @@ mod tests {
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='table' \
                      AND name IN ('brokers','working_aces','ace_holders', \
-                                  'placeholders','sandbox_user')",
+                                  'placeholders','converged_dacls', \
+                                  'write_intents','sandbox_user')",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
             assert_eq!(
-                n, 4,
-                "session schema: 4 bookkeeping tables, no sandbox_user"
+                n, 6,
+                "session schema: 6 bookkeeping tables, no sandbox_user"
             );
         });
     }
