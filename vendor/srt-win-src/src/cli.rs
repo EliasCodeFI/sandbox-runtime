@@ -416,9 +416,7 @@ struct AceTargets {
 /// [`placeholder_ancestors_of`], any earlier holder's — get
 /// [`SbAce::DenyDelete`], so every holder holds the FULL chain and
 /// releasing any one holder cannot strip an intermediate another
-/// holder still depends on. Each intermediate is listed ONCE per
-/// call however many deny targets sit beneath it
-/// ([`push_placeholder_ancestors`]).
+/// holder still depends on.
 ///
 /// A `Deny` target the broker cannot create (`PermissionDenied` —
 /// e.g. under `Program Files` non-elevated) or that names a UNC
@@ -448,8 +446,6 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
-    // Placeholder ancestors already listed as `DenyDelete` targets.
-    let mut held_ancestors = std::collections::HashSet::new();
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -532,38 +528,47 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
-        // Full-chain hold (see doc).
+        // Full-chain hold (see doc). Duplicates are merged below.
         if matches!(ace, SbAce::Deny(_)) {
-            push_placeholder_ancestors(
-                &mut targets,
-                &mut held_ancestors,
-                db.placeholder_ancestors_of(&canon)?,
-            );
+            for anc in db.placeholder_ancestors_of(&canon)? {
+                targets.push((anc, SbAce::DenyDelete));
+            }
         }
     }
     Ok(AceTargets {
-        targets,
+        targets: merge_ace_targets(targets),
         bad_inputs,
     })
 }
 
-/// Append `(ancestor, DenyDelete)` for each placeholder ancestor not
-/// already listed by this call (`seen`). Several deny targets under
-/// one placeholder directory (`.claude\a`, `.claude\b`, …) all
-/// report it; the repeat entries would be no-ops on the rows
-/// (`apply_aces` is idempotent per `(path, kind, holder)`) but each
-/// would still re-run the entry and its implied parent-FDC entry, so
-/// they are dropped here, keeping the first.
-fn push_placeholder_ancestors(
-    targets: &mut Vec<(String, srt_win::acl::SbAce)>,
-    seen: &mut std::collections::HashSet<String>,
-    ancestors: Vec<String>,
-) {
-    for anc in ancestors {
-        if seen.insert(anc.clone()) {
-            targets.push((anc, srt_win::acl::SbAce::DenyDelete));
+/// One entry per `(path, kind)`, where the path first came up, with
+/// the widest of the masks asked for it ([`SbAce::max`]).
+///
+/// INVARIANT: a batch hands `apply_aces` no `(path, kind)` twice. A
+/// holder has ONE row per `(path, kind)` and a later entry overwrites
+/// its mask, so a path in `denyRead` and in `denyWrite` (or named by
+/// two spellings of one object) would end at the write deny, which
+/// leaves read open.
+///
+/// [`SbAce::max`]: srt_win::acl::SbAce::max
+fn merge_ace_targets(
+    targets: Vec<(String, srt_win::acl::SbAce)>,
+) -> Vec<(String, srt_win::acl::SbAce)> {
+    let mut at = std::collections::HashMap::new();
+    let mut merged: Vec<(String, srt_win::acl::SbAce)> = Vec::with_capacity(targets.len());
+    for (canon, ace) in targets {
+        match at.entry((canon.clone(), ace.kind())) {
+            std::collections::hash_map::Entry::Occupied(seen) => {
+                let held: &mut (String, srt_win::acl::SbAce) = &mut merged[*seen.get()];
+                held.1 = held.1.max(ace);
+            }
+            std::collections::hash_map::Entry::Vacant(new) => {
+                new.insert(merged.len());
+                merged.push((canon, ace));
+            }
         }
     }
+    merged
 }
 
 /// Build the `user status` JSON object (sandbox-user provisioning
@@ -1804,14 +1809,17 @@ mod tests {
         let deny = SbAce::Deny(DenyMask::ReadDeny);
         let s = |p: &str| p.to_string();
         let (claude, hooks) = (r"\\?\C:\p\.claude", r"\\?\C:\p\.claude\hooks");
-        let mut targets = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        targets.push((s(r"\\?\C:\p\.claude\hooks\pre"), deny));
-        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(claude), s(hooks)]);
-        targets.push((s(r"\\?\C:\p\.claude\settings.json"), deny));
-        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(claude)]);
-        targets.push((s(r"\\?\C:\p\.claude\hooks\post"), deny));
-        push_placeholder_ancestors(&mut targets, &mut seen, vec![s(hooks), s(claude)]);
+        let anc = |p: &str| (s(p), SbAce::DenyDelete);
+        let targets = merge_ace_targets(vec![
+            (s(r"\\?\C:\p\.claude\hooks\pre"), deny),
+            anc(claude),
+            anc(hooks),
+            (s(r"\\?\C:\p\.claude\settings.json"), deny),
+            anc(claude),
+            (s(r"\\?\C:\p\.claude\hooks\post"), deny),
+            anc(hooks),
+            anc(claude),
+        ]);
         assert_eq!(
             targets,
             [
@@ -1905,5 +1913,45 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// A path in `denyRead` and in `denyWrite` keeps the read deny,
+    /// whichever comes first. smoke-aces.ps1 A32 shows it on disk.
+    #[test]
+    fn a_batch_names_each_path_and_kind_once_with_the_widest_mask() {
+        use srt_win::acl::{DenyMask, GrantMask, SbAce};
+        let read = SbAce::Deny(DenyMask::ReadDeny);
+        let write = SbAce::Deny(DenyMask::WriteDeny);
+        let t = |p: &str, ace: SbAce| (p.to_string(), ace);
+        for (first, second) in [(read, write), (write, read)] {
+            assert_eq!(
+                merge_ace_targets(vec![t(r"C:\a", first), t(r"C:\a", second)]),
+                vec![t(r"C:\a", read)]
+            );
+        }
+        assert_eq!(
+            merge_ace_targets(vec![
+                t(r"C:\a", SbAce::Grant(GrantMask::ReadOnly)),
+                t(r"C:\a", SbAce::Grant(GrantMask::Modify)),
+            ]),
+            vec![t(r"C:\a", SbAce::Grant(GrantMask::Modify))]
+        );
+        // Another kind on the same path is another row, another path
+        // is another entry, and each stays where it first came up.
+        assert_eq!(
+            merge_ace_targets(vec![
+                t(r"C:\b", write),
+                t(r"C:\a", SbAce::DenyDelete),
+                t(r"C:\a", write),
+                t(r"C:\b", write),
+                t(r"C:\a", SbAce::DenyDelete),
+                t(r"C:\a", read),
+            ]),
+            vec![
+                t(r"C:\b", write),
+                t(r"C:\a", SbAce::DenyDelete),
+                t(r"C:\a", read),
+            ]
+        );
     }
 }

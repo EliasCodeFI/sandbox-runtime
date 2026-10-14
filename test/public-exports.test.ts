@@ -55,6 +55,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'isUncPath',
   'parseWindowsBinShell',
   'parseWindowsSandboxError',
+  'realPathOf',
   'resolveSrtWin',
   'restoreWindowsAcl',
   'restoreWindowsAclAsync',
@@ -71,6 +72,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'windowsStateDir',
   'windowsTrustCa',
   'windowsTrustCaAsync',
+  'writeRootsOf',
 ]
 
 describe('package entry point', () => {
