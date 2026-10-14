@@ -70,6 +70,8 @@ import {
   grantWindowsAclAsync,
   revokeWindowsAclChecked,
   revokeWindowsAclCheckedAsync,
+  windowsAclIncompleteRevoke,
+  type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -285,34 +287,55 @@ function logWindowsAclOutcomes(
 
 /**
  * The release-ordering gate, shared by every release path: the deny
- * restore runs only after a revoke that COMPLETED. Returns whether
- * it may run.
+ * restore runs only after a revoke that COMPLETED, and never again in
+ * this process once one did not. Returns whether it may run.
  *
  * Revoke takes the ALLOW grants off, restore takes the DENY stamps
- * off. If the revoke failed, timed out or was only partial, an
- * ALLOW grant may still be on disk — and the sandbox account is
- * shared by every session, so with the stamps gone another session's
- * sandboxed process could write this tree's deny targets
- * (`.git/hooks`, settings files, …). So the stamps stay: they name
- * only the sandbox account's SID and cost the real user nothing.
- * Their rows stay held by this process, so srt-win's crash recovery
- * drops them on a later `acl` call once this process is gone.
+ * off. If the revoke failed, timed out, was only partial, or reported
+ * a path whose grant it could not release, an ALLOW grant may still
+ * be on disk — and the sandbox account is shared by every session, so
+ * with the stamps gone another session's sandboxed process could
+ * write this tree's deny targets (`.git/hooks`, settings files, …).
+ * So the stamps stay: they name only the sandbox account's SID and
+ * cost the real user nothing.
+ *
+ * The refusal lasts for the process: a later session's revoke that
+ * finds nothing left to release does not show the earlier grant is
+ * gone (an older srt-win forgets a path it could not open), so every
+ * later reset() keeps its stamps too.
+ *
+ * What clears them afterwards depends on the srt-win in use. A
+ * current one keeps the rows of a grant it could not release, held by
+ * this process; once this process has exited, any `srt-win acl`
+ * command retries those grants and takes this process's deny stamps
+ * off only when all of them are released. An older one has already
+ * dropped the row of such a grant: its crash recovery then removes
+ * the deny stamps once this process is gone, and the leftover ALLOW
+ * entry is recorded nowhere and has to be removed by hand.
  */
-function windowsAclRestoreAllowed(revoke: {
-  complete: boolean
-  outcomes: readonly { path: string; status: string }[] | undefined
-}): boolean {
+function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
-  if (!revoke.complete) {
-    logForDebugging(
-      `[Sandbox Windows] grant revoke did not complete — NOT running ` +
-        `the deny restore; deny ACEs stay in place while a grant may ` +
-        `still be on disk. Run \`srt-win acl recover\` after this ` +
-        `process exits to clear what is left.`,
-      { level: 'error' },
-    )
-  }
-  return revoke.complete
+  const earlier = windowsAclIncompleteRevoke()
+  if (revoke.complete && earlier === undefined) return true
+  const paths = [...new Set([...revoke.pending, ...(earlier ?? [])])]
+  logForDebugging(
+    `[Sandbox Windows] ` +
+      (revoke.complete
+        ? `an earlier grant revoke in this process did not complete`
+        : `grant revoke did not complete`) +
+      ` — NOT running the deny restore; deny ACEs stay in place ` +
+      `while a grant may still be on disk. Grants possibly left in ` +
+      `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
+      (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
+      `. After this process exits, \`srt-win acl recover\` retries ` +
+      `the grants still recorded for it and removes its deny ACEs ` +
+      `once they are released (it exits non-zero while one is not). ` +
+      `A listed path that still shows an ALLOW entry for the sandbox ` +
+      `account after that is no longer recorded; remove the entry by ` +
+      `hand.`,
+    { level: 'error' },
+  )
+  return false
 }
 
 /**
@@ -2415,8 +2438,8 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
-  // completes. Leftover ACEs are recoverable later via
-  // `srt-win acl recover` (which sweeps by trustee SID).
+  // completes. ACEs still recorded for this process are released by
+  // srt-win's crash recovery once it has exited.
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary (and timeout) the

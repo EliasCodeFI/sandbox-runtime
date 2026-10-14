@@ -60,6 +60,8 @@ const PUBLIC_VALUE_EXPORTS = [
   'restoreWindowsAclAsync',
   'revokeWindowsAcl',
   'revokeWindowsAclAsync',
+  'revokeWindowsAclChecked',
+  'revokeWindowsAclCheckedAsync',
   'stampWindowsAcl',
   'stampWindowsAclAsync',
   'uninstallWindowsSandbox',

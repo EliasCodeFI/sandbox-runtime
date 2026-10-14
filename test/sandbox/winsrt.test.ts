@@ -1148,6 +1148,7 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     aclSyncCalls = []
     aclSyncResult = () => undefined
     hold = new Set()
+    windowsUtils.clearWindowsAclIncompleteRevokesForTesting()
     dir = mkdtempSync(join(tmpdir(), 'srt-acl-async-'))
     mkdirSync(join(dir, 'secret'))
     spies = [
@@ -1219,6 +1220,7 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     hold.clear()
     for (const c of aclSpawns) c.finish()
     await SandboxManager.reset()
+    windowsUtils.clearWindowsAclIncompleteRevokesForTesting()
     for (const s of spies) s.mockRestore()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -1387,8 +1389,10 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     const rv = revokeWindowsAclAsync(o)
     ;(await spawned(3)).finish(1, '[{"path":"p","status":"failed"}]')
     expect(await rv).toEqual([{ path: 'p', status: 'failed' }])
-    // Unparseable output → undefined, not a throw.
-    const rs = restoreWindowsAclAsync(o)
+    // Unparseable output → undefined, not a throw. (Another holder:
+    // a restore for the holder whose revoke just failed is refused
+    // without a spawn.)
+    const rs = restoreWindowsAclAsync({ ...o, holderPid: process.pid + 1 })
     ;(await spawned(4)).finish(1, 'boom')
     expect(await rs).toBeUndefined()
   })
@@ -1730,6 +1734,197 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     expect((await initErr).code).toBe('acl_grant_failed')
     // The sync release owned the cleanup: no async revoke/restore.
     expect(subs()).toEqual(['grant'])
+  })
+
+  // ── Release ordering: what counts as a completed revoke ──
+  // Exit 0 with parseable JSON is not enough: every outcome must show
+  // its grant released. Checked at each release site — reset() and
+  // initialize()'s failure cleanup (async), the exit/signal handler
+  // (sync).
+
+  type Revoke = [how: string, stdout: () => string]
+  // Revoke output listing one released path plus `path` with `status`.
+  const reports = (status: string, path = 'p'): string =>
+    JSON.stringify([
+      { path: 'released', status: 'revoked' },
+      { path, status },
+    ])
+  // Exit-0 revokes that are NOT complete. (Thunks: `dir` exists only
+  // inside a test.)
+  const INCOMPLETE_REVOKES: Revoke[] = [
+    ['prints JSON that is not a list', () => '{}'],
+    ['lists an outcome with no status', () => '[{"path":"p"}]'],
+    // Statuses outside the allow-list — the last one is a status this
+    // code has never heard of.
+    ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
+      (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
+    ),
+    // What an srt-win without "unreadable" says about a path it could
+    // not open.
+    [
+      'reports "missing" for a path that still exists',
+      () => reports('missing', dir),
+    ],
+  ]
+  const COMPLETE_REVOKES: Revoke[] = [
+    ['releases nothing', () => '[]'],
+    ...['revoked', 'stillHeld', 'downgraded', 'relocated', 'noRow'].map(
+      (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
+    ),
+    [
+      'reports "missing" for a path that is gone',
+      () => reports('missing', join(dir, 'gone')),
+    ],
+  ]
+  const NO_RESTORE = ['grant', 'stamp', 'revoke']
+  const WITH_RESTORE = ['grant', 'stamp', 'revoke', 'restore']
+  // For direct helper calls; the spawns are stubbed, so any existing
+  // file does.
+  const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
+
+  /** A session whose reset()'s revoke exits 0 printing `stdout`. */
+  const resetWith = async (stdout: string): Promise<void> => {
+    const first = aclSpawns.length
+    await SandboxManager.initialize(config())
+    hold = new Set(['revoke'])
+    const reset = SandboxManager.reset()
+    ;(await spawned(first + 3)).finish(0, stdout)
+    hold = new Set()
+    await reset
+  }
+  /** initialize() whose stamp fails; its cleanup revoke prints `stdout`. */
+  const failingInitializeWith = async (stdout: string): Promise<void> => {
+    const first = aclSpawns.length
+    hold = new Set(['stamp', 'revoke'])
+    const initErr = rejection(SandboxManager.initialize(config()))
+    ;(await spawned(first + 2)).finish(2, '')
+    ;(await spawned(first + 3)).finish(0, stdout)
+    hold = new Set()
+    expect((await initErr).code).toBe('acl_stamp_failed')
+  }
+  /** A session ended by the exit handler; its sync revoke prints `stdout`. */
+  const exitWith = async (stdout: string): Promise<void> => {
+    await SandboxManager.initialize(config())
+    aclSyncResult = sub =>
+      sub === 'revoke'
+        ? { status: 0, stdout, stderr: '', error: null }
+        : undefined
+    await cleanupHandler()()
+  }
+  const syncSubs = () => aclSyncCalls.map(c => c.sub)
+
+  for (const [how, stdout] of INCOMPLETE_REVOKES) {
+    it(`reset(): revoke ${how} → restore is not spawned`, async () => {
+      await resetWith(stdout())
+      expect(subs()).toEqual(NO_RESTORE)
+      expect(aclSyncCalls).toEqual([])
+    })
+
+    it(`initialize() failure cleanup: revoke ${how} → restore is not spawned`, async () => {
+      await failingInitializeWith(stdout())
+      expect(subs()).toEqual(NO_RESTORE)
+    })
+
+    it(`exit/signal handler: sync revoke ${how} → restore is not run`, async () => {
+      await exitWith(stdout())
+      expect(syncSubs()).toEqual(['revoke'])
+      expect(subs()).toEqual(['grant', 'stamp'])
+    })
+  }
+
+  for (const [how, stdout] of COMPLETE_REVOKES) {
+    it(`reset(): revoke ${how} → restore runs`, async () => {
+      await resetWith(stdout())
+      expect(subs()).toEqual(WITH_RESTORE)
+    })
+
+    it(`initialize() failure cleanup: revoke ${how} → restore runs`, async () => {
+      await failingInitializeWith(stdout())
+      expect(subs()).toEqual(WITH_RESTORE)
+    })
+
+    it(`exit/signal handler: sync revoke ${how} → restore runs`, async () => {
+      await exitWith(stdout())
+      expect(syncSubs()).toEqual(['revoke', 'restore'])
+    })
+  }
+
+  // Once a revoke was incomplete, a later revoke that finds nothing
+  // wrong must not unlock the restore: the grant the first one left
+  // may no longer be recorded anywhere.
+  describe('after one incomplete revoke in this process', () => {
+    let first: number
+
+    beforeEach(async () => {
+      await resetWith(reports('unreadable'))
+      expect(subs()).toEqual(NO_RESTORE)
+      expect(windowsUtils.windowsAclIncompleteRevoke()).toEqual(['p'])
+      first = aclSpawns.length
+    })
+
+    it('reset(): a later clean revoke → restore is still not spawned', async () => {
+      await resetWith('[]')
+      expect(subs().slice(first)).toEqual(NO_RESTORE)
+    })
+
+    it('initialize() failure cleanup: a later clean revoke → restore is still not spawned', async () => {
+      await failingInitializeWith('[]')
+      expect(subs().slice(first)).toEqual(NO_RESTORE)
+    })
+
+    it('exit/signal handler: a later clean sync revoke → restore is still not run', async () => {
+      await exitWith('[]')
+      expect(syncSubs()).toEqual(['revoke'])
+      expect(subs().slice(first)).toEqual(['grant', 'stamp'])
+    })
+
+    it('restoreWindowsAcl and restoreWindowsAclAsync refuse for that holder, and only that holder', async () => {
+      const o = { sandboxUserSid: SID, srtWin: STUB_SRT_WIN }
+      expect(windowsUtils.restoreWindowsAcl(o)).toBeUndefined()
+      expect(await windowsUtils.restoreWindowsAclAsync(o)).toBeUndefined()
+      expect(syncSubs()).toEqual([])
+      expect(subs().slice(first)).toEqual([])
+      const other = { ...o, holderPid: process.pid + 1 }
+      expect(windowsUtils.restoreWindowsAcl(other)).toEqual([])
+      expect(await windowsUtils.restoreWindowsAclAsync(other)).toEqual([])
+      expect(syncSubs()).toEqual(['restore'])
+      expect(subs().slice(first)).toEqual(['restore'])
+    })
+  })
+
+  it('revokeWindowsAclAsync followed by a restore: an incomplete revoke blocks it', async () => {
+    const o = { sandboxUserSid: SID, srtWin: STUB_SRT_WIN }
+    hold = new Set(['revoke'])
+    const revoke = windowsUtils.revokeWindowsAclAsync(o)
+    ;(await spawned(1)).finish(0, reports('unreadable'))
+    expect((await revoke)?.map(e => e.status)).toEqual([
+      'revoked',
+      'unreadable',
+    ])
+    expect(await windowsUtils.restoreWindowsAclAsync(o)).toBeUndefined()
+    expect(windowsUtils.restoreWindowsAcl(o)).toBeUndefined()
+    expect(subs()).toEqual(['revoke'])
+    expect(syncSubs()).toEqual([])
+  })
+
+  it('revokeWindowsAclChecked and its async variant name the paths whose grant may be left', async () => {
+    const o = { sandboxUserSid: SID, srtWin: STUB_SRT_WIN }
+    aclSyncResult = () => ({
+      status: 0,
+      stdout: reports('unreadable', 'C:\\tree'),
+      stderr: '',
+      error: null,
+    })
+    const sync = windowsUtils.revokeWindowsAclChecked(o)
+    expect([sync.complete, sync.pending]).toEqual([false, ['C:\\tree']])
+    hold = new Set(['revoke'])
+    const pending = windowsUtils.revokeWindowsAclCheckedAsync(o)
+    ;(await spawned(1)).finish(0, reports('failed', 'C:\\other'))
+    const asyncResult = await pending
+    expect([asyncResult.complete, asyncResult.pending]).toEqual([
+      false,
+      ['C:\\other'],
+    ])
   })
 })
 

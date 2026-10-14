@@ -1956,6 +1956,78 @@ export interface WindowsAclAceOutcome {
   status: string
 }
 
+/**
+ * The `acl revoke` statuses after which a grant is known to be off
+ * disk, or legitimately still there for another holder. A revoke is
+ * complete only if every outcome carries one of these.
+ *
+ * This is an allow-list, so a status this code does not know fails
+ * closed: the srt-win binary a host embeds can be newer or older than
+ * this file, and a status added later ("unreadable", "failed") means
+ * the grant may still be on disk. "missing" has a further condition —
+ * see {@link windowsAclGrantReleased}.
+ */
+const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
+  'revoked',
+  'stillHeld',
+  'downgraded',
+  'relocated',
+  'noRow',
+  'missing',
+])
+
+/**
+ * Whether one `acl revoke` outcome shows its grant released.
+ *
+ * "missing" counts only if the path really is gone: an srt-win that
+ * predates the "unreadable" status reports a path it merely could not
+ * open as "missing" and forgets it, with the ACE still on the object.
+ * A path that no longer exists carries no ACE. The check does not
+ * follow a link at the path, and any answer other than "no such
+ * entry" (including an error from the check) counts as still there.
+ */
+function windowsAclGrantReleased(o: unknown): boolean {
+  if (typeof o !== 'object' || o === null) return false
+  const { path: p, status } = o as Partial<WindowsAclAceOutcome>
+  if (typeof p !== 'string' || typeof status !== 'string') return false
+  if (!WINDOWS_ACL_GRANT_RELEASED_STATUSES.has(status)) return false
+  if (status !== 'missing') return true
+  try {
+    fs.lstatSync(p)
+    return false
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+/**
+ * Holders (by PID) for which a grant revoke in this process did not
+ * complete, with the paths it reported as possibly still granted.
+ * Never cleared: once a grant may have been left on disk, a later
+ * revoke that finds nothing to do proves nothing (an older srt-win
+ * has already forgotten the path), so that holder's deny ACEs stay
+ * for the rest of the process.
+ */
+const windowsAclIncompleteRevokes = new Map<number, Set<string>>()
+
+/**
+ * The paths whose grants an incomplete revoke by `holderPid` (default:
+ * this process) may have left on disk — `undefined` if every revoke
+ * so far completed. The list can be empty: a revoke that timed out or
+ * printed nothing names no paths.
+ */
+export function windowsAclIncompleteRevoke(
+  holderPid: number = process.pid,
+): string[] | undefined {
+  const paths = windowsAclIncompleteRevokes.get(holderPid)
+  return paths && [...paths]
+}
+
+/** @internal Test hook: forget every incomplete revoke. */
+export function clearWindowsAclIncompleteRevokesForTesting(): void {
+  windowsAclIncompleteRevokes.clear()
+}
+
 type RawAclRestore =
   | WindowsAclAceOutcome[]
   | { paths?: WindowsAclAceOutcome[]; parents?: WindowsAclAceOutcome[] }
@@ -2005,11 +2077,37 @@ function aclReleaseFailed(sub: 'restore' | 'revoke', e: unknown): undefined {
 }
 
 /**
+ * Whether a restore for `opts`' holder must be refused — a grant
+ * revoke for it has been incomplete in this process. Logs when so.
+ */
+function aclRestoreRefused(opts: WindowsAclReleaseOptions): boolean {
+  const holder = opts.holderPid ?? process.pid
+  if (!windowsAclIncompleteRevokes.has(holder)) return false
+  logForDebugging(
+    `[Sandbox Windows] acl restore refused: a grant revoke for ` +
+      `holder ${holder} did not complete in this process, so its ` +
+      `deny ACEs stay in place`,
+    { level: 'error' },
+  )
+  return true
+}
+
+/**
  * Release this holder's deny ACEs and remove the sandbox-user ACE
  * on any path whose refcount falls to zero. Best-effort (does not
  * throw on per-path anomalies); returns per-path outcomes for the
- * caller to surface. Returns `undefined` only when `srt-win`
- * itself failed (no JSON to parse).
+ * caller to surface. Returns `undefined` when `srt-win` itself
+ * failed (no JSON to parse) or when the restore was refused.
+ *
+ * Ordering rule: release the grants first, with
+ * {@link revokeWindowsAclChecked} (or its async variant), and call
+ * this only if that reported `complete`. The deny ACEs protect paths
+ * inside the granted trees from the sandbox account, which every
+ * session shares; taking them off while a grant may still be on disk
+ * exposes those paths to another session's sandboxed process. As a
+ * backstop this function refuses (logs, spawns nothing, returns
+ * `undefined`) while a revoke for the same holder has been
+ * incomplete in this process.
  *
  * `spawnSync`-blocks the event loop — this is the variant for
  * contexts that cannot await (a process `'exit'` or signal handler);
@@ -2018,6 +2116,7 @@ function aclReleaseFailed(sub: 'restore' | 'revoke', e: unknown): undefined {
 export function restoreWindowsAcl(
   opts: WindowsAclReleaseOptions,
 ): WindowsAclAceOutcome[] | undefined {
+  if (aclRestoreRefused(opts)) return undefined
   // runSrtWinJsonAllowFail parses stdout before checking the exit
   // code, so a non-zero exit with the per-path JSON intact still
   // surfaces every entry to reset()'s loop.
@@ -2035,11 +2134,12 @@ export function restoreWindowsAcl(
 
 /**
  * Async variant of {@link restoreWindowsAcl} — same argv, same
- * result mapping, never rejects.
+ * result mapping, same ordering rule and refusal; never rejects.
  */
 export async function restoreWindowsAclAsync(
   opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
 ): Promise<WindowsAclAceOutcome[] | undefined> {
+  if (aclRestoreRefused(opts)) return undefined
   try {
     return mapAclRestore(
       await runSrtWinJsonAllowFailAsync<RawAclRestore>(
@@ -2112,16 +2212,35 @@ export async function grantWindowsAclAsync(
 }
 
 /**
- * Outcome of a revoke as the session teardown needs it: `complete`
- * is true only when `srt-win acl revoke` ran to the end and exited 0
- * — i.e. every grant this holder had is off disk. A timeout, a spawn
- * failure, unparseable output or a non-zero exit (srt-win exits
- * non-zero when any path "could not be revoked", and omits those
- * paths from the per-path list) all leave it false.
+ * Outcome of a revoke as the session teardown needs it.
  */
 export interface WindowsAclRevokeResult {
+  /**
+   * True only when `srt-win acl revoke` exited 0, its output parsed,
+   * and every per-path outcome shows the grant released (see
+   * {@link WINDOWS_ACL_GRANT_RELEASED_STATUSES}). A timeout, a spawn
+   * failure, unparseable output, a non-zero exit, or any other
+   * status leaves it false.
+   */
   complete: boolean
   outcomes: WindowsAclAceOutcome[] | undefined
+  /**
+   * Paths whose outcome does not show the grant released — the grant
+   * may still be on disk there. Empty when `complete`, and also when
+   * the revoke reported no outcomes at all.
+   */
+  pending: string[]
+  /** srt-win's stderr, or the error that stopped the revoke. */
+  detail?: string
+}
+
+/** Record and return the result of one revoke attempt. */
+function finishAclRevoke(
+  opts: WindowsAclReleaseOptions,
+  result: WindowsAclRevokeResult,
+): WindowsAclRevokeResult {
+  noteWindowsAclRevoke(opts.holderPid ?? process.pid, result)
+  return result
 }
 
 function toRevokeResult(r: {
@@ -2129,44 +2248,90 @@ function toRevokeResult(r: {
   json: WindowsAclAceOutcome[]
   stderr: string
 }): WindowsAclRevokeResult {
-  return { complete: r.ok, outcomes: mapAclRevoke(r) }
+  mapAclRevoke(r)
+  return windowsAclRevokeResult(r.ok, r.json, r.stderr)
+}
+
+function revokeDidNotRun(e: unknown): WindowsAclRevokeResult {
+  aclReleaseFailed('revoke', e)
+  return {
+    complete: false,
+    outcomes: undefined,
+    pending: [],
+    detail: (e as Error).message,
+  }
 }
 
 /**
  * {@link revokeWindowsAcl} that also reports whether the revoke
- * completed. SandboxManager gates the deny restore on this: taking
+ * completed. Gate {@link restoreWindowsAcl} on `complete`: taking
  * the DENY stamps off while an ALLOW grant may still be on disk
  * would open the deny targets to the (shared) sandbox account.
+ *
+ * An incomplete revoke is remembered for the holder for the rest of
+ * the process — see {@link windowsAclIncompleteRevoke}.
  */
 export function revokeWindowsAclChecked(
   opts: WindowsAclReleaseOptions,
 ): WindowsAclRevokeResult {
+  let result: WindowsAclRevokeResult
   try {
-    return toRevokeResult(
+    result = toRevokeResult(
       runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
         aclArgs('revoke', opts),
         aclRunOpts(opts),
       ),
     )
   } catch (e) {
-    return { complete: false, outcomes: aclReleaseFailed('revoke', e) }
+    result = revokeDidNotRun(e)
   }
+  return finishAclRevoke(opts, result)
 }
 
 /** Async variant of {@link revokeWindowsAclChecked}; never rejects. */
 export async function revokeWindowsAclCheckedAsync(
   opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
 ): Promise<WindowsAclRevokeResult> {
+  let result: WindowsAclRevokeResult
   try {
-    return toRevokeResult(
+    result = toRevokeResult(
       await runSrtWinJsonAllowFailAsync<WindowsAclAceOutcome[]>(
         aclArgs('revoke', opts),
         aclRunOpts(opts),
       ),
     )
   } catch (e) {
-    return { complete: false, outcomes: aclReleaseFailed('revoke', e) }
+    result = revokeDidNotRun(e)
   }
+  return finishAclRevoke(opts, result)
+}
+
+/** Judge a revoke that ran to the end and printed JSON. */
+function windowsAclRevokeResult(
+  exitedZero: boolean,
+  json: unknown,
+  stderr: string,
+): WindowsAclRevokeResult {
+  const outcomes = Array.isArray(json)
+    ? (json as WindowsAclAceOutcome[])
+    : undefined
+  const unreleased = (outcomes ?? []).filter(o => !windowsAclGrantReleased(o))
+  return {
+    complete: exitedZero && outcomes !== undefined && unreleased.length === 0,
+    outcomes,
+    pending: unreleased.map(o => String(o?.path)),
+    detail: stderr.trim() || undefined,
+  }
+}
+
+function noteWindowsAclRevoke(
+  holder: number,
+  result: WindowsAclRevokeResult,
+): void {
+  if (result.complete) return
+  let paths = windowsAclIncompleteRevokes.get(holder)
+  if (!paths) windowsAclIncompleteRevokes.set(holder, (paths = new Set()))
+  for (const p of result.pending) paths.add(p)
 }
 
 /**
@@ -2178,9 +2343,12 @@ export async function revokeWindowsAclCheckedAsync(
  * contexts that cannot await (a process `'exit'` or signal handler);
  * everywhere else prefer {@link revokeWindowsAclAsync}.
  *
- * If you follow it with {@link restoreWindowsAcl}, do so only when
- * the revoke completed — the returned list does not say (failed
- * paths are omitted from it, and `undefined` means it did not run).
+ * Ordering rule: do not follow this with {@link restoreWindowsAcl}.
+ * The returned list does not say whether the revoke completed (a
+ * path can be listed with a status that means its grant is still on
+ * disk, and `undefined` means it did not run). Use
+ * {@link revokeWindowsAclChecked} and restore only when it reports
+ * `complete`.
  */
 export function revokeWindowsAcl(
   opts: WindowsAclReleaseOptions,
@@ -2190,7 +2358,9 @@ export function revokeWindowsAcl(
 
 /**
  * Async variant of {@link revokeWindowsAcl} — same argv, same
- * result mapping, never rejects.
+ * result mapping, same ordering rule (use
+ * {@link revokeWindowsAclCheckedAsync} before a restore); never
+ * rejects.
  */
 export async function revokeWindowsAclAsync(
   opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
