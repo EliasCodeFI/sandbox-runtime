@@ -67,7 +67,7 @@ import {
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
-  revokeWindowsAcl,
+  revokeWindowsAclChecked,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -207,6 +207,64 @@ function registerCleanup(): void {
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
+}
+
+// 'restored'/'alreadyOriginal' are the pre- same-user-removal
+// srt-win's success vocabulary; 'revoked'/'stillHeld' are the
+// post-. Either is non-anomalous.
+const WINDOWS_ACL_RELEASE_OK = new Set([
+  'revoked',
+  'stillHeld',
+  'restored',
+  'alreadyOriginal',
+])
+
+function logWindowsAclOutcomes(
+  kind: string,
+  outcomes: readonly { path: string; status: string }[] | undefined,
+): void {
+  for (const e of outcomes ?? []) {
+    if (!WINDOWS_ACL_RELEASE_OK.has(e.status)) {
+      logForDebugging(
+        `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+          `ACE may be left in place; resolve and run ` +
+          `\`srt-win acl recover\` to clear`,
+        { level: 'warn' },
+      )
+    }
+  }
+}
+
+/**
+ * The release-ordering gate, shared by every release path: the deny
+ * restore runs only after a revoke that COMPLETED. Returns whether
+ * it may run.
+ *
+ * Revoke takes the ALLOW grants off, restore takes the DENY stamps
+ * off. If the revoke failed, timed out or was only partial, an
+ * ALLOW grant may still be on disk — and the sandbox account is
+ * shared by every session, so with the stamps gone another session's
+ * sandboxed process could write this tree's deny targets
+ * (`.git/hooks`, settings files, …). So the stamps stay: they name
+ * only the sandbox account's SID and cost the real user nothing.
+ * Their rows stay held by this process, so srt-win's crash recovery
+ * drops them on a later `acl` call once this process is gone.
+ */
+function windowsAclRestoreAllowed(revoke: {
+  complete: boolean
+  outcomes: readonly { path: string; status: string }[] | undefined
+}): boolean {
+  logWindowsAclOutcomes('grant revoke', revoke.outcomes)
+  if (!revoke.complete) {
+    logForDebugging(
+      `[Sandbox Windows] grant revoke did not complete — NOT running ` +
+        `the deny restore; deny ACEs stay in place while a grant may ` +
+        `still be on disk. Run \`srt-win acl recover\` after this ` +
+        `process exits to clear what is left.`,
+      { level: 'error' },
+    )
+  }
+  return revoke.complete
 }
 
 /**
@@ -910,9 +968,13 @@ async function initialize(
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
+      // Restore only after a completed revoke — see
+      // windowsAclRestoreAllowed.
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        const o = { sandboxUserSid: windowsFsSbUserSid, srtWin }
+        if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+          logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+        }
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -2199,25 +2261,12 @@ async function reset(): Promise<void> {
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
     const srtWin = srtWinSpawn
-    // 'restored'/'alreadyOriginal' are the pre- same-user-removal
-    // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-    // post-. Either is non-anomalous.
-    const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
-      if (!ok.has(e.status)) {
-        logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
-            `ACE may be left in place; resolve and run ` +
-            `\`srt-win acl recover\` to clear`,
-          { level: 'warn' },
-        )
-      }
-    }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
+    // Restore only after a completed revoke — see
+    // windowsAclRestoreAllowed. (The 'exit'/signal handler lands
+    // here too: this part of reset() runs synchronously.)
+    const o = { sandboxUserSid: sb, srtWin }
+    if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+      logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
     }
   }
   windowsFsStampedSet = undefined

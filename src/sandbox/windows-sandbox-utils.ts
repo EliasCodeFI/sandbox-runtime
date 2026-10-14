@@ -1957,15 +1957,29 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
- * Release this holder's grants and remove the sandbox-user ACE on
- * any path whose refcount falls to zero. Best-effort (does not
- * throw); logs anomalies.
+ * Outcome of a revoke as the session teardown needs it: `complete`
+ * is true only when `srt-win acl revoke` ran to the end and exited 0
+ * — i.e. every grant this holder had is off disk. A timeout, a spawn
+ * failure, unparseable output or a non-zero exit (srt-win exits
+ * non-zero when any path "could not be revoked", and omits those
+ * paths from the per-path list) all leave it false.
  */
-export function revokeWindowsAcl(opts: {
+export interface WindowsAclRevokeResult {
+  complete: boolean
+  outcomes: WindowsAclAceOutcome[] | undefined
+}
+
+/**
+ * {@link revokeWindowsAcl} that also reports whether the revoke
+ * completed. SandboxManager gates the deny restore on this: taking
+ * the DENY stamps off while an ALLOW grant may still be on disk
+ * would open the deny targets to the (shared) sandbox account.
+ */
+export function revokeWindowsAclChecked(opts: {
   sandboxUserSid: string
   holderPid?: number
   srtWin?: SrtWinSpawn
-}): WindowsAclAceOutcome[] | undefined {
+}): WindowsAclRevokeResult {
   const holder = opts.holderPid ?? process.pid
   try {
     const r = runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
@@ -1986,13 +2000,30 @@ export function revokeWindowsAcl(opts: {
         { level: 'error' },
       )
     }
-    return r.json
+    return { complete: r.ok, outcomes: r.json }
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl revoke: ${(e as Error).message}`, {
       level: 'error',
     })
-    return undefined
+    return { complete: false, outcomes: undefined }
   }
+}
+
+/**
+ * Release this holder's grants and remove the sandbox-user ACE on
+ * any path whose refcount falls to zero. Best-effort (does not
+ * throw); logs anomalies.
+ *
+ * If you follow it with {@link restoreWindowsAcl}, do so only when
+ * the revoke completed — the returned list does not say (failed
+ * paths are omitted from it, and `undefined` means it did not run).
+ */
+export function revokeWindowsAcl(opts: {
+  sandboxUserSid: string
+  holderPid?: number
+  srtWin?: SrtWinSpawn
+}): WindowsAclAceOutcome[] | undefined {
+  return revokeWindowsAclChecked(opts).outcomes
 }
 
 // ────────────────────────────────────────────────────────────────────

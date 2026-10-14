@@ -2,6 +2,7 @@ import {
   afterAll,
   afterEach,
   beforeAll,
+  beforeEach,
   describe,
   expect,
   it,
@@ -12,6 +13,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -30,6 +32,8 @@ import type {
 } from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
+import * as platformUtils from '../../src/utils/platform.js'
+import * as windowsUtils from '../../src/sandbox/windows-sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -1037,6 +1041,243 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     await checkWindowsDependenciesAsync({ srtWin })
     expect(maxInFlight).toBe(2)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════
+// Release ordering — no deny restore unless the revoke completed
+// (pure, all platforms)
+// ════════════════════════════════════════════════════════════════════
+// Revoke takes the session's ALLOW grants off, restore takes its DENY
+// stamps off. Running the restore after a revoke that failed, timed
+// out or was only partial would leave a grant on disk with the stamps
+// gone. These drive the real SandboxManager with the platform pinned
+// to Windows and both child_process entry points stubbed.
+
+describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
+  const SID = 'S-1-5-21-1'
+  const RAW_USER = {
+    user: {
+      exists: true,
+      sid: SID,
+      group_exists: true,
+      group_sid: 'S-1-5-21-2',
+      in_builtin_users: true,
+      in_sandbox_group: true,
+      hidden_from_logon: true,
+    },
+    cred_present: true,
+    marker_version: 1,
+    real_user_sid: 'S-1-5-21-3',
+    ca_cert_thumb: null,
+    ca_cert_pem: null,
+  }
+  const RAW_WFP = {
+    state: 'installed',
+    filters: 4,
+    port_range: [60080, 60089],
+    user_sid: SID,
+  }
+  const stdoutFor = (argv: readonly string[]): string =>
+    argv.includes('user')
+      ? JSON.stringify(RAW_USER)
+      : argv.includes('wfp')
+        ? JSON.stringify(RAW_WFP)
+        : argv.includes('status')
+          ? JSON.stringify({ user: RAW_USER, wfp: RAW_WFP })
+          : ''
+
+  type SyncResult = {
+    status: number | null
+    stdout: string
+    stderr: string
+    error: Error | null
+    signal?: string
+  }
+  const exit = (status: number, stdout: string): SyncResult => ({
+    status,
+    stdout,
+    stderr: '',
+    error: null,
+  })
+  // What spawnSync reports when it kills the child at `timeout`.
+  const TIMED_OUT: SyncResult = {
+    status: null,
+    signal: 'SIGTERM',
+    stdout: '',
+    stderr: '',
+    error: Object.assign(new Error('spawnSync ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+    }),
+  }
+  // The three ways a revoke does not complete, and the one way it does.
+  const INCOMPLETE_REVOKES: [string, SyncResult][] = [
+    // Partial: srt-win lists the paths it did revoke and exits 1.
+    ['exits non-zero', exit(1, '[{"path":"p","status":"revoked"}]')],
+    ['times out', TIMED_OUT],
+    ['prints unparseable output', exit(0, 'not json')],
+  ]
+
+  /** `acl` subcommands spawned, in order. */
+  let aclCalls: string[]
+  /** spawnSync result per `acl` subcommand; default exit 0, `[]`. */
+  let aclResult: Record<string, SyncResult>
+  let spies: { mockRestore(): void }[]
+  let dir: string
+
+  beforeEach(() => {
+    aclCalls = []
+    aclResult = {}
+    dir = mkdtempSync(join(tmpdir(), 'srt-acl-gate-'))
+    mkdirSync(join(dir, 'secret'))
+    spies = [
+      spyOn(platformUtils, 'getPlatform').mockReturnValue('windows'),
+      // The WFP probe binds a listener and is once-per-process; it is
+      // not what these tests are about.
+      spyOn(windowsUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
+        outcome: 'blocked',
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any),
+      // Async spawns: `user status` / `status` at initialize().
+      spyOn(child_process, 'spawn').mockImplementation(((
+        _exe: string,
+        argv: readonly string[],
+      ) => {
+        const mkStream = () => {
+          const s = new EventEmitter() as EventEmitter & {
+            setEncoding(e: string): typeof s
+            end(d?: string): void
+          }
+          s.setEncoding = () => s
+          s.end = () => {}
+          return s
+        }
+        const child = Object.assign(new EventEmitter(), {
+          stdout: mkStream(),
+          stderr: mkStream(),
+          stdin: mkStream(),
+          kill: () => true,
+        })
+        setImmediate(() => {
+          child.stdout.emit('data', stdoutFor(argv))
+          child.emit('close', 0, null)
+        })
+        return child
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any),
+      // Sync spawns: every `acl` call.
+      spyOn(child_process, 'spawnSync').mockImplementation(((
+        _exe: string,
+        argv: readonly string[],
+      ) => {
+        if (!argv.includes('acl')) return exit(0, stdoutFor(argv))
+        const sub = argv[argv.indexOf('acl') + 1]
+        aclCalls.push(sub)
+        return aclResult[sub] ?? exit(0, '[]')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any),
+    ]
+  })
+
+  afterEach(async () => {
+    aclResult = {}
+    await SandboxManager.reset()
+    for (const s of spies) s.mockRestore()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
+  // external so initialize() binds nothing.
+  const config = (): SandboxRuntimeConfig => ({
+    network: {
+      allowedDomains: [],
+      deniedDomains: [],
+      httpProxyPort: 1,
+      socksProxyPort: 2,
+    },
+    filesystem: {
+      denyRead: [join(dir, 'secret')],
+      allowRead: [],
+      allowWrite: [dir],
+      denyWrite: [],
+    },
+    windows: { srtWin: { path: process.execPath } },
+  })
+
+  /** initialize() whose stamp fails, so its failure cleanup runs. */
+  const failingInitialize = async (): Promise<WindowsSandboxError> => {
+    aclResult.stamp = exit(2, '')
+    try {
+      await SandboxManager.initialize(config())
+    } catch (e) {
+      return e as WindowsSandboxError
+    }
+    throw new Error('expected initialize() to reject')
+  }
+
+  /** The handler registerCleanup() put on 'exit', SIGINT and SIGTERM. */
+  const cleanupHandler = (): (() => unknown) => {
+    const onInt = new Set(process.listeners('SIGINT') as unknown[])
+    const onTerm = new Set(process.listeners('SIGTERM') as unknown[])
+    const h = (process.listeners('exit') as unknown[]).filter(
+      l => onInt.has(l) && onTerm.has(l),
+    )
+    expect(h.length).toBe(1)
+    return h[0] as () => unknown
+  }
+
+  for (const [how, result] of INCOMPLETE_REVOKES) {
+    it(`reset(): revoke ${how} → restore is not spawned`, async () => {
+      await SandboxManager.initialize(config())
+      aclResult.revoke = result
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual(['grant', 'stamp', 'revoke'])
+    })
+
+    it(`initialize() failure cleanup: revoke ${how} → restore is not spawned`, async () => {
+      aclResult.revoke = result
+      const e = await failingInitialize()
+      // Still rejects with the original failure.
+      expect(e.code).toBe('acl_stamp_failed')
+      expect(aclCalls).toEqual(['grant', 'stamp', 'revoke'])
+      expect(SandboxManager.getConfig()).toBeUndefined()
+    })
+
+    it(`exit/signal handler: revoke ${how} → restore is not spawned`, async () => {
+      await SandboxManager.initialize(config())
+      aclResult.revoke = result
+      const done = cleanupHandler()()
+      // Synchronous: decided before the handler returns.
+      expect(aclCalls).toEqual(['grant', 'stamp', 'revoke'])
+      await done
+      expect(aclCalls).toEqual(['grant', 'stamp', 'revoke'])
+    })
+  }
+
+  it('reset(): revoke completes → restore runs', async () => {
+    await SandboxManager.initialize(config())
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
+  })
+
+  it('initialize() failure cleanup: revoke completes → restore runs', async () => {
+    const e = await failingInitialize()
+    expect(e.code).toBe('acl_stamp_failed')
+    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
+  })
+
+  it('exit/signal handler: revoke completes → restore runs', async () => {
+    await SandboxManager.initialize(config())
+    const done = cleanupHandler()()
+    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
+    await done
+  })
+
+  it('reset(): a restore that fails after a completed revoke stays best-effort', async () => {
+    await SandboxManager.initialize(config())
+    aclResult.restore = exit(1, 'boom')
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
   })
 })
 
