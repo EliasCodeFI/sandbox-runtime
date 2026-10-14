@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { createServer as createHttpServer } from 'node:http'
+import { existsSync } from 'node:fs'
+import { createServer as createHttpServer, type Server } from 'node:http'
 import { connect, type Socket } from 'node:net'
 import {
   createMuxProxyServer,
@@ -15,12 +16,13 @@ import {
  */
 describe('mux-proxy first-byte dispatch', () => {
   let mux: MuxProxyServer
+  let httpStub: Server
   let port: number
   let socksHits: Buffer[]
 
   beforeEach(async () => {
     socksHits = []
-    const httpStub = createHttpServer((req, res) => {
+    httpStub = createHttpServer((req, res) => {
       res.writeHead(200, { connection: 'close' })
       res.end(`http-request:${req.method}:${req.url}\n`)
     })
@@ -98,6 +100,26 @@ describe('mux-proxy first-byte dispatch', () => {
     expect(text).toContain('http-connect:x:443')
   })
 
+  it('ends a client whose backend has closed without a reset, which would cost it what it has not read yet', async () => {
+    const errors: unknown[] = []
+    const hadError = await new Promise<boolean>(resolve => {
+      const c = connect({ port, host: '127.0.0.1', allowHalfOpen: true }, () =>
+        c.write('CONNECT example.com:443 HTTP/1.1\r\n\r\n'),
+      )
+      c.on('error', err => errors.push(err))
+      c.resume()
+      // Bytes sent to a socket that is closed are answered with a reset,
+      // and the next write fails.
+      c.once('end', () => {
+        c.write('late')
+        setTimeout(() => c.write('later'), 100)
+        setTimeout(() => c.end(), 200)
+      })
+      c.once('close', resolve)
+    })
+    expect([errors, hadError]).toEqual([[], false])
+  })
+
   it('routes a TLS ClientHello first byte (0x16) to HTTP, not SOCKS', async () => {
     // Not a valid HTTP request — the backend will 400 it — but the point
     // is it must NOT be treated as SOCKS.
@@ -126,5 +148,12 @@ describe('mux-proxy first-byte dispatch', () => {
       c.on('error', () => {})
     })
     expect(socksHits.length).toBe(0)
+  })
+
+  it('removeBackendSocketSync removes the backend socket file, and close() still works', () => {
+    const address = httpStub.address() // a path, or on Windows a port
+    if (typeof address === 'string') expect(existsSync(address)).toBe(true)
+    mux.removeBackendSocketSync()
+    if (typeof address === 'string') expect(existsSync(address)).toBe(false)
   })
 })
