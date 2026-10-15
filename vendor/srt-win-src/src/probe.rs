@@ -49,7 +49,12 @@
 //! In both, the thread's token is read back after the socket exists
 //! and the identity is assumed, immediately before the connect; an
 //! attempt whose token is not the one asked for is an `error`, never
-//! a `blocked`. Each ordering's own result is logged to stderr with
+//! a `blocked`. One case is told apart from every other failure: the
+//! call that puts the token on the thread (`ImpersonateAnonymousToken`
+//! or `SetThreadToken`) returning access-denied is the kernel refusing
+//! that identity to this process, reported as `denied`
+//! ([`Outcome::Denied`]) — no connect can be made that way, which is
+//! not the same as the probe failing to make one. Each ordering's own result is logged to stderr with
 //! the ordering named, and the attempt reports the WORSE of the two
 //! for the fence ([`Outcome::worse`]): one ordering getting through
 //! is the attempt getting through.
@@ -71,7 +76,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, LUID};
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, FD_SET, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IPPROTO_TCP,
     SO_ERROR, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET,
@@ -128,19 +133,26 @@ pub enum Outcome {
     /// The attempt was not made (no target for it).
     Skipped = 5,
     /// No connect was made under the token shape: it could not be
-    /// assumed, a socket could not be created under it, or the
-    /// thread's token read back as something else.
+    /// built or assumed (for a reason other than [`Outcome::Denied`]),
+    /// a socket could not be created under it, or the thread's token
+    /// read back as something else.
     Error = 6,
+    /// The kernel refused to put the token on the thread: the
+    /// impersonation call returned access-denied. The process cannot
+    /// present that identity at all, so there is no connect to fence.
+    /// The last value a field of [`BITS`] bits holds.
+    Denied = 7,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 6] = [
+    const ALL: [Outcome; 7] = [
         Outcome::Blocked,
         Outcome::Connected,
         Outcome::Refused,
         Outcome::Unreachable,
         Outcome::Skipped,
         Outcome::Error,
+        Outcome::Denied,
     ];
 
     fn from_bits(b: u32) -> Option<Self> {
@@ -156,6 +168,7 @@ impl Outcome {
             Outcome::Unreachable => "unreachable",
             Outcome::Skipped => "skipped",
             Outcome::Error => "error",
+            Outcome::Denied => "denied",
         }
     }
 
@@ -172,16 +185,21 @@ impl Outcome {
     ///     learned. These rank above `Blocked` so that a block in one
     ///     ordering cannot stand in for an ordering that was never
     ///     measured.
-    ///   - `Blocked`: the only outcome that is good for the fence, so
-    ///     the combined result is `Blocked` only when every part was.
+    ///   - `Denied`: the identity could not be assumed, so no connect
+    ///     was made. Below the three above, so a refusal in one
+    ///     ordering does not hide the other ordering going unmeasured;
+    ///     above `Blocked`, because no filter was seen to act.
+    ///   - `Blocked`: a filter refused the connect. The combined
+    ///     result is `Blocked` only when every part was.
     fn severity(self) -> u8 {
         match self {
             Outcome::Blocked => 0,
-            Outcome::Skipped => 1,
-            Outcome::Unreachable => 2,
-            Outcome::Error => 3,
-            Outcome::Refused => 4,
-            Outcome::Connected => 5,
+            Outcome::Denied => 1,
+            Outcome::Skipped => 2,
+            Outcome::Unreachable => 3,
+            Outcome::Error => 4,
+            Outcome::Refused => 5,
+            Outcome::Connected => 6,
         }
     }
 
@@ -309,14 +327,25 @@ pub struct Verdict {
 /// address to aim at) does not fail the probe. The two remaining
 /// attempts never fail it — the filters cannot refuse them — and are
 /// reported as residuals instead of passing silently.
-pub fn verdict(r: &Report) -> Verdict {
+///
+/// `child_token` says the probing process held the very token a
+/// sandboxed command gets (`wfp verify --write-restricted-token`,
+/// whose attempts are made by a lockdown child). Only then does an
+/// attempt the kernel refused ([`Outcome::Denied`]) count as closed,
+/// like a blocked one: a command holds the same token and is refused
+/// the same way. When the bare runner probes on behalf of the
+/// ordinary child token, a refusal says nothing certain about the
+/// child and stays inconclusive, as every other unassumed token does.
+pub fn verdict(r: &Report, child_token: bool) -> Verdict {
     let must = r.must_be_blocked();
+    let closed = |o: Outcome, may_skip: bool| {
+        o == Outcome::Blocked
+            || (may_skip && o == Outcome::Skipped)
+            || (child_token && o == Outcome::Denied)
+    };
     let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
         EXIT_NOT_FENCED
-    } else if must
-        .iter()
-        .any(|(o, may_skip)| !(*o == Outcome::Blocked || (*may_skip && *o == Outcome::Skipped)))
-    {
+    } else if must.iter().any(|(o, may_skip)| !closed(*o, *may_skip)) {
         EXIT_INCONCLUSIVE
     } else {
         EXIT_FENCED
@@ -520,10 +549,38 @@ fn confirm_thread_token(expect: Expect) -> Result<()> {
     Ok(())
 }
 
+/// Context on the error of an impersonation call the kernel answered
+/// with access-denied: the process may not carry that token. Found
+/// again by [`connect_as`], which reports [`Outcome::Denied`] for it.
+#[derive(Debug)]
+struct ImpersonationRefused(&'static str);
+
+impl std::fmt::Display for ImpersonationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} refused by the kernel", self.0)
+    }
+}
+
+/// The error of the call that puts a token on the thread, marked
+/// [`ImpersonationRefused`] when it is access-denied. Only these
+/// calls are marked: access-denied while BUILDING a token (opening,
+/// copying, restricting, relabelling) is a step the probe could not
+/// take, not the kernel's answer about the finished token.
+fn impersonation_error(call: &'static str, e: windows::core::Error) -> anyhow::Error {
+    let refused = e.code() == ERROR_ACCESS_DENIED.to_hresult();
+    let e = anyhow::Error::new(e);
+    if refused {
+        e.context(ImpersonationRefused(call))
+    } else {
+        e.context(call)
+    }
+}
+
 /// Put `imp` on the thread and confirm it took.
 fn impersonate(imp: HANDLE, integrity: Option<u32>) -> Result<Assumed> {
     let id = token_id(imp)?;
-    unsafe { SetThreadToken(None, Some(imp)) }.context("SetThreadToken")?;
+    unsafe { SetThreadToken(None, Some(imp)) }
+        .map_err(|e| impersonation_error("SetThreadToken", e))?;
     // From here the thread is impersonating: revert on every path,
     // including a failed confirmation.
     let assumed = Assumed {
@@ -541,7 +598,7 @@ fn assume(id: Identity) -> Result<Option<Assumed>> {
         Identity::Own => Ok(None),
         Identity::Anonymous => {
             unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }
-                .context("ImpersonateAnonymousToken")?;
+                .map_err(|e| impersonation_error("ImpersonateAnonymousToken", e))?;
             let assumed = Assumed {
                 expect: Expect::Anonymous,
                 _reverted: Reverted,
@@ -773,6 +830,14 @@ fn new_socket(target: &SocketAddr) -> Result<Sock> {
 /// and what is behind it.
 fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome, String) {
     let error = |what: &str, e: anyhow::Error| (Outcome::Error, format!("{what}: {e:#}"));
+    let not_assumed = |e: anyhow::Error| {
+        let outcome = if e.downcast_ref::<ImpersonationRefused>().is_some() {
+            Outcome::Denied
+        } else {
+            Outcome::Error
+        };
+        (outcome, format!("assuming the token: {e:#}"))
+    };
     let (sock, assumed) = match order {
         SocketOrder::BeforeToken => {
             let sock = match new_socket(target) {
@@ -781,13 +846,13 @@ fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome
             };
             match assume(id) {
                 Ok(a) => (sock, a),
-                Err(e) => return error("assuming the token", e),
+                Err(e) => return not_assumed(e),
             }
         }
         SocketOrder::AfterToken => {
             let assumed = match assume(id) {
                 Ok(a) => a,
-                Err(e) => return error("assuming the token", e),
+                Err(e) => return not_assumed(e),
             };
             match new_socket(target) {
                 Ok(s) => (s, assumed),
@@ -973,8 +1038,48 @@ mod tests {
         ] {
             assert_eq!(Report::decode(code), None, "{code:#x}");
         }
-        // In range, but a field holds no outcome.
-        assert_eq!(Report::decode(REPORT_BASE | 7), None);
+        // In range, but a field holds no outcome: zero is not one.
+        assert_eq!(Report::decode(REPORT_BASE | 1), None);
+        assert_eq!(
+            Report::decode((REPORT_BASE | (REPORT_BASE - 1)) & !MASK),
+            None
+        );
+    }
+
+    #[test]
+    fn every_outcome_fits_a_field() {
+        for o in Outcome::ALL {
+            assert!(o as u32 >= 1 && o as u32 <= MASK, "{o:?}");
+            assert_eq!(Outcome::from_bits(o as u32), Some(o));
+        }
+        // The largest outcome in every field is still a report, and
+        // still below the bit that marks one.
+        let all = [Denied; FIELDS as usize];
+        let r = lowered(
+            report(all[0], all[1], all[2], all[3]),
+            [all[4], all[5], all[6], all[7]],
+        );
+        assert_eq!(Denied as u32, MASK);
+        assert_eq!(r.encode(), REPORT_BASE | (REPORT_BASE - 1));
+        assert_eq!(Report::decode(r.encode()), Some(r));
+    }
+
+    #[test]
+    fn impersonation_error_marks_only_access_denied() {
+        use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
+        let denied = impersonation_error(
+            "SetThreadToken",
+            windows::core::Error::from(ERROR_ACCESS_DENIED),
+        );
+        assert!(denied.downcast_ref::<ImpersonationRefused>().is_some());
+        // The mark survives context added on the way up.
+        let wrapped = denied.context("assuming the token");
+        assert!(wrapped.downcast_ref::<ImpersonationRefused>().is_some());
+        let other = impersonation_error(
+            "SetThreadToken",
+            windows::core::Error::from(ERROR_INVALID_HANDLE),
+        );
+        assert!(other.downcast_ref::<ImpersonationRefused>().is_none());
     }
 
     #[test]
@@ -988,11 +1093,72 @@ mod tests {
 
     use Outcome::*;
 
+    /// The verdict when the bare runner probed (the ordinary token).
+    fn verdict_runner(r: &Report) -> Verdict {
+        verdict(r, false)
+    }
+
+    #[test]
+    fn verdict_denied_is_closed_only_for_the_child_token() {
+        let all_blocked = report(Blocked, Blocked, Blocked, Blocked);
+        // Each attempt the fence must refuse, refused by the kernel
+        // instead: closed when the child's own token was probed,
+        // inconclusive when the runner stood in for it.
+        let mut cases = vec![
+            report(Denied, Blocked, Blocked, Blocked),
+            report(Blocked, Denied, Blocked, Blocked),
+        ];
+        for field in 0..4 {
+            let mut l = [Blocked; 4];
+            l[field] = Denied;
+            cases.push(lowered(all_blocked, l));
+        }
+        for r in &cases {
+            let v = verdict(r, true);
+            assert_eq!(v.exit, EXIT_FENCED, "{r:?}");
+            assert!(v.residuals.is_empty());
+            assert_eq!(verdict(r, false).exit, EXIT_INCONCLUSIVE, "{r:?}");
+        }
+        // Refused everywhere it can be: still fenced, no residual —
+        // a token that cannot be assumed leaves nothing open.
+        let r = lowered(report(Blocked, Denied, Denied, Denied), [Denied; 4]);
+        assert_eq!(
+            verdict(&r, true),
+            Verdict {
+                exit: EXIT_FENCED,
+                residuals: vec![]
+            }
+        );
+        // A refusal elsewhere does not excuse a leak or an unmeasured
+        // attempt, and the other outcomes mean what they meant.
+        for child_token in [true, false] {
+            let leak = lowered(
+                report(Blocked, Denied, Blocked, Blocked),
+                [Connected, Blocked, Blocked, Blocked],
+            );
+            assert_eq!(verdict(&leak, child_token).exit, EXIT_NOT_FENCED);
+            let odd = report(Blocked, Error, Denied, Denied);
+            assert_eq!(verdict(&odd, child_token).exit, EXIT_INCONCLUSIVE);
+            // A residual is still named beside a refusal.
+            let v = verdict(&report(Blocked, Blocked, Denied, Connected), child_token);
+            assert_eq!(v.exit, EXIT_FENCED);
+            assert_eq!(v.residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
+        }
+    }
+
     #[test]
     fn worse_ranks_outcomes_for_the_fence() {
         // Worst first. Each one beats everything after it, whichever
         // side it is on.
-        let ranked = [Connected, Refused, Error, Unreachable, Skipped, Blocked];
+        let ranked = [
+            Connected,
+            Refused,
+            Error,
+            Unreachable,
+            Skipped,
+            Denied,
+            Blocked,
+        ];
         assert_eq!(ranked.len(), Outcome::ALL.len());
         for (i, a) in ranked.iter().enumerate() {
             assert_eq!(a.worse(*a), *a);
@@ -1016,6 +1182,12 @@ mod tests {
         assert_eq!(Blocked.worse(Blocked), Blocked);
         // A leak is not hidden by the other ordering failing.
         assert_eq!(Error.worse(Connected), Connected);
+        // A refused token in one ordering does not make the attempt
+        // blocked, and does not hide an unmeasured or leaking one.
+        assert_eq!(Blocked.worse(Denied), Denied);
+        assert_eq!(Denied.worse(Error), Error);
+        assert_eq!(Denied.worse(Refused), Refused);
+        assert!(!Denied.passed_fence());
     }
 
     #[test]
@@ -1029,23 +1201,23 @@ mod tests {
 
     #[test]
     fn verdict_fenced_without_residuals() {
-        let v = verdict(&report(Blocked, Blocked, Blocked, Blocked));
+        let v = verdict_runner(&report(Blocked, Blocked, Blocked, Blocked));
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
     }
 
     #[test]
     fn verdict_names_each_residual() {
-        let v = verdict(&report(Blocked, Blocked, Connected, Connected));
+        let v = verdict_runner(&report(Blocked, Blocked, Connected, Connected));
         assert_eq!(v.exit, EXIT_FENCED);
         assert_eq!(
             v.residuals,
             [RESIDUAL_ANONYMOUS_LOOPBACK, crate::wfp::RESIDUAL_DENY_ONLY]
         );
-        let v = verdict(&report(Blocked, Blocked, Blocked, Refused));
+        let v = verdict_runner(&report(Blocked, Blocked, Blocked, Refused));
         assert_eq!(v.residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
         // An attempt that could not be made is not a residual.
-        let v = verdict(&report(Blocked, Blocked, Error, Unreachable));
+        let v = verdict_runner(&report(Blocked, Blocked, Error, Unreachable));
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
     }
@@ -1054,10 +1226,10 @@ mod tests {
     fn verdict_plain_or_anonymous_getting_out_is_not_fenced() {
         for through in [Connected, Refused] {
             assert_eq!(
-                verdict(&report(through, Blocked, Blocked, Blocked)).exit,
+                verdict_runner(&report(through, Blocked, Blocked, Blocked)).exit,
                 EXIT_NOT_FENCED
             );
-            let v = verdict(&report(Blocked, through, Connected, Connected));
+            let v = verdict_runner(&report(Blocked, through, Connected, Connected));
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             // Residuals qualify a pass; a failure reports none.
             assert!(v.residuals.is_empty());
@@ -1071,7 +1243,7 @@ mod tests {
             for through in [Connected, Refused] {
                 let mut l = [Blocked; 4];
                 l[field] = through;
-                let v = verdict(&lowered(all_blocked, l));
+                let v = verdict_runner(&lowered(all_blocked, l));
                 assert_eq!(v.exit, EXIT_NOT_FENCED, "field {field} {through:?}");
                 assert!(v.residuals.is_empty());
             }
@@ -1087,19 +1259,22 @@ mod tests {
                 let mut l = [Blocked; 4];
                 l[field] = odd;
                 assert_eq!(
-                    verdict(&lowered(all_blocked, l)).exit,
+                    verdict_runner(&lowered(all_blocked, l)).exit,
                     EXIT_INCONCLUSIVE,
                     "field {field} {odd:?}"
                 );
             }
         }
         // Only the attempts at the off-loopback target can be skipped.
-        let v = verdict(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
+        let v = verdict_runner(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
         assert_eq!(v.exit, EXIT_FENCED);
         for loopback in [1, 3] {
             let mut l = [Blocked; 4];
             l[loopback] = Skipped;
-            assert_eq!(verdict(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
+            assert_eq!(
+                verdict_runner(&lowered(all_blocked, l)).exit,
+                EXIT_INCONCLUSIVE
+            );
         }
     }
 
@@ -1107,18 +1282,18 @@ mod tests {
     fn verdict_inconclusive_and_skipped() {
         for odd in [Unreachable, Error, Skipped] {
             assert_eq!(
-                verdict(&report(odd, Blocked, Blocked, Blocked)).exit,
+                verdict_runner(&report(odd, Blocked, Blocked, Blocked)).exit,
                 EXIT_INCONCLUSIVE
             );
         }
         for odd in [Unreachable, Error] {
             assert_eq!(
-                verdict(&report(Blocked, odd, Blocked, Blocked)).exit,
+                verdict_runner(&report(Blocked, odd, Blocked, Blocked)).exit,
                 EXIT_INCONCLUSIVE
             );
         }
         assert_eq!(
-            verdict(&report(Blocked, Skipped, Blocked, Blocked)).exit,
+            verdict_runner(&report(Blocked, Skipped, Blocked, Blocked)).exit,
             EXIT_FENCED
         );
     }

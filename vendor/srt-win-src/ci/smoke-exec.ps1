@@ -423,13 +423,38 @@ Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 #
 # Shapes: `anonymous` (ImpersonateAnonymousToken), `integrity:<sid>`
 # (a copy of the process token at that mandatory level), `denyonly`
-# (a restricted copy of the process token whose user SID is deny-only).
+# (a restricted copy of the process token whose user SID is deny-only),
+# `denyall` (the user SID and every group deny-only), `narrow` and
+# `narrow-wr` (a restricted copy whose restricting SIDs were asked to
+# be Everyone alone - without and with the write-restricted flag).
+#
+# `-Observe` shapes are not connected in two orderings. Each gets one
+# line, `OBS.<LABEL>=<steps>`, that says how far the child got in
+# building and assuming the token and what a connect on a socket
+# created AFTER it was assumed did, to the off-loopback target
+# (`-OffIp`/`-OffPort`; SKIPPED without one) and to `$Ip:$Port`:
+#
+#   create=ok | create=FAILED:<step>:<win32 error>    (not for anonymous)
+#   impersonate=ok | impersonate=FAILED:<win32 error>
+#   level=<impersonation level the thread's token reads back at>
+#   user=<its user SID>  restricting=[<its restricting SIDs>]
+#   off-loopback=<result>  loopback=<result>
+#
+# with <result> as above. The line stops at the first step that
+# failed. `OBS.PROCESS=` describes the process token the copies are
+# made from.
 function TokenProbeScript {
-  param([string] $Ip, [int] $Port, [string[]] $Shapes)
-  $calls = foreach ($entry in $Shapes) {
+  param([string] $Ip, [int] $Port, [string[]] $Shapes,
+        [string[]] $Observe = @(), [string] $OffIp = '', [int] $OffPort = 0)
+  $calls = @(foreach ($entry in $Shapes) {
     $label, $shape = $entry -split '=', 2
     "'$label.BEFORE=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$false)"
     "'$label.AFTER=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$true)"
+  })
+  if ($Observe.Count -gt 0) { $calls += "'OBS.PROCESS=' + [SrtTok]::Own()" }
+  foreach ($entry in $Observe) {
+    $label, $shape = $entry -split '=', 2
+    $calls += "'OBS.$label=' + [SrtTok]::Observe('$shape', '$OffIp', $OffPort, '$Ip', $Port)"
   }
   return @"
 `$src = @'
@@ -449,6 +474,7 @@ public static class SrtTok {
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool openAsSelf, out IntPtr token);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, ref SidAndAttributes disable, uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
+  [DllImport("advapi32.dll", EntryPoint="CreateRestrictedToken", SetLastError=true)] static extern bool CreateRestrictedTokenLists(IntPtr token, uint flags, uint disableCount, IntPtr disable, uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool ConvertSidToStringSidW(IntPtr psid, out IntPtr str);
   [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
@@ -459,7 +485,7 @@ public static class SrtTok {
   [DllImport("ws2_32.dll", SetLastError=true)] static extern IntPtr socket(int af, int type, int protocol);
   [DllImport("ws2_32.dll", SetLastError=true)] static extern int closesocket(IntPtr s);
   [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
-  const int TokenUser = 1, TokenImpersonationLevel = 9, TokenIntegrityLevel = 25;
+  const int TokenUser = 1, TokenGroups = 2, TokenImpersonationLevel = 9, TokenRestrictedSids = 11, TokenIntegrityLevel = 25;
   static readonly IntPtr InvalidSocket = new IntPtr(-1);
   static SrtTok() {
     // Start Winsock under the process's own token, once.
@@ -480,24 +506,61 @@ public static class SrtTok {
       Marshal.FreeHGlobal(buf);
     }
   }
-  // Put the token for a shape on this thread. Returns null on success.
-  static string Assume(string shape) {
-    if (shape == "anonymous")
-      return ImpersonateAnonymousToken(GetCurrentThread()) ? null : Fail("impersonate-anonymous");
-    IntPtr own = IntPtr.Zero, restricted = IntPtr.Zero, dup = IntPtr.Zero, psid = IntPtr.Zero;
-    IntPtr userBuf = IntPtr.Zero;
+  // Write one SID_AND_ATTRIBUTES, attributes 0, at index i of an array.
+  static void PutSid(IntPtr array, int i, IntPtr sid) {
+    int size = Marshal.SizeOf(typeof(SidAndAttributes));
+    Marshal.WriteIntPtr(array, i * size, sid);
+    Marshal.WriteInt32(array, i * size + IntPtr.Size, 0);
+  }
+  // Make the impersonation token for a shape other than "anonymous".
+  // Returns null on success, with the token in dup for the caller to
+  // close.
+  static string Build(string shape, out IntPtr dup) {
+    dup = IntPtr.Zero;
+    IntPtr own = IntPtr.Zero, restricted = IntPtr.Zero, psid = IntPtr.Zero;
+    IntPtr userBuf = IntPtr.Zero, groupBuf = IntPtr.Zero, list = IntPtr.Zero;
+    bool ok = false;
     try {
       // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY
       if (!OpenProcessToken(GetCurrentProcess(), 0x000B, out own)) return Fail("open");
       IntPtr source = own;
+      int ret;
       if (shape == "denyonly") {
         // The user SID in the disable list becomes deny-only.
         userBuf = Marshal.AllocHGlobal(256);
-        int ret;
         if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
         SidAndAttributes disable = new SidAndAttributes();
         disable.Sid = Marshal.ReadIntPtr(userBuf);
         if (!CreateRestrictedToken(own, 0, 1, ref disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
+        source = restricted;
+      } else if (shape == "denyall") {
+        // The user SID and every group become deny-only.
+        userBuf = Marshal.AllocHGlobal(256);
+        if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
+        GetTokenInformation(own, TokenGroups, IntPtr.Zero, 0, out ret);
+        if (ret <= 0) return Fail("size-groups");
+        groupBuf = Marshal.AllocHGlobal(ret);
+        if (!GetTokenInformation(own, TokenGroups, groupBuf, ret, out ret)) return Fail("query-groups");
+        int n = Marshal.ReadInt32(groupBuf), size = Marshal.SizeOf(typeof(SidAndAttributes));
+        list = Marshal.AllocHGlobal(size * (n + 1));
+        PutSid(list, 0, Marshal.ReadIntPtr(userBuf));
+        int count = 1;
+        for (int i = 0; i < n; i++) {
+          IntPtr entry = IntPtr.Add(groupBuf, IntPtr.Size + i * size);
+          // The integrity label is listed with the groups; it is not one.
+          if ((Marshal.ReadInt32(entry, IntPtr.Size) & 0x20) != 0) continue;
+          PutSid(list, count++, Marshal.ReadIntPtr(entry));
+        }
+        if (!CreateRestrictedTokenLists(own, 0, (uint)count, list, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
+        source = restricted;
+      } else if (shape == "narrow" || shape == "narrow-wr") {
+        // Ask for Everyone as the only restricting SID. 0x8 =
+        // WRITE_RESTRICTED.
+        if (!ConvertStringSidToSidW("S-1-1-0", out psid)) return Fail("sid");
+        list = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SidAndAttributes)));
+        PutSid(list, 0, psid);
+        uint flags = shape == "narrow-wr" ? 8u : 0u;
+        if (!CreateRestrictedTokenLists(own, flags, 0, IntPtr.Zero, 0, IntPtr.Zero, 1, list, out restricted)) return Fail("restrict");
         source = restricted;
       }
       // TOKEN_ALL_ACCESS, SecurityImpersonation, TokenImpersonation
@@ -509,14 +572,29 @@ public static class SrtTok {
         tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
         if (!SetTokenInformation(dup, TokenIntegrityLevel, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
       }
-      if (!SetThreadToken(IntPtr.Zero, dup)) return Fail("impersonate");
+      ok = true;
       return null;
     } finally {
+      if (!ok && dup != IntPtr.Zero) { CloseHandle(dup); dup = IntPtr.Zero; }
+      if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
+      if (groupBuf != IntPtr.Zero) Marshal.FreeHGlobal(groupBuf);
       if (userBuf != IntPtr.Zero) Marshal.FreeHGlobal(userBuf);
       if (psid != IntPtr.Zero) LocalFree(psid);
-      if (dup != IntPtr.Zero) CloseHandle(dup);
       if (restricted != IntPtr.Zero) CloseHandle(restricted);
       if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // Put the token for a shape on this thread. Returns null on success.
+  static string Assume(string shape) {
+    if (shape == "anonymous")
+      return ImpersonateAnonymousToken(GetCurrentThread()) ? null : Fail("impersonate-anonymous");
+    IntPtr dup;
+    string failed = Build(shape, out dup);
+    if (failed != null) return failed;
+    try {
+      return SetThreadToken(IntPtr.Zero, dup) ? null : Fail("impersonate");
+    } finally {
+      CloseHandle(dup);
     }
   }
   // Read the thread's token back. Returns null when it is the one the
@@ -544,12 +622,119 @@ public static class SrtTok {
       Marshal.FreeHGlobal(buf);
     }
   }
-  // shape "plain" connects under the process's own token.
-  public static string Go(string ip, int port, string shape, bool socketAfter) {
+  // A token's SIDs of one class (groups or restricting SIDs), as
+  // "[sid,sid]".
+  static string SidList(IntPtr token, int cls) {
+    int ret;
+    GetTokenInformation(token, cls, IntPtr.Zero, 0, out ret);
+    if (ret <= 0) return "unreadable:" + Marshal.GetLastWin32Error();
+    IntPtr buf = Marshal.AllocHGlobal(ret);
+    try {
+      if (!GetTokenInformation(token, cls, buf, ret, out ret)) return "unreadable:" + Marshal.GetLastWin32Error();
+      int n = Marshal.ReadInt32(buf), size = Marshal.SizeOf(typeof(SidAndAttributes));
+      string[] sids = new string[n];
+      for (int i = 0; i < n; i++) {
+        IntPtr str = IntPtr.Zero;
+        sids[i] = ConvertSidToStringSidW(Marshal.ReadIntPtr(buf, IntPtr.Size + i * size), out str) ? Marshal.PtrToStringUni(str) : "?";
+        if (str != IntPtr.Zero) LocalFree(str);
+      }
+      return "[" + string.Join(",", sids) + "]";
+    } finally {
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // The process token: its user and its restricting SIDs.
+  public static string Own() {
+    IntPtr own = IntPtr.Zero;
+    try {
+      if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out own)) return "unreadable:" + Marshal.GetLastWin32Error();
+      return "user=" + (TokenSid(own, TokenUser) ?? "unreadable") + " restricting=" + SidList(own, TokenRestrictedSids);
+    } catch (Exception e) {
+      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+    } finally {
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // The token the thread carries now: the impersonation level it reads
+  // back at, its user and its restricting SIDs.
+  static string ThreadToken() {
+    IntPtr cur = IntPtr.Zero, buf = Marshal.AllocHGlobal(8);
+    try {
+      // TOKEN_QUERY, opened as the process.
+      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) return "level=unreadable:" + Marshal.GetLastWin32Error();
+      int ret;
+      string level;
+      if (!GetTokenInformation(cur, TokenImpersonationLevel, buf, 4, out ret)) {
+        level = "unreadable:" + Marshal.GetLastWin32Error();
+      } else {
+        int l = Marshal.ReadInt32(buf);
+        level = l == 0 ? "anonymous" : l == 1 ? "identification" : l == 2 ? "impersonation" : l == 3 ? "delegation" : l.ToString();
+      }
+      return "level=" + level + " user=" + (TokenSid(cur, TokenUser) ?? "unreadable") + " restricting=" + SidList(cur, TokenRestrictedSids);
+    } finally {
+      if (cur != IntPtr.Zero) CloseHandle(cur);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  static byte[] Sockaddr(string ip, int port) {
     byte[] a = IPAddress.Parse(ip).GetAddressBytes();
     byte[] sa = new byte[16];
     sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
     Array.Copy(a, 0, sa, 4, 4);
+    return sa;
+  }
+  // One connect on a socket created now, under whatever token the
+  // thread carries.
+  static string ConnectNew(string ip, int port) {
+    byte[] sa = Sockaddr(ip, port);
+    IntPtr s = socket(2, 1, 6);
+    if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+    try {
+      int rc = connect(s, sa, sa.Length);
+      int err = Marshal.GetLastWin32Error();
+      return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    } finally {
+      closesocket(s);
+    }
+  }
+  // Build and assume a shape, one step at a time, and say how far it
+  // got; then connect, on sockets created under it, to the off-loopback
+  // target (none when offIp is empty) and to the loopback one. Nothing
+  // here is judged: a level below impersonation is printed and the
+  // connects are still tried.
+  public static string Observe(string shape, string offIp, int offPort, string ip, int port) {
+    bool assumed = false;
+    string r;
+    try {
+      if (shape == "anonymous") {
+        if (!ImpersonateAnonymousToken(GetCurrentThread())) return "impersonate=FAILED:" + Marshal.GetLastWin32Error();
+        r = "impersonate=ok";
+      } else {
+        IntPtr dup;
+        string failed = Build(shape, out dup);
+        // "TOKEN_FAILED:<step>:<code>"
+        if (failed != null) return "create=FAILED:" + failed.Substring(13);
+        try {
+          if (!SetThreadToken(IntPtr.Zero, dup)) return "create=ok impersonate=FAILED:" + Marshal.GetLastWin32Error();
+        } finally {
+          CloseHandle(dup);
+        }
+        r = "create=ok impersonate=ok";
+      }
+      assumed = true;
+      r += " " + ThreadToken();
+      r += " off-loopback=" + (offIp == "" ? "SKIPPED" : ConnectNew(offIp, offPort));
+      r += " loopback=" + ConnectNew(ip, port);
+      return r;
+    } catch (Exception e) {
+      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+    } finally {
+      if (assumed) RevertToSelf();
+    }
+  }
+  // shape "plain" connects under the process's own token.
+  public static string Go(string ip, int port, string shape, bool socketAfter) {
+    byte[] sa = Sockaddr(ip, port);
     bool assume = shape != "plain";
     IntPtr s = InvalidSocket;
     bool assumed = false;
@@ -710,6 +895,91 @@ try {
               "residuals=[$($verify.residuals -join ',')]")
 } finally {
   $tokLsn.Stop()
+}
+
+# ── R5k: what a child can do with its own token - OBSERVATIONS ────────
+# The filters name the sandbox account's SID. This row prints, for a
+# child launched WITH the write-restricted token and again for one
+# launched with the ordinary token, how far the child gets with each
+# token shape that could make a connect the filters do not attribute
+# to that SID, and what a connect on a socket created under the shape
+# does - to one of this machine's own off-loopback addresses and to an
+# out-of-range loopback port, both with a live listener. The shapes:
+#
+#   anonymous      ImpersonateAnonymousToken
+#   deny-only      a copy of the child's token, user SID deny-only
+#   deny-all       a copy with the user SID and every group deny-only
+#   low-integrity, untrusted-integrity
+#                  a copy at that mandatory level
+#   narrow         a copy whose restricting SIDs were asked to be
+#                  Everyone alone, so without the sandbox user's SID
+#   narrow-wr      the same, asked for with the write-restricted flag
+#
+# Every line starts `WRT obs:` and carries the child's own words (see
+# TokenProbeScript). Nothing here fails the script: a refusal by the
+# kernel is a result and is printed as one; a shape whose line the
+# child did not produce prints NOT EXERCISED with the reason.
+$wrtShapes = [ordered]@{
+  'anonymous'           = 'anonymous'
+  'deny-only'           = 'denyonly'
+  'deny-all'            = 'denyall'
+  'low-integrity'       = 'integrity:S-1-16-4096'
+  'untrusted-integrity' = 'integrity:S-1-16-0'
+  'narrow'              = 'narrow'
+  'narrow-wr'           = 'narrow-wr'
+}
+$wrtLoop = $null
+$wrtLan  = $null
+try {
+  $wrtLoop = Bind-Listener (50006, 50007, 50008, 49996)
+  $wrtPort = $wrtLoop.LocalEndpoint.Port
+  $wrtOffIp = ''
+  $wrtOffPort = 0
+  if ($lanIp) {
+    $wrtLan = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($lanIp), 0)
+    $wrtLan.Start()
+    $wrtOffIp = $lanIp
+    $wrtOffPort = $wrtLan.LocalEndpoint.Port
+  }
+  Write-Host "WRT obs: targets off-loopback=$(if ($wrtOffIp) { "${wrtOffIp}:$wrtOffPort" } else { 'none' }) loopback=127.0.0.1:$wrtPort"
+  $wrtScript = TokenProbeScript '127.0.0.1' $wrtPort @() `
+    -Observe @($wrtShapes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) `
+    -OffIp $wrtOffIp -OffPort $wrtOffPort
+  foreach ($mode in 'write-restricted', 'ordinary') {
+    $pre = "WRT obs: token=$mode"
+    $r = $null
+    $why = $null
+    try {
+      $tail = @()
+      if ($mode -eq 'write-restricted') { $tail += '--write-restricted-token' }
+      $tail += @('--', $pwsh, '-NoProfile', '-Command', $wrtScript)
+      $r = RExec $tail 300
+    } catch {
+      $why = "the child did not finish: $($_.Exception.Message)"
+    }
+    if ($r -and $r.out -notmatch '(?m)^PLAIN=') {
+      $why = "the probe did not run in the child (exec exit $($r.exit)): " +
+             "$(($r.raw.Trim() -replace '\s+', ' '))"
+    }
+    foreach ($name in @('process', 'plain') + @($wrtShapes.Keys)) {
+      $label = switch ($name) { 'process' { 'OBS.PROCESS' } 'plain' { 'PLAIN' } default { "OBS.$name" } }
+      if ($why) {
+        Write-Host "$pre shape=$name NOT EXERCISED: $why"
+      } elseif ($r.out -match "(?m)^$([regex]::Escape($label))=(.*?)\r?$") {
+        $got = $Matches[1]
+        if ($got -like 'EXCEPTION:*') { Write-Host "$pre shape=$name NOT EXERCISED: the probe threw ($got)" }
+        elseif ($name -eq 'plain')    { Write-Host "$pre shape=$name loopback=$got" }
+        else                          { Write-Host "$pre shape=$name $got" }
+      } else {
+        Write-Host "$pre shape=$name NOT EXERCISED: the child printed no $label line"
+      }
+    }
+  }
+} catch {
+  Write-Host "WRT obs: NOT EXERCISED: $($_.Exception.Message)"
+} finally {
+  if ($wrtLoop) { $wrtLoop.Stop() }
+  if ($wrtLan)  { $wrtLan.Stop() }
 }
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
@@ -1187,4 +1457,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'

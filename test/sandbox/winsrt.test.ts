@@ -2332,6 +2332,38 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect((err as WindowsSandboxError).message).toMatch(/windows-install/)
   })
 
+  it("verifyWindowsWfpEgress: a token the kernel refused is reported as denied, and srt-win's exit code decides", async () => {
+    // Under the write-restricted token srt-win exits 0: the identity
+    // is closed to the session's commands.
+    const r = await runVerify(
+      0,
+      verifyOut({
+        anonymous_probe: 'denied',
+        anonymous_loopback_probe: 'denied',
+        low_integrity_probe: 'denied',
+        write_restricted_token: true,
+      }),
+    )
+    expect(r.probes.anonymous).toBe('denied')
+    expect(r.probes.anonymousLoopback).toBe('denied')
+    expect(r.probes.lowIntegrity).toBe('denied')
+    expect(r.probes.plain).toBe('blocked')
+    expect(r.residuals).toEqual([])
+    // Not mistaken for a skipped attempt.
+    expect(r.warnings).toEqual([])
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // Under the ordinary token srt-win exits 2 for the same report.
+    expect(await verifyCode(2, verifyOut({ anonymous_probe: 'denied' }))).toBe(
+      'wfp_verify_inconclusive',
+    )
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // A word this version does not know reads as `error`.
+    const odd = await runVerify(0, verifyOut({ deny_only_probe: 'novel' }))
+    expect(odd.probes.denyOnly).toBe('error')
+  })
+
   it('verifyWindowsWfpEgress: inconclusive and unparseable runs reject', async () => {
     expect(
       await verifyCode(2, verifyOut({ anonymous_probe: 'unreachable' })),

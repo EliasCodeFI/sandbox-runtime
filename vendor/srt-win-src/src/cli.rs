@@ -863,7 +863,9 @@ enum WfpCmd {
     /// present (`srt_win::probe`).
     ///
     /// Prints one JSON line. Each `*_probe` is `blocked`,
-    /// `connected`, `refused`, `unreachable`, `skipped` or `error`:
+    /// `connected`, `refused`, `unreachable`, `skipped`, `error` or
+    /// `denied` (the kernel refused to let the probing process
+    /// impersonate that token, so no connect could be made under it):
     ///
     ///   - `egress_probe` — own token, to `target`.
     ///   - `anonymous_probe` — impersonating the anonymous token, to
@@ -900,7 +902,10 @@ enum WfpCmd {
     /// filters = fence MISSING), **2** (one was inconclusive — `error`
     /// means no connect was made under the token: it could not be
     /// assumed, or did not read back as assumed once the socket
-    /// existed, which is not a block; treat as failure), **19** when the
+    /// existed, which is not a block; treat as failure; `denied`
+    /// counts the same unless `--write-restricted-token` is given,
+    /// where the probing process holds a command's own token and a
+    /// refused identity is closed), **19** when the
     /// install record says the filter set predates this build, or
     /// **15** when the sandbox user is not provisioned. A runner
     /// exit that is not a probe report prints every probe as
@@ -1491,7 +1496,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     1,
                 );
             };
-            let verdict = probe::verdict(&report);
+            // Under the write-restricted token the report is the
+            // child's own, so an identity the kernel refused it is
+            // closed; see `probe::verdict`.
+            let verdict = probe::verdict(&report, write_restricted_token);
             for residual in &verdict.residuals {
                 eprintln!(
                     "srt-win: warning: wfp verify: residual '{residual}': {}",

@@ -215,6 +215,13 @@ export interface WindowsWfpStatusResult {
  * `refused` both mean the connect got past the filters (a refusal
  * comes from the destination). `unreachable` and `error` say nothing
  * about the fence; `skipped` means the attempt was not made.
+ * `denied` means the kernel refused to let the probing process
+ * impersonate that token (access-denied at the impersonation call),
+ * so no connect could be made under it: with the write-restricted
+ * token, where the probing process holds a command's own token, that
+ * identity is closed to commands and `srt-win` does not fail the
+ * verify for it; with the ordinary token it is inconclusive, like
+ * `error`.
  */
 export type WindowsWfpProbeOutcome =
   | 'blocked'
@@ -223,6 +230,7 @@ export type WindowsWfpProbeOutcome =
   | 'unreachable'
   | 'skipped'
   | 'error'
+  | 'denied'
 
 /**
  * A gap {@link verifyWindowsWfpEgress} observed that the filter set
@@ -244,7 +252,9 @@ export type WindowsWfpResidual = 'anonymous-loopback' | 'deny-only-user-sid'
  * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
  * return path `probes.plain` and the two lowered-integrity loopback
  * attempts are always `blocked`, and `probes.anonymous` and the two
- * lowered-integrity off-loopback attempts are `blocked` or `skipped`.
+ * lowered-integrity off-loopback attempts are `blocked` or `skipped`
+ * — except that under the write-restricted token any of them but
+ * `probes.plain` may instead be `denied`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -1091,6 +1101,16 @@ type RawWfpVerify = {
   hint?: string
 }
 
+const WFP_PROBE_OUTCOMES: readonly WindowsWfpProbeOutcome[] = [
+  'blocked',
+  'connected',
+  'refused',
+  'unreachable',
+  'skipped',
+  'error',
+  'denied',
+]
+
 const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
   'anonymous-loopback':
     'a connect to a loopback destination made while impersonating the ' +
@@ -1144,8 +1164,15 @@ export function interpretWindowsWfpVerify(r: {
         `(stderr: ${JSON.stringify(r.stderr)})`,
     )
   }
+  // An outcome word this version does not know is not a result it
+  // can vouch for: it reads as `error`, never as one of the known
+  // words.
   const outcome = (v: string | undefined): WindowsWfpProbeOutcome =>
-    (v ?? 'skipped') as WindowsWfpProbeOutcome
+    v === undefined
+      ? 'skipped'
+      : (WFP_PROBE_OUTCOMES as readonly string[]).includes(v)
+        ? (v as WindowsWfpProbeOutcome)
+        : 'error'
   const probes = {
     plain: outcome(raw.egress_probe),
     anonymous: outcome(raw.anonymous_probe),
