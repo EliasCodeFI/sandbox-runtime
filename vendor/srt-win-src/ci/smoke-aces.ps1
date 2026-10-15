@@ -698,9 +698,9 @@ try {
   $h33 = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
     -ArgumentList @('-NoProfile','-Command','Start-Sleep 600')
   try {
-    $null = Timed32 'grant' @{ write = @($tree33) } $h33.Id
-    if ((SbAces32 $tree33 $false) -join '|' -ne 'Allow:1301bf:3' -or
-        @(SbAces32 $deep33 $true -NoFlags) -notcontains 'Allow:1301bf') {
+    $null = Timed34 'grant' @{ write = @($tree33) } $h33.Id
+    if ((SbAces34 $tree33 $false) -join '|' -ne 'Allow:1301bf:3' -or
+        @(SbAces34 $deep33 $true -NoFlags) -notcontains 'Allow:1301bf') {
       throw 'A33 setup: grant did not land on the tree'
     }
     # (a) revoke by the test-hooks build, killed between the intent
@@ -714,7 +714,7 @@ try {
     if ($rk.exit -ne 86 -or $rk.raw -notmatch 'killed before dacl write') {
       throw "A33(a): kill hook did not fire (exit $($rk.exit)). raw: $($rk.raw)"
     }
-    if ((SbAces32 $tree33 $false) -join '|' -ne 'Allow:1301bf:3') {
+    if ((SbAces34 $tree33 $false) -join '|' -ne 'Allow:1301bf:3') {
       throw 'A33(a): grant ACE gone although the write never ran'
     }
     # (b) the row is gone (a second revoke finds nothing to release)
@@ -724,10 +724,10 @@ try {
     if ($rec.writesResumed -ne 1 -or $rec.writesPending -ne 0) {
       throw "A33(b): recover did not finish the interrupted write: $($rec | ConvertTo-Json -Compress)"
     }
-    if (@(SbAces32 $tree33 $false).Count -ne 0 -or @(SbAces32 $tree33 $true).Count -ne 0) {
+    if (@(SbAces34 $tree33 $false).Count -ne 0 -or @(SbAces34 $tree33 $true).Count -ne 0) {
       throw "A33(b): sandbox ACE left on the root: $((Get-Acl $tree33).Sddl)"
     }
-    if (@(SbAces32 $deep33 $false).Count -ne 0 -or @(SbAces32 $deep33 $true).Count -ne 0) {
+    if (@(SbAces34 $deep33 $false).Count -ne 0 -or @(SbAces34 $deep33 $true).Count -ne 0) {
       throw "A33(b): sandbox ACE left on a deep file: $((Get-Acl $deep33).Sddl)"
     }
     # (c) idempotent: nothing left to resume.
