@@ -1156,7 +1156,9 @@ async function initializeSteps(
     // refreshes it. Under the ordinary token there is none: one that is
     // found is removed before anything else is granted.
     windowsProfileGrantPaths = undefined
-    let profileExclusions: readonly string[] = []
+    let profileExclusions: Parameters<
+      typeof windowsProfileExclusionConflicts
+    >[1] = { exclusions: [], ungrantedOnly: [] }
     try {
       if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
         if (u.profileGrant) forgetWindowsProfileRead({ srtWin })
@@ -1184,7 +1186,7 @@ async function initializeSteps(
           )
         }
         windowsProfileGrantPaths = grant.paths ?? []
-        profileExclusions = grant.exclusions
+        profileExclusions = grant
       }
     } catch (e) {
       config = undefined
@@ -1301,14 +1303,21 @@ async function initializeSteps(
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
       // An allowRead path must not reach a path the profile read grant
-      // excludes: not be one, not lie inside one, and not lie above one
+      // protects: not be one, not lie inside one, and not lie above one
       // (a grant above it inherits, so a store created again beneath
-      // would be readable). Checked on what each path resolves to, and
-      // before anything is granted. The embedder's explicit override
-      // admits a path that is an excluded path or lies inside one —
-      // that reads the store on purpose, for this session. It never
-      // admits a path above an exclusion: nothing the override could
-      // add would keep a later-created store from inheriting the grant.
+      // would be readable). Nor may it be, or lie above, a directory
+      // the grant leaves ungranted as a whole (the temporary
+      // directory); a path INSIDE such a directory is fine, which is
+      // where a session's own directories usually are. Checked on what
+      // each path resolves to, and before anything is granted. The
+      // embedder's explicit override admits a path that is a protected
+      // path or lies inside one — that reads the store on purpose, for
+      // this session — and never a path above an exclusion.
+      //
+      // Only the configuration's allowRead is checked. The library's
+      // own read grant, the trust-bundle directory added below, is a
+      // fresh directory of its own in the temporary directory: inside
+      // an ungranted-only directory, so it would pass as well.
       const refused = windowsProfileExclusionConflicts(
         acc.grantRead,
         profileExclusions,
@@ -1323,11 +1332,15 @@ async function initializeSteps(
               .map(
                 c =>
                   `${c.path} ` +
-                  (c.relation === 'equal'
-                    ? `is the excluded ${c.exclusion}`
-                    : c.relation === 'inside'
-                      ? `lies inside the excluded ${c.exclusion}`
-                      : `contains the excluded ${c.exclusion}`),
+                  (c.kind === 'ungranted-only'
+                    ? (c.relation === 'equal' ? `is` : `contains`) +
+                      ` ${c.exclusion}, which is not granted as a whole ` +
+                      `(grant a directory inside it instead)`
+                    : c.relation === 'equal'
+                      ? `is the excluded ${c.exclusion}`
+                      : c.relation === 'inside'
+                        ? `lies inside the excluded ${c.exclusion}`
+                        : `contains the excluded ${c.exclusion}`),
               )
               .join('; ') +
             `. Nothing was granted. Remove the entry, or name a path that ` +

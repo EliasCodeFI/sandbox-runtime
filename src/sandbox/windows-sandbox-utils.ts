@@ -2746,12 +2746,22 @@ export interface WindowsProfileGrantStatus {
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
-   * Every path the grant was made to keep unreadable — the built-in
-   * list of the `srt-win` that made it and the added ones — as
-   * absolute paths, existing or not. A component that is `*` stands
-   * for any one name, one ending in `*` for any name with that prefix.
+   * Every PROTECTED path the grant was made to keep unreadable —
+   * credential, key and token stores: the built-in list of the
+   * `srt-win` that made it and the added ones — as absolute paths,
+   * existing or not. A component that is `*` stands for any one name,
+   * one ending in `*` for any name with that prefix. Each is denied,
+   * and a session may not grant a path that is one, lies inside one,
+   * or lies above one.
    */
   exclusions: string[]
+  /**
+   * The UNGRANTED-ONLY directories, in the same form (the user's
+   * temporary directory): not readable through the grant, and not
+   * denied. A session may grant a directory of its own inside one; it
+   * may not grant the directory itself or one above it.
+   */
+  ungrantedOnly: string[]
   counts: { containers: number; granted: number; files: number; denied: number }
   /**
    * Configuration-file variables for a sandboxed command — see
@@ -2768,6 +2778,7 @@ type RawProfileStatus = {
   profile?: string | null
   extra_exclusions?: string[]
   exclusions?: string[]
+  ungranted_only?: string[]
   containers?: number
   granted?: number
   files?: number
@@ -2823,6 +2834,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     ...(raw.profile && { profile: raw.profile }),
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: raw.exclusions ?? [],
+    ungrantedOnly: raw.ungranted_only ?? [],
     counts: {
       containers: raw.containers ?? 0,
       granted: raw.granted ?? 0,
@@ -3143,9 +3155,12 @@ export interface WindowsProfileExclusionConflict {
   path: string
   /** The exclusion, as the grant recorded it. */
   exclusion: string
+  /** Which list the exclusion is on. */
+  kind: 'protected' | 'ungranted-only'
   /**
    * `equal`: the path is the excluded one. `inside`: it lies beneath
-   * an excluded directory. `above`: an excluded path lies beneath it.
+   * an excluded directory (protected only). `above`: an excluded path
+   * lies beneath it.
    */
   relation: 'equal' | 'inside' | 'above'
 }
@@ -3160,34 +3175,60 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
 /**
  * The paths among `paths` that a session must not grant read access
  * to while the profile read grant exists, with the exclusion each
- * collides with (`exclusions` as
- * {@link WindowsProfileGrantStatus.exclusions} records them).
+ * collides with (`grant` is the recorded
+ * {@link WindowsProfileGrantStatus}, or its two lists).
  *
  * A path is compared as the object it resolves to: links, junctions,
  * 8.3 names and case are resolved first, the way `srt-win` resolves a
- * path it is asked to grant. It collides when it is an excluded path,
- * lies inside one, or lies above one. Above counts because a session
- * grant inherits: an excluded store that is deleted and created again
- * beneath it would be readable, which is what the grant's own layout
- * never allows.
+ * path it is asked to grant.
+ *
+ * - Against a PROTECTED exclusion it collides when it is the excluded
+ *   path, lies inside it, or lies above it. Above counts because a
+ *   session grant inherits: an excluded store that is deleted and
+ *   created again beneath it would be readable, which is what the
+ *   grant's own layout never allows.
+ * - Against an UNGRANTED-ONLY directory (the temporary directory) it
+ *   collides when it is that directory or lies above it: the grant
+ *   would cover everything in it. A path INSIDE one does not collide:
+ *   that is where sessions, and this library, stage directories of
+ *   their own.
  *
  * `override` (the embedder's
  * `dangerouslyAllowReadOfProfileExclusions`) takes a path out of the
  * result when one of its entries resolves to the same object and the
- * path is an excluded path or lies inside one. It never takes out a
- * path above an exclusion.
+ * path is a protected path or lies inside one. It never takes out a
+ * path above an exclusion, nor an ungranted-only directory itself.
  */
 export function windowsProfileExclusionConflicts(
   paths: readonly string[],
-  exclusions: readonly string[],
+  grant: Pick<WindowsProfileGrantStatus, 'exclusions' | 'ungrantedOnly'>,
   override: readonly string[] = [],
 ): WindowsProfileExclusionConflict[] {
-  if (paths.length === 0 || exclusions.length === 0) return []
+  if (paths.length === 0) return []
+  const rulesOf = (
+    list: readonly string[],
+    kind: WindowsProfileExclusionConflict['kind'],
+  ) =>
+    list.map(e => ({
+      exclusion: e,
+      kind,
+      parts: normalizeCaseForComparison(profilePathKey(e)).split('/'),
+    }))
+  // An ungranted-only directory is looked for first as the path
+  // itself, so that it is reported as what it is and not as "above"
+  // something inside it; then the protected paths; then the
+  // ungranted-only directories the path lies above.
+  const ungranted = rulesOf(grant.ungrantedOnly, 'ungranted-only')
+  const rules = [
+    ...ungranted.map(r => ({ ...r, onlyEqual: true })),
+    ...rulesOf(grant.exclusions, 'protected').map(r => ({
+      ...r,
+      onlyEqual: false,
+    })),
+    ...ungranted.map(r => ({ ...r, onlyEqual: false })),
+  ]
+  if (rules.length === 0) return []
   const admitted = new Set(override.map(windowsPathKey))
-  const rules = exclusions.map(e => ({
-    exclusion: e,
-    parts: normalizeCaseForComparison(profilePathKey(e)).split('/'),
-  }))
   const out: WindowsProfileExclusionConflict[] = []
   for (const p of paths) {
     const key = windowsPathKey(p)
@@ -3205,10 +3246,15 @@ export function windowsProfileExclusionConflicts(
           : parts.length > r.parts.length
             ? 'inside'
             : 'above'
-      // An admitted path is still checked against the other
-      // exclusions: it may lie above one of them.
-      if (relation !== 'above' && admitted.has(key)) continue
-      out.push({ path: p, exclusion: r.exclusion, relation })
+      if (r.onlyEqual && relation !== 'equal') continue
+      if (r.kind === 'ungranted-only') {
+        if (relation === 'inside') continue
+      } else if (relation !== 'above' && admitted.has(key)) {
+        // An admitted path is still checked against the other
+        // exclusions: it may lie above one of them.
+        continue
+      }
+      out.push({ path: p, exclusion: r.exclusion, kind: r.kind, relation })
       break
     }
   }

@@ -435,7 +435,7 @@ fn wanted(conn: &Connection, ids: &Ids, canon: &str, cur: FileId) -> Result<Vec<
         Some(crate::profile_plan::Kind::Container) => profile = Some(acl::ProfileAce::Container),
         Some(crate::profile_plan::Kind::Granted) => profile = Some(acl::ProfileAce::Granted),
         Some(crate::profile_plan::Kind::File) => profile = Some(acl::ProfileAce::File),
-        Some(crate::profile_plan::Kind::Skipped) | None => {}
+        Some(crate::profile_plan::Kind::Skipped | crate::profile_plan::Kind::Ungranted) | None => {}
     }
     if cap.is_none() && deny.is_none() && !deny_fdc && !deny_delete && profile.is_none() {
         return Ok(Vec::new());

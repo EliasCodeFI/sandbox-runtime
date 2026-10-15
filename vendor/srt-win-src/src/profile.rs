@@ -364,6 +364,7 @@ const VAL_HEADER: &str = "Profile";
 const VAL_EXTRA: &str = "ProfileExtra";
 const VAL_PATHS: &str = "ProfilePaths";
 const VAL_EXCLUSIONS: &str = "ProfileExclusions";
+const VAL_UNGRANTED: &str = "ProfileUngranted";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -490,12 +491,18 @@ pub struct Marker {
     /// as paths beneath the profile. A later run keeps them unless it
     /// is told to replace them.
     pub extra: Vec<String>,
-    /// Every exclusion the grant was made with — the built-in list of
-    /// the build that made it, at this profile's locations, and
-    /// `extra` — as absolute paths, wildcards as written. Whether
-    /// each exists is beside the point: this is what must never be
-    /// granted, by this grant or by a session on top of it.
+    /// Every PROTECTED exclusion the grant was made with — the
+    /// built-in list of the build that made it, at this profile's
+    /// locations, and `extra` — as absolute paths, wildcards as
+    /// written. Whether each exists is beside the point: this is what
+    /// must never be granted, by this grant or by a session on top of
+    /// it.
     pub exclusions: Vec<String>,
+    /// The UNGRANTED-ONLY exclusions, in the same form: directories
+    /// the grant leaves unreadable without denying them. A session
+    /// may grant a path inside one, not the directory or one above
+    /// it.
+    pub ungranted_only: Vec<String>,
     pub paths: Vec<Recorded>,
 }
 
@@ -537,6 +544,7 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .transpose()?,
         extra: k.get_multi_sz(VAL_EXTRA)?.unwrap_or_default(),
         exclusions: k.get_multi_sz(VAL_EXCLUSIONS)?.unwrap_or_default(),
+        ungranted_only: k.get_multi_sz(VAL_UNGRANTED)?.unwrap_or_default(),
         paths: k
             .get_multi_sz(VAL_PATHS)?
             .unwrap_or_default()
@@ -554,6 +562,7 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
     k.set_multi_sz(VAL_PATHS, &paths)?;
     k.set_multi_sz(VAL_EXTRA, &m.extra)?;
     k.set_multi_sz(VAL_EXCLUSIONS, &m.exclusions)?;
+    k.set_multi_sz(VAL_UNGRANTED, &m.ungranted_only)?;
     match &m.header {
         Some(h) => k.set_sz(VAL_HEADER, &h.encode()),
         None => reg::delete_value(&k, VAL_HEADER),
@@ -562,7 +571,13 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
 
 fn clear_marker(key: &str) -> Result<()> {
     if let Some(k) = reg::Key::open_hkcu(key, true)? {
-        for v in [VAL_HEADER, VAL_EXTRA, VAL_EXCLUSIONS, VAL_PATHS] {
+        for v in [
+            VAL_HEADER,
+            VAL_EXTRA,
+            VAL_EXCLUSIONS,
+            VAL_UNGRANTED,
+            VAL_PATHS,
+        ] {
             reg::delete_value(&k, v)?;
         }
     }
@@ -949,6 +964,8 @@ pub fn grant(
             }),
             // Its owner writes its deny; here it is only left out.
             Kind::Denied if !n.stamp => {}
+            // Left exactly as it is: no allow, no deny, no record.
+            Kind::Ungranted => {}
             _ => planned.push((path, n)),
         }
     }
@@ -961,11 +978,13 @@ pub fn grant(
         persist::marker_set_ever()?;
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
-    let exclusions: Vec<String> = rules
-        .spelled()
-        .iter()
-        .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
-        .collect();
+    let absolute = |rel: Vec<String>| -> Vec<String> {
+        rel.iter()
+            .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
+            .collect()
+    };
+    let exclusions = absolute(rules.spelled());
+    let ungranted_only = absolute(rules.spelled_ungranted());
     let mut header = Header {
         list_version: plan::LIST_VERSION,
         complete: false,
@@ -990,6 +1009,7 @@ pub fn grant(
             header: Some(header.clone()),
             extra: extra_strings.clone(),
             exclusions: exclusions.clone(),
+            ungranted_only: ungranted_only.clone(),
             paths: pre,
         },
     )?;
@@ -1037,7 +1057,7 @@ pub fn grant(
                 Kind::Granted => report.granted += 1,
                 Kind::File => report.files += 1,
                 Kind::Denied => report.denied += 1,
-                Kind::Skipped => {}
+                Kind::Skipped | Kind::Ungranted => {}
             }
             true
         }
@@ -1158,6 +1178,7 @@ pub fn grant(
             header: Some(header),
             extra: extra_strings,
             exclusions,
+            ungranted_only,
             paths,
         },
     )?;
@@ -1249,6 +1270,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                 }),
                 extra: marker.extra,
                 exclusions: marker.exclusions,
+                ungranted_only: marker.ungranted_only,
                 paths: all
                     .iter()
                     .filter(|r| failed_paths.contains(r.path.as_str()))
@@ -1324,6 +1346,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
         "exclusions": m.exclusions,
+        "ungranted_only": m.ungranted_only,
         "containers": count(Kind::Container),
         "granted": count(Kind::Granted),
         "files": count(Kind::File),
@@ -1675,6 +1698,8 @@ mod tests {
             r"AppData\Roaming\npm\x.cmd",
             r"AppData\Roaming\Microsoft\Credentials\c",
             r"AppData\Local\Temp\t.tmp",
+            r"AppData\Local\Temp\session\s.txt",
+            r"AppData\Local\Temp\keys\k.pem",
         ] {
             write(&prof, f);
         }
@@ -1747,12 +1772,20 @@ mod tests {
         }
         assert!(group_aces(&prof.join("stray.txt")).is_empty());
         // Exclusions: the deny, and nothing that allows.
-        for d in [
-            ".ssh",
-            r"AppData\Roaming\Microsoft\Credentials",
-            r"AppData\Local\Temp",
-        ] {
+        for d in [".ssh", r"AppData\Roaming\Microsoft\Credentials"] {
             assert_eq!(group_aces(&prof.join(d)), deny_dir, "excluded '{d}'");
+        }
+        // The temporary directory is ungranted, not denied: neither it
+        // nor anything in it carries an entry of the group's, so a
+        // session can grant a directory of its own in it.
+        for t in [
+            r"AppData\Local\Temp",
+            r"AppData\Local\Temp\t.tmp",
+            r"AppData\Local\Temp\session",
+            r"AppData\Local\Temp\session\s.txt",
+            r"AppData\Local\Temp\keys",
+        ] {
+            assert!(group_aces(&prof.join(t)).is_empty(), "'{t}'");
         }
         for f in [".netrc", r".cargo\credentials.toml"] {
             let a = group_aces(&prof.join(f));
@@ -1864,10 +1897,23 @@ mod tests {
 
         // A new exclusion from configuration turns a granted
         // directory into a denied one in one run.
-        let with_extra =
-            grant(&store, &ids, &layout, &["NewTop".to_owned()], false, false).unwrap();
+        let with_extra = grant(
+            &store,
+            &ids,
+            &layout,
+            &["NewTop".to_owned(), r"AppData\Local\Temp\keys".to_owned()],
+            false,
+            false,
+        )
+        .unwrap();
         assert!(with_extra.complete, "{with_extra:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
+        // A protected path inside the ungranted-only directory is
+        // denied; the directory and its other children still carry
+        // nothing.
+        assert_eq!(group_aces(&prof.join(r"AppData\Local\Temp\keys")), deny_dir);
+        assert!(group_aces(&prof.join(r"AppData\Local\Temp")).is_empty());
+        assert!(group_aces(&prof.join(r"AppData\Local\Temp\session")).is_empty());
         assert!(group_aces(&prof.join(r"NewTop\n.txt")).iter().all(|a| a.1));
 
         // A refresh that names no exclusion keeps the one an earlier
@@ -1877,22 +1923,34 @@ mod tests {
         assert_eq!(kept.writes, 0, "{kept:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
         let st = status_json(TEST_KEY, Ok(layout.clone()), false);
-        assert_eq!(st["extra_exclusions"], serde_json::json!(["NewTop"]));
+        assert_eq!(
+            st["extra_exclusions"],
+            serde_json::json!(["NewTop", r"AppData\Local\Temp\keys"])
+        );
         let listed: Vec<String> = st["exclusions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_lowercase())
             .collect();
+        let at = |rel: &str| format!("{}{rel}", layout.profile.to_lowercase());
         for want in [
             r"\newtop",
             r"\.ssh",
-            r"\appdata\local\temp",
+            r"\appdata\local\temp\keys",
             r"\ntuser.dat*",
         ] {
-            let full = format!("{}{want}", layout.profile.to_lowercase());
-            assert!(listed.contains(&full), "{full} not in {listed:?}");
+            assert!(listed.contains(&at(want)), "{want} not in {listed:?}");
         }
+        // The temporary directory is recorded as the other kind.
+        assert!(!listed.contains(&at(r"\appdata\local\temp")));
+        let ungranted: Vec<String> = st["ungranted_only"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+        assert_eq!(ungranted, [at(r"\appdata\local\temp")]);
         // Naming it again changes nothing; replacing the added list
         // with an empty one is what re-admits it.
         let same = grant(&store, &ids, &layout, &["newtop".to_owned()], false, false).unwrap();
@@ -1900,6 +1958,7 @@ mod tests {
         let replaced = grant(&store, &ids, &layout, &[], true, false).unwrap();
         assert!(replaced.complete, "{replaced:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
+        assert!(group_aces(&prof.join(r"AppData\Local\Temp\keys")).is_empty());
         assert_eq!(
             status_json(TEST_KEY, Ok(layout.clone()), false)["extra_exclusions"],
             serde_json::json!([])

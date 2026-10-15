@@ -336,11 +336,14 @@ enum ProfileCmd {
     /// excluded path get an entry that lets the sandbox list them and
     /// pass through; their other children are granted read + execute
     /// one by one (a directory with one inheriting entry, a file with
-    /// its own). Excluded paths — key and credential stores, browser
-    /// and password-manager data, the registry hives, the temporary
-    /// directory, and what `--exclude` adds — are never granted and
-    /// get a read deny, written before the first allow; an excluded
-    /// directory that does not exist is created empty to carry it.
+    /// its own). Protected paths — key and credential stores, browser
+    /// and password-manager data, the registry hives, and what
+    /// `--exclude` adds — are never granted and get a read deny,
+    /// written before the first allow; a protected directory that
+    /// does not exist is created empty to carry it. The temporary
+    /// directory is left as it is: nothing in it is granted, and it
+    /// is not denied, so a session can still grant a directory of its
+    /// own inside it.
     /// Junctions, symbolic links and cloud placeholders are skipped.
     /// No entry grants a write, delete or change-permissions right.
     ///
@@ -399,9 +402,12 @@ enum ProfileCmd {
     },
     /// Print the recorded grant as JSON: `{state, reason?, profile,
     /// list_version, recorded_list_version, extra_exclusions,
-    /// exclusions, containers, granted, files, denied, env?, paths?}`.
-    /// `exclusions` is every path the grant was made to keep
-    /// unreadable (wildcards as written), existing or not. `state` is
+    /// exclusions, ungranted_only, containers, granted, files, denied,
+    /// env?, paths?}`.
+    /// `exclusions` is every protected path the grant was made to
+    /// keep unreadable (wildcards as written), existing or not;
+    /// `ungranted_only` the directories it leaves ungranted without
+    /// denying them. `state` is
     /// `none`, `current`, `outdated`, `incomplete` or `unknown`; only
     /// `current` is a grant a session may rely on. `env` lists the
     /// configuration-file variables an embedder may set for a

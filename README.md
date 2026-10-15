@@ -873,7 +873,9 @@ The sandboxed process has its own profile, so a tool does not look in yours by i
 
 #### Exclusions
 
-Never granted, and denied explicitly to the sandbox group (the deny is written before anything is granted; an excluded directory that does not exist is created empty to carry it):
+There are two kinds.
+
+**Protected paths** hold credentials, keys or tokens. They are never granted, and they are denied explicitly to the sandbox group (the deny is written before anything is granted; a protected directory that does not exist is created empty to carry it). A session cannot grant read access to one, to anything inside one, or to a directory above one — see [Restricting it](#restricting-it). They are:
 
 - **Keys and sign-ins in the profile:** `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.terraform.d`, `.wrangler`, `.vercel`, `.netlify`, `.claude`, `.config\gcloud`, `.config\gh`, `.config\configstore`
 - **The same tools' Windows locations:** `%APPDATA%\gcloud`, `GitHub CLI`, `gnupg`, `com.vercel.cli`, `netlify`, `xdg.config`, `terraform.d`, `terraform.rc`; `%LOCALAPPDATA%\heroku`
@@ -882,8 +884,10 @@ Never granted, and denied explicitly to the sandbox group (the deny is written b
 - **Registry hives:** `NTUSER.DAT*`, `ntuser.ini`, `ntuser.pol`, `%LOCALAPPDATA%\Microsoft\Windows\UsrClass.dat*`
 - **Browsers and password managers:** the Chrome, Edge and Brave `User Data` directories, Firefox's profile directories, `EBWebView` directories under `%LOCALAPPDATA%\<app>` and `%LOCALAPPDATA%\Microsoft\<app>`, 1Password, Bitwarden, KeePass, KeePassXC
 - **Windows' own stores,** under both `%APPDATA%\Microsoft` and `%LOCALAPPDATA%\Microsoft`: `Credentials`, `Protect`, `Vault`, `Crypto`, `SystemCertificates`; and `%LOCALAPPDATA%\Microsoft\IdentityCache`, `TokenBroker`, `OneAuth`, `Windows\INetCookies`, `Windows\INetCache`, `Windows\WebCache`
-- **`%LOCALAPPDATA%\Packages`** (packaged applications' data), **all of `%LOCALAPPDATA%\Temp`**, and this library's own state directory
+- **`%LOCALAPPDATA%\Packages`** (packaged applications' data) and this library's own state directory, `%LOCALAPPDATA%\sandbox-runtime` (its CA key is not in the profile: it is in `%ProgramData%\sandbox-runtime`)
 - every other **file directly in the profile directory** except `.npmrc` and `.gitconfig` (not denied, just not granted)
+
+**Left ungranted, but not closed:** `%LOCALAPPDATA%\Temp`. Every program you run drops files in the temporary directory, so nothing in it is readable through the grant — a file directly in it is as unreadable as before. But it is not a secret as a whole, and it is where sessions (and this library, for its trust bundle) stage directories of their own: it is not denied, and a session may grant a directory inside it with `filesystem.allowRead` or `allowWrite` as usual. Only a grant of the temporary directory itself, or of a directory above it, is refused, because that would cover everything in it. (The browser caches under `Microsoft\Windows` are protected, not merely ungranted: they hold cookie and history databases and pages fetched with your sign-ins, and nothing stages a session directory in them.)
 
 The list covers known stores. `AppData` holds the data of every application you run, and an application this list does not know is readable until you exclude its directory.
 
@@ -891,7 +895,7 @@ The list covers known stores. `AppData` holds the data of every application you 
 
 - **For a session:** `filesystem.denyRead` and `credentials.files` entries (`mode: "mask"` included — on Windows a masked file is unreadable) apply on top of the grant. They are stamped for the session on every granted path they cover and released when it ends. `denyRead: ['~']` makes the whole profile unreadable for that session; the next session without it reads again.
 - **For every session — persistent exclusions:** pass paths inside the profile (absolute, or relative to it) as `profileExclude` to the install, as `exclude` to `grantWindowsProfileRead()`, or as `srt-win profile grant --exclude <path>` (repeatable): for example the embedding program's own configuration directory. They are recorded with the grant and stay excluded on later runs that do not name them; `replaceExclusions: true` (`--replace-excludes`) makes the given list the whole added list. Nothing removes a built-in exclusion. `windowsProfileReadExclusions(config, profileDir)` collects a configuration's `credentials.files` and `filesystem.denyRead` paths inside the profile for this purpose.
-- **`filesystem.allowRead` cannot reach an exclusion.** `initialize()` rejects with `profile_exclusion_read_grant`, before granting anything, when an `allowRead` path is an excluded path, lies inside one, or lies above one — compared with the exclusions recorded with the grant (built-in and added), after resolving links, junctions, short names and case. Above counts because a session grant inherits: an excluded store created again beneath it would be readable. An embedding program that means to open a store to its sessions passes the path to `initialize()` itself — `SandboxManager.initialize(config, askCallback, false, { dangerouslyAllowReadOfProfileExclusions: [path] })`; this is not a configuration key. It admits an `allowRead` path that is an excluded path or lies inside one. It never admits a path above an exclusion.
+- **`filesystem.allowRead` cannot reach an exclusion.** `initialize()` rejects with `profile_exclusion_read_grant`, before granting anything, when an `allowRead` path is a protected path, lies inside one, or lies above one, or is the temporary directory or lies above it — compared with the exclusions recorded with the grant (built-in and added), after resolving links, junctions, short names and case. Above counts because a session grant inherits: an excluded store created again beneath it would be readable. An embedding program that means to open a store to its sessions passes the path to `initialize()` itself — `SandboxManager.initialize(config, askCallback, false, { dangerouslyAllowReadOfProfileExclusions: [path] })`; this is not a configuration key. It admits an `allowRead` path that is an excluded path or lies inside one. It never admits a path above an exclusion.
 
 #### Removing it
 

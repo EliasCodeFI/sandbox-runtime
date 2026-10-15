@@ -32,7 +32,15 @@
     R4  it lists a container, and cannot read a file in the root that
         is not granted by name.
     X   it cannot read a key directory, a credential file in the
-        root, a store under AppData\Roaming, or AppData\Local\Temp.
+        root, or a store under AppData\Roaming.
+    TMP the temporary directory is left ungranted, not denied: a file
+        directly in AppData\Local\Temp is unreadable and the directory
+        carries no entry for the sandbox group; a subdirectory a
+        session grants itself is readable for that session, and only
+        that. The record lists the directory as ungranted-only, which
+        is what the library refuses a session grant of the directory
+        itself on (that refusal is the library's, before it calls
+        srt-win; its unit tests have the row).
     X2  an exclusion deleted and created again is still unreadable,
         and so is a credential file replaced by write-then-rename
         (in the root and in a container).
@@ -275,6 +283,7 @@ try {
   $credBlob = Seed 'AppData\Roaming\Microsoft\Credentials\blob' 'CRED-CONTENT'
   $npmTool  = Seed 'AppData\Roaming\npm\tool.cmd'               '@echo NPM-TOOL'
   $tempFile = Seed 'AppData\Local\Temp\t.txt'                   'TEMP-CONTENT'
+  $sessFile = Seed 'AppData\Local\Temp\session\s.txt'          'SESSION-CONTENT'
   $toolDir  = Join-Path $prof 'AppData\Local\Programs\MyTool'
   New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
   # cmd.exe under another name: an .exe that exists nowhere else on
@@ -313,7 +322,8 @@ try {
     (Join-Path $prof 'AppData'), (Join-Path $prof 'AppData\Roaming'),
     (Join-Path $prof 'AppData\Roaming\Microsoft'), (Join-Path $prof 'AppData\Roaming\Microsoft\Credentials'),
     $credBlob, (Join-Path $prof 'AppData\Roaming\npm'), $npmTool, (Join-Path $prof 'AppData\Local'),
-    (Join-Path $prof 'AppData\Local\Temp'), $tempFile, (Join-Path $prof 'AppData\Local\Programs'),
+    (Join-Path $prof 'AppData\Local\Temp'), $tempFile, (Join-Path $prof 'AppData\Local\Temp\session'),
+    $sessFile, (Join-Path $prof 'AppData\Local\Programs'),
     $toolDir, (Join-Path $prof 'bulk'), $bulkSample, $stray)
   $replaced = @((Join-Path $prof '.ssh'), $sshKey, $netrc, $cargoCr)
   $pre = @{}
@@ -397,7 +407,30 @@ try {
   Expect-NoRead 'X (credential file in the root)' $netrc 'NETRC-CONTENT'
   Expect-NoRead 'X (credential file in a container)' $cargoCr 'CARGO-CRED-CONTENT'
   Expect-NoRead 'X (store under AppData\Roaming)' $credBlob 'CRED-CONTENT'
-  Expect-NoRead 'X (AppData\Local\Temp)' $tempFile 'TEMP-CONTENT'
+
+  # ── TMP: the temporary directory ─────────────────────────────────
+  $tempDir = Join-Path $prof 'AppData\Local\Temp'
+  $sessDir = Join-Path $tempDir 'session'
+  Expect-NoRead 'TMP (a file directly in AppData\Local\Temp)' $tempFile 'TEMP-CONTENT'
+  Expect-NoRead 'TMP (a subdirectory no session granted)' $sessFile 'SESSION-CONTENT'
+  $named = @($tempDir, $tempFile, $sessDir, $sessFile) | Where-Object { Has-Group $_ }
+  if (@($named).Count -eq 0) { Ok 'TMP: neither the directory nor anything in it carries an entry for the sandbox group (ungranted, not denied)' }
+  else { Fail "TMP: the sandbox group is named on: $($named | ForEach-Object { "$_ $(Sddl $_)" })" }
+  $st = Status
+  if (@($st.ungranted_only | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -eq 1 -and
+      @($st.exclusions | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -eq 0) {
+    Ok 'TMP: the record lists the directory as ungranted-only, not as a protected path'
+  } else { Fail "TMP: ungranted_only=$($st.ungranted_only -join ' | ')" }
+  # A session's own read grant on a directory inside it.
+  $json = @{ read = @($sessDir); write = @(); denyRead = @(); denyWrite = @() } | ConvertTo-Json -Compress
+  $raw = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { Fail "TMP: a session read grant inside the temporary directory failed: $raw" }
+  else {
+    Expect-Read 'TMP (a subdirectory the session granted)' $sessFile 'SESSION-CONTENT'
+    Expect-NoRead 'TMP (the rest of the directory, during that session)' $tempFile 'TEMP-CONTENT'
+  }
+  End-Session
+  Expect-NoRead 'TMP (the subdirectory after the session)' $sessFile 'SESSION-CONTENT'
   $r = Sb @($cmd, '/d', '/s', '/c', "dir /b /a `"$(Join-Path $prof '.ssh')`"")
   if ($r.exit -ne 0 -and $r.out -notmatch 'id_test') { Ok 'X: an excluded directory cannot be listed' }
   else { Fail "X: dir of .ssh: exit=$($r.exit) raw: $($r.raw)" }
@@ -447,7 +480,7 @@ try {
   if (@($st.extra_exclusions) -contains 'NewTop' -and
       @($listed | Where-Object { $_ -match '\\NewTop$' }).Count -eq 1 -and
       @($listed | Where-Object { $_ -match '\\\.ssh$' }).Count -eq 1 -and
-      @($listed | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -ge 1) {
+      @($listed | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -eq 0) {
     Ok "E: the record lists the added exclusion with the built-in ones ($($listed.Count) in all)"
   } else { Fail "E: recorded exclusions: extra=$($st.extra_exclusions -join ',') all=$($listed -join ' | ')" }
   $ge = Grant @('--replace-excludes')
@@ -578,4 +611,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, X2, N, E, W, J, D, O, F, U)'
+Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, W, J, D, O, F, U)'

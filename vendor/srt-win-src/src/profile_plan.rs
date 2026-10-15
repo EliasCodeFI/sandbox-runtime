@@ -14,8 +14,13 @@
 //!   looked at on its own;
 //! - **granted**: it gets one inheriting read + execute entry and is
 //!   not descended;
-//! - **denied**: an exclusion. It gets an inheriting read deny and is
-//!   not descended;
+//! - **denied**: a protected exclusion. It gets an inheriting read
+//!   deny and is not descended;
+//! - **ungranted**: an ungranted-only exclusion (the temporary
+//!   directory), or a directory inside one. Nothing is written on it:
+//!   no allow of any kind, and no deny. It is descended only to reach
+//!   a protected exclusion inside it, which is denied as anywhere
+//!   else; nothing else in it is looked at;
 //! - **skipped**: a reparse point, a cloud placeholder, or a directory
 //!   that could not be opened. Nothing is written on it.
 //!
@@ -25,6 +30,22 @@
 //! ancestor that carries an inheriting allow: an excluded directory or
 //! file that is deleted and created again, or replaced by a rename,
 //! inherits nothing.
+//!
+//! ## Two kinds of exclusion
+//!
+//! A **protected** exclusion is a store of credentials, keys or
+//! tokens. It is never granted, it is read-denied, and a session may
+//! not grant a path that is it, lies inside it, or lies above it.
+//!
+//! An **ungranted-only** exclusion is a directory that is not readable
+//! by default without being a secret as a whole: the user's temporary
+//! directory, which every program writes to and in which sessions and
+//! this library routinely stage directories of their own. Nothing in
+//! it is granted here and nothing above it carries an inheriting
+//! allow, so it is exactly as unreadable as before the grant. It is
+//! not denied, so a session can grant a directory inside it; a session
+//! grant of the directory itself, or of one above it, would cover
+//! everything in it and is refused like one above a protected path.
 //!
 //! A file directly inside a container is readable only if it is
 //! granted itself. In the profile root that is the short list in
@@ -39,7 +60,7 @@
 
 /// Version of the exclusion list and of the walk rule. A recorded
 /// grant made with another version is reported as outdated.
-pub const LIST_VERSION: u32 = 1;
+pub const LIST_VERSION: u32 = 2;
 
 /// What a built-in exclusion's path is relative to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,23 +86,41 @@ pub struct Excl {
     /// False for a directory whose deny is written by its owner in
     /// this crate; it is then only kept out of the grant.
     pub stamp: bool,
+    /// Ungranted-only (see the module doc): kept out of the grant,
+    /// not denied. Every other entry is protected.
+    pub ungranted_only: bool,
 }
 
+/// A protected directory.
 const fn dir(base: Base, path: &'static str) -> Excl {
     Excl {
         base,
         path,
         dir: true,
         stamp: true,
+        ungranted_only: false,
     }
 }
 
+/// A protected file.
 const fn file(base: Base, path: &'static str) -> Excl {
     Excl {
         base,
         path,
         dir: false,
         stamp: true,
+        ungranted_only: false,
+    }
+}
+
+/// An ungranted-only directory.
+const fn ungranted(base: Base, path: &'static str) -> Excl {
+    Excl {
+        base,
+        path,
+        dir: true,
+        stamp: false,
+        ungranted_only: true,
     }
 }
 
@@ -174,6 +213,10 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Local, r"Microsoft\Crypto"),
     dir(Local, r"Microsoft\SystemCertificates"),
     // Account token caches and web sessions of the signed-in user.
+    // The two caches are protected, not merely ungranted: they hold
+    // the cookie and history databases and pages fetched with the
+    // user's sign-ins, and nothing stages a directory of its own in
+    // them that a session would need to read.
     dir(Local, r"Microsoft\IdentityCache"),
     dir(Local, r"Microsoft\TokenBroker"),
     dir(Local, r"Microsoft\OneAuth"),
@@ -182,17 +225,22 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Local, r"Microsoft\Windows\WebCache"),
     // Private data of packaged applications.
     dir(Local, "Packages"),
-    // The user's temporary directory, whole: every program of the
-    // user drops files there, among them this library's own.
-    dir(Local, "Temp"),
-    // This library's state directory. Its owner (`state_db`) writes
-    // its access list, deny included, on every open.
+    // This library's state directory (the session database; on
+    // Windows its CA key is not in the profile at all, but in the
+    // machine store under %ProgramData%). Its owner (`state_db`)
+    // writes its access list, deny included, on every open.
     Excl {
         base: Local,
         path: "sandbox-runtime",
         dir: true,
         stamp: false,
+        ungranted_only: false,
     },
+    // UNGRANTED-ONLY. The user's temporary directory: every program
+    // of the user drops files there, so none of it is readable by
+    // default; sessions and this library stage directories in it and
+    // grant those, so it is not denied as a whole.
+    ungranted(Local, "Temp"),
 ];
 
 /// Files in the profile ROOT that are granted by name. Every other
@@ -341,7 +389,10 @@ struct Rule {
     /// The components as spelled, for creating a missing directory.
     spelled: Vec<String>,
     stamp: bool,
-    /// A built-in directory with no wildcard: created when missing.
+    /// Ungranted-only; otherwise protected.
+    ungranted: bool,
+    /// A protected built-in directory with no wildcard: created when
+    /// missing.
     placeholder: bool,
 }
 
@@ -402,7 +453,8 @@ impl Rules {
                     pats,
                     spelled,
                     stamp: e.stamp,
-                    placeholder: e.dir && e.stamp && !wild,
+                    ungranted: e.ungranted_only,
+                    placeholder: e.dir && e.stamp && !wild && !e.ungranted_only,
                 });
             }
         }
@@ -411,19 +463,20 @@ impl Rules {
                 pats: x.iter().map(|c| Pat::Lit(norm_component(c))).collect(),
                 spelled: x.clone(),
                 stamp: true,
+                ungranted: false,
                 placeholder: false,
             });
         }
         Rules { rules }
     }
 
-    /// Every exclusion in force, as written: components beneath the
-    /// profile joined by `\\`, wildcards included. Recorded with a
+    /// The exclusions of one kind, as written: components beneath
+    /// the profile joined by `\\`, wildcards included. Recorded with a
     /// grant, so that what a grant excluded can be read back from its
     /// record rather than from the list of whichever build asks.
-    pub fn spelled(&self) -> Vec<String> {
+    fn spelled_where(&self, ungranted: bool) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for r in &self.rules {
+        for r in self.rules.iter().filter(|r| r.ungranted == ungranted) {
             let s = r.spelled.join("\\");
             if !out.contains(&s) {
                 out.push(s);
@@ -432,17 +485,40 @@ impl Rules {
         out
     }
 
-    /// Whether `rel` (components beneath the profile) is an exclusion
-    /// or lies beneath one. Matches each rule against the whole path;
-    /// the walk matches incrementally and must agree with this.
-    pub fn excludes(&self, rel: &[Name]) -> bool {
+    /// The protected exclusions, built-in and added.
+    pub fn spelled(&self) -> Vec<String> {
+        self.spelled_where(false)
+    }
+
+    /// The ungranted-only exclusions.
+    pub fn spelled_ungranted(&self) -> Vec<String> {
+        self.spelled_where(true)
+    }
+
+    fn at_or_beneath(&self, rel: &[Name], ungranted: bool) -> bool {
         self.rules.iter().any(|r| {
-            r.pats.len() <= rel.len() && r.pats.iter().zip(rel).all(|(p, n)| n.matched_by(p))
+            r.ungranted == ungranted
+                && r.pats.len() <= rel.len()
+                && r.pats.iter().zip(rel).all(|(p, n)| n.matched_by(p))
         })
     }
 
-    /// Whether an exclusion could lie strictly beneath the directory
-    /// `rel`, whatever is on disk.
+    /// Whether `rel` (components beneath the profile) is a protected
+    /// exclusion or lies beneath one. Matches each rule against the
+    /// whole path; the walk matches incrementally and must agree with
+    /// this.
+    pub fn excludes(&self, rel: &[Name]) -> bool {
+        self.at_or_beneath(rel, false)
+    }
+
+    /// Whether `rel` is an ungranted-only exclusion or lies beneath
+    /// one.
+    pub fn ungranted(&self, rel: &[Name]) -> bool {
+        self.at_or_beneath(rel, true)
+    }
+
+    /// Whether an exclusion of either kind could lie strictly beneath
+    /// the directory `rel`, whatever is on disk.
     pub fn could_exclude_beneath(&self, rel: &[Name]) -> bool {
         self.rules.iter().any(|r| {
             r.pats.len() > rel.len() && r.pats.iter().zip(rel).all(|(p, n)| n.matched_by(p))
@@ -481,8 +557,11 @@ pub enum Kind {
     Granted,
     /// File: read + execute on the file itself.
     File,
-    /// Exclusion: read deny (inheriting on a directory).
+    /// Protected exclusion: read deny (inheriting on a directory).
     Denied,
+    /// An ungranted-only exclusion, or a directory inside one on the
+    /// way to a protected path: nothing written, nothing granted.
+    Ungranted,
     /// Nothing written.
     Skipped,
 }
@@ -494,6 +573,7 @@ impl Kind {
             Kind::Granted => "granted",
             Kind::File => "file",
             Kind::Denied => "denied",
+            Kind::Ungranted => "ungranted",
             Kind::Skipped => "skipped",
         }
     }
@@ -504,6 +584,7 @@ impl Kind {
             "granted" => Kind::Granted,
             "file" => Kind::File,
             "denied" => Kind::Denied,
+            "ungranted" => Kind::Ungranted,
             "skipped" => Kind::Skipped,
             _ => return None,
         })
@@ -538,18 +619,21 @@ pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
         stamp: true,
         note: None,
     }];
-    walk(tree, rules, &[], entries, &rules.all(), &mut out);
+    walk(tree, rules, &[], entries, &rules.all(), false, &mut out);
     Ok(out)
 }
 
 /// Walk one container. `alive` are the rules whose first `rel.len()`
-/// components matched the path so far.
+/// components matched the path so far. `bare` is set inside an
+/// ungranted-only exclusion: nothing there is granted, and the walk
+/// goes on only towards protected paths.
 fn walk(
     tree: &mut dyn Tree,
     rules: &Rules,
     rel: &[String],
     entries: Vec<Entry>,
     alive: &[usize],
+    bare: bool,
     out: &mut Vec<Node>,
 ) {
     let depth = rel.len();
@@ -580,11 +664,42 @@ fn walk(
             .map(|&i| &rules.rules[i])
             .filter(|r| r.pats.len() == depth + 1)
             .collect();
-        if !ending.is_empty() {
+        // A protected rule ending here wins over an ungranted-only one.
+        let protected: Vec<&&Rule> = ending.iter().filter(|r| !r.ungranted).collect();
+        if !protected.is_empty() {
             out.push(Node {
-                stamp: ending.iter().all(|r| r.stamp),
+                stamp: protected.iter().all(|r| r.stamp),
                 ..node(name, e.is_dir, Kind::Denied)
             });
+            continue;
+        }
+        if bare || !ending.is_empty() {
+            // An ungranted-only exclusion, or something inside one:
+            // no entry of any kind. A directory is entered only if a
+            // rule goes on beneath it.
+            if !e.is_dir {
+                continue;
+            }
+            let deeper: Vec<usize> = next
+                .iter()
+                .copied()
+                .filter(|&i| rules.rules[i].pats.len() > depth + 1)
+                .collect();
+            if !deeper.is_empty() {
+                let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
+                match tree.list(&child) {
+                    Ok(children) => {
+                        out.push(node(name, true, Kind::Ungranted));
+                        walk(tree, rules, &child, children, &deeper, true, out);
+                    }
+                    Err(why) => out.push(Node {
+                        note: Some(why),
+                        ..node(name, true, Kind::Skipped)
+                    }),
+                }
+            } else if !ending.is_empty() {
+                out.push(node(name, true, Kind::Ungranted));
+            }
             continue;
         }
         if !e.is_dir {
@@ -607,7 +722,7 @@ fn walk(
         match tree.list(&child) {
             Ok(children) => {
                 out.push(node(name, true, Kind::Container));
-                walk(tree, rules, &child, children, &next, out);
+                walk(tree, rules, &child, children, &next, false, out);
             }
             Err(why) => out.push(Node {
                 note: Some(why),
@@ -617,7 +732,11 @@ fn walk(
     }
     // Excluded directories that are not there yet, and the directories
     // on the way to them: created empty so the deny has an object to
-    // sit on. Only where no entry of this container has the name.
+    // sit on. Only where no entry of this container has the name, and
+    // never inside an ungranted-only exclusion or through one.
+    if bare {
+        return;
+    }
     let mut made: Vec<String> = Vec::new();
     for &i in alive {
         let r = &rules.rules[i];
@@ -648,6 +767,9 @@ fn walk(
             // A shorter rule may end at this directory: then it is the
             // excluded one, and nothing is created beneath it.
             let names: Vec<Name> = chain.iter().map(|c| Name::long(c)).collect();
+            if rules.ungranted(&names) {
+                break;
+            }
             let excluded_here = rules.excludes(&names);
             out.push(Node {
                 rel: chain,
@@ -883,7 +1005,10 @@ mod tests {
         is(r"AppData\Roaming\Microsoft\Credentials", Kind::Denied);
         is(r"AppData\Roaming\Microsoft\Windows", Kind::Granted);
         is(r"AppData\Local", Kind::Container);
-        is(r"AppData\Local\Temp", Kind::Denied);
+        // The temporary directory: ungranted, not denied, and nothing
+        // in it is planned.
+        is(r"AppData\Local\Temp", Kind::Ungranted);
+        absent(r"AppData\Local\Temp\t.tmp");
         is(r"AppData\Local\Programs", Kind::Container);
         is(r"AppData\Local\Programs\Python", Kind::Granted);
         is(r"AppData\Local\SomeApp", Kind::Container);
@@ -929,6 +1054,46 @@ mod tests {
             .find(|n| n.rel.join("\\") == r"AppData\Local\sandbox-runtime")
             .unwrap();
         assert_eq!((n.kind, n.stamp), (Kind::Denied, false));
+    }
+
+    /// An ungranted-only directory gets nothing and gives its
+    /// children nothing; a protected path inside it is still denied,
+    /// and the directories on the way to it get nothing either.
+    #[test]
+    fn an_ungranted_only_directory_is_left_bare_but_for_protected_paths_inside() {
+        let extra = vec![split_path(r"AppData\Local\Temp\app\keys")];
+        let rules = Rules::new(None, None, &extra);
+        let mut t = Mem::default();
+        t.add(r"AppData\Local\Temp\loose.txt")
+            .add(r"AppData\Local\Temp\session-1\work\f.txt")
+            .add(r"AppData\Local\Temp\app\keys\ca.key")
+            .add(r"AppData\Local\Temp\app\other\o.txt")
+            .add(r"AppData\Local\Temp\app\a.txt")
+            .add(r"AppData\Local\Other\x");
+        let nodes = plan(&mut t, &rules).unwrap();
+        let k = kinds(&nodes);
+        let got: Vec<(&str, Kind)> = k
+            .iter()
+            .filter(|(p, _)| p.starts_with(r"AppData\Local\Temp"))
+            .map(|(p, v)| (p.as_str(), v.0))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (r"AppData\Local\Temp", Kind::Ungranted),
+                (r"AppData\Local\Temp\app", Kind::Ungranted),
+                (r"AppData\Local\Temp\app\keys", Kind::Denied),
+            ]
+        );
+        // A session's own directory in it is not part of the plan: it
+        // is the session's to grant.
+        assert!(!k.contains_key(r"AppData\Local\Temp\session-1"));
+        // It is not created when missing, and nothing is created in
+        // or through it.
+        let mut t = Mem::default();
+        t.add(r"AppData\Local\x");
+        let k = kinds(&plan(&mut t, &rules).unwrap());
+        assert!(!k.keys().any(|p| p.starts_with(r"AppData\Local\Temp")));
     }
 
     #[test]
@@ -991,7 +1156,6 @@ mod tests {
             "ntuser.dat.LOG2",
             "NTUSER.DAT{guid}.TM.blf",
             r"appdata\roaming\microsoft\CREDENTIALS",
-            r"AppData\Local\Temp\x\y",
             r"AppData\Local\Anything\EBWebView\Default",
             r"AppData\Local\Microsoft\Olk\EBWebView",
             r"AppData\Local\Microsoft\Windows\UsrClass.dat.LOG1",
@@ -999,6 +1163,15 @@ mod tests {
         ] {
             assert!(ex(p), "{p} is not excluded");
         }
+        // The temporary directory is not a protected path; it is an
+        // ungranted-only one, with everything in it.
+        assert!(!ex(r"AppData\Local\Temp"));
+        assert!(!ex(r"AppData\Local\Temp\x\y"));
+        for p in [r"AppData\Local\Temp", r"appdata\LOCAL\temp.\x\y"] {
+            assert!(r.ungranted(&names(&split_path(p))), "{p}");
+        }
+        assert!(!r.ungranted(&names(&split_path(r"AppData\Local\Temp2"))));
+        assert!(!r.ungranted(&names(&split_path(".ssh"))));
         for p in [
             ".sshx",
             "ssh",
@@ -1074,7 +1247,6 @@ mod tests {
         for want in [
             ".myapp",
             ".ssh",
-            r"AppData\Local\Temp",
             r"AppData\Roaming\Microsoft\Credentials",
             r"AppData\Local\*\EBWebView",
             "NTUSER.DAT*",
@@ -1086,6 +1258,9 @@ mod tests {
                 "{want}"
             );
         }
+        // The two kinds are recorded apart.
+        assert_eq!(r.spelled_ungranted(), [r"AppData\Local\Temp"]);
+        assert!(!spelled.contains(&r"AppData\Local\Temp".to_owned()));
     }
 
     /// Both spellings of an application-data location are covered:
@@ -1099,7 +1274,7 @@ mod tests {
         assert!(ex(r"Data\Roam\Microsoft\Credentials"));
         assert!(ex(r"Data\Roam\gcloud"));
         assert!(ex(r"AppData\Roaming\Microsoft\Credentials"));
-        assert!(ex(r"AppData\Local\Temp"));
+        assert!(r.ungranted(&names(&split_path(r"AppData\Local\Temp"))));
         assert!(!ex(r"Data\Roam\npm"));
         // Every built-in entry resolves beneath the profile at the
         // conventional locations, and the list holds the Windows-side
@@ -1196,6 +1371,7 @@ mod tests {
         "d.exe",
         ".myapp",
         "tokens",
+        "keys",
     ];
 
     fn random_tree(rng: &mut Rng) -> Mem {
@@ -1250,6 +1426,8 @@ mod tests {
         let extra = vec![
             vec![".myapp".to_owned(), "tokens".to_owned()],
             vec!["Documents".to_owned(), "a".to_owned()],
+            // A protected path inside the ungranted-only directory.
+            split_path(r"AppData\Local\Temp\keys"),
         ];
         let rules = Rules::new(None, None, &extra);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -1274,16 +1452,35 @@ mod tests {
                     }
                     Kind::File => assert!(!rules.excludes(&rel), "round {round}: {path}"),
                     Kind::Denied => assert!(rules.excludes(&rel), "round {round}: {path}"),
+                    Kind::Ungranted => {
+                        assert!(rules.ungranted(&rel), "round {round}: {path}");
+                        assert!(!rules.excludes(&rel), "round {round}: {path}");
+                    }
                     Kind::Container | Kind::Skipped => {}
                 }
-                // Every ancestor is a container: nothing is planned
-                // beneath a granted, denied or skipped directory.
+                // Nothing in an ungranted-only directory, or the
+                // directory itself, carries an allow of any kind.
+                if rules.ungranted(&rel) {
+                    assert!(
+                        matches!(n.kind, Kind::Ungranted | Kind::Denied | Kind::Skipped),
+                        "round {round}: {path} is {:?} inside an ungranted-only directory",
+                        n.kind
+                    );
+                }
+                // Every ancestor is a container or, inside an
+                // ungranted-only directory, an ungranted one: nothing
+                // is planned beneath a granted, denied or skipped
+                // directory.
                 for up in 1..n.rel.len() {
                     let anc = n.rel[..up].join("\\");
                     let a = by_rel
                         .get(&anc)
                         .unwrap_or_else(|| panic!("round {round}: {path} has no planned parent"));
-                    assert_eq!(a.kind, Kind::Container, "round {round}: {path} under {anc}");
+                    assert!(
+                        matches!(a.kind, Kind::Container | Kind::Ungranted),
+                        "round {round}: {path} under {anc} ({:?})",
+                        a.kind
+                    );
                 }
                 if !n.rel.is_empty() {
                     assert_eq!(by_rel[""].kind, Kind::Container);
@@ -1294,9 +1491,9 @@ mod tests {
             for (dir, entries) in &t.dirs {
                 let parent = split_path(dir);
                 let walked = (0..=parent.len()).all(|up| {
-                    by_rel
-                        .get(&parent[..up].join("\\"))
-                        .is_some_and(|n| n.kind == Kind::Container && !n.missing)
+                    by_rel.get(&parent[..up].join("\\")).is_some_and(|n| {
+                        matches!(n.kind, Kind::Container | Kind::Ungranted) && !n.missing
+                    })
                 });
                 if !walked {
                     continue;
@@ -1429,6 +1626,7 @@ mod tests {
             Kind::Granted,
             Kind::File,
             Kind::Denied,
+            Kind::Ungranted,
             Kind::Skipped,
         ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));

@@ -242,6 +242,7 @@ const CURRENT_PROFILE_GRANT = JSON.stringify({
   state: 'current',
   extra_exclusions: [],
   exclusions: [],
+  ungranted_only: [],
   paths: [],
   env: {},
 })
@@ -1357,6 +1358,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         state: 'current',
         extraExclusions: [],
         exclusions: [],
+        ungrantedOnly: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {},
         paths: [],
@@ -5475,14 +5477,26 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     rec('denied', '.cargo', 'credentials.toml'),
     rec('denied', '.ssh'),
   ]
-  /** What the grant excludes: built-in entries and one added one. */
+  /** The made-up profile's temporary directory. */
+  const temp = () => join(home, 'AppData', 'Local', 'Temp')
+  /**
+   * What the grant protects: built-in entries, one added one, and an
+   * added one inside the temporary directory.
+   */
   const exclusions = () => [
     join(home, '.ssh'),
     join(home, '.cargo', 'credentials.toml'),
     join(home, 'NTUSER.DAT*'),
     join(home, 'AppData', 'Local', '*', 'EBWebView'),
     join(home, '.myapp'),
+    join(temp(), 'keys'),
   ]
+  /** What it leaves ungranted without denying it. */
+  const ungrantedOnly = () => [temp()]
+  const lists = () => ({
+    exclusions: exclusions(),
+    ungrantedOnly: ungrantedOnly(),
+  })
   const current = (extra: string[] = ['.myapp']) => ({
     state: 'current',
     profile: home,
@@ -5490,6 +5504,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     recorded_list_version: 1,
     extra_exclusions: extra,
     exclusions: exclusions(),
+    ungranted_only: ungrantedOnly(),
     containers: 2,
     granted: 1,
     files: 2,
@@ -5533,6 +5548,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       recursive: true,
     })
     mkdirSync(join(home, 'AppData', 'Local', 'App', 'data'))
+    mkdirSync(join(temp(), 'session', 'work'), { recursive: true })
+    mkdirSync(join(temp(), 'keys', 'sub'), { recursive: true })
     writeFileSync(join(home, '.npmrc'), '//feed/:_authToken=t\n')
     profileStatus = current()
     grantRun = { stderr: [], stdout: grantJson(), code: 0 }
@@ -5891,7 +5908,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     })
 
     it('the exclusions are the recorded ones: with none recorded nothing is refused', async () => {
-      profileStatus = { ...current([]), exclusions: [] }
+      profileStatus = { ...current([]), exclusions: [], ungranted_only: [] }
       await SandboxManager.initialize(allowRead(join(home, '.ssh')))
       expect(stdinOf('acl grant')?.read).toEqual([join(home, '.ssh')])
     })
@@ -5922,10 +5939,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     it('another case → refused', async () => {
       // As a recorded exclusion spelled in another case …
       expect(
-        winUtils.windowsProfileExclusionConflicts(
-          [join(home, '.ssh')],
-          [join(home, '.SSH').toUpperCase()],
-        ),
+        winUtils.windowsProfileExclusionConflicts([join(home, '.ssh')], {
+          exclusions: [join(home, '.SSH').toUpperCase()],
+          ungrantedOnly: [],
+        }),
       ).toHaveLength(1)
       // … and, where the filesystem folds case, as the session's path.
       const upper = join(home, '.SSH')
@@ -5969,6 +5986,61 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         dangerouslyAllowReadOfProfileExclusions: [home],
       })
       expect(e.message).toContain('contains the excluded')
+    })
+
+    describe('the temporary directory: ungranted as a whole, not closed to a session', () => {
+      it('a directory inside it is granted: where a session stages its own', async () => {
+        const session = join(temp(), 'session')
+        await SandboxManager.initialize(
+          allowRead(session, join(session, 'work')),
+        )
+        expect(new Set(stdinOf('acl grant')?.read)).toEqual(
+          new Set([session, join(session, 'work')]),
+        )
+      })
+
+      it('the directory itself → refused: the grant would cover everything in it', async () => {
+        const e = await refused(allowRead(temp()))
+        expect(e.message).toContain('not granted as a whole')
+        expect(e.message).toContain('grant a directory inside it')
+      })
+
+      it('a directory above it → refused', async () => {
+        // Above the temporary directory and above protected paths
+        // alike; either is reason enough.
+        await refused(allowRead(join(home, 'AppData')))
+      })
+
+      it('a protected path inside it stays protected: itself and what is inside it → refused', async () => {
+        const e = await refused(allowRead(join(temp(), 'keys')))
+        expect(e.message).toContain('is the excluded')
+        await SandboxManager.reset()
+        calls = []
+        await refused(allowRead(join(temp(), 'keys', 'sub')))
+      })
+
+      it('the override does not admit the directory itself', async () => {
+        await refused(allowRead(temp()), {
+          dangerouslyAllowReadOfProfileExclusions: [temp()],
+        })
+      })
+
+      it('write roots in it are untouched by the check', async () => {
+        const root = join(temp(), 'session')
+        await SandboxManager.initialize(config({}, { allowWrite: [root] }))
+        expect(stdinOf('acl grant')?.write).toEqual([root])
+      })
+
+      it('the library’s own grant, a fresh directory in the temporary directory, collides with nothing', () => {
+        // The trust bundle is staged in a directory of its own made
+        // with mkdtemp under the temporary directory, and granted read
+        // at initialize() without going through the configuration.
+        const bundleDir = join(temp(), 'srt-ca-AbC123')
+        mkdirSync(bundleDir)
+        expect(
+          winUtils.windowsProfileExclusionConflicts([bundleDir], lists()),
+        ).toEqual([])
+      })
     })
 
     it('the override is not a configuration key', () => {
@@ -6304,6 +6376,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(st.profile).toBe(home)
       expect(st.extraExclusions).toEqual(['.myapp'])
       expect(st.exclusions).toEqual(exclusions())
+      expect(st.ungrantedOnly).toEqual(ungrantedOnly())
       expect(st.counts).toEqual({
         containers: 2,
         granted: 1,
@@ -6324,12 +6397,13 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       const odd = winUtils.getWindowsProfileReadStatus({ srtWin })
       expect(odd.state).toBe('unknown')
       expect(odd.exclusions).toEqual([])
+      expect(odd.ungrantedOnly).toEqual([])
     })
 
     it('windowsProfileExclusionConflicts: equal, inside, above, wildcards, and what is unrelated', () => {
-      const rel = (p: string) =>
-        winUtils.windowsProfileExclusionConflicts([p], exclusions())[0]
-          ?.relation
+      const hit = (p: string) =>
+        winUtils.windowsProfileExclusionConflicts([p], lists())[0]
+      const rel = (p: string) => hit(p)?.relation
       expect(rel(join(home, '.ssh'))).toBe('equal')
       expect(rel(join(home, '.ssh', 'keys'))).toBe('inside')
       expect(rel(home)).toBe('above')
@@ -6344,11 +6418,30 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(rel(join(home, '.sshx'))).toBeUndefined()
       expect(rel(join(home, 'AppData', 'Local', 'App', 'data'))).toBeUndefined()
       expect(rel(work)).toBeUndefined()
+      // The two kinds.
+      expect(hit(join(home, '.ssh'))?.kind).toBe('protected')
+      expect(hit(temp())).toMatchObject({
+        kind: 'ungranted-only',
+        relation: 'equal',
+      })
+      expect(rel(join(temp(), 'session'))).toBeUndefined()
+      expect(rel(join(temp(), 'session', 'work'))).toBeUndefined()
+      expect(hit(join(temp(), 'keys'))).toMatchObject({
+        kind: 'protected',
+        relation: 'equal',
+      })
+      expect(hit(join(temp(), 'keys', 'sub'))).toMatchObject({
+        kind: 'protected',
+        relation: 'inside',
+      })
       // A recorded path with the extended prefix compares the same.
       expect(
         winUtils.windowsProfileExclusionConflicts(
           [join(home, '.ssh', 'keys')],
-          ['\\\\?\\' + join(home, '.ssh')],
+          {
+            exclusions: ['\\\\?\\' + join(home, '.ssh')],
+            ungrantedOnly: [],
+          },
         )[0]?.relation,
       ).toBe('inside')
     })
@@ -6360,6 +6453,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         state,
         extraExclusions: [],
         exclusions: [],
+        ungrantedOnly: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {
           NPM_CONFIG_USERCONFIG: 'n',
