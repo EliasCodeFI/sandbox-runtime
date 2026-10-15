@@ -3784,12 +3784,17 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     90_000,
   )
 
+  // `-O -`: the body goes to stdout, so the row does not depend on
+  // any output file. (An MSYS-runtime program handed the Win32 name
+  // `NUL` creates a FILE of that name in its working directory rather
+  // than opening the null device; the working directory is not one of
+  // this session's write roots. The Z-rows below pin the devices.)
   it.skipIf(!existsSync(MSYS2_WGET))(
     'E3: msys2 wget to an allowed host → 200',
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
-        `"${MSYS2_WGET}" -O NUL --server-response --timeout=15 https://example.com`,
+        `"${MSYS2_WGET}" -O - --server-response --timeout=15 https://example.com`,
       )
       if (!/HTTP\/[\d.]+ 200/.test(r.stderr + r.stdout)) {
         throw new Error(
@@ -3800,6 +3805,120 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     },
     90_000,
   )
+
+  // ════════════════════════════════════════════════════════════════
+  // Group Z — the null device under the default child token
+  // ════════════════════════════════════════════════════════════════
+  // Discarding output must work for a command that can write nowhere:
+  // this session has no write roots and the working directory is not
+  // writable to it. Each row opens the null device for writing the way
+  // its shell or runtime does — cmd and PowerShell by the Win32 name,
+  // Git Bash and msys2 programs through the MSYS runtime's /dev/null —
+  // and must run to its last word. The same command is first run
+  // unsandboxed: a row whose command the shell itself rejects says
+  // nothing about the sandbox, and fails as such.
+
+  /** Run `command` under `shell` in the sandbox; the output must be `want`. */
+  async function nullDeviceRow(
+    id: string,
+    shell: string | undefined,
+    command: string,
+    want: string,
+  ): Promise<void> {
+    const sh = parseWindowsBinShell(shell)
+    const host = await spawnAsync(sh.exe, [...sh.args, command], {
+      timeout: 60_000,
+      cwd: tmpdir(),
+    })
+    const raw = (label: string, r: RunResult): string =>
+      `${label}: exit=${r.status} stdout=${JSON.stringify(r.stdout)} ` +
+      `stderr=${JSON.stringify(r.stderr)}`
+    if (host.status !== 0 || host.stdout.trim() !== want) {
+      throw new Error(
+        `${id}: the command does not work OUTSIDE the sandbox either, so ` +
+          `this row says nothing about the child token · ${raw('unsandboxed', host)}`,
+      )
+    }
+    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+      command,
+      shell,
+    )
+    expect(argv).toContain('--write-restricted-token')
+    expect(argv).not.toContain('--write-root')
+    const r = await spawnAsync(argv[0], argv.slice(1), {
+      timeout: 60_000,
+      env,
+    })
+    console.error(`[winsrt ${id}] ${raw('sandboxed', r)}`)
+    if (r.status !== 0 || r.stdout.trim() !== want) {
+      throw new Error(
+        `${id}: \`${command}\` under the default child token · ` +
+          `${raw('sandboxed', r)} · ${raw('unsandboxed', host)}`,
+      )
+    }
+  }
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'Z1: Git Bash — stdout redirected to /dev/null',
+    () => nullDeviceRow('Z1', GIT_BASH, 'echo x > /dev/null && echo ok', 'ok'),
+    90_000,
+  )
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'Z2: Git Bash — stderr redirected to /dev/null',
+    () =>
+      nullDeviceRow(
+        'Z2',
+        GIT_BASH,
+        'ls /nonexistent 2>/dev/null; echo done',
+        'done',
+      ),
+    90_000,
+  )
+
+  it(
+    'Z3: cmd — stdout redirected to NUL',
+    () => nullDeviceRow('Z3', undefined, 'echo x > NUL && echo ok', 'ok'),
+    90_000,
+  )
+
+  it(
+    "Z4: PowerShell — 'x' | Out-File NUL",
+    () => nullDeviceRow('Z4', 'powershell', "'x' | Out-File NUL; 'ok'", 'ok'),
+    90_000,
+  )
+
+  it(
+    "Z5: PowerShell — 'x' > $null",
+    () => nullDeviceRow('Z5', 'powershell', "'x' > $null; 'ok'", 'ok'),
+    90_000,
+  )
+
+  for (const [id, out] of [
+    ['Z6', '/dev/null'],
+    ['Z7', '-'],
+  ] as const) {
+    it.skipIf(!existsSync(MSYS2_WGET))(
+      `${id}: msys2 wget -O ${out} to an allowed host → 200`,
+      async () => {
+        SandboxManager.updateConfig(createTestConfig(['example.com']))
+        const r = await runSandboxed(
+          `"${MSYS2_WGET}" -O ${out} --server-response --timeout=15 https://example.com`,
+        )
+        console.error(
+          `[winsrt ${id}] exit=${r.status} stderr=${JSON.stringify(r.stderr.slice(-600))}`,
+        )
+        if (r.status !== 0 || !/HTTP\/[\d.]+ 200/.test(r.stderr + r.stdout)) {
+          throw new Error(
+            `${id}: wget -O ${out} under the default child token · ` +
+              `exit=${r.status} · stdout=${JSON.stringify(r.stdout.slice(-2000))} · ` +
+              `stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
+          )
+        }
+      },
+      90_000,
+    )
+  }
 
   it.skipIf(!hasTool('nslookup'))(
     'C2: nslookup with explicit server → direct UDP 53 blocked',
