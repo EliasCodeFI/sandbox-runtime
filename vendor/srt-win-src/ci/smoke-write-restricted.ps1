@@ -56,7 +56,9 @@
         a restricted exec whose root has no capability SID recorded
         does not run; a per-session `acl grant` is refused.
     P9  turning the option off (`acl forget --all`) removes the
-        persistent ACEs; then the ordinary token runs again.
+        persistent ACEs and leaves each root's DACL as it was before
+        its grant; then the ordinary token runs again, and cannot
+        write a root that gives the sandbox account nothing itself.
     P10 a per-session `acl grant` finds and removes a persistent grant
         that neither the marker nor the database records.
     P11 `uninstall` removes persistent grants.
@@ -253,13 +255,43 @@ try { Start-Service seclogon -ea Stop } catch {
 # and clean up.
 $root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
 $adm  = @('*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')
+# Give directory `$d` a protected DACL holding `$grants` (icacls
+# `*<SID>:<rights>` terms) and nothing else.
+#
+# Two icacls runs, not one. Given together with /grant, /inheritance:r
+# keeps what the directory inherited as explicit ACEs. Under the drive
+# root that is Modify for Authenticated Users and read for
+# BUILTIN\Users, and the sandbox account is a member of both: it could
+# then write every test directory with the ordinary token, whatever
+# the row meant to grant. The result is checked, and a directory that
+# still carries anything else is reported as a failed row.
+function Set-OnlyAces { param([string] $d, [string[]] $grants)
+  & icacls $d /inheritance:r | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "icacls $d /inheritance:r exited $LASTEXITCODE" }
+  & icacls $d /grant:r @grants | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "icacls $d /grant:r exited $LASTEXITCODE" }
+  $want  = @($grants | ForEach-Object { ($_ -split ':')[0].TrimStart('*') })
+  $rules = (Get-Acl -LiteralPath $d).GetAccessRules(
+    $true, $true, [System.Security.Principal.SecurityIdentifier])
+  $stray = @($rules | Where-Object { $_.IsInherited -or $want -notcontains $_.IdentityReference.Value })
+  if ($stray.Count -gt 0) {
+    Fail "setup: $d carries ACEs other than the ones set on it ($($want -join ', ')); rows that use it prove less. Sddl=$(Sddl $d)"
+  }
+}
 function New-AclDir { param([string] $name, [string[]] $extraGrants)
   $d = Join-Path $root $name
   New-Item -ItemType Directory -Path $d -Force | Out-Null
-  $grants = $adm + $extraGrants
-  & icacls $d /inheritance:r /grant:r @grants | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "icacls $d exited $LASTEXITCODE" }
+  Set-OnlyAces $d ($adm + $extraGrants)
   return $d
+}
+# A path's DACL in a form two readings can be compared in: whether it
+# is protected, then its ACEs as SDDL, sorted so that the comparison
+# is of which ACEs are there and not of their order.
+function Dacl { param([string] $p)
+  $sd = Sddl $p
+  $prot = if ($sd -match 'D:[A-Z]*P[A-Z]*\(') { 'protected' } else { 'inheriting' }
+  $aces = @([regex]::Matches($sd, '\([^)]*\)') | ForEach-Object Value | Sort-Object)
+  return "$prot $($aces -join '')"
 }
 # Seed the three files an A-row acts on. Created AFTER the directory
 # ACL is set so they inherit it.
@@ -556,6 +588,8 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   # ══ Write grants kept between sessions ═══════════════════════════
   $pa = New-AclDir 'pa' @()
   $pb = New-AclDir 'pb' @()
+  # What `acl forget` has to leave behind (P9).
+  $pbBase = Dacl $pb
   $st = Persist-Status
   if ($st.state -eq 'none') { Ok 'P: no persistent grant recorded before the first one is made' }
   else { Fail "P: user status reports persistent_grants=$($st | ConvertTo-Json -Compress) before any was made" }
@@ -752,7 +786,8 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   # modify for Authenticated Users.
   $pc = Join-Path $root 'pc'
   New-Item -ItemType Directory -Path $pc -Force | Out-Null
-  & icacls $pc /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-11:(OI)(CI)(M)' | Out-Null
+  Set-OnlyAces $pc @('*S-1-5-18:(OI)(CI)(F)', '*S-1-5-11:(OI)(CI)(M)')
+  $pcBase = Dacl $pc
   $mine = Join-Path $pc 'mine.txt'
   'MINE' | Set-Content -Encoding ASCII $mine
   $g = Grant-P @($pc)
@@ -815,15 +850,34 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   elseif ($still) { Fail "P9: persistent ACEs remain after forget --all (database deleted) on: $($still -join ', ')" }
   elseif ((Sddl $pb) -match '\(A;OICI;RC;;;OW\)') { Fail "P9: PB still carries the OWNER RIGHTS ACE: $(Sddl $pb)" }
   else { Ok 'P9: forget --all removed every persistent ACE, from the marker alone' }
+  # Nothing of a grant stays, and nothing else went with it: each
+  # root's own DACL is the one it had before its first grant.
+  Write-Host "P9: PB Sddl=$(Sddl $pb)"
+  Write-Host "P9: PC Sddl=$(Sddl $pc)"
+  foreach ($c in @(@{ n = 'PB'; p = $pb; base = $pbBase }, @{ n = 'PC'; p = $pc; base = $pcBase })) {
+    $now = Dacl $c.p
+    if ($now -eq $c.base) { Ok "P9: $($c.n)'s DACL is the one it had before its grant" }
+    else { Fail "P9: $($c.n)'s DACL after forget --all is not the one it had before its grant. before: $($c.base)  after: $now" }
+  }
   $st = Persist-Status
   if ($st.state -eq 'none' -and @($st.roots).Count -eq 0) { Ok 'P9: user status reports no persistent grants' }
   else { Fail "P9: user status persistent_grants=$($st | ConvertTo-Json -Compress) after forget --all" }
   $r = SbOff @($cmd, '/d', '/s', '/c', 'echo P9-RUNS')
   if ($r.exit -eq 0 -and $r.out -match 'P9-RUNS') { Ok 'P9: the ordinary token runs again' }
   else { Fail "P9: the ordinary token does not run after forget --all (exit=$($r.exit)). raw: $($r.raw)" }
-  $r = SbOff @($cmd, '/d', '/s', '/c', "echo P9-W> `"$pb\p9.txt`"")
-  if (Test-Path "$pb\p9.txt") { Fail 'P9: the ordinary token can write a root whose grant was forgotten' }
-  else { Ok 'P9: the ordinary token cannot write a root whose grant was forgotten' }
+  # PB's own DACL names Administrators and SYSTEM only, so with the
+  # grant forgotten the sandbox account has no write access to it
+  # under any token. (A root whose own DACL lets Authenticated Users
+  # or BUILTIN\Users write stays writable to the ordinary token — rows
+  # A — and forgetting a grant does not change that.)
+  $p9 = Join-Path $pb 'p9.txt'
+  $r = SbOff @($cmd, '/d', '/s', '/c', "echo P9-W> `"$p9`"")
+  if (-not (Test-Path -LiteralPath $p9)) { Ok 'P9: the ordinary token cannot write a root whose grant was forgotten' }
+  else {
+    Fail ("P9: the ordinary token CREATED a file in PB after its grant was forgotten. " +
+          "exec exit=$($r.exit) raw: $($r.raw)  PB Sddl=$(Sddl $pb)  " +
+          "p9.txt Sddl=$(Sddl $p9) owner=$((Get-Acl -LiteralPath $p9).Owner)")
+  }
 
   # ── P10: a grant neither store records ───────────────────────────
   $g = Grant-P @($pb)
