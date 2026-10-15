@@ -735,14 +735,23 @@ enum WfpCmd {
     ///     they are reported, with a warning on stderr, and do not
     ///     change the exit code.
     ///
+    /// Every probe but `egress_probe` makes its connect twice: once
+    /// on a socket created before the token is assumed and once on a
+    /// socket created after, since the engine attributes a connect
+    /// to the token in effect when its socket was created. The JSON
+    /// carries the worse of the two results for the fence; stderr
+    /// carries one line per ordering, each naming it (`socket before
+    /// token`, `socket after token`).
+    ///
     /// Every other probe must be blocked: `egress_probe`,
     /// `anonymous_probe` and the four lowered-integrity ones, whose
     /// token still carries the sandbox account's SID. Exits **0**
     /// (all of them were blocked, or skipped for want of an
     /// off-loopback address = fence active), **3** (one got past the
     /// filters = fence MISSING), **2** (one was inconclusive — `error`
-    /// means the token could not be assumed, which is not a block;
-    /// treat as failure), **19** when the
+    /// means no connect was made under the token: it could not be
+    /// assumed, or did not read back as assumed once the socket
+    /// existed, which is not a block; treat as failure), **19** when the
     /// install record says the filter set predates this build, or
     /// **15** when the sandbox user is not provisioned. A runner
     /// exit that is not a probe report prints every probe as
@@ -1242,10 +1251,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     match *residual {
                         probe::RESIDUAL_ANONYMOUS_LOOPBACK =>
                             "a connect to a loopback destination made while \
-                             impersonating the anonymous token is not blocked",
+                             impersonating the anonymous token is not blocked \
+                             (see the per-ordering lines above)",
                         _ =>
                             "a connect made under a copy of the sandbox token \
-                             whose user SID is deny-only is not blocked",
+                             whose user SID is deny-only is not blocked \
+                             (see the per-ordering lines above)",
                     },
                 );
             }

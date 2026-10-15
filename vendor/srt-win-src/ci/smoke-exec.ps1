@@ -154,6 +154,11 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # attempts are shapes no filter covers; they must be REPORTED, and
 # what they report is recorded here, not asserted: a connect is the
 # documented residual and is named in `residuals`.
+#
+# Every one of these is the worse of two connects - one on a socket
+# created before the token is assumed, one on a socket created after.
+# The runner's stderr lines above (`[<attempt>; socket before token]`,
+# `[<attempt>; socket after token]`) show each ordering's own result.
 foreach ($f in 'anonymous_probe','anonymous_loopback_probe','deny_only_probe','residuals') {
   if ($null -eq $v.PSObject.Properties[$f]) { throw "V1b: wfp verify output lacks '$f': $vout" }
 }
@@ -168,9 +173,11 @@ foreach ($pair in @(@('anonymous_loopback_probe','anonymous-loopback'), @('deny_
   if ($open -ne ($v.residuals -contains $pair[1])) {
     throw "V1b: $($pair[0])='$got' but residuals=[$($v.residuals -join ',')] - a connect must be named as '$($pair[1])', and only a connect"
   }
-  if ($open) { Write-Host "V1b residual (documented): $($pair[1]) - $($pair[0])=$got" }
-  else       { Write-Host "V1b: $($pair[0])=$got (no residual observed)" }
+  Write-Host "V1b obs: $($pair[1]) $($pair[0])=$got named-in-residuals=$open"
 }
+# Kept for the in-sandbox rows below, which print the same shapes'
+# results beside these.
+$verify = $v
 Write-Host "V1b ok: anonymous_probe=$($v.anonymous_probe) target=$($v.anonymous_target); residuals=[$($v.residuals -join ',')]"
 
 # Exec helper. Same .exit/.raw/.out shape as before. The broker
@@ -386,57 +393,245 @@ if ($r.out -notmatch 'AccessDenied') {
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 
-# ── R5g/R5h: connects made while impersonating the anonymous token ──
-# The identity the filters check is the connecting THREAD's effective
-# token. After ImpersonateAnonymousToken that is ANONYMOUS LOGON,
-# which the block-user filter does not match; the block-anonymous
-# filter refuses it for every destination outside loopback.
+# ── R5g-R5j: connects made under an assumed token ────────────────────
+# The filtering engine attributes a connect to the token that was in
+# effect when its SOCKET was created. A socket the process creates
+# under its own token and connects while impersonating is attributed
+# to the process, and block-user refuses it whatever the thread's
+# token is. So a probe that creates its socket first says nothing
+# about the assumed token. Each shape below is therefore tried in
+# both orderings, on one thread:
 #
-# One C# method does socket -> impersonate -> connect -> revert on a
-# single thread, with the socket created BEFORE the impersonation and
-# the connect made through ws2_32 directly, so nothing but the connect
-# itself runs under the anonymous token. It prints one line per
-# attempt: CONNECTED, WSA:<code> (10013 = refused by a filter, 10061 =
-# refused by the destination, i.e. it got past the filters), or
-# IMPERSONATE_FAILED:<gle>.
-function AnonProbeScript {
-  param([string] $Ip, [int] $Port)
+#   AFTER  - assume the token, create the socket, connect. The socket
+#            belongs to the assumed token; this is the ordering that
+#            matters.
+#   BEFORE - create the socket, assume the token, connect. Kept in
+#            case an engine attributes at connect time instead.
+#
+# One C# method does this through ws2_32 directly, reads the thread's
+# token back after the socket exists and before the connect, and
+# reverts. It prints one line per shape and ordering,
+# `<SHAPE>.<BEFORE|AFTER>=<result>`, where the result is:
+#
+#   CONNECTED              the connect completed
+#   WSA:<code>             10013 = refused by a filter; 10061 = refused
+#                          by the destination, i.e. past the filters
+#   TOKEN_FAILED:<step>:<code>   the token could not be assumed
+#   SOCKET_FAILED:<code>   no socket could be created under the token
+#   TOKEN_LOST:<what>      the thread's token did not read back as the
+#                          one assumed, so no connect was made
+#
+# Shapes: `anonymous` (ImpersonateAnonymousToken), `integrity:<sid>`
+# (a copy of the process token at that mandatory level), `denyonly`
+# (a restricted copy of the process token whose user SID is deny-only).
+function TokenProbeScript {
+  param([string] $Ip, [int] $Port, [string[]] $Shapes)
+  $calls = foreach ($entry in $Shapes) {
+    $label, $shape = $entry -split '=', 2
+    "'$label.BEFORE=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$false)"
+    "'$label.AFTER=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$true)"
+  }
   return @"
 `$src = @'
 using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-public static class SrtAnon {
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateAnonymousToken(IntPtr thread);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+public static class SrtTok {
+  [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+  [StructLayout(LayoutKind.Sequential)] struct TokenMandatoryLabel { public SidAndAttributes Label; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
   [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateAnonymousToken(IntPtr thread);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool openAsSelf, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, ref SidAndAttributes disable, uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ConvertSidToStringSidW(IntPtr psid, out IntPtr str);
+  [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TokenMandatoryLabel info, int len);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int len, out int ret);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetThreadToken(IntPtr thread, IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern IntPtr socket(int af, int type, int protocol);
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern int closesocket(IntPtr s);
   [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
-  public static string Go(string ip, int port, bool anonymous) {
+  const int TokenUser = 1, TokenImpersonationLevel = 9, TokenIntegrityLevel = 25;
+  static readonly IntPtr InvalidSocket = new IntPtr(-1);
+  static SrtTok() {
+    // Start Winsock under the process's own token, once.
+    new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp).Dispose();
+  }
+  static string Fail(string step) { return "TOKEN_FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
+  // The SID a TokenUser / TokenIntegrityLevel query starts with, as a
+  // string; null when it cannot be read.
+  static string TokenSid(IntPtr token, int cls) {
+    IntPtr buf = Marshal.AllocHGlobal(256), str = IntPtr.Zero;
+    try {
+      int ret;
+      if (!GetTokenInformation(token, cls, buf, 256, out ret)) return null;
+      if (!ConvertSidToStringSidW(Marshal.ReadIntPtr(buf), out str)) return null;
+      return Marshal.PtrToStringUni(str);
+    } finally {
+      if (str != IntPtr.Zero) LocalFree(str);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // Put the token for a shape on this thread. Returns null on success.
+  static string Assume(string shape) {
+    if (shape == "anonymous")
+      return ImpersonateAnonymousToken(GetCurrentThread()) ? null : Fail("impersonate-anonymous");
+    IntPtr own = IntPtr.Zero, restricted = IntPtr.Zero, dup = IntPtr.Zero, psid = IntPtr.Zero;
+    IntPtr userBuf = IntPtr.Zero;
+    try {
+      // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY
+      if (!OpenProcessToken(GetCurrentProcess(), 0x000B, out own)) return Fail("open");
+      IntPtr source = own;
+      if (shape == "denyonly") {
+        // The user SID in the disable list becomes deny-only.
+        userBuf = Marshal.AllocHGlobal(256);
+        int ret;
+        if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
+        SidAndAttributes disable = new SidAndAttributes();
+        disable.Sid = Marshal.ReadIntPtr(userBuf);
+        if (!CreateRestrictedToken(own, 0, 1, ref disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
+        source = restricted;
+      }
+      // TOKEN_ALL_ACCESS, SecurityImpersonation, TokenImpersonation
+      if (!DuplicateTokenEx(source, 0xF01FF, IntPtr.Zero, 2, 2, out dup)) return Fail("duplicate");
+      if (shape.StartsWith("integrity:")) {
+        if (!ConvertStringSidToSidW(shape.Substring(10), out psid)) return Fail("sid");
+        TokenMandatoryLabel tml = new TokenMandatoryLabel();
+        tml.Label.Sid = psid;
+        tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
+        if (!SetTokenInformation(dup, TokenIntegrityLevel, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
+      }
+      if (!SetThreadToken(IntPtr.Zero, dup)) return Fail("impersonate");
+      return null;
+    } finally {
+      if (userBuf != IntPtr.Zero) Marshal.FreeHGlobal(userBuf);
+      if (psid != IntPtr.Zero) LocalFree(psid);
+      if (dup != IntPtr.Zero) CloseHandle(dup);
+      if (restricted != IntPtr.Zero) CloseHandle(restricted);
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // Read the thread's token back. Returns null when it is the one the
+  // shape asks for, at impersonation level.
+  static string Lost(string shape) {
+    IntPtr cur = IntPtr.Zero, buf = Marshal.AllocHGlobal(8);
+    try {
+      // TOKEN_QUERY, opened as the process.
+      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) return "TOKEN_LOST:no-thread-token:" + Marshal.GetLastWin32Error();
+      int ret;
+      if (!GetTokenInformation(cur, TokenImpersonationLevel, buf, 4, out ret)) return "TOKEN_LOST:query-level:" + Marshal.GetLastWin32Error();
+      int level = Marshal.ReadInt32(buf);
+      if (level < 2) return "TOKEN_LOST:level:" + level;
+      if (shape == "anonymous") {
+        string user = TokenSid(cur, TokenUser);
+        if (user != "S-1-5-7") return "TOKEN_LOST:user:" + user;
+      }
+      if (shape.StartsWith("integrity:")) {
+        string il = TokenSid(cur, TokenIntegrityLevel);
+        if (il != shape.Substring(10)) return "TOKEN_LOST:integrity:" + il;
+      }
+      return null;
+    } finally {
+      if (cur != IntPtr.Zero) CloseHandle(cur);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // shape "plain" connects under the process's own token.
+  public static string Go(string ip, int port, string shape, bool socketAfter) {
     byte[] a = IPAddress.Parse(ip).GetAddressBytes();
     byte[] sa = new byte[16];
     sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
     Array.Copy(a, 0, sa, 4, 4);
-    using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
-      if (anonymous && !ImpersonateAnonymousToken(GetCurrentThread()))
-        return "IMPERSONATE_FAILED:" + Marshal.GetLastWin32Error();
-      int rc = connect(s.Handle, sa, sa.Length);
+    bool assume = shape != "plain";
+    IntPtr s = InvalidSocket;
+    bool assumed = false;
+    try {
+      if (!socketAfter || !assume) {
+        s = socket(2, 1, 6);
+        if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+      }
+      if (assume) {
+        string failed = Assume(shape);
+        if (failed != null) return failed;
+        assumed = true;
+        if (socketAfter) {
+          s = socket(2, 1, 6);
+          if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+        }
+        string lost = Lost(shape);
+        if (lost != null) return lost;
+      }
+      int rc = connect(s, sa, sa.Length);
       int err = Marshal.GetLastWin32Error();
-      if (anonymous) RevertToSelf();
       return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    } finally {
+      if (assumed) RevertToSelf();
+      if (s != InvalidSocket) closesocket(s);
     }
   }
 }
 '@
 Add-Type -TypeDefinition `$src
-'PLAIN=' + [SrtAnon]::Go('$Ip', $Port, `$false)
-'ANON=' + [SrtAnon]::Go('$Ip', $Port, `$true)
+'PLAIN=' + [SrtTok]::Go('$Ip', $Port, 'plain', `$false)
+$($calls -join "`n")
 "@
 }
 
-# R5g: off-loopback. The destination is one of this runner's own
-# addresses with a live listener, so "not blocked" would be an actual
-# connect rather than a timeout.
+# One result of the probe above as the word `wfp verify` uses for it.
+function Probe-Word([string] $raw) {
+  switch -Regex ($raw) {
+    '^WSA:10013$' { return 'blocked' }
+    '^CONNECTED$' { return 'connected' }
+    '^WSA:10061$' { return 'refused' }
+    default       { return $raw }
+  }
+}
+
+# Both orderings' raw results for one shape label, from probe output.
+function Probe-Orderings([string] $out, [string] $label, [string] $row) {
+  $r = @{}
+  foreach ($order in 'BEFORE','AFTER') {
+    if ($out -notmatch "(?m)^$label\.$order=(\S+)") { throw "${row}: no $label.$order result. out: $out" }
+    $r[$order] = $Matches[1]
+  }
+  return $r
+}
+
+# Assert that a shape was blocked in both orderings. A token the child
+# could not assume, or could not create a socket under, is a route
+# that does not exist from inside exec: it is reported as NOT
+# EXERCISED, never as blocked. Anything else fails the row.
+function Assert-BothOrderingsBlocked([string] $out, [string] $label, [string] $row, [string] $what, [string] $raw) {
+  $res = Probe-Orderings $out $label $row
+  Write-Host "$row raw: $label socket-before=$($res.BEFORE) socket-after=$($res.AFTER)"
+  foreach ($order in 'BEFORE','AFTER') {
+    $got = $res[$order]
+    $name = "socket-$($order.ToLower())"
+    if ($got -in 'CONNECTED','WSA:10061') {
+      throw "${row}: BYPASS - $what was NOT blocked with the $name ordering ($label.$order=$got). raw: $raw"
+    } elseif ($got -like 'TOKEN_FAILED:*' -or $got -like 'SOCKET_FAILED:*') {
+      Write-Host "$row NOT EXERCISED ($name): $what - the child could not set it up ($got); see wfp verify (V1b/V1c)"
+    } elseif ($got -eq 'WSA:10013') {
+      Write-Host "$row ok ($name): $what blocked (WSA:10013)"
+    } else {
+      throw "${row}: expected $label.$order=WSA:10013, got '$got'. raw: $raw"
+    }
+  }
+}
+
+# R5g: anonymous, off-loopback - ASSERTED in both orderings. The
+# destination is one of this runner's own addresses with a live
+# listener, so "not blocked" would be an actual connect rather than a
+# timeout. block-anonymous is what must refuse the socket-after
+# ordering.
 $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ea SilentlyContinue |
   Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
   Select-Object -First 1).IPAddress
@@ -451,186 +646,70 @@ if (-not $lanIp) {
     $bs = (Test-NetConnection $lanIp -Port $lanPort `
            -WarningAction SilentlyContinue).TcpTestSucceeded
     if (-not $bs) { throw "R5g: broker-side connect to ${lanIp}:$lanPort failed - test invalid" }
-    $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (AnonProbeScript $lanIp $lanPort))
+    $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+                 (TokenProbeScript $lanIp $lanPort @('ANON=anonymous')))
     Write-Host "R5g probe output (${lanIp}:$lanPort): $($r.out.Trim() -replace '\s+',' ')"
     if ($r.out -notmatch 'PLAIN=WSA:10013') {
       throw "R5g: plain connect to ${lanIp}:$lanPort expected WSA:10013 (block-user). raw: $($r.raw)"
     }
-    if ($r.out -match 'ANON=(CONNECTED|WSA:10061)') {
-      throw "R5g: connect to ${lanIp}:$lanPort while impersonating anonymous was NOT blocked - " +
-            "block-anonymous not in effect. raw: $($r.raw)"
-    }
-    if ($r.out -match 'ANON=IMPERSONATE_FAILED:(\d+)') {
-      # The restricted child may be refused the anonymous token
-      # outright. Then this route does not exist from inside exec;
-      # the filter itself is still shown by V1b (unrestricted runner).
-      Write-Host "R5g ok: child could not impersonate anonymous (gle=$($Matches[1])); block-anonymous is shown by V1b"
-    } elseif ($r.out -match 'ANON=WSA:10013') {
-      Write-Host 'R5g ok: off-loopback connect while impersonating anonymous blocked (WSA:10013)'
-    } else {
-      throw "R5g: expected ANON=WSA:10013. raw: $($r.raw)"
-    }
+    Assert-BothOrderingsBlocked $r.out 'ANON' 'R5g' `
+      "off-loopback connect to ${lanIp}:$lanPort while impersonating anonymous" $r.raw
   } finally {
     $lanLsn.Stop()
   }
 }
 
-# R5h: the same to an out-of-range LOOPBACK listener. No filter covers
-# a loopback connect made while impersonating anonymous, so this row
-# RECORDS what happens instead of asserting it: a connect is the
-# documented residual. Only the plain half is asserted (R5c's result,
-# through this probe).
-$anonLb = Bind-Listener (50003, 50004, 50005, 49997)
-$anonLbPort = $anonLb.LocalEndpoint.Port
+# R5h, R5i, R5j share one out-of-range LOOPBACK listener, live from
+# the broker, so "not blocked" is an actual connect.
+$tokLsn = Bind-Listener (50003, 50004, 50005, 49997)
+$tokPort = $tokLsn.LocalEndpoint.Port
 try {
-  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (AnonProbeScript '127.0.0.1' $anonLbPort))
-  Write-Host "R5h probe output (127.0.0.1:$anonLbPort): $($r.out.Trim() -replace '\s+',' ')"
-  if ($r.out -notmatch 'PLAIN=WSA:10013') {
-    throw "R5h: plain connect to out-of-range loopback expected WSA:10013. raw: $($r.raw)"
-  }
-  if ($r.out -notmatch 'ANON=(\S+)') { throw "R5h: no ANON result. raw: $($r.raw)" }
-  $anonLbResult = $Matches[1]
-  if ($anonLbResult -eq 'CONNECTED') {
-    Write-Host "R5h residual (documented): out-of-range loopback connect while impersonating anonymous CONNECTED"
-  } else {
-    Write-Host "R5h: out-of-range loopback connect while impersonating anonymous -> $anonLbResult (residual not observed)"
-  }
-} finally {
-  $anonLb.Stop()
-}
-
-# ── R5i: a lowered-integrity copy of the child's own token ──────────
-# The same question as V1c, asked from inside a sandboxed command. A
-# process may lower the integrity level of a copy of its own token
-# without any privilege and impersonate it; the copy still carries the
-# sandbox account's SID, so block-user must refuse a connect made
-# under it.
-#
-# One C# method does socket -> duplicate token -> set integrity level
-# -> impersonate -> connect -> revert on a single thread, with the
-# socket created BEFORE the impersonation and the connect made through
-# ws2_32 directly. It prints one line per attempt: CONNECTED,
-# WSA:<code> (10013 = refused by a filter, 10061 = refused by the
-# destination, i.e. it got past the filters), or
-# TOKEN_FAILED:<step>:<code> when the lowered token could not be
-# assumed (for the `level` step the code is the impersonation level
-# the thread ended up with, otherwise the Win32 error).
-function LoweredIntegrityProbeScript {
-  param([string] $Ip, [int] $Port)
-  return @"
-`$src = @'
-using System;
-using System.Net;
-using System.Net.Sockets;
-using System.Runtime.InteropServices;
-public static class SrtLowIl {
-  [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
-  [StructLayout(LayoutKind.Sequential)] struct TokenMandatoryLabel { public SidAndAttributes Label; }
-  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
-  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
-  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool openAsSelf, out IntPtr token);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
-  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
-  [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TokenMandatoryLabel info, int len);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int len, out int ret);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetThreadToken(IntPtr thread, IntPtr token);
-  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
-  [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
-  static string Fail(string step) { return "TOKEN_FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
-  // Impersonate a copy of the process token at the integrity level
-  // named by sid. Returns null on success.
-  static string Assume(string sid) {
-    IntPtr own = IntPtr.Zero, dup = IntPtr.Zero, psid = IntPtr.Zero, cur = IntPtr.Zero;
-    try {
-      // TOKEN_DUPLICATE | TOKEN_QUERY
-      if (!OpenProcessToken(GetCurrentProcess(), 0x000A, out own)) return Fail("open");
-      // TOKEN_ALL_ACCESS, SecurityImpersonation, TokenImpersonation
-      if (!DuplicateTokenEx(own, 0xF01FF, IntPtr.Zero, 2, 2, out dup)) return Fail("duplicate");
-      if (!ConvertStringSidToSidW(sid, out psid)) return Fail("sid");
-      TokenMandatoryLabel tml = new TokenMandatoryLabel();
-      tml.Label.Sid = psid;
-      tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
-      // 25 = TokenIntegrityLevel
-      if (!SetTokenInformation(dup, 25, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
-      if (!SetThreadToken(IntPtr.Zero, dup)) return Fail("impersonate");
-      // The thread must really be impersonating: a token left at
-      // identification level would make the connect say nothing.
-      int level, ret;
-      // TOKEN_QUERY; 9 = TokenImpersonationLevel
-      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) { string f = Fail("open-thread"); RevertToSelf(); return f; }
-      if (!GetTokenInformation(cur, 9, out level, 4, out ret)) { string f = Fail("query-level"); RevertToSelf(); return f; }
-      if (level < 2) { RevertToSelf(); return "TOKEN_FAILED:level:" + level; }
-      return null;
-    } finally {
-      if (cur != IntPtr.Zero) CloseHandle(cur);
-      if (psid != IntPtr.Zero) LocalFree(psid);
-      if (dup != IntPtr.Zero) CloseHandle(dup);
-      if (own != IntPtr.Zero) CloseHandle(own);
-    }
-  }
-  // An empty integritySid connects under the process's own token.
-  public static string Go(string ip, int port, string integritySid) {
-    bool lowered = !String.IsNullOrEmpty(integritySid);
-    byte[] a = IPAddress.Parse(ip).GetAddressBytes();
-    byte[] sa = new byte[16];
-    sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
-    Array.Copy(a, 0, sa, 4, 4);
-    using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
-      if (lowered) {
-        string failed = Assume(integritySid);
-        if (failed != null) return failed;
-      }
-      int rc = connect(s.Handle, sa, sa.Length);
-      int err = Marshal.GetLastWin32Error();
-      if (lowered) RevertToSelf();
-      return rc == 0 ? "CONNECTED" : "WSA:" + err;
-    }
-  }
-}
-'@
-Add-Type -TypeDefinition `$src
-'PLAIN=' + [SrtLowIl]::Go('$Ip', $Port, '')
-'LOW=' + [SrtLowIl]::Go('$Ip', $Port, 'S-1-16-4096')
-'UNTRUSTED=' + [SrtLowIl]::Go('$Ip', $Port, 'S-1-16-0')
-"@
-}
-
-# The destination is an out-of-range loopback listener, live from the
-# broker, so "not blocked" is an actual connect.
-$lowIlLsn = Bind-Listener (50006, 50007, 50008, 49996)
-$lowIlPort = $lowIlLsn.LocalEndpoint.Port
-try {
-  $bs = (Test-NetConnection 127.0.0.1 -Port $lowIlPort `
+  $bs = (Test-NetConnection 127.0.0.1 -Port $tokPort `
          -WarningAction SilentlyContinue).TcpTestSucceeded
-  if (-not $bs) { throw "R5i: broker-side connect to 127.0.0.1:$lowIlPort failed - test invalid" }
-  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (LoweredIntegrityProbeScript '127.0.0.1' $lowIlPort))
-  Write-Host "R5i probe output (127.0.0.1:$lowIlPort): $($r.out.Trim() -replace '\s+',' ')"
+  if (-not $bs) { throw "R5h-j: broker-side connect to 127.0.0.1:$tokPort failed - test invalid" }
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+               (TokenProbeScript '127.0.0.1' $tokPort @(
+                  'ANON=anonymous', 'LOW=integrity:S-1-16-4096',
+                  'UNTRUSTED=integrity:S-1-16-0', 'DENYONLY=denyonly')))
+  Write-Host "R5h-j probe output (127.0.0.1:$tokPort): $($r.out.Trim() -replace '\s+',' ')"
   if ($r.out -notmatch 'PLAIN=WSA:10013') {
-    throw "R5i: plain connect to out-of-range loopback expected WSA:10013 (block-user). raw: $($r.raw)"
+    throw "R5h-j: plain connect to out-of-range loopback expected WSA:10013 (block-user). raw: $($r.raw)"
   }
+
+  # R5h: anonymous, out-of-range loopback - an OBSERVATION. No filter
+  # covers a loopback connect on a socket created while impersonating
+  # anonymous; this row prints what happened in each ordering beside
+  # what `wfp verify` reported for the same shape, and never fails.
+  $o = Probe-Orderings $r.out 'ANON' 'R5h'
+  Write-Host ("R5h obs: anonymous-loopback " +
+              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
+              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
+              "wfp verify anonymous_loopback_probe=$($verify.anonymous_loopback_probe) " +
+              "residuals=[$($verify.residuals -join ',')]")
+
+  # R5i: a lowered-integrity copy of the child's own token - ASSERTED
+  # in both orderings. A process may lower the integrity level of a
+  # copy of its own token without any privilege; the copy still
+  # carries the sandbox account's SID, so block-user must refuse a
+  # connect on a socket created under it.
   foreach ($shape in 'LOW','UNTRUSTED') {
-    if ($r.out -notmatch "(?m)^$shape=(\S+)") { throw "R5i: no $shape result. raw: $($r.raw)" }
-    $got = $Matches[1]
-    if ($got -in 'CONNECTED','WSA:10061') {
-      throw "R5i: BYPASS - connect under a $shape-integrity copy of the sandboxed child's token was NOT blocked " +
-            "($shape=$got); block-user does not match that token. raw: $($r.raw)"
-    } elseif ($got -like 'TOKEN_FAILED:*') {
-      # Not a block: the child could not assume the token, so this
-      # route was not exercised from inside exec. The filter's answer
-      # for this shape is V1c's (unrestricted runner).
-      Write-Host "R5i NOT EXERCISED: child could not assume the $shape-integrity token ($got); see V1c"
-    } elseif ($got -eq 'WSA:10013') {
-      Write-Host "R5i ok: connect under a $shape-integrity copy of the child's token blocked (WSA:10013)"
-    } else {
-      throw "R5i: expected $shape=WSA:10013, got '$got'. raw: $($r.raw)"
-    }
+    Assert-BothOrderingsBlocked $r.out $shape 'R5i' `
+      "connect under a $shape-integrity copy of the sandboxed child's token" $r.raw
   }
+
+  # R5j: a copy of the child's own token with the user SID deny-only -
+  # an OBSERVATION. A deny-only SID is matched by no allow entry, so
+  # no filter here can name that token; this row prints what happened
+  # in each ordering beside what `wfp verify` reported, and never
+  # fails.
+  $o = Probe-Orderings $r.out 'DENYONLY' 'R5j'
+  Write-Host ("R5j obs: deny-only-user-sid " +
+              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
+              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
+              "wfp verify deny_only_probe=$($verify.deny_only_probe) " +
+              "residuals=[$($verify.residuals -join ',')]")
 } finally {
-  $lowIlLsn.Stop()
+  $tokLsn.Stop()
 }
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
@@ -1108,4 +1187,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b, R1-R7c, R5g/R5h, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'
