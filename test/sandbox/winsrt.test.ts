@@ -5460,10 +5460,77 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   /** Exit code of `install`, sync and async. */
   let installCode: number
   let spies: { mockRestore(): void }[]
-  /** Stands in for the profile directory. */
+  /**
+   * Stands in for the profile directory, in the form `srt-win` records
+   * a path in: what the final-path lookup gives — links resolved, 8.3
+   * short names expanded (`RUNNER~1` → `runneradmin`), the case on
+   * disk. Every recorded path and exclusion below is built on it, as a
+   * real record's are; the library resolves a session's paths with the
+   * same lookup before comparing them with the record.
+   */
   let home: string
+  /**
+   * The same directory as the temp directory spells it, which on
+   * Windows can be through a short name and on macOS is through a
+   * link: a spelling a session configuration may well use.
+   */
+  let homeAsSpelled: string
   /** A write root outside it. */
   let work: string
+
+  /** The final-path lookup the library and `srt-win` both use. */
+  const canonical = (p: string): string => {
+    try {
+      // eslint-disable-next-line no-restricted-properties
+      return realpathSync.native(p)
+    } catch (e) {
+      return `<${(e as NodeJS.ErrnoException).code ?? 'error'}: ${p}>`
+    }
+  }
+  /**
+   * What a failed row needs to be read without a Windows machine: the
+   * paths as given, as resolved, the record they were measured
+   * against, and what the functions under test made of them.
+   */
+  const explain = (paths: readonly string[]): string =>
+    JSON.stringify(
+      {
+        platform: process.platform,
+        tmpdir: tmpdir(),
+        homeAsSpelled,
+        home,
+        paths: paths.map(p => ({ given: p, resolved: canonical(p) })),
+        exclusions: exclusions(),
+        ungrantedOnly: ungrantedOnly(),
+        recorded: recorded(),
+        conflicts: winUtils.windowsProfileExclusionConflicts(paths, lists()),
+        conflictsAsWrite: winUtils.windowsProfileExclusionConflicts(
+          paths,
+          lists(),
+          { write: true },
+        ),
+        denyTargets: winUtils.windowsProfileGrantDenyTargets(
+          paths,
+          recorded() as winUtils.WindowsProfileGrantPath[],
+        ),
+        calls: calls.map(c => `${c.cmd} ${c.sub}`),
+      },
+      null,
+      1,
+    )
+  /** Run assertions; on failure, say what they were about. */
+  const explained = async <T>(
+    paths: readonly string[],
+    run: () => T | Promise<T>,
+  ): Promise<T> => {
+    try {
+      return await run()
+    } catch (e) {
+      const err = e as Error
+      err.message = `${err.message}\n--- context ---\n${explain(paths)}`
+      throw err
+    }
+  }
 
   const names = () => calls.map(c => `${c.cmd} ${c.sub}`)
   const stdinOf = (name: string) =>
@@ -5547,8 +5614,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     asyncCalls = []
     installCode = 0
     winUtils.clearWindowsAclIncompleteRevokesForTesting()
-    home = realpathSync(mkdtempSync(join(tmpdir(), 'srt-profile-')))
-    work = realpathSync(mkdtempSync(join(tmpdir(), 'srt-profile-work-')))
+    homeAsSpelled = mkdtempSync(join(tmpdir(), 'srt-profile-'))
+    home = canonical(homeAsSpelled)
+    work = canonical(mkdtempSync(join(tmpdir(), 'srt-profile-work-')))
     mkdirSync(join(home, 'Documents', 'sub'), { recursive: true })
     mkdirSync(join(home, '.cargo'))
     mkdirSync(join(home, '.ssh', 'keys'), { recursive: true })
@@ -5560,6 +5628,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     mkdirSync(join(temp(), 'session', 'work'), { recursive: true })
     mkdirSync(join(temp(), 'keys', 'sub'), { recursive: true })
     writeFileSync(join(home, '.npmrc'), '//feed/:_authToken=t\n')
+    writeFileSync(join(home, '.cargo', 'config.toml'), '')
     profileStatus = current()
     grantRun = { stderr: [], stdout: grantJson(), code: 0 }
     const stdoutFor = (argv: readonly string[]): string => {
@@ -5702,6 +5771,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     windows: { srtWin: { path: process.execPath }, ...windows },
   })
   const ORDINARY = { writeRestrictedToken: false }
+  const pathsOf = (cfg: SandboxRuntimeConfig): string[] =>
+    [
+      ...(cfg.filesystem.allowRead ?? []),
+      ...cfg.filesystem.allowWrite,
+      ...cfg.filesystem.denyRead,
+    ].filter((p): p is string => typeof p === 'string')
   const rejection = async (
     cfg: SandboxRuntimeConfig,
     options?: Parameters<typeof SandboxManager.initialize>[3],
@@ -5711,7 +5786,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     } catch (e) {
       return e as WindowsSandboxError
     }
-    throw new Error('expected initialize() to reject')
+    throw new Error(
+      `expected initialize() to reject\n--- context ---\n` +
+        `options: ${JSON.stringify(options)}\n${explain(pathsOf(cfg))}`,
+    )
   }
 
   describe('a default session: initialize() checks the record and never writes the grant', () => {
@@ -5874,9 +5952,22 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
     it('on the profile directory: stamped on every path the grant made readable, and on none it excluded', async () => {
       const stamped = await denyRead(home)
-      expect(new Set(stamped)).toEqual(new Set(readable.map(p => p())))
-      // Each once: the profile directory is itself a recorded path.
-      expect(stamped).toHaveLength(5)
+      await explained([home], () => {
+        expect(new Set(stamped)).toEqual(new Set(readable.map(p => p())))
+        // Each once: the profile directory is itself a recorded path.
+        expect(stamped).toHaveLength(5)
+      })
+    })
+
+    it('on the profile directory as the session spells it (a short name, a link, another case): the same stamps', async () => {
+      // However the deny itself ends up spelled, it and its stamps
+      // are, as objects, exactly the readable paths.
+      const stamped = await denyRead(homeAsSpelled)
+      await explained([homeAsSpelled], () => {
+        expect(new Set((stamped ?? []).map(canonical))).toEqual(
+          new Set(readable.map(p => p())),
+        )
+      })
     })
 
     it('denyRead of the profile directory holds for that session only: the next one stamps nothing', async () => {
@@ -5904,9 +5995,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     })
 
     it('on a container: the container and the files granted in it', async () => {
-      expect(new Set(await denyRead(join(home, '.cargo')))).toEqual(
-        new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
-      )
+      const stamped = await denyRead(join(home, '.cargo'))
+      await explained([join(home, '.cargo')], () => {
+        expect(new Set(stamped)).toEqual(
+          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
+        )
+      })
     })
 
     it('beneath a granted directory: only its own path — a deny there already comes first', async () => {
@@ -5951,9 +6045,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         cfg,
       )
       const denied = argv.filter((_, i) => argv[i - 1] === '--deny-read')
-      expect(new Set(denied)).toEqual(
-        new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
-      )
+      await explained([join(home, '.cargo')], () => {
+        expect(new Set(denied)).toEqual(
+          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
+        )
+      })
     })
 
     it('under the ordinary token there is no grant, and nothing is added to a deny', async () => {
@@ -5971,11 +6067,15 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       options?: Parameters<typeof SandboxManager.initialize>[3],
     ) => {
       const e = await rejection(cfg, options)
-      expect(e).toBeInstanceOf(WindowsSandboxError)
-      expect(e.code).toBe('profile_exclusion_read_grant')
-      // Refused before anything is granted.
-      expect(names()).toEqual(['profile status'])
-      expect(SandboxManager.getConfig()).toBeUndefined()
+      await explained(pathsOf(cfg), () => {
+        expect(e).toBeInstanceOf(WindowsSandboxError)
+        expect(`${e.code}: ${e.message}`).toStartWith(
+          'profile_exclusion_read_grant: ',
+        )
+        // Refused before anything is granted.
+        expect(names()).toEqual(['profile status'])
+        expect(SandboxManager.getConfig()).toBeUndefined()
+      })
       return e
     }
 
@@ -6026,6 +6126,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(e.message).toContain('is the excluded')
         await SandboxManager.reset()
       }
+      // The store named through the temp directory's own spelling of
+      // the profile — on Windows often a real 8.3 short name, on macOS
+      // a link — is the same store.
+      calls = []
+      const e = await refused(allowRead(join(homeAsSpelled, '.ssh')))
+      expect(e.message).toContain('is the excluded')
     })
 
     it('another case → refused', async () => {
@@ -6668,51 +6774,68 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(odd.ungrantedOnly).toEqual([])
     })
 
-    it('windowsProfileExclusionConflicts: equal, inside, above, wildcards, and what is unrelated', () => {
-      const hit = (p: string) =>
-        winUtils.windowsProfileExclusionConflicts([p], lists())[0]
-      const rel = (p: string) => hit(p)?.relation
-      expect(rel(join(home, '.ssh'))).toBe('equal')
-      expect(rel(join(home, '.ssh', 'keys'))).toBe('inside')
-      expect(rel(home)).toBe('above')
-      expect(rel(join(home, '.cargo'))).toBe('above')
-      expect(rel(join(home, '.cargo', 'credentials.toml'))).toBe('equal')
-      expect(rel(join(home, 'ntuser.dat.LOG1'))).toBe('equal')
-      expect(rel(join(home, 'AppData', 'Local'))).toBe('above')
-      expect(rel(join(home, 'AppData', 'Local', 'App', 'EBWebView'))).toBe(
-        'equal',
-      )
-      expect(rel(join(home, 'Documents'))).toBeUndefined()
-      expect(rel(join(home, '.sshx'))).toBeUndefined()
-      expect(rel(join(home, 'AppData', 'Local', 'App', 'data'))).toBeUndefined()
-      expect(rel(work)).toBeUndefined()
-      // The two kinds.
-      expect(hit(join(home, '.ssh'))?.kind).toBe('protected')
-      expect(hit(temp())).toMatchObject({
-        kind: 'ungranted-only',
-        relation: 'equal',
-      })
-      expect(rel(join(temp(), 'session'))).toBeUndefined()
-      expect(rel(join(temp(), 'session', 'work'))).toBeUndefined()
-      expect(hit(join(temp(), 'keys'))).toMatchObject({
-        kind: 'protected',
-        relation: 'equal',
-      })
-      expect(hit(join(temp(), 'keys', 'sub'))).toMatchObject({
-        kind: 'protected',
-        relation: 'inside',
-      })
-      // A recorded path with the extended prefix compares the same.
-      expect(
-        winUtils.windowsProfileExclusionConflicts(
-          [join(home, '.ssh', 'keys')],
-          {
-            exclusions: ['\\\\?\\' + join(home, '.ssh')],
-            ungrantedOnly: [],
-          },
-        )[0]?.relation,
-      ).toBe('inside')
-    })
+    it('windowsProfileExclusionConflicts: equal, inside, above, wildcards, and what is unrelated', () =>
+      explained(
+        [
+          join(home, '.ssh'),
+          join(home, '.ssh', 'keys'),
+          home,
+          join(home, '.cargo'),
+          join(home, 'AppData', 'Local', 'App', 'EBWebView'),
+          join(home, 'Documents'),
+          temp(),
+          join(temp(), 'session'),
+          join(temp(), 'keys'),
+          work,
+        ],
+        () => {
+          const hit = (p: string) =>
+            winUtils.windowsProfileExclusionConflicts([p], lists())[0]
+          const rel = (p: string) => hit(p)?.relation
+          expect(rel(join(home, '.ssh'))).toBe('equal')
+          expect(rel(join(home, '.ssh', 'keys'))).toBe('inside')
+          expect(rel(home)).toBe('above')
+          expect(rel(join(home, '.cargo'))).toBe('above')
+          expect(rel(join(home, '.cargo', 'credentials.toml'))).toBe('equal')
+          expect(rel(join(home, 'ntuser.dat.LOG1'))).toBe('equal')
+          expect(rel(join(home, 'AppData', 'Local'))).toBe('above')
+          expect(rel(join(home, 'AppData', 'Local', 'App', 'EBWebView'))).toBe(
+            'equal',
+          )
+          expect(rel(join(home, 'Documents'))).toBeUndefined()
+          expect(rel(join(home, '.sshx'))).toBeUndefined()
+          expect(
+            rel(join(home, 'AppData', 'Local', 'App', 'data')),
+          ).toBeUndefined()
+          expect(rel(work)).toBeUndefined()
+          // The two kinds.
+          expect(hit(join(home, '.ssh'))?.kind).toBe('protected')
+          expect(hit(temp())).toMatchObject({
+            kind: 'ungranted-only',
+            relation: 'equal',
+          })
+          expect(rel(join(temp(), 'session'))).toBeUndefined()
+          expect(rel(join(temp(), 'session', 'work'))).toBeUndefined()
+          expect(hit(join(temp(), 'keys'))).toMatchObject({
+            kind: 'protected',
+            relation: 'equal',
+          })
+          expect(hit(join(temp(), 'keys', 'sub'))).toMatchObject({
+            kind: 'protected',
+            relation: 'inside',
+          })
+          // A recorded path with the extended prefix compares the same.
+          expect(
+            winUtils.windowsProfileExclusionConflicts(
+              [join(home, '.ssh', 'keys')],
+              {
+                exclusions: ['\\\\?\\' + join(home, '.ssh')],
+                ungrantedOnly: [],
+              },
+            )[0]?.relation,
+          ).toBe('inside')
+        },
+      ))
 
     it('windowsProfileReadEnv: the pointers, minus what the embedder sets itself; none without a current grant', () => {
       const status = (
