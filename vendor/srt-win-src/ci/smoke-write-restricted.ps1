@@ -249,49 +249,64 @@ try { Start-Service seclogon -ea Stop } catch {
   Write-Host "smoke-write-restricted: WARNING: Start-Service seclogon: $_"
 }
 
-# Scratch tree at the system-drive root, with inheritance cut on each
-# test directory so the ACEs below are the only ones that apply.
-# Administrators + SYSTEM keep full control so this script can seed
-# and clean up.
-$root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
-$adm  = @('*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')
-# Give directory `$d` a protected DACL holding `$grants` (icacls
-# `*<SID>:<rights>` terms) and nothing else.
+# Scratch tree at the system-drive root. The root and every test
+# directory get a protected DACL that is written whole, so the ACEs
+# listed for a directory are the only ones that apply to it: nothing
+# is inherited from the drive root, where Authenticated Users hold
+# Modify and BUILTIN\Users read, and the sandbox account is a member
+# of both.
 #
-# Two icacls runs, not one. Given together with /grant, /inheritance:r
-# keeps what the directory inherited as explicit ACEs. Under the drive
-# root that is Modify for Authenticated Users and read for
-# BUILTIN\Users, and the sandbox account is a member of both: it could
-# then write every test directory with the ordinary token, whatever
-# the row meant to grant. The result is checked, and a directory that
-# still carries anything else is reported as a failed row.
-function Set-OnlyAces { param([string] $d, [string[]] $grants)
-  & icacls $d /inheritance:r | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "icacls $d /inheritance:r exited $LASTEXITCODE" }
-  & icacls $d /grant:r @grants | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "icacls $d /grant:r exited $LASTEXITCODE" }
-  $want  = @($grants | ForEach-Object { ($_ -split ':')[0].TrimStart('*') })
-  $rules = (Get-Acl -LiteralPath $d).GetAccessRules(
-    $true, $true, [System.Security.Principal.SecurityIdentifier])
-  $stray = @($rules | Where-Object { $_.IsInherited -or $want -notcontains $_.IdentityReference.Value })
-  if ($stray.Count -gt 0) {
-    Fail "setup: $d carries ACEs other than the ones set on it ($($want -join ', ')); rows that use it prove less. Sddl=$(Sddl $d)"
-  }
-}
-function New-AclDir { param([string] $name, [string[]] $extraGrants)
-  $d = Join-Path $root $name
-  New-Item -ItemType Directory -Path $d -Force | Out-Null
-  Set-OnlyAces $d ($adm + $extraGrants)
-  return $d
-}
-# A path's DACL in a form two readings can be compared in: whether it
-# is protected, then its ACEs as SDDL, sorted so that the comparison
-# is of which ACEs are there and not of their order.
-function Dacl { param([string] $p)
-  $sd = Sddl $p
+# Every test directory carries full control for Administrators and
+# SYSTEM, and what its row adds. This script and the broker run
+# elevated as a member of Administrators, which is what lets them
+# seed, grant and clean up; the sandbox account is in neither, so it
+# gains nothing from the two entries.
+$root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
+$adm  = @('(A;OICI;FA;;;BA)', '(A;OICI;FA;;;SY)')
+# The root itself: the same two, and read for BUILTIN\Users on the
+# root only (no inheritance flags), so a sandboxed process can still
+# look a child up by name. No entry lets the sandbox account write.
+$rootAces = $adm + @('(A;;0x1200a9;;;BU)')
+# Modify, inherited by files and directories, as an ACE for `$who`
+# (an SDDL SID alias).
+function ModifyAce { param([string] $who) "(A;OICI;0x1301bf;;;$who)" }
+# The DACL of the SDDL string `$sd` in a form two of them can be
+# compared in: whether it is protected, then its ACEs, sorted so that
+# the comparison is of which ACEs are there and not of their order.
+function DaclOf { param([string] $sd)
   $prot = if ($sd -match 'D:[A-Z]*P[A-Z]*\(') { 'protected' } else { 'inheriting' }
   $aces = @([regex]::Matches($sd, '\([^)]*\)') | ForEach-Object Value | Sort-Object)
   return "$prot $($aces -join '')"
+}
+function Dacl { param([string] $p) DaclOf (Sddl $p) }
+# Give directory `$d` a protected DACL holding exactly `$aces` (SDDL
+# ACE strings, spelled the way a DACL is reported back).
+#
+# The DACL is built here and written in one call. icacls is not used:
+# what `/inheritance:r` leaves of the inherited ACEs differs between
+# Windows versions (removed on one, kept as explicit ACEs on another),
+# and a directory that keeps them is writable to the sandbox account
+# whatever its row meant to grant. The DACL is then read back, and a
+# directory that does not carry exactly `$aces` is a failed row.
+function Set-OnlyAces { param([string] $d, [string[]] $aces)
+  $want = "D:PAI$($aces -join '')"
+  $sec = [System.Security.AccessControl.DirectorySecurity]::new()
+  $sec.SetSecurityDescriptorSddlForm(
+    $want, [System.Security.AccessControl.AccessControlSections]::Access)
+  # Protected, and nothing inherited kept.
+  $sec.SetAccessRuleProtection($true, $false)
+  [System.IO.FileSystemAclExtensions]::SetAccessControl(
+    [System.IO.DirectoryInfo]::new($d), $sec)
+  $got = Dacl $d
+  if ($got -ne (DaclOf $want)) {
+    Fail "setup: the DACL of $d is not the one set on it; rows that use it prove less. want: $(DaclOf $want)  got: $got  Sddl=$(Sddl $d)"
+  }
+}
+function New-AclDir { param([string] $name, [string[]] $extraAces)
+  $d = Join-Path $root $name
+  New-Item -ItemType Directory -Path $d -Force | Out-Null
+  Set-OnlyAces $d ($adm + $extraAces)
+  return $d
 }
 # Seed the three files an A-row acts on. Created AFTER the directory
 # ACL is set so they inherit it.
@@ -330,6 +345,7 @@ try {
   # every option-off row below be refused.
   & $Exe acl forget --all 2>&1 | Out-Null
   New-Item -ItemType Directory -Path $root -Force | Out-Null
+  Set-OnlyAces $root $rootAces
 
   # ── G: the token itself ──────────────────────────────────────────
   # First, so every later row is read knowing what token it ran under.
@@ -364,8 +380,8 @@ try {
 
   # ── A: ambient group-held write access ───────────────────────────
   foreach ($case in @(
-      @{ tag = 'Authenticated Users'; name = 'au';    ace = '*S-1-5-11:(OI)(CI)(M)' },
-      @{ tag = 'BUILTIN\Users';       name = 'users'; ace = '*S-1-5-32-545:(OI)(CI)(M)' })) {
+      @{ tag = 'Authenticated Users'; name = 'au';    ace = (ModifyAce 'AU') },
+      @{ tag = 'BUILTIN\Users';       name = 'users'; ace = (ModifyAce 'BU') })) {
     $d = New-AclDir $case.name @($case.ace)
     Seed-Dir $d
     # ON first: nothing in the directory is owned by the sandbox
@@ -400,7 +416,7 @@ try {
   # A (observations, never failed): what stays writable by design.
   # (1) A directory that grants Modify to Everyone — Everyone is in
   #     the restricting list.
-  $d = New-AclDir 'everyone' @('*S-1-1-0:(OI)(CI)(M)')
+  $d = New-AclDir 'everyone' @(ModifyAce 'WD')
   Seed-Dir $d
   $null = Mutate $d $true
   $s = State $d
@@ -786,7 +802,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   # modify for Authenticated Users.
   $pc = Join-Path $root 'pc'
   New-Item -ItemType Directory -Path $pc -Force | Out-Null
-  Set-OnlyAces $pc @('*S-1-5-18:(OI)(CI)(F)', '*S-1-5-11:(OI)(CI)(M)')
+  Set-OnlyAces $pc @('(A;OICI;FA;;;SY)', (ModifyAce 'AU'))
   $pcBase = Dacl $pc
   $mine = Join-Path $pc 'mine.txt'
   'MINE' | Set-Content -Encoding ASCII $mine
