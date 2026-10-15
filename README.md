@@ -802,6 +802,93 @@ There is no per-tool workaround for these inside the sandbox; the way to run the
 
 The token is fixed per session. Every `initialize()` verifies the egress fence with that session's token and fails if the probe is not blocked; a per-command override in `customConfig` is rejected, and `updateConfig()` does not change it until the next `reset()` + `initialize()`. If the token cannot be created, or a command fails under it, the failure is reported: nothing retries under the ordinary token.
 
+### Reading your user profile (`windows.profileRead`)
+
+By default nothing in your user profile is readable inside the sandbox: reads are allow-listed, and the sandboxed command runs as another account. So a tool installed under the profile does not start, and npm, pip, NuGet, Maven, Gradle and git do not see your configuration, including the sign-in for a private package feed.
+
+`windows.profileRead: true` (default `false`) makes the profile readable to sandboxed commands, minus the credential stores listed below, as on macOS and Linux. It is a grant kept on disk, and it is made by an explicit step, not by a session:
+
+```typescript
+import {
+  grantWindowsProfileRead,
+  windowsProfileReadExclusions,
+} from '@anthropic-ai/sandbox-runtime'
+
+// At install time, and again to refresh. Runs as you, unelevated.
+await grantWindowsProfileRead({
+  srtWin,
+  exclude: windowsProfileReadExclusions(config, os.homedir()),
+  onProgress: line => console.error(line), // "12/57 top-level item(s) done"
+  timeoutMs: 30 * 60_000, // the default
+})
+```
+
+(or `srt-win profile grant [--exclude <path>]…`). `initialize()` never writes the grant. With the option on it checks that a current one is recorded and rejects with a `WindowsSandboxError` otherwise: `profile_grant_missing` when there is none, `profile_grant_outdated` when it was made by a release with another exclusion list, for another profile directory, did not finish, or lacks an entry of `windows.profileReadExclude`. In both cases the fix is to run the grant.
+
+**What it does.** The grant is read + execute for the sandbox group, never write. Starting at the profile directory, each directory is handled in one of two ways:
+
+- a directory that could hold an excluded path — the profile directory itself, `AppData`, `AppData\Roaming`, `AppData\Local` and its children, `.config`, `.cargo`, `.gradle`, … — can be listed and passed through, and its children are granted one by one. Its files are readable (in the profile directory itself: only the files named below), each through an entry of its own;
+- every other directory is granted whole, with everything in it.
+
+No excluded path ever sits beneath a directory that is granted whole, so an excluded directory or file that is deleted and created again, or replaced by a rename, does not become readable.
+
+**What it does not do.**
+
+- It grants no write access. Sandboxed commands still write only where `filesystem.allowWrite` says, and the sandboxed process keeps its own `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP` and `TMP` — tools write caches under those.
+- It does not follow links. Junctions, symbolic links and cloud-only (placeholder) directories are skipped and reported, wherever the walk meets one, and nothing is written through one.
+- **New items need a refresh.** Something created later directly in the profile directory, or in another directory whose children are granted one by one, is not readable until `grantWindowsProfileRead()` runs again. Items created inside a directory that was granted whole are readable at once.
+- **It is not per session.** Once granted, any sandboxed session on the machine that runs as the sandbox account can read your profile, whatever its own configuration says, until the grant is removed.
+
+**Cost.** The first run sets an entry on every file under the granted directories and on the excluded ones: expect minutes on a large profile, and no other session of yours can start while it runs. A refresh reads one access list per recorded path and writes only what changed.
+
+#### Readable files that can contain package-feed tokens
+
+These configuration files are readable by sandboxed commands when the option is on. That is the point of the option — a private feed's sign-in works inside the sandbox — and it means a sandboxed command can read any token stored in them:
+
+| File | Read by |
+| --- | --- |
+| `%USERPROFILE%\.npmrc` | npm |
+| `%APPDATA%\pip\pip.ini`, `%USERPROFILE%\pip\pip.ini`, `%USERPROFILE%\.config\pip\pip.conf` | pip |
+| `%APPDATA%\NuGet\NuGet.Config` | NuGet |
+| `%USERPROFILE%\.m2\settings.xml`, `settings-security.xml` | Maven |
+| `%USERPROFILE%\.gradle\gradle.properties` | Gradle |
+| `%USERPROFILE%\.gitconfig`, `%USERPROFILE%\.config\git\config` | git |
+
+To keep one of them unreadable, list it in `credentials.files`, `filesystem.denyRead` or `windows.profileReadExclude`.
+
+The sandboxed process has its own profile, so a tool does not look in yours by itself. `windowsProfileReadEnv(getWindowsProfileReadStatus({ srtWin }), yourEnv)` returns the variables that point each tool at its file, for the files that exist; the library sets none of them — pass the ones you want with the command's environment:
+
+| Variable | Tool | Notes |
+| --- | --- | --- |
+| `NPM_CONFIG_USERCONFIG` | npm | |
+| `GIT_CONFIG_GLOBAL` | git 2.32+ | replaces both global files; left out when you set it yourself |
+| `PIP_CONFIG_FILE` | pip | read in addition to pip's other files |
+| `MAVEN_ARGS` (`-s … -Dsettings.security=…`) | Maven 3.9+ | older Maven needs `-s` on the command line |
+| — | NuGet | no variable names the user file: pass `--configfile`, or keep a `NuGet.Config` in or above the project |
+| — | Gradle | no variable names `gradle.properties` (`GRADLE_USER_HOME` would move the caches too): pass properties as `ORG_GRADLE_PROJECT_<name>` or `-P` |
+
+#### Exclusions
+
+Never granted, and denied explicitly to the sandbox group (the deny is written before anything is granted; an excluded directory that does not exist is created empty to carry it):
+
+- **Keys and sign-ins in the profile:** `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.terraform.d`, `.wrangler`, `.vercel`, `.netlify`, `.claude`, `.config\gcloud`, `.config\gh`, `.config\configstore`
+- **The same tools' Windows locations:** `%APPDATA%\gcloud`, `GitHub CLI`, `gnupg`, `com.vercel.cli`, `netlify`, `xdg.config`, `terraform.d`, `terraform.rc`; `%LOCALAPPDATA%\heroku`
+- **Feed sign-in caches:** `%LOCALAPPDATA%\.IdentityService`, `%LOCALAPPDATA%\MicrosoftCredentialProvider`
+- **Credential files:** `.git-credentials`, `.netrc`, `_netrc`, `.pypirc`, `.vault-token`, `.terraformrc`, `.cargo\credentials`, `.cargo\credentials.toml`, `.config\git\credentials`, `.gradle\enterprise\keys.properties`, `.gradle\develocity\keys.properties`
+- **Registry hives:** `NTUSER.DAT*`, `ntuser.ini`, `ntuser.pol`, `%LOCALAPPDATA%\Microsoft\Windows\UsrClass.dat*`
+- **Browsers and password managers:** the Chrome, Edge and Brave `User Data` directories, Firefox's profile directories, `EBWebView` directories under `%LOCALAPPDATA%\<app>` and `%LOCALAPPDATA%\Microsoft\<app>`, 1Password, Bitwarden, KeePass, KeePassXC
+- **Windows' own stores,** under both `%APPDATA%\Microsoft` and `%LOCALAPPDATA%\Microsoft`: `Credentials`, `Protect`, `Vault`, `Crypto`, `SystemCertificates`; and `%LOCALAPPDATA%\Microsoft\IdentityCache`, `TokenBroker`, `OneAuth`, `Windows\INetCookies`, `Windows\INetCache`, `Windows\WebCache`
+- **`%LOCALAPPDATA%\Packages`** (packaged applications' data), **all of `%LOCALAPPDATA%\Temp`**, and this library's own state directory
+- every other **file directly in the profile directory** except `.npmrc` and `.gitconfig` (not denied, just not granted)
+
+The list covers known stores. `AppData` holds the data of every application you run, and an application this list does not know is readable: add its directory with `windows.profileReadExclude` (absolute, or relative to the profile — for example the embedding program's own configuration directory). Entries only add; nothing removes a built-in exclusion. `windowsProfileReadExclusions(config, profileDir)` collects those entries together with the `credentials.files` and `filesystem.denyRead` paths inside the profile, so they are excluded for every session, not only denied in yours.
+
+A session's own read denies still apply on top of the grant: `filesystem.denyRead` and `credentials.files` entries (`mode: "mask"` included — on Windows a masked file is unreadable) are stamped for the session on every granted path they cover, and released when it ends.
+
+#### Removing it
+
+`forgetWindowsProfileRead({ srtWin })` or `srt-win profile forget` takes the sandbox group's entry off every recorded path, leaving each access list as it was, and removes the empty directories the grant created. `initialize()` does the same by itself when it finds a grant and `windows.profileRead` is not set (and rejects with `profile_forget_failed` if it cannot), and so does `windows-uninstall`. `srt-win profile status` shows what is recorded. The option cannot be combined with `windows.writeRestrictedToken: false`: while a grant is recorded, nothing runs under the ordinary token.
+
 ### TLS termination on Windows
 
 `network.tlsTerminate` requires the MITM CA to be present in the **sandbox user's** `CurrentUser\Root` certificate store (schannel — the TLS backend used by `System32\curl.exe`, PowerShell `Invoke-WebRequest`, .NET, and default-backend `git` — trusts only the OS store, not environment variables; these clients run only with `windows.writeRestrictedToken: false`, see [above](#the-child-token-and-kept-write-grants)). This is an install-time step, separate from `windows-install`:
@@ -822,13 +909,15 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 - `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
+- `windows.profileRead` — boolean, default `false`. Lets sandboxed commands read your user profile, minus credential stores, through a grant your program writes with `grantWindowsProfileRead()`; see [Reading your user profile](#reading-your-user-profile-windowsprofileread).
+- `windows.profileReadExclude` — paths inside the profile to keep unreadable in addition to the built-in exclusions.
 - `windows.writeRestrictedToken` — boolean, default `true`. Leave it unset for the write-restricted child token and the kept write grants described under [The child token and kept write grants](#the-child-token-and-kept-write-grants). Set it to `false` only to run Schannel-based clients inside the sandbox; that section says what opting out costs. It is session-level: it cannot be changed per command.
 
 ### Known limitations
 
 - **Schannel-based clients do not work inside the sandbox by default** — see [The child token and kept write grants](#the-child-token-and-kept-write-grants) for the list and the opt-out.
 - **Certificate revocation under schannel** (with `windows.writeRestrictedToken: false`; by default Schannel clients do not get this far). CryptoAPI's CRL/OCSP fetch goes out via WinHTTP under the caller's token, ignoring the proxy environment, so it is blocked by the WFP egress fence. Tools that use schannel with revocation checking on by default fail with `CRYPT_E_REVOCATION_OFFLINE` (`0x80092013`) unless revocation is disabled per tool: `curl --ssl-no-revoke`, `git -c http.schannelCheckRevoke=false`, `CARGO_HTTP_CHECK_REVOKE=false`. `Invoke-WebRequest`, .NET `HttpClient`, and `gh` do not check revocation by default and are unaffected. A CRL distribution point served from the loopback proxy is planned to remove this workaround.
-- **Per-user tool installs are not reachable.** The sandboxed process runs as `srt-sandbox`, not as you, so tools installed under your profile (nvm/fnm-managed Node, per-user `winget`/Scoop packages, `pip install --user`, `%LOCALAPPDATA%\Programs\…`) resolve on the inherited `PATH` but cannot be opened by the sandbox account. Prefer machine-wide installs (`Program Files`, `choco`/`winget --scope machine`), or add the specific profile paths to `filesystem.allowRead`.
+- **Per-user tool installs are not reachable by default.** [`windows.profileRead`](#reading-your-user-profile-windowsprofileread) makes them reachable. Without it: the sandboxed process runs as `srt-sandbox`, not as you, so tools installed under your profile (nvm/fnm-managed Node, per-user `winget`/Scoop packages, `pip install --user`, `%LOCALAPPDATA%\Programs\…`) resolve on the inherited `PATH` but cannot be opened by the sandbox account. Prefer machine-wide installs (`Program Files`, `choco`/`winget --scope machine`), or add the specific profile paths to `filesystem.allowRead`.
 - **Per-exec `filesystem.allowRead` / `filesystem.allowWrite` overrides are not supported.** Session-level `allowRead`/`allowWrite` (in the config passed to `initialize()`) work as described above; passing them per-command in `wrapWithSandbox`'s `customConfig` throws — grants are applied session-wide via `srt-win acl grant` at `initialize()`, and `srt-win exec` only exposes per-exec denies.
 - **`proxyAuthToken` is visible in the runner's command line.** The proxy environment (including `HTTP_PROXY=http://srt:<token>@127.0.0.1:…`) is passed to the two-hop runner as `--env` arguments on `srt-win exec`'s argv, so the token is readable by any local principal that can open the runner process for `PROCESS_QUERY_LIMITED_INFORMATION`. The token exists so the sandboxed process can authenticate to the loopback proxy, so it is not a secret from the sandbox itself; on a single-user development machine this is generally acceptable, but on a shared host treat the proxy allowlist as reachable by other same-session principals.
 - **DNS resolution via the system resolver is not fenced.** `getaddrinfo()` is serviced by the `Dnscache` service running as `NETWORK SERVICE`, so name resolution succeeds even though the subsequent `connect()` from the sandboxed process is blocked. Tools that do their own UDP/53 (`nslookup`, `dig`) are fenced. This mirrors the macOS behaviour.
@@ -839,7 +928,7 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 npx @anthropic-ai/sandbox-runtime windows-uninstall
 ```
 
-Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, the write grants kept on `allowWrite` roots by sessions of the user running it, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
+Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, the write grants kept on `allowWrite` roots by sessions of the user running it, that user's profile read grant, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
 
 ## Development
 
