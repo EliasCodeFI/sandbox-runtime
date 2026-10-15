@@ -651,11 +651,21 @@ fn all_recorded(store: &Store<'_>, marker: &Marker) -> Result<Vec<Recorded>> {
 
 /// Why a command that runs the sandbox account under the ordinary
 /// token must not run now, as far as this grant goes; `None` when it
-/// may. A marker that cannot be read refuses. (A database that still
-/// holds rows after the marker was lost refuses through
-/// [`crate::persist::write_grant_block_reason`].)
+/// may. A marker that cannot be read refuses, and so do rows the
+/// session database still holds after the marker was lost. (A
+/// database that is missing or unreadable after any kept grant was
+/// made refuses through
+/// [`crate::persist::write_grant_block_reason`], which is asked
+/// first.)
 pub fn block_reason() -> Option<String> {
-    block_reason_from(read_marker_at(persist::MARKER_KEY))
+    block_reason_from(read_marker_at(persist::MARKER_KEY)).or_else(|| {
+        let conn = crate::state_db::open_db_ro().ok()??;
+        db_has_rows(&conn).unwrap_or(true).then(|| {
+            "the state database records paths of a profile read grant that the registry \
+             no longer lists"
+                .to_owned()
+        })
+    })
 }
 
 fn block_reason_from(marker: Result<Marker>) -> Option<String> {

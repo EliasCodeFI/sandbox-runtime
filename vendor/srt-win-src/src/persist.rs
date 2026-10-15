@@ -248,17 +248,11 @@ fn marker_remove(path: &str) -> Result<()> {
 
 // ─── Running without the write-restricted token ─────────────────────
 
-/// Root paths the session database records — and, as one more entry,
-/// the profile directory when it records paths of a profile read
-/// grant — or `None` if it is missing, unreadable, or has no such
-/// table.
+/// Root paths the session database records, or `None` if it is
+/// missing, unreadable, or has no such table.
 fn db_roots_ro() -> Option<Vec<String>> {
     let conn = crate::state_db::open_db_ro().ok()??;
-    let mut roots = all_root_paths(&conn).ok()?;
-    if crate::profile::db_has_rows(&conn).ok()? {
-        roots.push("the profile read grant".to_owned());
-    }
-    Some(roots)
+    all_root_paths(&conn).ok()
 }
 
 /// Why a command that runs the sandbox account WITHOUT the
