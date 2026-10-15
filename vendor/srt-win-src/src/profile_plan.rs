@@ -530,6 +530,104 @@ impl Rules {
     }
 }
 
+// ─── Session grants against a recorded grant ────────────────────────
+
+/// How a path stands to an exclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// The path is the excluded one.
+    Equal,
+    /// It lies beneath the excluded directory.
+    Inside,
+    /// The excluded path lies beneath it.
+    Above,
+}
+
+/// How `path` stands to the recorded exclusion `rule`, both absolute;
+/// `rule` may hold the wildcards of the built-in list. `None` when
+/// neither contains the other.
+pub fn relation(path: &str, rule: &str) -> Option<Relation> {
+    let p: Vec<String> = split_path(path).iter().map(|c| norm_component(c)).collect();
+    let r: Vec<Pat> = split_path(rule).iter().map(|c| Pat::parse(c)).collect();
+    let shared = p.len().min(r.len());
+    if !(0..shared).all(|i| r[i].matches(&p[i])) {
+        return None;
+    }
+    Some(match p.len().cmp(&r.len()) {
+        std::cmp::Ordering::Equal => Relation::Equal,
+        std::cmp::Ordering::Greater => Relation::Inside,
+        std::cmp::Ordering::Less => Relation::Above,
+    })
+}
+
+/// Why a session must not be granted `path` (canonical) while a
+/// profile read grant with these recorded exclusions exists; `None`
+/// when it may.
+///
+/// | path is … | protected | ungranted-only |
+/// |---|---|---|
+/// | the exclusion | refused (read: unless admitted) | refused |
+/// | inside it | refused (read: unless admitted) | allowed |
+/// | above it | refused | refused |
+///
+/// A grant above an exclusion inherits: a store that is deleted and
+/// created again beneath it would carry the grant, which the profile
+/// grant's own layout never allows. `admitted` are the paths the
+/// caller explicitly asked to open (`acl grant
+/// --allow-profile-exclusion`); they count for a READ grant that is a
+/// protected path or lies inside one, and for nothing else — a write
+/// grant is never admitted, nor anything above an exclusion.
+pub fn session_grant_refusal(
+    path: &str,
+    write: bool,
+    protected: &[String],
+    ungranted: &[String],
+    admitted: &[String],
+) -> Option<String> {
+    let what = if write { "write" } else { "read" };
+    for u in ungranted {
+        if relation(path, u) == Some(Relation::Equal) {
+            return Some(format!(
+                "a {what} grant on '{path}' would cover everything in it, and it is not \
+                 granted as a whole; grant a directory inside it"
+            ));
+        }
+    }
+    let is_admitted = !write
+        && admitted
+            .iter()
+            .any(|a| relation(path, a) == Some(Relation::Equal) && !a.contains('*'));
+    for r in protected {
+        match relation(path, r) {
+            None => {}
+            Some(Relation::Above) => {
+                return Some(format!(
+                    "a {what} grant on '{path}' would be inherited by the excluded '{r}' \
+                     beneath it if that is ever created again; choose a narrower directory"
+                ));
+            }
+            Some(Relation::Equal | Relation::Inside) if is_admitted => {}
+            Some(Relation::Equal) => {
+                return Some(format!("'{path}' is excluded from reads of the profile"));
+            }
+            Some(Relation::Inside) => {
+                return Some(format!(
+                    "'{path}' lies inside '{r}', which is excluded from reads of the profile"
+                ));
+            }
+        }
+    }
+    for u in ungranted {
+        if relation(path, u) == Some(Relation::Above) {
+            return Some(format!(
+                "a {what} grant on '{path}' would cover everything in '{u}', which is not \
+                 granted as a whole; choose a narrower directory"
+            ));
+        }
+    }
+    None
+}
+
 // ─── Plan ───────────────────────────────────────────────────────────
 
 /// One directory entry as the walk sees it.
@@ -1617,6 +1715,78 @@ mod tests {
                 .contains(&var)
             );
         }
+    }
+
+    #[test]
+    fn a_session_grant_is_measured_against_the_recorded_exclusions() {
+        let p = |rel: &str| format!(r"\\?\C:\Users\me\{rel}");
+        let protected = vec![
+            p(".ssh"),
+            p(r"AppData\Local\*\EBWebView"),
+            p("NTUSER.DAT*"),
+            p(r"AppData\Local\Temp\keys"),
+        ];
+        let ungranted = vec![p(r"AppData\Local\Temp")];
+        let check = |rel: &str, write: bool, admitted: &[String]| {
+            session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted)
+        };
+        let refused = |rel: &str, write: bool| check(rel, write, &[]).is_some();
+        for write in [false, true] {
+            // Protected: the path, inside it, above it.
+            assert!(refused(".ssh", write));
+            assert!(refused(r".SSH.\keys", write));
+            assert!(refused(r"AppData\Local\App\EBWebView\Default", write));
+            assert!(refused("ntuser.dat.LOG1", write));
+            assert!(refused(r"AppData\Local\App", write));
+            assert!(refused("AppData", write));
+            // Ungranted-only: the directory and above it, not inside.
+            assert!(refused(r"AppData\Local\Temp", write));
+            assert!(refused(r"AppData\Local", write));
+            assert!(!refused(r"AppData\Local\Temp\session", write));
+            assert!(!refused(r"AppData\Local\Temp\session\work", write));
+            // … unless that is a protected path inside it.
+            assert!(refused(r"AppData\Local\Temp\keys", write));
+            assert!(refused(r"AppData\Local\Temp\keys\sub", write));
+            // Unrelated paths.
+            assert!(!refused("Documents", write));
+            assert!(!refused(".sshx", write));
+            assert!(!refused(r"AppData\Local\App\data", write));
+        }
+        // The profile directory, and everything above it.
+        for root in [r"\\?\C:\Users\me", r"\\?\C:\Users", r"\\?\C:\"] {
+            for write in [false, true] {
+                assert!(
+                    session_grant_refusal(root, write, &protected, &ungranted, &[]).is_some(),
+                    "{root}"
+                );
+            }
+        }
+        // Another drive, another user.
+        for other in [r"\\?\D:\work", r"\\?\C:\Users\other\.ssh"] {
+            assert_eq!(
+                session_grant_refusal(other, true, &protected, &ungranted, &[]),
+                None
+            );
+        }
+        // An admitted path: a read grant that is a protected path or
+        // lies inside one, named exactly. Never a write, never a path
+        // above an exclusion, never the ungranted-only directory.
+        let ssh = [p(".ssh")];
+        assert_eq!(check(".ssh", false, &ssh), None);
+        assert!(check(".ssh", true, &ssh).is_some());
+        assert!(check(r".ssh\keys", false, &ssh).is_some());
+        assert_eq!(check(r".ssh\keys", false, &[p(r".ssh\keys")]), None);
+        assert!(check("AppData", false, &[p("AppData")]).is_some());
+        let temp = [p(r"AppData\Local\Temp")];
+        assert!(check(r"AppData\Local\Temp", false, &temp).is_some());
+        // The message for a write root above an exclusion says what
+        // to do about it.
+        let why = check("AppData", true, &[]).unwrap();
+        assert!(why.contains("narrower"), "{why}");
+        assert_eq!(relation(&p(".ssh"), &p(".ssh")), Some(Relation::Equal));
+        assert_eq!(relation(&p(r".ssh\a"), &p(".ssh")), Some(Relation::Inside));
+        assert_eq!(relation(&p(""), &p(".ssh")), Some(Relation::Above));
+        assert_eq!(relation(&p("x"), &p(".ssh")), None);
     }
 
     #[test]

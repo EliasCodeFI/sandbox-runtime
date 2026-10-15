@@ -432,7 +432,7 @@ enum UserCmd {
     /// cred_present, marker_version?, setup_version,
     /// marker_user_sid?, ca_cert_thumb?, ca_cert_pem?,
     /// persistent_grants: {state, roots, reason?}, profile_grant:
-    /// {state, reason?}}`. The install is
+    /// {state, reason?}, session_user_sid?}`. The install is
     /// usable by this build only when `marker_version` equals
     /// `setup_version`; otherwise re-run `srt-win install`.
     Status,
@@ -517,6 +517,16 @@ enum AclCmd {
         /// account.
         #[arg(long)]
         persistent: bool,
+        /// While a profile read grant is recorded, no path is granted
+        /// here that is a protected exclusion of it, lies inside one,
+        /// or lies above one, nor one that is or lies above a
+        /// directory it leaves ungranted as a whole (the temporary
+        /// directory): the command fails and grants nothing. This
+        /// flag names a `read` path that may be granted although it is
+        /// a protected exclusion or lies inside one. Repeatable. It
+        /// admits no `write` path, and no path above an exclusion.
+        #[arg(long = "allow-profile-exclusion", value_name = "PATH")]
+        allow_profile_exclusion: Vec<String>,
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
@@ -834,6 +844,10 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // Whether a profile read grant is recorded (`none`, `present`
         // or `unknown`); `profile status` says whether it is current.
         "profile_grant": srt_win::profile::brief_status_json(),
+        // The user of the interactive session this process is in, when
+        // that can be told (`null` otherwise): an install applies the
+        // profile read grant only when it runs as that user.
+        "session_user_sid": session_user_sid_for_status(),
     }))
 }
 
@@ -1561,6 +1575,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     holder_pid,
                     sandbox_user_sid,
                     persistent,
+                    allow_profile_exclusion,
                 },
         } => {
             use srt_win::{acl, persist, state_db};
@@ -1596,6 +1611,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
                         ],
                     )?;
+                    // Before anything is granted, in either mode: no
+                    // grant may reach what a recorded profile read
+                    // grant excludes.
+                    let grants: Vec<(String, bool)> = at
+                        .targets
+                        .iter()
+                        .filter_map(|(p, a)| match a {
+                            acl::SbAce::Grant(m) => Some((p.clone(), *m == acl::GrantMask::Modify)),
+                            _ => None,
+                        })
+                        .collect();
+                    srt_win::profile::check_session_grants(&grants, &allow_profile_exclusion)?;
                     if !persistent {
                         // These grants are for the ordinary token.
                         let paths: Vec<String> =
@@ -2292,6 +2319,17 @@ fn test_profile_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// `session_user_sid` of `user status`. A `test-hooks` build that was
+/// given a made-up profile has no session owner to compare it with,
+/// and reports the caller.
+fn session_user_sid_for_status() -> Option<String> {
+    #[cfg(feature = "test-hooks")]
+    if test_profile_from_env().is_some() {
+        return srt_win::sid::current_user_sid().ok();
+    }
+    srt_win::profile::session_user_sid()
+}
+
 /// LocalSystem, LocalService or NetworkService.
 fn is_service_account(sid: &str) -> bool {
     matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
@@ -2790,6 +2828,27 @@ mod tests {
                 }
             })
         ));
+        match parse(&[
+            "srt-win",
+            "acl",
+            "grant",
+            "--holder-pid",
+            "7",
+            "--sandbox-user-sid",
+            "S-1-5-21-1",
+            "--persistent",
+            "--allow-profile-exclusion",
+            r"C:\Users\me\.ssh",
+        ]) {
+            Ok(Cmd::Acl {
+                sub:
+                    AclCmd::Grant {
+                        allow_profile_exclusion,
+                        ..
+                    },
+            }) => assert_eq!(allow_profile_exclusion, [r"C:\Users\me\.ssh"]),
+            _ => panic!("wrong subcommand"),
+        }
         assert!(is_service_account("S-1-5-18"));
         assert!(!is_service_account("S-1-5-21-1-2-3-1001"));
         assert!(matches!(

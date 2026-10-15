@@ -50,6 +50,14 @@
         that does not name it keeps it excluded, and the record lists
         it beside the built-in exclusions; only `--replace-excludes`
         re-admits it, and no built-in exclusion goes with it.
+    A   `acl grant` (a session's grants) refuses, and grants nothing,
+        when a write root is a protected exclusion, lies inside one,
+        or lies above one (the profile directory), and when it is the
+        temporary directory; the target's SDDL is unchanged each time.
+        A read grant on a protected path is refused the same way, and
+        granted only with `--allow-profile-exclusion`; that flag
+        admits no write root. A write root inside the temporary
+        directory is granted as usual.
     W   it cannot write, create, delete, rename or mkdir under a
         granted child, a container, or the profile root.
     J   a junction inside a granted directory pointing at an excluded
@@ -488,6 +496,61 @@ try {
   Expect-Read 'E (re-admitted by replacing the added list)' $newFile 'NEWTOP-CONTENT'
   Expect-NoRead 'E (a built-in exclusion is not replaceable)' $sshKey 'SSH2-CONTENT'
 
+  # ── A: a session's grants against the exclusions ─────────────────
+  # `acl grant --persistent` as initialize() sends it. Returns the
+  # exit code; the output is shown on a surprise.
+  function Session-Grant { param([string[]] $read = @(), [string[]] $write = @(), [string[]] $flags = @())
+    $json = @{ read = @($read); write = @($write); denyRead = @(); denyWrite = @() } | ConvertTo-Json -Compress
+    $script:lastGrant = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent @flags 2>&1 | Out-String
+    return $LASTEXITCODE
+  }
+  function Refused { param([string] $what, [string] $target, [string[]] $read = @(), [string[]] $write = @(), [string[]] $flags = @())
+    $before = Sddl $target
+    $code = Session-Grant $read $write $flags
+    $after = Sddl $target
+    End-Session
+    if ($code -ne 0 -and $after -eq $before -and $script:lastGrant -match 'nothing was granted') {
+      Ok "A: refused, target unchanged: $what"
+    } else {
+      Fail "A: $what — exit=$code SDDL $(if ($after -eq $before) { 'unchanged' } else { "CHANGED to $after" }) output: $($script:lastGrant)"
+    }
+  }
+  $sshDir = Join-Path $prof '.ssh'
+  $sshSub = Join-Path $sshDir 'sub'
+  New-Item -ItemType Directory -Path $sshSub -Force | Out-Null
+  $workDir = Join-Path $root 'work'
+  New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+  Refused 'a write root that is a protected exclusion'            $sshDir -write @($sshDir)
+  Refused 'a write root inside a protected exclusion'             $sshSub -write @($sshSub)
+  Refused 'a write root above a protected exclusion (the profile)' $prof  -write @($prof)
+  Refused 'a write root above one (AppData)' (Join-Path $prof 'AppData') -write @((Join-Path $prof 'AppData'))
+  Refused 'the temporary directory as a write root'               $tempDir -write @($tempDir)
+  Refused 'a read grant on a protected exclusion'                 $sshDir -read @($sshDir)
+  Refused 'a read grant above a protected exclusion'              $prof   -read @($prof)
+  Refused 'a write root that is a protected exclusion, with the read override' $sshDir -write @($sshDir) -flags @('--allow-profile-exclusion', $sshDir)
+  Refused 'a read grant above an exclusion, with the override'    $prof   -read @($prof) -flags @('--allow-profile-exclusion', $prof)
+  # One refused path refuses the whole call: the unrelated root in the
+  # same call is not granted either.
+  $before = Sddl $workDir
+  $code = Session-Grant -write @($workDir, $sshDir)
+  End-Session
+  if ($code -ne 0 -and (Sddl $workDir) -eq $before) { Ok 'A: a call with one refused path grants none of its paths' }
+  else { Fail "A: mixed call: exit=$code work SDDL=$(Sddl $workDir) output: $($script:lastGrant)" }
+  # The explicit flag opens a protected path to a READ grant, for the
+  # session.
+  $code = Session-Grant -read @($sshDir) -flags @('--allow-profile-exclusion', $sshDir)
+  if ($code -ne 0) { Fail "A: read grant with --allow-profile-exclusion failed: $($script:lastGrant)" }
+  else { Expect-Read 'A (a protected path opened to this session on purpose)' $sshKey 'SSH2-CONTENT' }
+  End-Session
+  Expect-NoRead 'A (after that session)' $sshKey 'SSH2-CONTENT'
+  # Inside the temporary directory a write root is granted as usual.
+  $code = Session-Grant -write @($sessDir)
+  if ($code -eq 0) { Ok 'A: a write root inside the temporary directory is granted' }
+  else { Fail "A: write root inside the temporary directory: exit=$code output: $($script:lastGrant)" }
+  End-Session
+  & $Exe acl forget $sessDir 2>&1 | Out-Null
+  Remove-Item -Recurse -Force -LiteralPath $sshSub
+
   # ── W: nothing is writable ───────────────────────────────────────
   foreach ($case in @(
       @{ tag = 'a granted child'; dir = (Join-Path $prof 'Documents'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
@@ -611,4 +674,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, W, J, D, O, F, U)'
+Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, A, W, J, D, O, F, U)'

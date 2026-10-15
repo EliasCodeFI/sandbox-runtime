@@ -720,6 +720,101 @@ pub fn brief_status_json() -> serde_json::Value {
     }
 }
 
+// ─── Session grants against the recorded grant ──────────────────────
+
+/// Version of the record's format and of what `profile status`
+/// prints about it. A reader that does not know the version it finds
+/// must not rely on the lists.
+pub const RECORD_VERSION: u32 = 1;
+
+/// `acl grant`'s check, before it grants anything: no path a session
+/// asks for (canonical, with whether it is a write grant) may reach
+/// what a recorded profile read grant excludes
+/// ([`plan::session_grant_refusal`]). `admitted_raw` are the paths of
+/// `--allow-profile-exclusion`.
+///
+/// With no grant recorded there is nothing to check against, and
+/// nothing in the profile is readable by default either. A grant that
+/// is recorded but whose record cannot be read, or lists no
+/// exclusions — the built-in list is never empty — refuses every
+/// grant: "could not read the list" is not "nothing is excluded".
+pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) -> Result<()> {
+    let admitted: Vec<String> = admitted_raw
+        .iter()
+        .map(|a| {
+            path_id::canonicalize_path(a)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| a.clone())
+        })
+        .collect();
+    check_grants_against(read_marker_at(persist::MARKER_KEY), grants, &admitted)
+}
+
+fn check_grants_against(
+    marker: Result<Marker>,
+    grants: &[(String, bool)],
+    admitted: &[String],
+) -> Result<()> {
+    let m = marker.map_err(|e| {
+        anyhow!(
+            "the record of the profile read grant cannot be read ({e:#}), so what it \
+             excludes is unknown; nothing is granted"
+        )
+    })?;
+    if m.is_empty() {
+        return Ok(());
+    }
+    if m.exclusions.is_empty() {
+        bail!(
+            "a profile read grant is recorded without its exclusion list; nothing is \
+             granted until `srt-win profile grant` has run again (or `srt-win profile \
+             forget`)"
+        );
+    }
+    for (path, write) in grants {
+        if let Some(why) =
+            plan::session_grant_refusal(path, *write, &m.exclusions, &m.ungranted_only, admitted)
+        {
+            bail!("refused, and nothing was granted: {why}");
+        }
+    }
+    Ok(())
+}
+
+/// The SID of the user who owns the interactive session this process
+/// runs in — the Terminal Services session's logged-on user — or
+/// `None` when it cannot be told: a session with no logged-on user
+/// (session 0, a service or scheduled task), or a name that does not
+/// resolve. A process started with other credentials inside someone's
+/// session (`runas`, an elevation prompt answered with an
+/// administrator's account) has a token user that differs from this.
+pub fn session_user_sid() -> Option<String> {
+    use windows::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory,
+        WTSQuerySessionInformationW, WTSUserName,
+    };
+    let query = |class: WTS_INFO_CLASS| -> Option<String> {
+        let mut buf = windows::core::PWSTR::null();
+        let mut bytes = 0u32;
+        unsafe {
+            WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, class, &mut buf, &mut bytes)
+        }
+        .ok()?;
+        if buf.is_null() {
+            return None;
+        }
+        let s = unsafe { buf.to_string() }.ok();
+        unsafe { WTSFreeMemory(buf.0 as *mut std::ffi::c_void) };
+        s.filter(|s| !s.is_empty())
+    };
+    let user = query(WTSUserName)?;
+    let name = match query(WTSDomainName) {
+        Some(domain) => format!("{domain}\\{user}"),
+        None => user,
+    };
+    crate::sid::lookup_account_sid(&name).ok()
+}
+
 // ─── Grant ──────────────────────────────────────────────────────────
 
 /// A path with why it was skipped or what failed on it.
@@ -1337,10 +1432,15 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         Err(e) => return json!({ "state": "unknown", "reason": format!("{e:#}") }),
     };
     if m.is_empty() {
-        return json!({ "state": "none", "list_version": plan::LIST_VERSION });
+        return json!({
+            "state": "none",
+            "record_version": RECORD_VERSION,
+            "list_version": plan::LIST_VERSION,
+        });
     }
     let count = |k: Kind| m.paths.iter().filter(|r| r.kind == k).count();
     let mut out = json!({
+        "record_version": RECORD_VERSION,
         "list_version": plan::LIST_VERSION,
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
@@ -1552,6 +1652,88 @@ mod tests {
         }))
         .unwrap();
         assert!(r.contains("profile read grant exists"), "{r}");
+    }
+
+    /// The broker's own check of a session's grants: nothing to check
+    /// with no grant recorded, and a refusal — never a pass — when a
+    /// grant is recorded and its exclusions cannot be told.
+    #[test]
+    fn session_grants_are_refused_unless_the_exclusion_list_is_there_to_clear_them() {
+        let p = |rel: &str| format!(r"\\?\C:\Users\me\{rel}");
+        let read = |rel: &str| vec![(p(rel), false)];
+        let write = |rel: &str| vec![(p(rel), true)];
+        let header = Header {
+            list_version: plan::LIST_VERSION,
+            complete: true,
+            file_id: FileId::from_bytes(&[0u8; 24]).unwrap(),
+            profile: p(""),
+        };
+        let recorded = || Marker {
+            header: Some(header.clone()),
+            extra: Vec::new(),
+            exclusions: vec![p(".ssh"), p("NTUSER.DAT*")],
+            ungranted_only: vec![p(r"AppData\Local\Temp")],
+            paths: Vec::new(),
+        };
+        let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
+            check_grants_against(m, g, admitted)
+        };
+        // No grant recorded: nothing in the profile is readable by
+        // default, and there is no list to check against.
+        check(Ok(Marker::default()), &write(".ssh"), &[]).unwrap();
+        // A record that cannot be read.
+        let e = check(Err(anyhow!("access denied")), &read("Documents"), &[]).unwrap_err();
+        assert!(format!("{e:#}").contains("cannot be read"), "{e:#}");
+        // A grant recorded without its list, in each shape: no list,
+        // paths only (a removal that did not finish), header only.
+        for broken in [
+            Marker {
+                exclusions: Vec::new(),
+                ..recorded()
+            },
+            Marker {
+                header: None,
+                exclusions: Vec::new(),
+                paths: vec![Recorded {
+                    path: p("Documents"),
+                    kind: Kind::Granted,
+                    created: false,
+                    file_id: None,
+                }],
+                ..recorded()
+            },
+            Marker {
+                header: Some(header.clone()),
+                ..Default::default()
+            },
+        ] {
+            let e = check(Ok(broken), &read("Documents"), &[]).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("without its exclusion list"),
+                "{e:#}"
+            );
+        }
+        // With the list: unrelated paths pass; a protected path is
+        // refused for a read and for a write, equal, inside and above.
+        check(Ok(recorded()), &read("Documents"), &[]).unwrap();
+        check(Ok(recorded()), &write(r"AppData\Local\Temp\session"), &[]).unwrap();
+        for rel in [".ssh", r".ssh\keys", "", r"AppData\Local\Temp", "AppData"] {
+            assert!(
+                check(Ok(recorded()), &read(rel), &[]).is_err(),
+                "read {rel}"
+            );
+            assert!(
+                check(Ok(recorded()), &write(rel), &[]).is_err(),
+                "write {rel}"
+            );
+        }
+        // One refused path refuses the batch.
+        let mut batch = read("Documents");
+        batch.extend(write(".ssh"));
+        assert!(check(Ok(recorded()), &batch, &[]).is_err());
+        // The explicit flag admits a read, never a write.
+        check(Ok(recorded()), &read(".ssh"), &[p(".ssh")]).unwrap();
+        assert!(check(Ok(recorded()), &write(".ssh"), &[p(".ssh")]).is_err());
     }
 
     #[test]
