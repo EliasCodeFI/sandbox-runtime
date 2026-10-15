@@ -109,6 +109,33 @@ if ($v.egress_probe -ne 'blocked') {
 }
 Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 
+# ── V1b: wfp verify reports each token shape separately ─────────
+# Same run as V1. Beside the plain connect the runner tries one
+# while impersonating the anonymous token, aimed at this machine's
+# own off-loopback address (srt-win picks it; `skipped` when there is
+# none), which the anonymous BLOCK must refuse. The two remaining
+# attempts are shapes no filter covers; they must be REPORTED, and
+# what they report is recorded here, not asserted: a connect is the
+# documented residual and is named in `residuals`.
+foreach ($f in 'anonymous_probe','anonymous_loopback_probe','deny_only_probe','residuals') {
+  if ($null -eq $v.PSObject.Properties[$f]) { throw "V1b: wfp verify output lacks '$f': $vout" }
+}
+if ($v.anonymous_probe -eq 'skipped') {
+  Write-Host 'V1b note: anonymous attempt skipped (no off-loopback address on this runner)'
+} elseif ($v.anonymous_probe -ne 'blocked') {
+  throw "V1b: anonymous-token connect to $($v.anonymous_target) expected blocked, got '$($v.anonymous_probe)'"
+}
+foreach ($pair in @(@('anonymous_loopback_probe','anonymous-loopback'), @('deny_only_probe','deny-only-user-sid'))) {
+  $got = $v.($pair[0])
+  $open = $got -in 'connected','refused'
+  if ($open -ne ($v.residuals -contains $pair[1])) {
+    throw "V1b: $($pair[0])='$got' but residuals=[$($v.residuals -join ',')] - a connect must be named as '$($pair[1])', and only a connect"
+  }
+  if ($open) { Write-Host "V1b residual (documented): $($pair[1]) - $($pair[0])=$got" }
+  else       { Write-Host "V1b: $($pair[0])=$got (no residual observed)" }
+}
+Write-Host "V1b ok: anonymous_probe=$($v.anonymous_probe) target=$($v.anonymous_target); residuals=[$($v.residuals -join ',')]"
+
 # Exec helper. Same .exit/.raw/.out shape as before. The broker
 # forwards exactly what it is told via --env (it does NOT enumerate
 # its own environment), so pass PATH/PATHEXT here — same overlay the
@@ -321,6 +348,119 @@ if ($r.out -notmatch 'AccessDenied') {
   throw "R5e: expected AccessDenied (WFP block), got: $($r.raw)"
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
+
+# ── R5g/R5h: connects made while impersonating the anonymous token ──
+# The identity the filters check is the connecting THREAD's effective
+# token. After ImpersonateAnonymousToken that is ANONYMOUS LOGON,
+# which the block-user filter does not match; the block-anonymous
+# filter refuses it for every destination outside loopback.
+#
+# One C# method does socket -> impersonate -> connect -> revert on a
+# single thread, with the socket created BEFORE the impersonation and
+# the connect made through ws2_32 directly, so nothing but the connect
+# itself runs under the anonymous token. It prints one line per
+# attempt: CONNECTED, WSA:<code> (10013 = refused by a filter, 10061 =
+# refused by the destination, i.e. it got past the filters), or
+# IMPERSONATE_FAILED:<gle>.
+function AnonProbeScript {
+  param([string] $Ip, [int] $Port)
+  return @"
+`$src = @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+public static class SrtAnon {
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateAnonymousToken(IntPtr thread);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
+  public static string Go(string ip, int port, bool anonymous) {
+    byte[] a = IPAddress.Parse(ip).GetAddressBytes();
+    byte[] sa = new byte[16];
+    sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
+    Array.Copy(a, 0, sa, 4, 4);
+    using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
+      if (anonymous && !ImpersonateAnonymousToken(GetCurrentThread()))
+        return "IMPERSONATE_FAILED:" + Marshal.GetLastWin32Error();
+      int rc = connect(s.Handle, sa, sa.Length);
+      int err = Marshal.GetLastWin32Error();
+      if (anonymous) RevertToSelf();
+      return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    }
+  }
+}
+'@
+Add-Type -TypeDefinition `$src
+'PLAIN=' + [SrtAnon]::Go('$Ip', $Port, `$false)
+'ANON=' + [SrtAnon]::Go('$Ip', $Port, `$true)
+"@
+}
+
+# R5g: off-loopback. The destination is one of this runner's own
+# addresses with a live listener, so "not blocked" would be an actual
+# connect rather than a timeout.
+$lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ea SilentlyContinue |
+  Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+  Select-Object -First 1).IPAddress
+if (-not $lanIp) {
+  Write-Host 'R5g SKIPPED: runner has no off-loopback IPv4 address'
+} else {
+  $lanLsn = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($lanIp), 0)
+  $lanLsn.Start()
+  $lanPort = $lanLsn.LocalEndpoint.Port
+  try {
+    # Sanity: the listener is live from the unsandboxed broker.
+    $bs = (Test-NetConnection $lanIp -Port $lanPort `
+           -WarningAction SilentlyContinue).TcpTestSucceeded
+    if (-not $bs) { throw "R5g: broker-side connect to ${lanIp}:$lanPort failed - test invalid" }
+    $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (AnonProbeScript $lanIp $lanPort))
+    Write-Host "R5g probe output (${lanIp}:$lanPort): $($r.out.Trim() -replace '\s+',' ')"
+    if ($r.out -notmatch 'PLAIN=WSA:10013') {
+      throw "R5g: plain connect to ${lanIp}:$lanPort expected WSA:10013 (block-user). raw: $($r.raw)"
+    }
+    if ($r.out -match 'ANON=(CONNECTED|WSA:10061)') {
+      throw "R5g: connect to ${lanIp}:$lanPort while impersonating anonymous was NOT blocked - " +
+            "block-anonymous not in effect. raw: $($r.raw)"
+    }
+    if ($r.out -match 'ANON=IMPERSONATE_FAILED:(\d+)') {
+      # The restricted child may be refused the anonymous token
+      # outright. Then this route does not exist from inside exec;
+      # the filter itself is still shown by V1b (unrestricted runner).
+      Write-Host "R5g ok: child could not impersonate anonymous (gle=$($Matches[1])); block-anonymous is shown by V1b"
+    } elseif ($r.out -match 'ANON=WSA:10013') {
+      Write-Host 'R5g ok: off-loopback connect while impersonating anonymous blocked (WSA:10013)'
+    } else {
+      throw "R5g: expected ANON=WSA:10013. raw: $($r.raw)"
+    }
+  } finally {
+    $lanLsn.Stop()
+  }
+}
+
+# R5h: the same to an out-of-range LOOPBACK listener. No filter covers
+# a loopback connect made while impersonating anonymous, so this row
+# RECORDS what happens instead of asserting it: a connect is the
+# documented residual. Only the plain half is asserted (R5c's result,
+# through this probe).
+$anonLb = Bind-Listener (50003, 50004, 50005, 49997)
+$anonLbPort = $anonLb.LocalEndpoint.Port
+try {
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (AnonProbeScript '127.0.0.1' $anonLbPort))
+  Write-Host "R5h probe output (127.0.0.1:$anonLbPort): $($r.out.Trim() -replace '\s+',' ')"
+  if ($r.out -notmatch 'PLAIN=WSA:10013') {
+    throw "R5h: plain connect to out-of-range loopback expected WSA:10013. raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'ANON=(\S+)') { throw "R5h: no ANON result. raw: $($r.raw)" }
+  $anonLbResult = $Matches[1]
+  if ($anonLbResult -eq 'CONNECTED') {
+    Write-Host "R5h residual (documented): out-of-range loopback connect while impersonating anonymous CONNECTED"
+  } else {
+    Write-Host "R5h: out-of-range loopback connect while impersonating anonymous -> $anonLbResult (residual not observed)"
+  }
+} finally {
+  $anonLb.Stop()
+}
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
 # The SMB redirector dials from kernel mode as SYSTEM, so the
@@ -725,10 +865,76 @@ try {
   Remove-Item -Recurse -Force $gRoot -ErrorAction SilentlyContinue
 }
 
+# ── U-rows: a fence written by an earlier build ─────────────────
+# An install from a build that predates the fence revision record has
+# everything this one has EXCEPT the `FenceRevision` value (and the
+# filters that came with it). Removing the value reproduces what the
+# non-elevated broker can see of such an install — it cannot
+# enumerate filters, so the record is what it goes by. The filters
+# themselves are left in place: nothing in this script can delete a
+# single WFP filter, so the tag-based half of `wfp status` (a set
+# missing block-anonymous) is covered by the cargo unit tests only.
+$regBase = 'HKLM:\SOFTWARE\sandbox-runtime'
+$rev = (Get-ItemProperty $regBase -ea Stop).FenceRevision
+if (-not $rev) { throw "U0: install did not record FenceRevision under $regBase" }
+$st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($st0.state -ne 'installed' -or $st0.filters -lt 6) {
+  throw "U0: fresh install expected installed/>=6 filters, got $($st0.state)/$($st0.filters)"
+}
+Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters"
+Remove-ItemProperty $regBase -Name FenceRevision -ea Stop
+
+# U1: status (both forms) reports the fence as out of date, with the repair.
+$u1 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($u1.state -ne 'outdated') { throw "U1: wfp status expected outdated, got '$($u1.state)'" }
+if ($u1.hint -notmatch '(?i)srt-win install') { throw "U1: hint lacks the reinstall instruction: $($u1.hint)" }
+$u1c = J @('status','--sublayer-guid',$Sublayer)
+if ($u1c.wfp.state -ne 'outdated') { throw "U1: status .wfp expected outdated, got '$($u1c.wfp.state)'" }
+Write-Host "U1 ok: status reports outdated ($($u1.hint))"
+
+# U2: exec refuses to launch, exit 19, naming the repair.
+$r = RExec @('--', $cmd, '/c', 'echo U2-RAN')
+if ($r.exit -ne 19) { throw "U2: exec expected exit 19 (fence out of date), got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'U2-RAN') { throw "U2: child RAN against an out-of-date fence. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)out of date' -or $r.raw -notmatch '(?i)srt-win install') {
+  throw "U2: exec message lacks 'out of date' / reinstall hint. raw: $($r.raw)"
+}
+Write-Host 'U2 ok: exec exits 19 with the reinstall hint and does not launch'
+
+# U3: wfp verify refuses likewise, before probing.
+$u3Lsn = Bind-Listener (49980..49989)
+$u3out = & $Exe wfp verify --target "127.0.0.1:$($u3Lsn.LocalEndpoint.Port)"
+$u3exit = $LASTEXITCODE
+$u3Lsn.Stop()
+if ($u3exit -ne 19) { throw "U3: wfp verify expected exit 19, got $u3exit. out: $u3out" }
+if (-not ($u3out | ConvertFrom-Json).outdated) { throw "U3: wfp verify output lacks outdated=true: $u3out" }
+Write-Host 'U3 ok: wfp verify exits 19 (outdated)'
+
+# U4: re-running install (same config, no --force) repairs it — it
+# must not take the "already installed; no changes" early-out.
+Run @('install',
+      '--sublayer-guid',$Sublayer,
+      '--proxy-port-range',$PortRange)
+$u4 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($u4.state -ne 'installed' -or $u4.filters -ne $st0.filters) {
+  throw "U4: after reinstall expected installed/$($st0.filters) filters, got $($u4.state)/$($u4.filters)"
+}
+if ((Get-ItemProperty $regBase -ea Stop).FenceRevision -ne $rev) {
+  throw 'U4: reinstall did not restore FenceRevision'
+}
+$r = RExec @('--', $cmd, '/c', 'echo U4-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
+  throw "U4: exec after reinstall failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'U4 ok: reinstall restores the fence; exec runs again'
+
 # ── teardown ─────────────────────────────────────────────────────
 Run @('uninstall','--sublayer-guid',$Sublayer)
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b)'
+if ($post.filters -ne 0) {
+  throw "post-uninstall expected 0 filters, got $($post.filters)"
+}
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b, R1-R7c, R5g/R5h, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'

@@ -70,8 +70,11 @@ if ($pre.state -ne 'absent') {
 
 Run (@('install') + $isl + $pr)
 $iw = J (@('wfp', 'status') + $isl)
-if ($iw.state -ne 'installed' -or $iw.filters -lt 4) {
-  throw "install: wfp expected installed/>=4, got $($iw.state)/$($iw.filters)"
+# 6 = per ALE connect layer (v4, v6): loopback PERMIT, sandbox-user
+# BLOCK, anonymous BLOCK. `installed` (not `outdated`) also says each
+# BLOCK is present at this build's fence revision on both layers.
+if ($iw.state -ne 'installed' -or $iw.filters -lt 6) {
+  throw "install: wfp expected installed/>=6, got $($iw.state)/$($iw.filters)"
 }
 if ($iw.port_range[0] -ne 60080 -or $iw.port_range[1] -ne 60089) {
   throw "install: expected port_range [60080,60089], got [$($iw.port_range -join ',')]"
@@ -361,6 +364,20 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
+# The install record must stop describing the removed filters as
+# current: `FenceRevision` is reset to 0 ("removed") in the same
+# step. That value is all a NON-elevated `wfp status` has to go by
+# (it cannot enumerate filters), and it maps 0 to `absent`; `exec`
+# refuses on it (exit 19) instead of launching with no fence.
+$fr0 = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevision
+if ($fr0 -ne 0) {
+  throw "uninstall --keep-user: FenceRevision expected 0 (removed), got '$fr0'"
+}
+$x0 = & $Exe exec -- (Join-Path $env:SystemRoot 'System32\cmd.exe') /c 'echo KEEPUSER-RAN' 2>&1 | Out-String
+if ($LASTEXITCODE -ne 19 -or $x0 -match 'KEEPUSER-RAN' -or $x0 -notmatch '(?i)srt-win install') {
+  throw "uninstall --keep-user: exec expected exit 19 + install hint, got $LASTEXITCODE. out: $x0"
+}
+Write-Host 'uninstall --keep-user ok: FenceRevision reset to 0; exec refuses (exit 19)'
 
 # ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
 # Filters were just removed (`uninstall --keep-user`) but the

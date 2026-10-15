@@ -5,8 +5,8 @@
 //!
 //! At install time we provision the dedicated `srt-sandbox` local
 //! user account ([`crate::user`]) and persist **one machine-wide**
-//! filter set — two filters at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4`
-//! and `_V6` (4 total), all under one persistent sublayer:
+//! filter set — three filters at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4`
+//! and `_V6` (6 total), all under one persistent sublayer:
 //!
 //!   - **PERMIT loopback** (weight [`W_LOOPBACK`]) —
 //!     `IP_REMOTE_ADDRESS` is `127.0.0.0/8` (v4) / `::1` (v6) **and**
@@ -21,7 +21,33 @@
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
 //!     `<srt-sandbox SID>`. Everyone else (the broker, services,
 //!     SYSTEM, the real user) carries a different user SID → no match
-//!     → falls through to default-permit.
+//!     → falls through to default-permit. The SD also carries ALLOW
+//!     ACEs for the two all-packages SIDs so an AppContainer token
+//!     derived from the sandbox account still matches (see
+//!     [`sddl_sandbox_user`]).
+//!
+//!   - **BLOCK anonymous, off-loopback** (weight [`W_BLOCK`]) —
+//!     `ALE_USER_ID` SD = [`sddl_anonymous`] **and** `IP_REMOTE_ADDRESS`
+//!     outside loopback ([`non_loopback_v4_ranges`] /
+//!     [`non_loopback_v6_ranges`]). The identity WFP checks is the
+//!     connecting thread's *effective* token, so a sandboxed thread
+//!     that impersonates the anonymous token presents `ANONYMOUS
+//!     LOGON`, which the sandbox-user SD does not grant. This filter
+//!     is what refuses that connect. It is machine-wide — it applies
+//!     to ANY thread impersonating anonymous, whoever owns the
+//!     process — so it is confined to non-loopback destinations.
+//!
+//! ## What the filters do not cover
+//!
+//!   - A connect to a **loopback** destination made while
+//!     impersonating anonymous matches neither BLOCK: local listeners
+//!     outside the proxy port range are reachable that way.
+//!   - A token whose user SID has been made **deny-only**
+//!     (`CreateRestrictedToken`) is matched by no ALLOW ACE, so the
+//!     sandbox-user BLOCK does not match it. No descriptor can fix
+//!     that: the filter set blocks what it can name and permits the
+//!     rest. `srt-win wfp verify` probes this shape and reports it as
+//!     the [`RESIDUAL_DENY_ONLY`] residual.
 //!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
@@ -33,8 +59,10 @@
 //! still matches the BLOCK.
 //!
 //! Filters carry a small JSON tag in `providerData` (`{tool, kind,
-//! port_range?, user_sid}`) so install/uninstall/status can locate
-//! them by enumeration. BFE enumeration is admin-gated (see
+//! port_range?, user_sid, rev}`) so install/uninstall/status can
+//! locate them by enumeration. `rev` is [`FENCE_REVISION`]; a set
+//! written by an earlier build lacks it (or the anonymous BLOCK) and
+//! reads as `outdated`. BFE enumeration is admin-gated (see
 //! [`WfpAccessDenied`]) — `wfp status` returns `cannot-read` for a
 //! non-elevated caller; the non-elevated readiness check is `srt-win
 //! wfp verify` (a behavioral connect probe).
@@ -53,10 +81,10 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
     FWP_BYTE_BLOB, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_OVERLAPPING,
     FWP_MATCH_EQUAL, FWP_MATCH_RANGE, FWP_RANGE_TYPE, FWP_RANGE0, FWP_SECURITY_DESCRIPTOR_TYPE,
-    FWP_UINT16, FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
+    FWP_UINT16, FWP_UINT32, FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_VALUE0,
+    FWP_VALUE0_0, FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER_FLAG_PERSISTENT,
     FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
     FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
@@ -256,7 +284,25 @@ fn fwp_uint16(v: u16) -> FWP_VALUE0 {
     }
 }
 
-fn cond_port_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
+fn fwp_uint32(v: u32) -> FWP_VALUE0 {
+    FWP_VALUE0 {
+        r#type: FWP_UINT32,
+        Anonymous: FWP_VALUE0_0 { uint32: v },
+    }
+}
+
+/// The caller must keep `addr` alive (and unmoved) for as long as the
+/// returned value is in use.
+fn fwp_byte_array16(addr: &mut FWP_BYTE_ARRAY16) -> FWP_VALUE0 {
+    FWP_VALUE0 {
+        r#type: FWP_BYTE_ARRAY16_TYPE,
+        Anonymous: FWP_VALUE0_0 {
+            byteArray16: addr as *mut _,
+        },
+    }
+}
+
+fn cond_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
     FWPM_FILTER_CONDITION0 {
         fieldKey: field_key,
         matchType: FWP_MATCH_RANGE,
@@ -285,7 +331,7 @@ pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// `permit-loopback-user` / `block-user`.
+    /// `permit-loopback-user` / `block-user` / `block-anonymous`.
     pub kind: String,
     /// `[low, high]` for `permit-loopback-user`; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +340,10 @@ pub struct FilterTag {
     /// the user-SID-keyed design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
+    /// [`FENCE_REVISION`] of the build that wrote the filter. `None`
+    /// on filters written before the revision was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u32>,
 }
 
 impl FilterTag {
@@ -303,6 +353,7 @@ impl FilterTag {
             kind: kind.into(),
             port_range: range.map(|(l, h)| [l, h]),
             user_sid: Some(sid.into()),
+            rev: Some(FENCE_REVISION),
         }
     }
     fn to_blob_bytes(&self) -> Vec<u8> {
@@ -310,8 +361,36 @@ impl FilterTag {
     }
 }
 
-/// Number of filters in the user-SID-keyed set (2 per layer × v4/v6).
-pub const FILTER_COUNT: usize = 4;
+/// Number of filters in the set (3 per layer × v4/v6).
+pub const FILTER_COUNT: usize = 6;
+
+/// Revision of the filter set this build installs and requires.
+/// Bumped whenever the set changes in a way an existing install must
+/// pick up by re-running `srt-win install`:
+///
+///   1. loopback PERMIT + sandbox-user BLOCK (unrecorded — filters of
+///      this revision carry no `rev`).
+///   2. adds the anonymous BLOCK and the all-packages ACEs on the
+///      sandbox-user descriptor.
+///
+/// Recorded twice: in every filter's tag (what an elevated `wfp
+/// status` reads) and in the install record (what the non-elevated
+/// broker reads — it cannot enumerate filters).
+pub const FENCE_REVISION: u32 = 2;
+
+/// What the install record holds in place of a revision once an
+/// uninstall has removed the filters but kept the account. Never a
+/// revision a filter set carries.
+pub const FENCE_REVISION_REMOVED: u32 = 0;
+
+/// Filter kinds that must be present, at [`FENCE_REVISION`], on each
+/// ALE connect layer for the fence to be current.
+const REQUIRED_BLOCK_KINDS: [&str; 2] = ["block-user", "block-anonymous"];
+
+/// Name of the residual `srt-win wfp verify` reports when a connect
+/// made under a copy of the sandbox token whose user SID is deny-only
+/// is not blocked. See the module doc.
+pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 
 // Filter weights — kept below 2^60 so they stay in WFP's
 // "manual weight" class (top 4 bits are auto-classifier). The
@@ -504,17 +583,79 @@ fn add_filter(
 // with no `G:`. The group's value is irrelevant to DACL
 // evaluation; LS is just a stable, always-present principal.
 
-/// SDDL for the BLOCK filter — ALLOW `<sandbox_user_sid>`. Matches
-/// iff the connecting token carries that SID **enabled**, which for
-/// a *user* SID means "is that user". The broker, services, and
-/// every other process carry a different user SID → no match → fall
-/// through to default-permit.
+/// SDDL for the sandbox-user BLOCK filter — ALLOW `<sandbox_user_sid>`
+/// plus ALLOW for ALL APPLICATION PACKAGES (`S-1-15-2-1`) and ALL
+/// RESTRICTED APPLICATION PACKAGES (`S-1-15-2-2`).
+///
+/// The user ACE matches iff the connecting token carries that SID
+/// **enabled**, which for a *user* SID means "is that user". The
+/// broker, services, and every other process carry a different user
+/// SID → no match → fall through to default-permit.
+///
+/// The two package ACEs exist for AppContainer tokens. The access
+/// check of such a token has two halves that must BOTH grant: the
+/// ordinary one over the user and group SIDs, and one over the
+/// package and capability SIDs. With the user ACE alone, an
+/// AppContainer process started under the sandbox account passes the
+/// first half and fails the second, so the BLOCK would not match it.
+/// The package ACEs supply the second half. They grant nothing by
+/// themselves: a token outside an AppContainer does not carry either
+/// SID, and an AppContainer token of any OTHER user still fails the
+/// first half.
 pub fn sddl_sandbox_user(sid: &str) -> String {
-    format!("O:LSG:LSD:(A;;CC;;;{sid})")
+    format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }
 
-/// Install (or refresh) the user-SID-keyed filter set under
-/// `sublayer`. Two filters at each of the v4/v6 ALE-connect layers
+/// SDDL for the anonymous BLOCK filter — ALLOW `ANONYMOUS LOGON`
+/// (`S-1-5-7`). Matches the anonymous token and nothing else: no
+/// other token carries that SID.
+pub fn sddl_anonymous() -> String {
+    "O:LSG:LSD:(A;;CC;;;S-1-5-7)".to_string()
+}
+
+// "Not loopback" for the anonymous BLOCK.
+//
+// The engine offers three ways to say it, and only one fits:
+//
+//   - A negative match on the address (`FWP_MATCH_NOT_EQUAL`) is
+//     defined for sortable value types only. The loopback v4 prefix is
+//     an address-and-mask value, which is not sortable, so `!= 127/8`
+//     cannot be written.
+//   - The loopback FLAG (`FWP_CONDITION_FLAG_IS_LOOPBACK`, none-set)
+//     is true for every connect that stays on the machine, including
+//     one to the machine's own LAN address. That is a wider exemption
+//     than "the loopback addresses", and it would leave nothing on
+//     the machine that could show the filter working: every
+//     off-loopback destination a readiness probe can reach without an
+//     external host is one of the machine's own addresses.
+//   - A RANGE match on the address is a positive match over a sortable
+//     type (a v4 address is a `UINT32`, a v6 address a 16-byte array),
+//     and conditions on the same field are OR'ed. The complement of
+//     loopback is two ranges per family — below it and above it.
+//
+// So the filter carries two `IP_REMOTE_ADDRESS` range conditions per
+// layer. They are disjoint from the loopback PERMIT's destinations by
+// construction, and the PERMIT and the sandbox-user BLOCK are added
+// exactly as before, so loopback handling for the sandbox account is
+// unchanged.
+
+/// The IPv4 addresses outside `127.0.0.0/8`, as inclusive
+/// host-byte-order ranges.
+pub(crate) const fn non_loopback_v4_ranges() -> [(u32, u32); 2] {
+    [(0x0000_0000, 0x7EFF_FFFF), (0x8000_0000, 0xFFFF_FFFF)]
+}
+
+/// The IPv6 addresses other than `::1`, as inclusive network-order
+/// ranges.
+pub(crate) const fn non_loopback_v6_ranges() -> [([u8; 16], [u8; 16]); 2] {
+    let zero = [0u8; 16];
+    let mut two = [0u8; 16];
+    two[15] = 2;
+    [(zero, zero), (two, [0xFF; 16])]
+}
+
+/// Install (or refresh) the filter set under
+/// `sublayer`. Three filters at each of the v4/v6 ALE-connect layers
 /// ([`FILTER_COUNT`] total) — see the module doc for the design.
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
@@ -529,6 +670,7 @@ pub fn install_filters(
     debug_assert!(port_range.0 <= port_range.1);
     let sd_user = OwnedSd::from_sddl(&sddl_sandbox_user(sandbox_user_sid))
         .context("build sandbox-user SD")?;
+    let sd_anon = OwnedSd::from_sddl(&sddl_anonymous()).context("build anonymous SD")?;
 
     with_wfp_txn(|engine| {
         // Sublayer (idempotent). Display name identifies the owning
@@ -579,6 +721,33 @@ pub fn install_filters(
             FilterTag::user("permit-loopback-user", sandbox_user_sid, Some(port_range))
                 .to_blob_bytes();
         let mut tag_bk = FilterTag::user("block-user", sandbox_user_sid, None).to_blob_bytes();
+        let mut tag_an = FilterTag::user("block-anonymous", sandbox_user_sid, None).to_blob_bytes();
+
+        // Range endpoints for the anonymous BLOCK. The v6 endpoints
+        // are passed by pointer, so they live here, outside the loop,
+        // for the whole transaction.
+        let mut sd_anon_blob = sd_byte_blob(&sd_anon);
+        let mut v4_out = non_loopback_v4_ranges().map(|(lo, hi)| FWP_RANGE0 {
+            valueLow: fwp_uint32(lo),
+            valueHigh: fwp_uint32(hi),
+        });
+        let mut v6_ends = non_loopback_v6_ranges().map(|(lo, hi)| {
+            (
+                FWP_BYTE_ARRAY16 { byteArray16: lo },
+                FWP_BYTE_ARRAY16 { byteArray16: hi },
+            )
+        });
+        let [(a_lo, a_hi), (b_lo, b_hi)] = &mut v6_ends;
+        let mut v6_out = [
+            FWP_RANGE0 {
+                valueLow: fwp_byte_array16(a_lo),
+                valueHigh: fwp_byte_array16(a_hi),
+            },
+            FWP_RANGE0 {
+                valueLow: fwp_byte_array16(b_lo),
+                valueHigh: fwp_byte_array16(b_hi),
+            },
+        ];
 
         for (layer, label) in [
             (FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4"),
@@ -592,7 +761,7 @@ pub fn install_filters(
             };
             let mut c_lb = [
                 addr_cond,
-                cond_port_range(FWPM_CONDITION_IP_REMOTE_PORT, &mut port_range_slot),
+                cond_range(FWPM_CONDITION_IP_REMOTE_PORT, &mut port_range_slot),
             ];
             add_filter(
                 engine.h(),
@@ -615,6 +784,29 @@ pub fn install_filters(
                 FWP_ACTION_BLOCK,
                 &mut c_bk,
                 &mut tag_bk,
+            )?;
+            // BLOCK anonymous, off-loopback. The two address ranges
+            // share a field key and are therefore OR'ed with each
+            // other, then AND'ed with the user condition.
+            let [out_a, out_b] = if label == "v4" {
+                &mut v4_out
+            } else {
+                &mut v6_out
+            };
+            let mut c_an = [
+                cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_anon_blob),
+                cond_range(FWPM_CONDITION_IP_REMOTE_ADDRESS, out_a),
+                cond_range(FWPM_CONDITION_IP_REMOTE_ADDRESS, out_b),
+            ];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-block-anonymous"),
+                W_BLOCK,
+                FWP_ACTION_BLOCK,
+                &mut c_an,
+                &mut tag_an,
             )?;
         }
         Ok(())
@@ -639,11 +831,9 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
     })
 }
 
-/// Status of the WFP fence under `sublayer`. `installed` iff at
-/// least one `block-user` srt-win filter exists. (We don't insist
-/// on the exact count so enterprise tooling that adds extras under
-/// the same sublayer doesn't break detection.) `port_range` is read
-/// from the first `permit-loopback-user` tag.
+/// Status of the WFP fence under `sublayer` — see
+/// [`classify_fence`] for `absent` / `installed` / `outdated`.
+/// `port_range` is read from the first `permit-loopback-user` tag.
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -659,9 +849,84 @@ pub struct WfpStatus {
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
-    /// Populated only on `cannot-read`.
+    /// Populated on `cannot-read` and on `outdated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// What to tell the operator when the fence is not at
+/// [`FENCE_REVISION`]. One wording for `wfp status`, `wfp verify`
+/// and `exec`.
+pub fn outdated_hint(have: Option<u32>) -> String {
+    if have == Some(FENCE_REVISION_REMOVED) {
+        return "the network fence on this machine is not installed (its \
+                filters were removed by an uninstall) — re-run `srt-win \
+                install` (one UAC prompt)"
+            .to_string();
+    }
+    let have = match have {
+        Some(r) => format!("revision {r}"),
+        None => "an unrecorded earlier revision".to_string(),
+    };
+    format!(
+        "the network fence on this machine is out of date ({have}; \
+         this build requires revision {FENCE_REVISION}, which also \
+         blocks connects made while impersonating the anonymous \
+         token) — re-run `srt-win install` (one UAC prompt)"
+    )
+}
+
+/// Classify an enumerated filter set, given `(layer, tag)` for every
+/// srt-win filter under the sublayer.
+///
+///   - `absent` — no `block-user` filter at all.
+///   - `installed` — every [`REQUIRED_BLOCK_KINDS`] filter is present
+///     at [`FENCE_REVISION`] on BOTH ALE connect layers.
+///   - `outdated` — anything in between: a set written by an earlier
+///     build (no `rev`, no anonymous BLOCK), or one missing a layer.
+///
+/// Extra filters are ignored, so enterprise tooling that adds its own
+/// under the same sublayer does not break detection.
+pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
+    if !tags.iter().any(|(_, t)| t.kind == "block-user") {
+        return "absent";
+    }
+    let current = ALE_LAYERS.iter().all(|(_, layer)| {
+        REQUIRED_BLOCK_KINDS.iter().all(|kind| {
+            tags.iter()
+                .any(|(l, t)| l == layer && t.kind == *kind && t.rev == Some(FENCE_REVISION))
+        })
+    });
+    if current { "installed" } else { "outdated" }
+}
+
+/// Fold the install record's fence revision into an enumerated
+/// status. `record` is `None` when the machine has no install record
+/// at all, `Some(rev)` when it has one (`rev` itself is `None` for a
+/// record written before the revision was kept).
+///
+/// A non-elevated caller cannot enumerate filters (`cannot-read`), so
+/// the record is its only way to learn that the install predates this
+/// build (`outdated`) or that an uninstall removed the filters
+/// (`absent`); and an elevated caller that enumerated a
+/// current-looking set under one sublayer still must not report
+/// `installed` while the record says otherwise (`outdated`). Only a
+/// record at [`FENCE_REVISION`] leaves `installed` or `cannot-read`
+/// standing.
+pub fn apply_recorded_revision(mut st: WfpStatus, record: Option<Option<u32>>) -> WfpStatus {
+    if let Some(rev) = record
+        && rev != Some(FENCE_REVISION)
+        && matches!(st.state, "installed" | "cannot-read")
+    {
+        let removed = rev == Some(FENCE_REVISION_REMOVED);
+        st.state = if removed && st.state == "cannot-read" {
+            "absent"
+        } else {
+            "outdated"
+        };
+        st.hint = Some(outdated_hint(rev));
+    }
+    st
 }
 
 /// Live BFE enumeration. Admin-gated — a non-elevated caller gets
@@ -677,20 +942,17 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         Err(e) => return Err(e),
     };
-    let mut filters = 0usize;
-    let mut have_block = false;
+    let mut tags: Vec<(&'static str, FilterTag)> = Vec::new();
     let mut port_range: Option<[u16; 2]> = None;
     let mut user_sid: Option<String> = None;
-    let enum_result = for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
-        filters += 1;
+    let enum_result = for_each_tagged_filter(&engine, sublayer, |layer, _, tag| {
         if user_sid.is_none() {
             user_sid.clone_from(&tag.user_sid);
         }
-        match tag.kind.as_str() {
-            "block-user" => have_block = true,
-            "permit-loopback-user" => port_range = tag.port_range,
-            _ => {}
+        if tag.kind == "permit-loopback-user" {
+            port_range = tag.port_range;
         }
+        tags.push((layer, tag.clone()));
     });
     if let Err(e) = enum_result {
         if e.downcast_ref::<WfpAccessDenied>().is_some() {
@@ -698,12 +960,16 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         return Err(e);
     }
+    let state = classify_fence(&tags);
     Ok(WfpStatus {
-        state: if have_block { "installed" } else { "absent" },
-        filters,
+        state,
+        filters: tags.len(),
         port_range,
         user_sid,
-        hint: None,
+        hint: (state == "outdated").then(|| {
+            // The oldest revision present is the one worth naming.
+            outdated_hint(tags.iter().map(|(_, t)| t.rev).min().flatten())
+        }),
     })
 }
 
@@ -788,6 +1054,178 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_sddl_parses() {
+        let sd = OwnedSd::from_sddl(&sddl_anonymous()).expect("sddl");
+        assert!(sd.len > 0);
+    }
+
+    #[test]
+    fn sandbox_user_sddl_carries_both_package_aces() {
+        let s = sddl_sandbox_user("S-1-5-21-1-2-3-1005");
+        assert!(s.contains("(A;;CC;;;S-1-5-21-1-2-3-1005)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-1)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-2)"));
+        // ALLOW only: a DENY ACE in a match descriptor would invert
+        // which tokens the filter applies to.
+        assert!(!s.contains("(D;"));
+    }
+
+    fn in_v4(a: [u8; 4]) -> bool {
+        let v = u32::from_be_bytes(a);
+        non_loopback_v4_ranges()
+            .iter()
+            .any(|(lo, hi)| (*lo..=*hi).contains(&v))
+    }
+
+    fn in_v6(a: std::net::Ipv6Addr) -> bool {
+        let v = a.octets();
+        non_loopback_v6_ranges()
+            .iter()
+            .any(|(lo, hi)| *lo <= v && v <= *hi)
+    }
+
+    /// The anonymous BLOCK's address ranges are exactly the
+    /// complement of the loopback PERMIT's destinations.
+    #[test]
+    fn non_loopback_ranges_exclude_only_loopback() {
+        for a in [
+            [127, 0, 0, 0],
+            [127, 0, 0, 1],
+            [127, 0, 0, 2],
+            [127, 255, 255, 255],
+        ] {
+            assert!(!in_v4(a), "{a:?} is loopback");
+        }
+        for a in [
+            [0, 0, 0, 0],
+            [10, 0, 0, 1],
+            [126, 255, 255, 255],
+            [128, 0, 0, 0],
+            [169, 254, 169, 254],
+            [192, 168, 1, 1],
+            [255, 255, 255, 255],
+        ] {
+            assert!(in_v4(a), "{a:?} is not loopback");
+        }
+        let [(_, a_hi), (b_lo, _)] = non_loopback_v4_ranges();
+        assert_eq!(a_hi + 1, 0x7F00_0000);
+        assert_eq!(b_lo - 1, 0x7FFF_FFFF);
+
+        assert!(!in_v6(std::net::Ipv6Addr::LOCALHOST));
+        for a in ["::", "::2", "fe80::1", "2001:db8::1", "::ffff:127.0.0.1"] {
+            assert!(in_v6(a.parse().unwrap()), "{a} is not ::1");
+        }
+        assert!(in_v6(std::net::Ipv6Addr::from([0xFF; 16])));
+    }
+
+    fn tag(kind: &str, rev: Option<u32>) -> FilterTag {
+        FilterTag {
+            rev,
+            ..FilterTag::user(kind, "S-1-5-21-1-2-3-1005", None)
+        }
+    }
+
+    fn full_set(rev: Option<u32>, kinds: &[&str]) -> Vec<(&'static str, FilterTag)> {
+        ALE_LAYERS
+            .iter()
+            .flat_map(|(_, layer)| kinds.iter().map(move |k| (*layer, tag(k, rev))))
+            .collect()
+    }
+
+    const ALL_KINDS: [&str; 3] = ["permit-loopback-user", "block-user", "block-anonymous"];
+
+    #[test]
+    fn classify_fence_states() {
+        assert_eq!(classify_fence(&[]), "absent");
+        // Only a PERMIT left behind: nothing is fenced.
+        assert_eq!(
+            classify_fence(&full_set(Some(FENCE_REVISION), &["permit-loopback-user"])),
+            "absent"
+        );
+        let current = full_set(Some(FENCE_REVISION), &ALL_KINDS);
+        assert_eq!(current.len(), FILTER_COUNT);
+        assert_eq!(classify_fence(&current), "installed");
+        // The set an earlier build wrote: no rev, no anonymous BLOCK.
+        assert_eq!(
+            classify_fence(&full_set(None, &["permit-loopback-user", "block-user"])),
+            "outdated"
+        );
+        // All three kinds but written at an earlier revision.
+        assert_eq!(classify_fence(&full_set(Some(1), &ALL_KINDS)), "outdated");
+        // One layer missing its anonymous BLOCK.
+        let mut half = current.clone();
+        let v6 = ALE_LAYERS[1].1;
+        half.retain(|(l, t)| !(*l == v6 && t.kind == "block-anonymous"));
+        assert_eq!(classify_fence(&half), "outdated");
+        // Foreign extras under the sublayer do not disturb a current set.
+        let mut extra = current;
+        extra.push((v6, tag("something-else", None)));
+        assert_eq!(classify_fence(&extra), "installed");
+    }
+
+    fn status(state: &'static str) -> WfpStatus {
+        WfpStatus {
+            state,
+            filters: 0,
+            port_range: None,
+            user_sid: None,
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn recorded_revision_overrides_installed_and_cannot_read() {
+        let cur = Some(Some(FENCE_REVISION));
+        for s in ["installed", "cannot-read", "absent", "outdated"] {
+            assert_eq!(apply_recorded_revision(status(s), cur).state, s);
+            // No install record at all: nothing to compare against.
+            assert_eq!(apply_recorded_revision(status(s), None).state, s);
+        }
+        for old in [Some(None), Some(Some(FENCE_REVISION - 1))] {
+            for s in ["installed", "cannot-read"] {
+                let st = apply_recorded_revision(status(s), old);
+                assert_eq!(st.state, "outdated");
+                assert!(st.hint.unwrap().contains("srt-win install"));
+            }
+            assert_eq!(
+                apply_recorded_revision(status("absent"), old).state,
+                "absent"
+            );
+        }
+    }
+
+    /// After an uninstall that keeps the account, the record is
+    /// `FENCE_REVISION_REMOVED`. A caller that cannot enumerate must
+    /// then read `absent`; one that still enumerates a set (the reset
+    /// landed and the filter removal did not, or another sublayer
+    /// holds one) must read `outdated`. Neither may read `installed`.
+    #[test]
+    fn removed_record_never_reads_as_installed() {
+        let removed = Some(Some(FENCE_REVISION_REMOVED));
+        let st = apply_recorded_revision(status("cannot-read"), removed);
+        assert_eq!(st.state, "absent");
+        let hint = st.hint.unwrap();
+        assert!(hint.contains("not installed") && hint.contains("srt-win install"));
+        assert_eq!(
+            apply_recorded_revision(status("installed"), removed).state,
+            "outdated"
+        );
+        assert_eq!(
+            apply_recorded_revision(status("absent"), removed).state,
+            "absent"
+        );
+        // Whatever else the record holds, only FENCE_REVISION lets
+        // `installed` or `cannot-read` through unchanged.
+        for rev in [None, Some(0), Some(1), Some(FENCE_REVISION + 1)] {
+            for s in ["installed", "cannot-read"] {
+                let got = apply_recorded_revision(status(s), Some(rev)).state;
+                assert!(matches!(got, "absent" | "outdated"), "{rev:?}/{s} -> {got}");
+            }
+        }
+        const { assert!(FENCE_REVISION_REMOVED != FENCE_REVISION) };
+    }
+
+    #[test]
     fn sddl_rejects_garbage() {
         assert!(OwnedSd::from_sddl("O:LSG:LSD:(A;;CC;;;NOT-A-SID)").is_err());
     }
@@ -798,6 +1236,7 @@ mod tests {
         let bk = FilterTag::user("block-user", sid, None);
         assert_eq!(bk.user_sid.as_deref(), Some(sid));
         assert_eq!(bk.port_range, None);
+        assert_eq!(bk.rev, Some(FENCE_REVISION));
         let lb = FilterTag::user("permit-loopback-user", sid, Some((60080, 60089)));
         assert_eq!(lb.port_range, Some([60080, 60089]));
         // Round-trips through JSON.
@@ -815,6 +1254,11 @@ mod tests {
         assert_eq!(t.kind, "permit-loopback");
         assert_eq!(t.port_range, None);
         assert_eq!(t.user_sid, None);
+        assert_eq!(t.rev, None);
+        // The tag the 4-filter set wrote: a user SID but no rev.
+        let prev = br#"{"tool":"srt-win","kind":"block-user","user_sid":"S-1-5-21-1"}"#;
+        let t: FilterTag = serde_json::from_slice(prev).unwrap();
+        assert_eq!(t.rev, None);
     }
 
     /// const-assert the weight invariant directly so a reshuffle in
