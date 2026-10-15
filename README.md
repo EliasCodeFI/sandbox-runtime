@@ -745,7 +745,7 @@ npx @anthropic-ai/sandbox-runtime windows-install
 
 This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted in `HKLM\SOFTWARE\sandbox-runtime` — machine-wide, so fleet installs running as SYSTEM work and one user's rotation updates the copy the others read), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
 
-After the elevated step, the install makes **your user profile readable to sandboxed commands, except for credential stores**, as the user who ran it and without elevation; on a large profile this takes minutes the first time. See [Reading your user profile](#reading-your-user-profile) for what is readable (including configuration files that can hold package-feed tokens), what is excluded, and how to restrict or remove it. On a machine with several users, or after an install by a deployment tool running as SYSTEM, each user applies it once with `srt-win profile grant` (`grantWindowsProfileRead()`); until then that user's sessions are rejected with `profile_grant_missing`.
+After the elevated step, the install makes **your user profile readable to sandboxed commands, except for credential stores**, as the user who ran it and without elevation; on a large profile this takes minutes the first time. It first prints one line saying so, naming the configuration files that can hold feed tokens and how to skip (`--skip-profile-grant`) or undo it (`srt-win profile forget`). See [Reading your user profile](#reading-your-user-profile) for what is readable, what is excluded, and how to restrict or remove it — and read [Shared machines](#shared-machines) before installing on a computer that more than one person uses. The sandbox works without the grant; its commands then read nothing in your profile.
 
 **No logout is required.** The WFP filters key on the dedicated sandbox account's SID, so your own network, services, and every other principal on the machine are unaffected.
 
@@ -795,7 +795,7 @@ There is no per-tool workaround for these inside the sandbox; the way to run the
 **Write grants on `allowWrite` roots are kept between sessions.** Granting a directory means writing an access entry that Windows copies to every file below it, which takes time proportional to the tree — and as long again to take back. So a root is granted the first time it is used; afterwards `initialize()` reads one access list per root, and `reset()` leaves the grant in place.
 
 - A session can write only the roots in its own `allowWrite`. Each kept root is tied to an identifier of its own, which only a session given that root carries in its token, so a session in one project cannot write another project's kept root.
-- **Reads are not separated this way: any sandboxed session can read a kept root**, whether or not the root is in its lists, until the grant is removed.
+- **Reads are not separated this way: any sandboxed session can read a kept root**, whether or not the root is in its lists, until the grant is removed. That includes sandboxed sessions started by other users of the same computer: the sandbox account and group are one per machine. They can read a kept root; they cannot write it.
 - `denyRead` / `denyWrite` entries beneath a kept root are kept with it, and are added to but not removed by later sessions.
 - Sandboxed programs cannot change the permissions of files they create under a kept root.
 - The kept grants are removed by `windows-uninstall`, by `srt-win acl forget <root>` or `srt-win acl forget --all`, and by opting out (next paragraph). `srt-win user status` lists them.
@@ -821,11 +821,12 @@ const r = await installWindowsSandboxAsync({
 ```
 
 - The elevation prompt may be answered by another (administrator) account; the grant is still made by, and for, the user whose process called the install.
-- An install run as a service account (LocalSystem and the like, for a machine-wide deployment) applies no grant and says so in `profileGrant.reason`. Each user then runs `grantWindowsProfileRead({ srtWin })` (or `srt-win profile grant`) once themselves.
+- The grant is applied only when the installing process runs as the person using the session it is in. An install run as another account on someone's desktop (an administrator's elevated prompt, `runas`), as a service account (a machine-wide deployment), or where the session's owner cannot be determined, applies no grant and says why in `profileGrant.reason`. That person then runs the install, or `grantWindowsProfileRead({ srtWin })` (`srt-win profile grant`), as themselves.
+- `onProfileGrantStart` receives one line describing what is about to become readable (`windowsProfileGrantNotice()`), for you to show; `windows-install` prints it.
 - If the grant fails or times out, the install throws `profile_grant_failed`: the account and the filters are installed, the grant is recorded as incomplete, and no session starts on it. Run the install or `grantWindowsProfileRead()` again to finish it.
-- `skipProfileGrant: true` (`windows-install --skip-profile-grant`) installs without it.
+- `skipProfileGrant: true` (`windows-install --skip-profile-grant`) installs without it. The sandbox then works as it does without the grant: sessions run, and nothing in the profile is readable beyond `filesystem.allowRead`.
 
-`initialize()` never writes or refreshes the grant. It checks that a current one is recorded and rejects with a `WindowsSandboxError` otherwise: `profile_grant_missing` when there is none for this user, `profile_grant_outdated` when it was made by a release with another exclusion list, for another profile directory, or did not finish. The fix in both cases is to run `windows-install` again or call `grantWindowsProfileRead()`.
+**The grant being there is the switch.** `initialize()` never writes or refreshes it. With no grant recorded — skipped at install, or removed with `profile forget` — a session runs exactly as it would without this feature, and `SandboxManager.getWindowsProfileRead()` returns `'absent'`. With a current grant it returns `'granted'`. `initialize()` rejects, with `profile_grant_outdated`, only when a grant is recorded that cannot be relied on: its run did not finish, it was made by a release with an older exclusion list (a path excluded since would otherwise stay readable) or for another profile directory, or its record is unreadable or lacks its list of exclusions. Then run `grantWindowsProfileRead()` (or `windows-install`) again, or `forgetWindowsProfileRead()` to go without.
 
 **What it does.** The grant is read + execute for the sandbox group, never write. Starting at the profile directory, each directory is handled in one of two ways:
 
@@ -839,7 +840,7 @@ No excluded path ever sits beneath a directory that is granted whole, so an excl
 - It grants no write access. Sandboxed commands still write only where `filesystem.allowWrite` says, and the sandboxed process keeps its own `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP` and `TMP` — tools write caches under those.
 - It does not follow links. Junctions, symbolic links and cloud-only (placeholder) directories are skipped and reported, wherever the walk meets one, and nothing is written through one.
 - **New items need a refresh.** Something created later directly in the profile directory, or in another directory whose children are granted one by one, is not readable until `grantWindowsProfileRead()` (or `windows-install`) runs again. Items created inside a directory that was granted whole are readable at once.
-- **It is not per session.** Once granted, any sandboxed session on the machine that runs as the sandbox account can read your profile, whatever its own configuration says, until the grant is removed.
+- **It is not per session, and not per user.** Once granted, any sandboxed session on the machine can read your profile, whatever its own configuration says, until the grant is removed — see [Shared machines](#shared-machines).
 
 **The token opt-out turns it off.** The grant exists only with the write-restricted child token, the default. With `windows.writeRestrictedToken: false`, `initialize()` removes a recorded grant before it grants anything (and rejects with `profile_forget_failed` if it cannot); sandboxed commands then read nothing in your profile beyond `filesystem.allowRead`, and nothing runs under the ordinary token while a grant is still recorded.
 
@@ -891,15 +892,31 @@ There are two kinds.
 
 The list covers known stores. `AppData` holds the data of every application you run, and an application this list does not know is readable until you exclude its directory.
 
+#### Shared machines
+
+The sandbox account and the sandbox group exist once per machine, not once per user. The read grant on your profile is a grant to that group. So once ANY user's profile is granted, sandboxed commands started by ANY local user who can use the sandbox can read that profile (minus the exclusions) — not only commands you start. A person at another account on the same computer can read your documents, source trees and the configuration files listed above by running a sandboxed command.
+
+On a computer that more than one person has an account on, do not apply the grant: install with `--skip-profile-grant` (`skipProfileGrant: true`), or run `srt-win profile forget` if it is already there. The sandbox works without it.
+
+The same holds for the write grants kept on project roots (see [The child token and kept write grants](#the-child-token-and-kept-write-grants)): another user's sandboxed session can read a kept root, though not write it.
+
 #### Restricting it
 
 - **For a session:** `filesystem.denyRead` and `credentials.files` entries (`mode: "mask"` included — on Windows a masked file is unreadable) apply on top of the grant. They are stamped for the session on every granted path they cover and released when it ends. `denyRead: ['~']` makes the whole profile unreadable for that session; the next session without it reads again.
 - **For every session — persistent exclusions:** pass paths inside the profile (absolute, or relative to it) as `profileExclude` to the install, as `exclude` to `grantWindowsProfileRead()`, or as `srt-win profile grant --exclude <path>` (repeatable): for example the embedding program's own configuration directory. They are recorded with the grant and stay excluded on later runs that do not name them; `replaceExclusions: true` (`--replace-excludes`) makes the given list the whole added list. Nothing removes a built-in exclusion. `windowsProfileReadExclusions(config, profileDir)` collects a configuration's `credentials.files` and `filesystem.denyRead` paths inside the profile for this purpose.
-- **`filesystem.allowRead` cannot reach an exclusion.** `initialize()` rejects with `profile_exclusion_read_grant`, before granting anything, when an `allowRead` path is a protected path, lies inside one, or lies above one, or is the temporary directory or lies above it — compared with the exclusions recorded with the grant (built-in and added), after resolving links, junctions, short names and case. Above counts because a session grant inherits: an excluded store created again beneath it would be readable. An embedding program that means to open a store to its sessions passes the path to `initialize()` itself — `SandboxManager.initialize(config, askCallback, false, { dangerouslyAllowReadOfProfileExclusions: [path] })`; this is not a configuration key. It admits an `allowRead` path that is an excluded path or lies inside one. It never admits a path above an exclusion.
+- **A session cannot grant its way to an exclusion.** `initialize()` rejects with `profile_exclusion_read_grant`, before granting anything, when a path the session would grant reaches an excluded one — compared with the exclusions recorded with the grant (built-in and added), after resolving links, junctions, short names and case; `srt-win acl grant` makes the same check itself:
+
+  | The path is … | a protected path | the temporary directory |
+  | --- | --- | --- |
+  | the excluded path itself | refused | refused |
+  | inside it | refused | allowed |
+  | above it | refused | refused |
+
+  This holds for `filesystem.allowRead` and for write roots (`allowWrite`, and so the working directory) alike: a write root grants read too, and its grant is kept between sessions. Above counts because a grant inherits: an excluded store created again beneath it would carry the grant. So a session cannot use your profile directory, `AppData`, or another directory that contains an excluded path as its working directory — choose a narrower one, such as the project's own directory. An embedding program that means to open a protected store to its sessions for READING passes the path to `initialize()` itself — `SandboxManager.initialize(config, askCallback, false, { dangerouslyAllowReadOfProfileExclusions: [path] })`; this is not a configuration key. It admits an `allowRead` path that is a protected path or lies inside one. It never admits a write root, or any path above an exclusion. When no grant is recorded none of this applies: nothing in the profile is readable by default then.
 
 #### Removing it
 
-`forgetWindowsProfileRead({ srtWin })` or `srt-win profile forget` takes the sandbox group's entry off every recorded path, leaving each access list as it was, and removes the empty directories the grant created. `windows-uninstall` does the same, and so does `initialize()` under `windows.writeRestrictedToken: false`. `srt-win profile status` shows what is recorded. After a removal, default sessions do not start until the grant is applied again.
+`forgetWindowsProfileRead({ srtWin })` or `srt-win profile forget` takes the sandbox group's entry off every recorded path, leaving each access list as it was, and removes the empty directories the grant created. `windows-uninstall` does the same, and so does `initialize()` under `windows.writeRestrictedToken: false`. `srt-win profile status` shows what is recorded. After a removal sessions keep running; they no longer read the profile.
 
 ### TLS termination on Windows
 
