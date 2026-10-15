@@ -88,6 +88,10 @@ import {
   windowsSetupVersionMismatch,
   windowsWriteRestrictedTokenEnabled,
   forgetWindowsPersistentGrants,
+  forgetWindowsProfileRead,
+  getWindowsProfileReadStatus,
+  windowsProfileExclusionsMissing,
+  windowsProfileGrantDenyTargets,
   revokeWindowsAclChecked,
   windowsAclIncompleteRevoke,
   type WindowsAclRevokeResult,
@@ -100,6 +104,7 @@ import {
   type SrtWinSpawn,
   type WindowsBinShell,
   type WindowsFsAccessSet,
+  type WindowsProfileGrantPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
@@ -226,6 +231,11 @@ const windowsWfpVerified = { defaultToken: false }
 // it is the option's default, so a wrap made there never gets the
 // ordinary token.
 let windowsWriteRestrictedToken = true
+// Windows, `windows.profileRead`: the paths the profile read grant wrote
+// on, as recorded when initialize() checked it. A read deny has to be
+// stamped on each of these it covers (windowsProfileGrantDenyTargets);
+// `undefined` when the option is off.
+let windowsProfileGrantPaths: readonly WindowsProfileGrantPath[] | undefined
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1114,6 +1124,56 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
+    // The profile read grant. It is written by the embedder's explicit
+    // grantWindowsProfileRead(), never here: with the option on this
+    // only checks that a current grant is recorded, and with it off a
+    // grant that is found is removed before anything else is granted.
+    const profileRead = runtimeConfig.windows?.profileRead === true
+    windowsProfileGrantPaths = undefined
+    try {
+      if (!profileRead) {
+        if (u.profileGrant) forgetWindowsProfileRead({ srtWin })
+      } else {
+        if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
+          throw new WindowsSandboxError(
+            'profile_read_needs_write_restricted_token',
+            `windows.profileRead cannot be combined with ` +
+              `windows.writeRestrictedToken: false: the grant is kept on ` +
+              `disk, and nothing runs under the ordinary token while it ` +
+              `exists.`,
+          )
+        }
+        const grant = getWindowsProfileReadStatus({ paths: true, srtWin })
+        if (grant.state === 'none') {
+          throw new WindowsSandboxError(
+            'profile_grant_missing',
+            `windows.profileRead is set and no profile read grant is ` +
+              `recorded. Run grantWindowsProfileRead() (\`srt-win profile ` +
+              `grant\`) once, as this user, before starting a session.`,
+          )
+        }
+        const missing = windowsProfileExclusionsMissing(
+          grant,
+          runtimeConfig.windows?.profileReadExclude ?? [],
+        )
+        if (grant.state !== 'current' || missing.length > 0) {
+          throw new WindowsSandboxError(
+            'profile_grant_outdated',
+            `windows.profileRead is set and the recorded profile read ` +
+              `grant cannot be used (` +
+              (grant.state !== 'current'
+                ? `${grant.state}${grant.reason ? `: ${grant.reason}` : ''}`
+                : `made without the exclusion(s) ${missing.join(', ')}`) +
+              `). Run grantWindowsProfileRead() (\`srt-win profile grant\`) ` +
+              `again.`,
+          )
+        }
+        windowsProfileGrantPaths = grant.paths ?? []
+      }
+    } catch (e) {
+      config = undefined
+      throw e
+    }
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
     // so this is the non-elevated readiness check. Fails closed: a
@@ -1224,6 +1284,19 @@ async function initializeSteps(
         // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
+      // A read deny on or above a path the profile read grant made
+      // readable is stamped on that path too, for the session: the
+      // path's own ALLOW would otherwise be met first. These ride the
+      // session's deny list, so reset() releases them with it, and a
+      // failure to stamp one fails initialize() below.
+      if (windowsProfileGrantPaths) {
+        acc.denyRead.push(
+          ...windowsProfileGrantDenyTargets(
+            acc.denyRead,
+            windowsProfileGrantPaths,
+          ),
+        )
+      }
       // The trust bundle the CA-trust env vars point at
       // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
       // srt-sandbox child. It's written into the broker's %TEMP%,
@@ -2683,7 +2756,18 @@ async function wrapWithSandboxArgv(
         ],
         held: windowsFsStampedSet,
       })
-      perExecDenyRead = ranked.denyRead.filter(p => !sessRead.has(p))
+      // As at initialize(): a deny on or above a path of the profile
+      // read grant goes on that path too, for this command.
+      const denyRead = windowsProfileGrantPaths
+        ? [
+            ...ranked.denyRead,
+            ...windowsProfileGrantDenyTargets(
+              ranked.denyRead,
+              windowsProfileGrantPaths,
+            ),
+          ]
+        : ranked.denyRead
+      perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
@@ -2994,6 +3078,7 @@ async function reset(): Promise<void> {
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
+  windowsProfileGrantPaths = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the

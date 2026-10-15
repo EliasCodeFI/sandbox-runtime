@@ -2359,4 +2359,71 @@ describe('Config Validation', () => {
       }
     })
   })
+
+  describe('windows.profileRead', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('is off unless set to true', () => {
+      for (const windows of [undefined, {}, { profileRead: false }]) {
+        const r = parse(windows)
+        expect(r.success).toBe(true)
+        expect(r.success && r.data.windows?.profileRead === true).toBe(false)
+      }
+      const on = parse({ profileRead: true })
+      expect(on.success && on.data.windows?.profileRead).toBe(true)
+    })
+
+    test('rejects a value that is not a boolean', () => {
+      for (const bad of ['true', 1, 'on', null, {}]) {
+        expect(parse({ profileRead: bad }).success).toBe(false)
+      }
+    })
+
+    test('cannot be combined with the ordinary token', () => {
+      const r = parse({ profileRead: true, writeRestrictedToken: false })
+      expect(r.success).toBe(false)
+      expect(!r.success && r.error.issues.map(i => i.path.join('.'))).toEqual([
+        'windows.profileRead',
+      ])
+      // Each of the two alone is accepted, and so is the default token
+      // spelled out.
+      expect(parse({ writeRestrictedToken: false }).success).toBe(true)
+      expect(
+        parse({ profileRead: false, writeRestrictedToken: false }).success,
+      ).toBe(true)
+      expect(
+        parse({ profileRead: true, writeRestrictedToken: true }).success,
+      ).toBe(true)
+    })
+
+    test('profileReadExclude adds paths; there is nothing that lists paths to re-admit', () => {
+      const r = parse({
+        profileRead: true,
+        profileReadExclude: [
+          '.myapp',
+          'C:\\Users\\me\\AppData\\Roaming\\MyApp',
+        ],
+      })
+      expect(r.success && r.data.windows?.profileReadExclude).toEqual([
+        '.myapp',
+        'C:\\Users\\me\\AppData\\Roaming\\MyApp',
+      ])
+      for (const bad of ['.myapp', [''], [1], null]) {
+        expect(parse({ profileReadExclude: bad }).success).toBe(false)
+      }
+      const shape = Object.keys(
+        SandboxRuntimeConfigSchema.safeParse({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+          windows: { profileRead: true, profileReadInclude: ['.ssh'] },
+        }).data?.windows ?? {},
+      )
+      expect(shape).not.toContain('profileReadInclude')
+    })
+  })
 })
