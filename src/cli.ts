@@ -215,8 +215,9 @@ async function main(): Promise<void> {
     )
     .option(
       '--skip-profile-grant',
-      'install the account and the filters only; sessions do not start ' +
-        'until the profile read grant is applied',
+      'install the account and the filters only; sandboxed commands ' +
+        'then read nothing in your profile (use this on a computer other ' +
+        'people have accounts on)',
     )
     .action(
       async (o: Record<string, string | boolean | string[] | undefined>) => {
@@ -237,6 +238,9 @@ async function main(): Promise<void> {
             force: Boolean(o.force),
             skipProfileGrant: Boolean(o.skipProfileGrant),
             profileExclude: o.profileExclude as string[],
+            // One line on what is about to become readable, and how to
+            // skip or undo it, before the grant is applied.
+            onProfileGrantStart: notice => console.error(notice),
             onProfileGrantProgress: line => console.error(line),
             // Our own CLI opts into the packaged exe explicitly —
             // there is no ambient vendor fallback.

@@ -88,6 +88,8 @@ export {
   windowsProfileReadExclusions,
   windowsProfileReadEnv,
   windowsProfileExclusionConflicts,
+  windowsProfileGrantSkipReason,
+  windowsProfileGrantNotice,
   WINDOWS_PROFILE_READ_ENV_VARS,
   expandWindowsFsPaths,
   buildGitConfigEnv,

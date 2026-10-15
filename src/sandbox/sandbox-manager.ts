@@ -237,6 +237,12 @@ let windowsWriteRestrictedToken = true
 // (windowsProfileGrantDenyTargets); `undefined` under the ordinary
 // token, where there is no such grant.
 let windowsProfileGrantPaths: readonly WindowsProfileGrantPath[] | undefined
+// Windows: whether this session's commands read the user's profile
+// through the profile read grant. 'absent': no grant is recorded (it
+// was skipped at install, or forgotten) or the session runs under the
+// ordinary token — the sandbox works, the profile is not readable.
+// `undefined` outside a Windows session.
+let windowsProfileRead: 'granted' | 'absent' | undefined
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1150,45 +1156,56 @@ async function initializeSteps(
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
     // The read grant on the user's profile. It belongs to the
-    // write-restricted token (the default): the install applies it,
-    // grantWindowsProfileRead() refreshes it, and this only checks,
-    // cheaply, that a current one is recorded — it never writes or
-    // refreshes it. Under the ordinary token there is none: one that is
-    // found is removed before anything else is granted.
+    // write-restricted token (the default). The install applies it,
+    // grantWindowsProfileRead() refreshes it; this never writes or
+    // refreshes it. Whether one is recorded is the switch:
+    //  - none recorded (skipped at install, or forgotten): the session
+    //    runs as it would without the feature, and nothing in the
+    //    profile is readable;
+    //  - recorded and current: the session runs on it;
+    //  - recorded and not current (a run that did not finish, an older
+    //    exclusion list, a record that cannot be read or lacks its
+    //    lists): rejected — its allows are on disk, and what it must
+    //    keep excluded cannot be relied on.
+    // Under the ordinary token there is no grant: one that is found is
+    // removed before anything else is granted.
     windowsProfileGrantPaths = undefined
+    windowsProfileRead = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
     >[1] = { exclusions: [], ungrantedOnly: [] }
     try {
       if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
         if (u.profileGrant) forgetWindowsProfileRead({ srtWin })
-      } else {
+      } else if (u.profileGrant) {
         const grant = getWindowsProfileReadStatus({ paths: true, srtWin })
-        const remedy =
-          `Run \`npx sandbox-runtime windows-install\` again (or ` +
-          `installWindowsSandbox()), or call grantWindowsProfileRead() ` +
-          `(\`srt-win profile grant\`), as the user who starts sessions. ` +
-          `initialize() does not apply the grant itself.`
-        if (grant.state === 'none') {
-          throw new WindowsSandboxError(
-            'profile_grant_missing',
-            `No read grant on your user profile is recorded: the Windows ` +
-              `sandbox was installed without it, or by another user. ` +
-              remedy,
-          )
-        }
-        if (grant.state !== 'current') {
+        if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
             `The recorded read grant on your user profile cannot be used ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''}). ` +
-              remedy,
+              `Call grantWindowsProfileRead() (\`srt-win profile grant\`, ` +
+              `or \`npx sandbox-runtime windows-install\` again) as the ` +
+              `user who starts sessions to bring it up to date, or ` +
+              `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
+              `run without reading the profile. initialize() does neither ` +
+              `itself.`,
           )
         }
-        windowsProfileGrantPaths = grant.paths ?? []
-        profileExclusions = grant
+        if (grant.state === 'current') {
+          windowsProfileGrantPaths = grant.paths ?? []
+          profileExclusions = grant
+          windowsProfileRead = 'granted'
+        }
+      }
+      if (windowsProfileRead === 'absent') {
+        logForDebugging(
+          `[Sandbox Windows] no profile read grant: the user profile is ` +
+            `not readable to sandboxed commands in this session`,
+        )
       }
     } catch (e) {
+      windowsProfileRead = undefined
       config = undefined
       throw e
     }
@@ -1302,49 +1319,68 @@ async function initializeSteps(
         // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
-      // An allowRead path must not reach a path the profile read grant
-      // protects: not be one, not lie inside one, and not lie above one
-      // (a grant above it inherits, so a store created again beneath
-      // would be readable). Nor may it be, or lie above, a directory
-      // the grant leaves ungranted as a whole (the temporary
-      // directory); a path INSIDE such a directory is fine, which is
-      // where a session's own directories usually are. Checked on what
-      // each path resolves to, and before anything is granted. The
-      // embedder's explicit override admits a path that is a protected
-      // path or lies inside one — that reads the store on purpose, for
-      // this session — and never a path above an exclusion.
+      // No path the session grants, in any form, may reach what the
+      // profile read grant excludes. Checked on what each path resolves
+      // to, over everything initialize() hands to srt-win — the read
+      // grants, the write roots (a write root grants read too, and its
+      // grant is kept), and the library's own trust-bundle directory —
+      // before anything is granted. srt-win makes the same check on
+      // its side.
       //
-      // Only the configuration's allowRead is checked. The library's
-      // own read grant, the trust-bundle directory added below, is a
-      // fresh directory of its own in the temporary directory: inside
-      // an ungranted-only directory, so it would pass as well.
-      const refused = windowsProfileExclusionConflicts(
-        acc.grantRead,
-        profileExclusions,
-        options?.dangerouslyAllowReadOfProfileExclusions,
-      )
+      //                 protected path        ungranted-only directory
+      //   the path      refused (*)           refused
+      //   inside it     refused (*)           allowed
+      //   above it      refused               refused
+      //
+      // (*) A READ path only: the embedder's explicit override admits
+      // it — the store is then read on purpose, for this session. A
+      // write root is never admitted. Nothing above an exclusion is: a
+      // grant there inherits, so a store created again beneath it
+      // would carry it, and for a write root that grant is kept
+      // between sessions.
+      //
+      // With no grant recorded the lists are empty and nothing is
+      // checked: nothing in the profile is readable by default then.
+      const ownRead = mitmCA ? [dirname(mitmCA.trustBundlePath)] : []
+      const override = options?.dangerouslyAllowReadOfProfileExclusions ?? []
+      const refused = [
+        ...windowsProfileExclusionConflicts(acc.grantRead, profileExclusions, {
+          override,
+        }),
+        ...windowsProfileExclusionConflicts(ownRead, profileExclusions),
+        ...windowsProfileExclusionConflicts(acc.grantWrite, profileExclusions, {
+          write: true,
+        }),
+      ]
       if (refused.length > 0) {
+        const describe = (c: (typeof refused)[number]): string => {
+          const list = c.access === 'write' ? 'allowWrite' : 'allowRead'
+          const what =
+            c.kind === 'ungranted-only'
+              ? (c.relation === 'equal' ? `is` : `contains`) +
+                ` ${c.exclusion}, which is not granted as a whole (grant ` +
+                `a directory inside it instead)`
+              : c.relation === 'equal'
+                ? `is the excluded ${c.exclusion}`
+                : c.relation === 'inside'
+                  ? `lies inside the excluded ${c.exclusion}`
+                  : `contains the excluded ${c.exclusion}`
+          return (
+            `${list} ${c.path} ${what}` +
+            (c.access === 'write' && c.relation === 'above'
+              ? `: a write grant on it is kept and inherited, so that ` +
+                `path would be writable and readable if it is ever ` +
+                `created again — choose a narrower working directory`
+              : '')
+          )
+        }
         throw new WindowsSandboxError(
           'profile_exclusion_read_grant',
-          `filesystem.allowRead reaches a path that is excluded from ` +
+          `The session would grant a path that reaches one excluded from ` +
             `reads of your user profile: ` +
-            refused
-              .map(
-                c =>
-                  `${c.path} ` +
-                  (c.kind === 'ungranted-only'
-                    ? (c.relation === 'equal' ? `is` : `contains`) +
-                      ` ${c.exclusion}, which is not granted as a whole ` +
-                      `(grant a directory inside it instead)`
-                    : c.relation === 'equal'
-                      ? `is the excluded ${c.exclusion}`
-                      : c.relation === 'inside'
-                        ? `lies inside the excluded ${c.exclusion}`
-                        : `contains the excluded ${c.exclusion}`),
-              )
-              .join('; ') +
+            refused.map(describe).join('; ') +
             `. Nothing was granted. Remove the entry, or name a path that ` +
-            `does not contain an excluded one.`,
+            `neither is nor contains an excluded one.`,
         )
       }
       // A read deny on or above a path the profile read grant made
@@ -1406,6 +1442,7 @@ async function initializeSteps(
             write: acc.grantWrite,
             denyRead: acc.denyRead,
             denyWrite: acc.denyWrite,
+            allowProfileExclusions: override,
             srtWin,
           })
         }
@@ -1469,6 +1506,7 @@ async function initializeSteps(
         }
       }
       windowsFsSbUserSid = undefined
+      windowsProfileRead = undefined
       config = undefined
       throw e
     }
@@ -3142,6 +3180,7 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
   windowsProfileGrantPaths = undefined
+  windowsProfileRead = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
@@ -3448,6 +3487,14 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
+  /**
+   * Windows: whether the commands of the current session read the
+   * user's profile through the profile read grant. `'absent'` when no
+   * grant is recorded (skipped at install, or forgotten) or the
+   * session runs under the ordinary token: the sandbox works, the
+   * profile is not readable. `undefined` outside a Windows session.
+   */
+  getWindowsProfileRead(): 'granted' | 'absent' | undefined
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -3492,6 +3539,7 @@ export const SandboxManager: ISandboxManager = {
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,
+  getWindowsProfileRead: () => windowsProfileRead,
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,

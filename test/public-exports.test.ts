@@ -68,6 +68,8 @@ const PUBLIC_VALUE_EXPORTS = [
   'verifyWindowsWfpEgress',
   'windowsInstallInstructions',
   'windowsProfileExclusionConflicts',
+  'windowsProfileGrantNotice',
+  'windowsProfileGrantSkipReason',
   'windowsProfileReadEnv',
   'windowsProfileReadExclusions',
   'windowsStateDir',
