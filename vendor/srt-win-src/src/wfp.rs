@@ -59,6 +59,47 @@
 //! The probe makes each of these connects with the socket created
 //! after the token is assumed as well as before; see [`crate::probe`].
 //!
+//! ## Negative mode (`srt-win install --fence-mode negative`)
+//!
+//! The set above matches the sandbox account POSITIVELY: its BLOCK
+//! applies to a token an ALLOW ACE for the account's SID grants. The
+//! engine attributes a connect to the token in effect when the socket
+//! was created, and a sandboxed process can derive tokens from its own
+//! that no such ACE grants — a copy whose user SID is deny-only, a
+//! copy whose restricting SIDs leave the account's SID out — and
+//! create its socket while impersonating one.
+//!
+//! [`FenceMode::Negative`] installs a different set under the same
+//! sublayer and layers, which names who may connect instead of who may
+//! not:
+//!
+//!   - **PERMIT loopback** (weight [`W_LOOPBACK`]) — as above.
+//!   - **PERMIT other principals** (weight [`W_PERMIT_PRINCIPALS`]) —
+//!     `ALE_USER_ID` SD = [`sddl_negative`]: DENY the sandbox account,
+//!     DENY `ANONYMOUS LOGON`, ALLOW everyone else. A DENY ACE applies
+//!     to a SID the token carries enabled OR deny-only, so every token
+//!     derived from the sandbox account fails this check.
+//!   - **BLOCK the rest** (weight [`W_BLOCK_REST`]) — no conditions.
+//!
+//! Within the sublayer a connect is therefore permitted iff it goes
+//! to the loopback proxy range or its token passes the descriptor;
+//! everything else is blocked, including the two residuals above.
+//! The sandbox-user and anonymous BLOCK filters are not installed in
+//! this mode.
+//!
+//! The cost is that the set is no longer inert for other principals:
+//! a token of ANY account that fails the descriptor loses its
+//! outbound connects. [`sddl_negative`] lists the shapes that do, and
+//! `srt-win install` proves, before it reports success, that the
+//! installing user's own token still connects — and removes the set
+//! if it does not ([`crate::probe::confirm_still_permitted`]).
+//!
+//! The mode is chosen at install time, defaults to
+//! [`FenceMode::Positive`], and is recorded next to the fence revision
+//! ([`crate::install::read_fence_mode`]). `wfp verify` reads it there
+//! and, in negative mode, requires the two residual attempts to be
+//! blocked like every other.
+//!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
 //! connecting token: the filter *matches* iff the check grants
@@ -70,7 +111,8 @@
 //!
 //! Filters carry a small JSON tag in `providerData` (`{tool, kind,
 //! port_range?, user_sid, rev}`) so install/uninstall/status can
-//! locate them by enumeration. `rev` is [`FENCE_REVISION`]; a set
+//! locate them by enumeration. `kind` also tells the two modes apart
+//! ([`fence_mode_of`]). `rev` is [`FENCE_REVISION`]; a set
 //! written by an earlier build lacks it (or the anonymous BLOCK) and
 //! reads as `outdated`. BFE enumeration is admin-gated (see
 //! [`WfpAccessDenied`]) — `wfp status` returns `cannot-read` for a
@@ -341,7 +383,9 @@ pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// `permit-loopback-user` / `block-user` / `block-anonymous`.
+    /// `permit-loopback-user` in both modes; `block-user` and
+    /// `block-anonymous` in positive mode; `permit-principals` and
+    /// `block-rest` in negative mode.
     pub kind: String,
     /// `[low, high]` for `permit-loopback-user`; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,6 +430,15 @@ pub const FILTER_COUNT: usize = 6;
 /// Recorded twice: in every filter's tag (what an elevated `wfp
 /// status` reads) and in the install record (what the non-elevated
 /// broker reads — it cannot enumerate filters).
+///
+/// The negative-mode set ([`FenceMode::Negative`]) is written at this
+/// same revision. The revision exists to make a broker refuse a set
+/// that lacks filters it relies on; the default set is unchanged, and
+/// the negative set blocks everything the default one does and more,
+/// so no broker has to refuse either. Which of the two is installed
+/// is recorded separately ([`crate::install::read_fence_mode`]); a
+/// record that disagrees with the filters after an interrupted
+/// install errs toward the stricter verdict in `wfp verify`.
 pub const FENCE_REVISION: u32 = 2;
 
 /// What the install record holds in place of a revision once an
@@ -393,9 +446,66 @@ pub const FENCE_REVISION: u32 = 2;
 /// revision a filter set carries.
 pub const FENCE_REVISION_REMOVED: u32 = 0;
 
-/// Filter kinds that must be present, at [`FENCE_REVISION`], on each
-/// ALE connect layer for the fence to be current.
-const REQUIRED_BLOCK_KINDS: [&str; 2] = ["block-user", "block-anonymous"];
+/// Which filter set `srt-win install` writes. See the module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FenceMode {
+    /// BLOCK what an ALLOW ACE for the sandbox account's SID matches,
+    /// and the anonymous token off loopback. Inert for every other
+    /// principal. The default.
+    #[default]
+    Positive,
+    /// PERMIT what is not the sandbox account or the anonymous token,
+    /// BLOCK the rest.
+    Negative,
+}
+
+impl FenceMode {
+    /// The word used on the command line, in the install record and
+    /// in status output.
+    pub fn label(self) -> &'static str {
+        match self {
+            FenceMode::Positive => "positive",
+            FenceMode::Negative => "negative",
+        }
+    }
+
+    /// Parse a `--fence-mode` argument.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim() {
+            "positive" => Ok(FenceMode::Positive),
+            "negative" => Ok(FenceMode::Negative),
+            other => Err(anyhow!(
+                "invalid fence mode '{other}': expected 'positive' or 'negative'"
+            )),
+        }
+    }
+
+    /// The mode a recorded value stands for. No value is a record
+    /// written before the mode was kept, which is a positive set. A
+    /// value this build does not know reads as negative: `wfp verify`
+    /// then holds the fence to the stricter of the two verdicts.
+    pub fn from_record(value: Option<&str>) -> Self {
+        match value {
+            None | Some("positive") => FenceMode::Positive,
+            Some(_) => FenceMode::Negative,
+        }
+    }
+
+    /// Filter kinds that must be present, at [`FENCE_REVISION`], on
+    /// each ALE connect layer for a fence of this mode to be current.
+    fn required_kinds(self) -> [&'static str; 2] {
+        match self {
+            FenceMode::Positive => [KIND_BLOCK_USER, KIND_BLOCK_ANONYMOUS],
+            FenceMode::Negative => [KIND_PERMIT_PRINCIPALS, KIND_BLOCK_REST],
+        }
+    }
+}
+
+const KIND_PERMIT_LOOPBACK: &str = "permit-loopback-user";
+const KIND_BLOCK_USER: &str = "block-user";
+const KIND_BLOCK_ANONYMOUS: &str = "block-anonymous";
+const KIND_PERMIT_PRINCIPALS: &str = "permit-principals";
+const KIND_BLOCK_REST: &str = "block-rest";
 
 /// Name of the residual `srt-win wfp verify` reports when a connect
 /// made under a copy of the sandbox token whose user SID is deny-only
@@ -411,6 +521,11 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 // source of truth.
 pub(crate) const W_LOOPBACK: u64 = 0x0F80_0000_0000_0000;
 pub(crate) const W_BLOCK: u64 = 0x0F40_0000_0000_0000;
+// Negative mode. The principals PERMIT sits below the loopback PERMIT
+// (which needs no token to pass) and above the unconditional BLOCK,
+// which must be the last filter of the sublayer to be reached.
+pub(crate) const W_PERMIT_PRINCIPALS: u64 = 0x0F40_0000_0000_0000;
+pub(crate) const W_BLOCK_REST: u64 = 0x0F00_0000_0000_0000;
 
 // ────────────────────── filter enumeration ──────────────────────
 
@@ -671,6 +786,99 @@ pub fn sddl_anonymous() -> String {
     "O:LSG:LSD:(A;;CC;;;S-1-5-7)".to_string()
 }
 
+/// SDDL for the negative-mode PERMIT filter: the tokens that may
+/// connect. A token that FAILS this descriptor reaches the
+/// unconditional BLOCK below it.
+///
+/// ```text
+/// (D;;CC;;;<sandbox SID>)  DENY  the sandbox account
+/// (D;;CC;;;S-1-5-7)        DENY  ANONYMOUS LOGON
+/// (A;;CC;;;S-1-1-0)        ALLOW Everyone
+/// (A;;CC;;;S-1-5-12)       ALLOW RESTRICTED
+/// (A;;CC;;;S-1-15-2-1)     ALLOW ALL APPLICATION PACKAGES
+/// (A;;CC;;;S-1-15-2-2)     ALLOW ALL RESTRICTED APPLICATION PACKAGES
+/// ```
+///
+/// **The two DENY ACEs are the fence.** They come first, so they are
+/// read before any ALLOW. A DENY ACE applies to a SID the token
+/// carries enabled or deny-only — deny-only means exactly "use this
+/// SID for DENY ACEs only" — and a token's user SID can be made
+/// deny-only but never removed. So every token derived from the
+/// sandbox account fails here, whatever was done to it: user SID
+/// deny-only, every group deny-only, restricting SIDs narrowed to a
+/// list of the process's choosing (the denial is decided in the pass
+/// over the token's ordinary SIDs, before the restricting list is
+/// looked at), integrity lowered, wrapped in an AppContainer. The
+/// one identity a sandboxed process can assume that does not carry
+/// its SID is the anonymous token, which the second ACE names.
+///
+/// On a default machine the anonymous token does not carry Everyone
+/// (the "let Everyone permissions apply to anonymous users" policy is
+/// off), so it would fail the ALLOW list anyway. The explicit DENY is
+/// kept because that policy can be switched on, and because the ALLOW
+/// list below is meant to be generous: nothing added to it may ever
+/// admit the anonymous token.
+///
+/// **The ALLOW ACEs decide who else keeps the network.** Nothing in
+/// them weakens the fence — a sandbox-derived or anonymous token is
+/// refused before they are read — so the list errs toward admitting:
+///
+///   - *Everyone* is in every ordinary token: interactive users
+///     (elevated or not), SYSTEM, LOCAL SERVICE, NETWORK SERVICE, and
+///     services running under a per-service SID.
+///   - A **restricted** token must be granted twice: once through its
+///     ordinary SIDs and once through its restricting SIDs. Windows
+///     services with a restricted service SID carry `[service SID,
+///     Everyone, logon SID, WRITE RESTRICTED]`; restricted tokens made
+///     by programs commonly carry Everyone, RESTRICTED, or both.
+///     Everyone covers the first kind in both passes; the *RESTRICTED*
+///     ACE covers a list that has RESTRICTED without Everyone.
+///   - An **AppContainer** token must also be granted through its
+///     package and capability SIDs. *ALL APPLICATION PACKAGES* covers
+///     an ordinary AppContainer; a less-privileged AppContainer is
+///     matched by *ALL RESTRICTED APPLICATION PACKAGES* only.
+///
+/// **Tokens of other accounts this descriptor does NOT admit**, which
+/// therefore lose every connect outside the loopback proxy range
+/// while the negative set is installed:
+///
+///   - A restricted token whose restricting list holds none of
+///     Everyone and RESTRICTED — for example only the user's own SID,
+///     only the logon SID, or only the null SID. A user's own SID and
+///     a logon SID differ per account and per logon, so they cannot be
+///     listed here; nothing can be done for such a token short of
+///     naming it.
+///   - A token in which Everyone is deny-only and no other listed SID
+///     is enabled — the most locked-down tokens a process sandbox
+///     builds (every group deny-only, at most the logon SID left
+///     enabled). Processes given such a token usually have no network
+///     use of their own; one that does is cut off.
+///   - The anonymous token, for every process on the machine. In
+///     positive mode a connect made while impersonating anonymous is
+///     blocked off loopback only; here it is blocked to loopback too
+///     (outside the proxy range).
+///   - A token whose integrity level is below medium, IF the engine's
+///     access check applies the mandatory integrity rule to the match
+///     right. The descriptor carries no label — the engine refuses a
+///     labelled descriptor in a filter condition — and an unlabelled
+///     one is treated as medium. That would cut off every
+///     low-integrity and AppContainer process. In positive mode the
+///     engine matches lowered-integrity copies of the sandbox token
+///     against the equally unlabelled sandbox-user descriptor, which
+///     says it does not apply that rule; `srt-win install` checks a
+///     low-integrity copy of the installer's token before it keeps
+///     this set, and the CI smoke starts a low-integrity child.
+///
+/// Like [`sddl_sandbox_user`], the descriptor carries `O:LSG:LS`: an
+/// owner's implicit rights are `READ_CONTROL` and `WRITE_DAC`, never
+/// the match right, so the owner admits no one.
+pub fn sddl_negative(sandbox_sid: &str) -> String {
+    format!(
+        "O:LSG:LSD:(D;;CC;;;{sandbox_sid})(D;;CC;;;S-1-5-7)\
+         (A;;CC;;;S-1-1-0)(A;;CC;;;S-1-5-12)(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)"
+    )
+}
+
 // "Not loopback" for the anonymous BLOCK.
 //
 // The engine offers three ways to say it, and only one fits:
@@ -712,23 +920,29 @@ pub(crate) const fn non_loopback_v6_ranges() -> [([u8; 16], [u8; 16]); 2] {
     [(zero, zero), (two, [0xFF; 16])]
 }
 
-/// Install (or refresh) the filter set under
+/// Install (or refresh) the filter set of `mode` under
 /// `sublayer`. Three filters at each of the v4/v6 ALE-connect layers
 /// ([`FILTER_COUNT`] total) — see the module doc for the design.
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
-/// — including legacy discriminator-group-keyed filters from a
-/// pre-separate-user install — are deleted first, then a fresh set
-/// is added, all inside one WFP transaction.
+/// — of either mode, and including legacy discriminator-group-keyed
+/// filters from a pre-separate-user install — are deleted first, then
+/// a fresh set is added, all inside one WFP transaction. The engine
+/// therefore never holds half a set: in particular the negative
+/// mode's unconditional BLOCK is never in effect without the PERMIT
+/// filters above it.
 pub fn install_filters(
     sublayer: &GUID,
     sandbox_user_sid: &str,
     port_range: (u16, u16),
+    mode: FenceMode,
 ) -> Result<()> {
     debug_assert!(port_range.0 <= port_range.1);
     let sd_user = OwnedSd::from_sddl(&sddl_sandbox_user(sandbox_user_sid))
         .context("build sandbox-user SD")?;
     let sd_anon = OwnedSd::from_sddl(&sddl_anonymous()).context("build anonymous SD")?;
+    let sd_negative =
+        OwnedSd::from_sddl(&sddl_negative(sandbox_user_sid)).context("build negative-mode SD")?;
 
     with_wfp_txn(|engine| {
         // Sublayer (idempotent). Display name identifies the owning
@@ -775,11 +989,14 @@ pub fn install_filters(
             valueHigh: fwp_uint16(port_range.1),
         };
 
-        let mut tag_lb =
-            FilterTag::user("permit-loopback-user", sandbox_user_sid, Some(port_range))
-                .to_blob_bytes();
-        let mut tag_bk = FilterTag::user("block-user", sandbox_user_sid, None).to_blob_bytes();
-        let mut tag_an = FilterTag::user("block-anonymous", sandbox_user_sid, None).to_blob_bytes();
+        let tag = |kind: &str| FilterTag::user(kind, sandbox_user_sid, None).to_blob_bytes();
+        let mut tag_lb = FilterTag::user(KIND_PERMIT_LOOPBACK, sandbox_user_sid, Some(port_range))
+            .to_blob_bytes();
+        let mut tag_bk = tag(KIND_BLOCK_USER);
+        let mut tag_an = tag(KIND_BLOCK_ANONYMOUS);
+        let mut tag_pp = tag(KIND_PERMIT_PRINCIPALS);
+        let mut tag_br = tag(KIND_BLOCK_REST);
+        let mut sd_negative_blob = sd_byte_blob(&sd_negative);
 
         // Range endpoints for the anonymous BLOCK. The v6 endpoints
         // are passed by pointer, so they live here, outside the loop,
@@ -831,6 +1048,32 @@ pub fn install_filters(
                 &mut c_lb,
                 &mut tag_lb,
             )?;
+            if mode == FenceMode::Negative {
+                // PERMIT every token the negative descriptor grants.
+                let mut c_pp = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_negative_blob)];
+                add_filter(
+                    engine.h(),
+                    sublayer,
+                    layer,
+                    &format!("srt-win-{label}-permit-principals"),
+                    W_PERMIT_PRINCIPALS,
+                    FWP_ACTION_PERMIT,
+                    &mut c_pp,
+                    &mut tag_pp,
+                )?;
+                // BLOCK whatever reached here: no conditions.
+                add_filter(
+                    engine.h(),
+                    sublayer,
+                    layer,
+                    &format!("srt-win-{label}-block-rest"),
+                    W_BLOCK_REST,
+                    FWP_ACTION_BLOCK,
+                    &mut [],
+                    &mut tag_br,
+                )?;
+                continue;
+            }
             // BLOCK sandbox user.
             let mut c_bk = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
             add_filter(
@@ -907,6 +1150,12 @@ pub struct WfpStatus {
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
+    /// `positive` or `negative` ([`FenceMode::label`]): read off the
+    /// enumerated filters, or — for a caller that cannot enumerate —
+    /// off the install record ([`apply_recorded_mode`]). Absent when
+    /// neither says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence_mode: Option<&'static str>,
     /// Populated on `cannot-read` and on `outdated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -934,28 +1183,62 @@ pub fn outdated_hint(have: Option<u32>) -> String {
     )
 }
 
+/// Which mode an enumerated filter set was written in, read off the
+/// kind of its BLOCK: `block-user` is the positive set's, `block-rest`
+/// the negative set's. `None` when the set has neither (nothing is
+/// fenced) or both (a set no single install writes).
+pub(crate) fn fence_mode_of(tags: &[(&str, FilterTag)]) -> Option<FenceMode> {
+    let has = |kind: &str| tags.iter().any(|(_, t)| t.kind == kind);
+    match (has(KIND_BLOCK_USER), has(KIND_BLOCK_REST)) {
+        (true, false) => Some(FenceMode::Positive),
+        (false, true) => Some(FenceMode::Negative),
+        _ => None,
+    }
+}
+
 /// Classify an enumerated filter set, given `(layer, tag)` for every
 /// srt-win filter under the sublayer.
 ///
-///   - `absent` — no `block-user` filter at all.
-///   - `installed` — every [`REQUIRED_BLOCK_KINDS`] filter is present
-///     at [`FENCE_REVISION`] on BOTH ALE connect layers.
+///   - `absent` — no `block-user` and no `block-rest` filter at all.
+///   - `installed` — every filter the set's mode requires
+///     ([`fence_mode_of`]) is present at [`FENCE_REVISION`] on BOTH
+///     ALE connect layers.
 ///   - `outdated` — anything in between: a set written by an earlier
-///     build (no `rev`, no anonymous BLOCK), or one missing a layer.
+///     build (no `rev`, no anonymous BLOCK), one missing a layer, or
+///     one holding the BLOCK of both modes.
 ///
 /// Extra filters are ignored, so enterprise tooling that adds its own
 /// under the same sublayer does not break detection.
 pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
-    if !tags.iter().any(|(_, t)| t.kind == "block-user") {
-        return "absent";
-    }
+    let Some(mode) = fence_mode_of(tags) else {
+        let any_block = tags
+            .iter()
+            .any(|(_, t)| t.kind == KIND_BLOCK_USER || t.kind == KIND_BLOCK_REST);
+        return if any_block { "outdated" } else { "absent" };
+    };
     let current = ALE_LAYERS.iter().all(|(_, layer)| {
-        REQUIRED_BLOCK_KINDS.iter().all(|kind| {
+        mode.required_kinds().iter().all(|kind| {
             tags.iter()
                 .any(|(l, t)| l == layer && t.kind == *kind && t.rev == Some(FENCE_REVISION))
         })
     });
     if current { "installed" } else { "outdated" }
+}
+
+/// Fold the install record's fence mode into a status. A caller that
+/// enumerated the filters already has the mode from them; one that
+/// could not (`cannot-read`) takes it from the record, which is the
+/// only thing it can read. `cannot-read` survives
+/// [`apply_recorded_revision`] only when the record is current, so
+/// the mode is never reported for a fence the record says is gone.
+pub fn apply_recorded_mode(mut st: WfpStatus, record: Option<FenceMode>) -> WfpStatus {
+    if st.fence_mode.is_none()
+        && st.state == "cannot-read"
+        && let Some(mode) = record
+    {
+        st.fence_mode = Some(mode.label());
+    }
+    st
 }
 
 /// Fold the install record's fence revision into an enumerated
@@ -1007,7 +1290,7 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         if user_sid.is_none() {
             user_sid.clone_from(&tag.user_sid);
         }
-        if tag.kind == "permit-loopback-user" {
+        if tag.kind == KIND_PERMIT_LOOPBACK {
             port_range = tag.port_range;
         }
         tags.push((layer, tag.clone()));
@@ -1024,6 +1307,7 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         filters: tags.len(),
         port_range,
         user_sid,
+        fence_mode: fence_mode_of(&tags).map(FenceMode::label),
         hint: (state == "outdated").then(|| {
             // The oldest revision present is the one worth naming.
             outdated_hint(tags.iter().map(|(_, t)| t.rev).min().flatten())
@@ -1037,6 +1321,7 @@ fn cannot_read(e: anyhow::Error) -> WfpStatus {
         filters: 0,
         port_range: None,
         user_sid: None,
+        fence_mode: None,
         hint: Some(format!(
             "{e}; elevation required for filter enum — run `srt-win \
              wfp verify` for a behavioral check"
@@ -1235,8 +1520,97 @@ mod tests {
             filters: 0,
             port_range: None,
             user_sid: None,
+            fence_mode: None,
             hint: None,
         }
+    }
+
+    const NEGATIVE_KINDS: [&str; 3] = ["permit-loopback-user", "permit-principals", "block-rest"];
+
+    #[test]
+    fn classify_fence_negative_mode() {
+        let current = full_set(Some(FENCE_REVISION), &NEGATIVE_KINDS);
+        assert_eq!(current.len(), FILTER_COUNT);
+        assert_eq!(classify_fence(&current), "installed");
+        assert_eq!(fence_mode_of(&current), Some(FenceMode::Negative));
+        assert_eq!(
+            fence_mode_of(&full_set(Some(FENCE_REVISION), &ALL_KINDS)),
+            Some(FenceMode::Positive)
+        );
+        assert_eq!(fence_mode_of(&[]), None);
+        // The PERMIT without the BLOCK below it fences nothing.
+        assert_eq!(
+            classify_fence(&full_set(
+                Some(FENCE_REVISION),
+                &["permit-loopback-user", "permit-principals"]
+            )),
+            "absent"
+        );
+        // The BLOCK without the principals PERMIT on one layer.
+        let mut half = current.clone();
+        let v6 = ALE_LAYERS[1].1;
+        half.retain(|(l, t)| !(*l == v6 && t.kind == "permit-principals"));
+        assert_eq!(classify_fence(&half), "outdated");
+        // The BLOCK of both modes at once is no set an install writes.
+        let mut both = current;
+        both.extend(full_set(Some(FENCE_REVISION), &["block-user"]));
+        assert_eq!(fence_mode_of(&both), None);
+        assert_eq!(classify_fence(&both), "outdated");
+    }
+
+    #[test]
+    fn fence_mode_words() {
+        for m in [FenceMode::Positive, FenceMode::Negative] {
+            assert_eq!(FenceMode::parse(m.label()).unwrap(), m);
+            assert_eq!(FenceMode::from_record(Some(m.label())), m);
+        }
+        assert_eq!(FenceMode::default(), FenceMode::Positive);
+        assert!(FenceMode::parse("both").is_err());
+        assert!(FenceMode::parse("").is_err());
+        // No recorded value: an install from before the mode was kept.
+        assert_eq!(FenceMode::from_record(None), FenceMode::Positive);
+        // An unknown value takes the stricter verdict.
+        assert_eq!(FenceMode::from_record(Some("other")), FenceMode::Negative);
+    }
+
+    #[test]
+    fn recorded_mode_fills_in_only_what_was_not_enumerated() {
+        let neg = Some(FenceMode::Negative);
+        assert_eq!(
+            apply_recorded_mode(status("cannot-read"), neg).fence_mode,
+            Some("negative")
+        );
+        assert_eq!(
+            apply_recorded_mode(status("cannot-read"), None).fence_mode,
+            None
+        );
+        // A set that was enumerated keeps what its filters say.
+        let mut st = status("installed");
+        st.fence_mode = Some("positive");
+        assert_eq!(apply_recorded_mode(st, neg).fence_mode, Some("positive"));
+        // No fence, no mode.
+        for s in ["absent", "outdated"] {
+            assert_eq!(apply_recorded_mode(status(s), neg).fence_mode, None);
+        }
+    }
+
+    #[test]
+    fn negative_sddl_denies_before_it_allows() {
+        let sid = "S-1-5-21-1-2-3-1005";
+        let s = sddl_negative(sid);
+        assert_eq!(
+            s,
+            "O:LSG:LSD:(D;;CC;;;S-1-5-21-1-2-3-1005)(D;;CC;;;S-1-5-7)\
+             (A;;CC;;;S-1-1-0)(A;;CC;;;S-1-5-12)(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)"
+        );
+        // Both DENY ACEs precede every ALLOW ACE.
+        let first_allow = s.find("(A;").unwrap();
+        assert_eq!(s.matches("(D;").count(), 2);
+        assert!(s.rfind("(D;").unwrap() < first_allow);
+        // No mandatory label: the engine refuses one in a condition.
+        assert!(!s.contains("S:("));
+        let sd = OwnedSd::from_sddl(&s).expect("sddl");
+        assert!(sd.len > 0);
     }
 
     #[test]
@@ -1332,6 +1706,10 @@ mod tests {
     #[test]
     fn weight_invariant() {
         const { assert!(W_LOOPBACK > W_BLOCK) };
+        const { assert!(W_LOOPBACK > W_PERMIT_PRINCIPALS) };
+        const { assert!(W_PERMIT_PRINCIPALS > W_BLOCK_REST) };
+        // Manual weights: the top four bits stay clear.
+        const { assert!(W_LOOPBACK >> 60 == 0) };
     }
 
     #[test]

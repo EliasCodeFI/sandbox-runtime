@@ -54,6 +54,7 @@ function MustFail([string[]]$argv, [string]$why) {
 MustFail (@('install', '--proxy-port-range', '100-50') + $isl) 'low>high'
 MustFail (@('install', '--proxy-port-range', '1-1000') + $isl) 'range too wide'
 MustFail (@('install', '--proxy-port-range', '60080') + $isl) 'missing dash'
+MustFail (@('install', '--fence-mode', 'both') + $isl) 'unknown fence mode'
 
 # ── pre-install absent ───────────────────────────────────────────────
 # CI runners are elevated so BFE enum succeeds; a non-elevated caller
@@ -78,6 +79,11 @@ if ($iw.state -ne 'installed' -or $iw.filters -lt 6) {
 }
 if ($iw.port_range[0] -ne 60080 -or $iw.port_range[1] -ne 60089) {
   throw "install: expected port_range [60080,60089], got [$($iw.port_range -join ',')]"
+}
+# Without `--fence-mode` the set is the positive one. (The negative
+# one is exercised by smoke-exec.ps1's NEG rows.)
+if ($iw.fence_mode -ne 'positive') {
+  throw "install: expected fence_mode 'positive' by default, got '$($iw.fence_mode)'"
 }
 
 # ── sandbox user provisioned by install ────────────────────────────

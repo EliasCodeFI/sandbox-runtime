@@ -1401,7 +1401,10 @@ $st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($st0.state -ne 'installed' -or $st0.filters -lt 6) {
   throw "U0: fresh install expected installed/>=6 filters, got $($st0.state)/$($st0.filters)"
 }
-Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters"
+if ($st0.fence_mode -ne 'positive') {
+  throw "U0: an install without --fence-mode expected fence_mode=positive, got '$($st0.fence_mode)'"
+}
+Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters, fence_mode=$($st0.fence_mode)"
 Remove-ItemProperty $regBase -Name FenceRevision -ea Stop
 
 # U1: status (both forms) reports the fence as out of date, with the repair.
@@ -1448,6 +1451,385 @@ if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
 }
 Write-Host 'U4 ok: reinstall restores the fence; exec runs again'
 
+# ── NEG rows: the negative-mode filter set ───────────────────────
+# Everything above ran against the default (positive) filter set, which
+# BLOCKs what an allow entry for the sandbox account's SID matches.
+# `install --fence-mode negative` replaces it with a set that PERMITs
+# every token that is not the sandbox account or the anonymous token
+# and BLOCKs the rest (see `srt_win::wfp`). Two things are measured:
+#
+#   NEG:          from inside the sandbox, every token shape a child
+#                 can derive from its own must now be BLOCKED - the ones
+#                 the positive set leaves open (anonymous over loopback,
+#                 deny-only, deny-all, narrow) included. ASSERTED, for
+#                 both child token kinds.
+#   NEG control:  from OUTSIDE the sandbox, as the user running this
+#                 script, connects must still work. That set blocks
+#                 whatever its descriptor does not admit, on the whole
+#                 machine, so these rows are what shows it admits
+#                 ordinary tokens. Each is first run under the positive
+#                 set as a baseline; a control that worked then must
+#                 work now.
+#
+# No row here throws when it fails. Failures are collected, every row
+# still runs and prints, the positive set is reinstalled, and only then
+# does the script fail with the list.
+$negFail = [System.Collections.Generic.List[string]]::new()
+function Neg-Fail([string] $msg) {
+  Write-Host "NEG: FAIL $msg"
+  $negFail.Add($msg)
+}
+
+# One TCP connect from this (unsandboxed) process.
+function Try-Connect([string] $Ip, [int] $Port, [int] $TimeoutMs = 8000) {
+  $c = [System.Net.Sockets.TcpClient]::new(([System.Net.IPAddress]::Parse($Ip)).AddressFamily)
+  try {
+    if (-not $c.ConnectAsync($Ip, $Port).Wait($TimeoutMs)) { return 'TIMEOUT' }
+    return 'CONNECTED'
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    if ($e -is [System.Net.Sockets.SocketException]) { return "WSA:$($e.ErrorCode)" }
+    return "ERROR:$($e.GetType().Name)"
+  } finally {
+    $c.Dispose()
+  }
+}
+
+# Start a command line as a child of this process at LOW integrity: a
+# primary copy of this process's token with its mandatory level
+# lowered, handed to CreateProcessAsUser. Returns `EXIT:<code>`,
+# `TIMEOUT`, or `FAILED:<step>:<win32 error>`.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SrtLowIl {
+  [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+  [StructLayout(LayoutKind.Sequential)] struct TokenMandatoryLabel { public SidAndAttributes Label; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct StartupInfo {
+    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct ProcessInformation { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr h, uint code);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
+  [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TokenMandatoryLabel info, int len);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessAsUserW(IntPtr token, string app, StringBuilder cmdline, IntPtr procAttrs, IntPtr threadAttrs, bool inherit, uint flags, IntPtr env, string cwd, ref StartupInfo si, out ProcessInformation pi);
+  static string Fail(string step) { return "FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
+  public static string Run(string commandLine, int timeoutMs) {
+    IntPtr own = IntPtr.Zero, dup = IntPtr.Zero, psid = IntPtr.Zero;
+    ProcessInformation pi = new ProcessInformation();
+    try {
+      // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT
+      if (!OpenProcessToken(GetCurrentProcess(), 0x008B, out own)) return Fail("open");
+      // MAXIMUM_ALLOWED, SecurityImpersonation, TokenPrimary
+      if (!DuplicateTokenEx(own, 0x02000000, IntPtr.Zero, 2, 1, out dup)) return Fail("duplicate");
+      if (!ConvertStringSidToSidW("S-1-16-4096", out psid)) return Fail("sid");
+      TokenMandatoryLabel tml = new TokenMandatoryLabel();
+      tml.Label.Sid = psid;
+      tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
+      // 25 = TokenIntegrityLevel
+      if (!SetTokenInformation(dup, 25, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
+      StartupInfo si = new StartupInfo();
+      si.cb = Marshal.SizeOf(si);
+      // CREATE_NO_WINDOW
+      if (!CreateProcessAsUserW(dup, null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, null, ref si, out pi)) return Fail("create-process");
+      if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) { TerminateProcess(pi.hProcess, 1); return "TIMEOUT"; }
+      uint code;
+      if (!GetExitCodeProcess(pi.hProcess, out code)) return Fail("exit-code");
+      return "EXIT:" + code;
+    } finally {
+      if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+      if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+      if (psid != IntPtr.Zero) LocalFree(psid);
+      if (dup != IntPtr.Zero) CloseHandle(dup);
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+}
+'@
+
+# A connect to $Ip:$Port made by a Windows PowerShell child started at
+# low integrity. The child's exit code carries the answer: 0 connected,
+# a Winsock error code if the connect failed with one, 2 if the child
+# found itself NOT at low integrity (the row would then show nothing),
+# 1 for anything else.
+function Low-Integrity-Connect([string] $Ip, [int] $Port) {
+  $script = "if (-not ((whoami /groups) -match 'S-1-16-4096')) { exit 2 }; " +
+            "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('$Ip', $Port); exit 0 } " +
+            "catch { `$e = `$_.Exception; while (`$e.InnerException) { `$e = `$e.InnerException }; " +
+            "if (`$e -is [Net.Sockets.SocketException]) { exit `$e.ErrorCode }; exit 1 }"
+  $got = [SrtLowIl]::Run("`"$pwsh`" -NoProfile -NonInteractive -Command `"$script`"", 120000)
+  switch -Regex ($got) {
+    '^EXIT:0$' { return 'CONNECTED' }
+    '^EXIT:2$' { return 'NOT-LOW-INTEGRITY' }
+    '^EXIT:1$' { return 'CHILD-ERROR' }
+    '^EXIT:(\d+)$' { return "WSA:$($Matches[1])" }
+    default    { return $got }
+  }
+}
+
+# Every machine-side control, as an ordered name -> result table. Run
+# once under each filter set. $LoopPort/$LanPort have live listeners.
+function Neg-Controls([int] $LoopPort, [int] $LanPort) {
+  $c = [ordered]@{}
+  $c['out-of-range loopback connect (127.0.0.1)'] = Try-Connect '127.0.0.1' $LoopPort
+  $c['off-loopback connect (this machine''s own address)'] =
+    if ($lanIp) { Try-Connect $lanIp $LanPort } else { 'SKIPPED:no-off-loopback-address' }
+  # Name resolution, past the resolver cache: the query leaves this
+  # machine from the DNS client service, under a service account.
+  $addr = $null
+  try {
+    try { Clear-DnsClientCache -ea Stop } catch { Write-Host "NEG control: note: Clear-DnsClientCache: $_" }
+    $addrs = [System.Net.Dns]::GetHostAddresses('github.com') |
+      Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+    $addr = @($addrs)[0]
+    $c['name resolution (github.com)'] = if ($addr) { 'RESOLVED' } else { 'FAILED:no-address' }
+  } catch {
+    $c['name resolution (github.com)'] = "FAILED:$($_.Exception.GetType().Name)"
+  }
+  $c['off-machine connect (github.com:443)'] =
+    if ($addr) { Try-Connect $addr.ToString() 443 15000 } else { 'SKIPPED:not-resolved' }
+  $c['low-integrity child, out-of-range loopback'] = Low-Integrity-Connect '127.0.0.1' $LoopPort
+  $c['low-integrity child, off-loopback'] =
+    if ($lanIp) { Low-Integrity-Connect $lanIp $LanPort } else { 'SKIPPED:no-off-loopback-address' }
+  return $c
+}
+function Neg-Control-Ok([string] $r) { return $r -in 'CONNECTED','RESOLVED' }
+
+$negShapes = [ordered]@{
+  'anonymous'           = 'anonymous'
+  'deny-only'           = 'denyonly'
+  'deny-all'            = 'denyall'
+  'low-integrity'       = 'integrity:S-1-16-4096'
+  'untrusted-integrity' = 'integrity:S-1-16-0'
+  'narrow'              = 'narrow'
+  'narrow-wr'           = 'narrow-wr'
+}
+$negLoop = $null
+$negLan = $null
+$negIn = $null
+$negTmp = $null
+$negInstalled = $false
+try {
+  $negLoop = Bind-Listener (50010, 50011, 50012, 49995)
+  $negPort = $negLoop.LocalEndpoint.Port
+  $negLanPort = 0
+  if ($lanIp) {
+    $negLan = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($lanIp), 0)
+    $negLan.Start()
+    $negLanPort = $negLan.LocalEndpoint.Port
+  }
+  Write-Host "NEG: targets off-loopback=$(if ($lanIp) { "${lanIp}:$negLanPort" } else { 'none' }) loopback=127.0.0.1:$negPort"
+
+  # Baseline, under the positive set.
+  $base = Neg-Controls $negPort $negLanPort
+  foreach ($k in $base.Keys) { Write-Host "NEG control: baseline (positive mode): $k = $($base[$k])" }
+
+  # ── N0: install in negative mode ──
+  # install proves, before it exits 0, that its own token still
+  # connects past the new set; if not it removes the set and exits 12.
+  $negOut = & $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --fence-mode negative 2>&1 | Out-String
+  $negExit = $LASTEXITCODE
+  Write-Host "NEG: install --fence-mode negative exit=$negExit output:`n$negOut"
+  if ($negExit -ne 0) {
+    Neg-Fail "install --fence-mode negative exited $negExit (12 = the set refused the installer's own connect and was removed); no negative-mode row could run"
+  } else {
+    $negInstalled = $true
+    if ($negOut -notmatch 'permit check \[own token\].*CONNECTED') {
+      Neg-Fail 'install did not report its own-token permit check as CONNECTED'
+    }
+    $nst = J @('wfp','status','--sublayer-guid',$Sublayer)
+    $nrec = (Get-ItemProperty $regBase -ea Stop).FenceMode
+    Write-Host "NEG: wfp status state=$($nst.state) filters=$($nst.filters) fence_mode=$($nst.fence_mode); recorded FenceMode=$nrec"
+    if ($nst.state -ne 'installed' -or $nst.fence_mode -ne 'negative' -or $nrec -ne 'negative') {
+      Neg-Fail "after the negative install expected installed/negative/negative, got $($nst.state)/$($nst.fence_mode)/$nrec"
+    }
+
+    # ── NEG control: the machine outside the sandbox ──
+    # First, so that a set that cuts the machine off is seen (and
+    # reported) before anything else is tried under it.
+    $now = Neg-Controls $negPort $negLanPort
+    foreach ($k in $now.Keys) {
+      $b = $base[$k]
+      $n = $now[$k]
+      if (Neg-Control-Ok $n) {
+        Write-Host "NEG control: ok: $k = $n (baseline $b)"
+      } elseif (Neg-Control-Ok $b) {
+        Write-Host "NEG control: FAIL: $k = $n under the negative set (baseline $b)"
+        Neg-Fail "control '$k' worked under the positive set ($b) and not under the negative one ($n)"
+      } else {
+        Write-Host "NEG control: NOT EXERCISED: $k = $n, and the baseline did not work either ($b)"
+      }
+    }
+
+    # The same token shapes the sandbox rows use, taken on by a process
+    # of THIS user: what the negative set does to tokens it is not
+    # aimed at. Low integrity must still connect; the rest is printed
+    # as observed. (anonymous and deny-all are expected to be blocked
+    # for every user under this set - that is its cost.)
+    $negTmp = Join-Path ([System.IO.Path]::GetTempPath()) "srt-neg-control-$PID.ps1"
+    TokenProbeScript '127.0.0.1' $negPort @() `
+      -Observe @($negShapes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) `
+      -OffIp $(if ($lanIp) { $lanIp } else { '' }) -OffPort $negLanPort |
+      Set-Content -Encoding UTF8 $negTmp
+    $ctl = & $pwsh -NoProfile -ExecutionPolicy Bypass -File $negTmp 2>&1 | Out-String
+    foreach ($name in @('process', 'plain') + @($negShapes.Keys)) {
+      $label = switch ($name) { 'process' { 'OBS.PROCESS' } 'plain' { 'PLAIN' } default { "OBS.$name" } }
+      if ($ctl -match "(?m)^$([regex]::Escape($label))=(.*?)\r?$") {
+        $got = $Matches[1]
+        Write-Host "NEG control: runner-user shape=$name $(if ($name -eq 'plain') { "loopback=$got" } else { $got })"
+        if ($name -eq 'plain' -and $got -ne 'CONNECTED') {
+          Neg-Fail "runner-user plain connect to out-of-range loopback: $got"
+        }
+        if ($name -eq 'low-integrity' -and $got -notmatch 'FAILED:' -and
+            ($got -notmatch '\sloopback=CONNECTED' -or $got -match 'off-loopback=WSA:10013')) {
+          Neg-Fail "runner-user connect under a low-integrity copy of its own token was not permitted: $got"
+        }
+      } else {
+        Write-Host "NEG control: runner-user shape=$name NOT EXERCISED: no $label line. output: $(($ctl.Trim() -replace '\s+', ' '))"
+      }
+    }
+
+    # ── NEG V1: wfp verify under the negative set ──
+    # Same command, no flag: it reads the mode from the install record.
+    # Every probe must be blocked now, the two the positive set reports
+    # as residuals included, and no residual may be named.
+    $nvFields = 'egress_probe','anonymous_probe','anonymous_loopback_probe','deny_only_probe',
+                'low_integrity_probe','low_integrity_loopback_probe',
+                'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
+    foreach ($wr in $false, $true) {
+      $nvArgs = @('wfp','verify','--target',"127.0.0.1:$negPort")
+      if ($wr) { $nvArgs += '--write-restricted-token' }
+      $nvOut = & $Exe @nvArgs
+      $nvExit = $LASTEXITCODE
+      $kind = if ($wr) { 'write-restricted' } else { 'ordinary' }
+      Write-Host "NEG: V1 token=$kind wfp verify exit=$nvExit stdout='$nvOut'"
+      $nv = $null
+      try { $nv = $nvOut | ConvertFrom-Json } catch { }
+      if (-not $nv) { Neg-Fail "V1 token=${kind}: wfp verify printed no JSON (exit $nvExit)"; continue }
+      if ($nv.fence_mode -ne 'negative') { Neg-Fail "V1 token=${kind}: wfp verify judged against fence_mode='$($nv.fence_mode)', expected negative" }
+      if ($nvExit -ne 0) { Neg-Fail "V1 token=${kind}: wfp verify exit $nvExit, expected 0. $nvOut" }
+      if (@($nv.residuals).Count -ne 0) { Neg-Fail "V1 token=${kind}: residuals=[$($nv.residuals -join ',')], expected none in negative mode" }
+      foreach ($f in $nvFields) {
+        $got = $nv.$f
+        $offLoopback = $f -in 'anonymous_probe','low_integrity_probe','untrusted_integrity_probe'
+        if ($got -eq 'blocked') { continue }
+        if ($got -eq 'skipped' -and $offLoopback) { Write-Host "NEG: V1 token=$kind note: $f skipped (no off-loopback address)"; continue }
+        # The child's own token was refused that identity by the kernel:
+        # there is no connect to block.
+        if ($got -eq 'denied' -and $wr) { Write-Host "NEG: V1 token=$kind note: $f denied (the child cannot take that identity)"; continue }
+        Neg-Fail "V1 token=${kind}: $f='$got', expected blocked"
+      }
+    }
+
+    # ── NEG: the proxy path is still reachable from the sandbox ──
+    $negIn = Bind-Listener ($PortHi..($PortLo+5))
+    $negInPort = $negIn.LocalEndpoint.Port
+    try {
+      $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+        "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $negInPort); Write-Output CONNECTED } " +
+        "catch { Write-Output blocked }")
+      if ($r.out -match 'CONNECTED') { Write-Host "NEG: proxy-range loopback (port $negInPort) CONNECTED from the sandbox" }
+      else { Neg-Fail "sandboxed connect to in-range loopback port $negInPort did not succeed. raw: $($r.raw)" }
+    } catch {
+      Neg-Fail "proxy-range row did not finish: $($_.Exception.Message)"
+    }
+
+    # ── NEG: every token shape, both child token kinds ──
+    # One line per shape, as R5k prints them, but judged: a shape the
+    # child built and assumed must have BOTH its connects refused by a
+    # filter (WSA:10013). A shape the kernel would not let the child
+    # build or assume is NOT EXERCISED - no connect exists to block.
+    $negScript = TokenProbeScript '127.0.0.1' $negPort @() `
+      -Observe @($negShapes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) `
+      -OffIp $(if ($lanIp) { $lanIp } else { '' }) -OffPort $negLanPort
+    foreach ($mode in 'write-restricted', 'ordinary') {
+      $pre = "token=$mode"
+      $r = $null
+      $why = $null
+      try {
+        $tail = @()
+        if ($mode -eq 'write-restricted') { $tail += '--write-restricted-token' }
+        $tail += @('--', $pwsh, '-NoProfile', '-Command', $negScript)
+        $r = RExec $tail 300
+      } catch {
+        $why = "the child did not finish: $($_.Exception.Message)"
+      }
+      if ($r -and $r.out -notmatch '(?m)^PLAIN=') {
+        $why = "the probe did not run in the child (exec exit $($r.exit)): $(($r.raw.Trim() -replace '\s+', ' '))"
+      }
+      if ($why) { Neg-Fail "$pre no shape was measured: $why"; continue }
+      if ($r.out -match '(?m)^OBS\.PROCESS=(.*?)\r?$') { Write-Host "NEG: $pre shape=process $($Matches[1])" }
+      $r.out -match '(?m)^PLAIN=(.*?)\r?$' | Out-Null
+      $plain = $Matches[1]
+      if ($plain -eq 'WSA:10013') { Write-Host "NEG: $pre shape=plain BLOCKED loopback=$plain" }
+      else { Neg-Fail "$pre shape=plain NOT BLOCKED: loopback=$plain" }
+      foreach ($name in $negShapes.Keys) {
+        if ($r.out -notmatch "(?m)^$([regex]::Escape("OBS.$name"))=(.*?)\r?$") {
+          Neg-Fail "$pre shape=$name was not measured: the child printed no OBS.$name line"
+          continue
+        }
+        $got = $Matches[1]
+        if ($got -like 'EXCEPTION:*') { Neg-Fail "$pre shape=$name was not measured: the probe threw ($got)"; continue }
+        if ($got -match 'FAILED:') {
+          Write-Host "NEG: $pre shape=$name NOT EXERCISED (the child could not build or assume it): $got"
+          continue
+        }
+        $open = @()
+        foreach ($dest in 'off-loopback', 'loopback') {
+          if ($got -notmatch "(?:^|\s)$dest=(\S+)") { $open += "$dest=<no result>"; continue }
+          $res = $Matches[1]
+          if ($res -eq 'WSA:10013') { continue }
+          if ($res -eq 'SKIPPED' -and $dest -eq 'off-loopback') { continue }
+          $open += "$dest=$res"
+        }
+        if ($open.Count -eq 0) { Write-Host "NEG: $pre shape=$name BLOCKED $got" }
+        else { Neg-Fail "$pre shape=$name NOT BLOCKED ($($open -join ', ')). raw line: $got" }
+      }
+    }
+  }
+} catch {
+  Neg-Fail "the negative-mode rows stopped early: $($_.Exception.Message)"
+} finally {
+  foreach ($l in $negLoop, $negLan, $negIn) { if ($l) { $l.Stop() } }
+  if ($negTmp) { Remove-Item -Force $negTmp -ErrorAction SilentlyContinue }
+  # Back to the positive set, whatever happened above, so that nothing
+  # after this script runs under the negative one. A plain install does
+  # it: the mode defaults to positive and a set in the other mode is
+  # replaced. If that fails, take the filters out altogether.
+  & $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "NEG: restoring the positive set failed (install exit $LASTEXITCODE); uninstalling"
+    & $Exe uninstall --sublayer-guid $Sublayer
+    throw "NEG: could not reinstall the positive filter set after the negative-mode rows (uninstall exit $LASTEXITCODE)"
+  }
+}
+$pst = J @('wfp','status','--sublayer-guid',$Sublayer)
+$prec = (Get-ItemProperty $regBase -ea Stop).FenceMode
+if ($pst.state -ne 'installed' -or $pst.fence_mode -ne 'positive' -or $prec -ne 'positive') {
+  throw "NEG: after restoring expected installed/positive/positive, got $($pst.state)/$($pst.fence_mode)/$prec"
+}
+$r = RExec @('--', $cmd, '/c', 'echo NEG-RESTORED')
+if ($r.exit -ne 0 -or $r.out -notmatch 'NEG-RESTORED') {
+  throw "NEG: exec after restoring the positive set failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host "NEG: positive set restored ($($pst.filters) filters, fence_mode=$($pst.fence_mode)); exec runs"
+if ($negFail.Count -gt 0) {
+  throw "NEG: $($negFail.Count) negative-mode check(s) failed:`n - $($negFail -join "`n - ")"
+}
+Write-Host 'NEG ok: negative mode blocks every sandbox-derived token shape and permits the controls'
+
 # ── teardown ─────────────────────────────────────────────────────
 Run @('uninstall','--sublayer-guid',$Sublayer)
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
@@ -1457,4 +1839,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b, R11, R12, G1-G6/G3b, U0-U4, NEG)'

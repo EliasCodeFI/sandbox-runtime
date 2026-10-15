@@ -94,6 +94,7 @@ export type {
   MappedDriveCwdError,
   WindowsInstallOptions,
   WindowsInstallResult,
+  WindowsFenceMode,
   WindowsWfpStatus,
   WindowsAclStampOptions,
   WindowsAclGrantOptions,

@@ -192,6 +192,22 @@ export type WindowsWfpStatus =
   | 'outdated'
   | 'cannot-read'
 
+/**
+ * Which filter set `srt-win install` wrote.
+ *
+ * `positive` (the default) blocks the sandbox account and leaves every
+ * other principal on the machine alone. `negative` permits every
+ * principal that is not the sandbox account or the anonymous token and
+ * blocks the rest, which also closes the two residuals
+ * {@link verifyWindowsWfpEgress} names under `positive`.
+ *
+ * The mode is chosen when the fence is installed (`srt-win install
+ * --fence-mode`); this library does not choose it. It runs on
+ * whichever is installed: `wfp verify` and `exec` take no mode
+ * argument and read it from the install record.
+ */
+export type WindowsFenceMode = 'positive' | 'negative'
+
 export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
   /** Live filter count from BFE enum; `0` on `cannot-read`. */
@@ -200,6 +216,13 @@ export interface WindowsWfpStatusResult {
   portRange?: [number, number]
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
+  /**
+   * The installed filter set's mode: read off the filters by an
+   * elevated caller, off the install record by a non-elevated one.
+   * Absent when no fence is installed, when it is `outdated` for a
+   * non-elevated caller, and from an `srt-win` that predates the mode.
+   */
+  fenceMode?: WindowsFenceMode
   /**
    * Populated on `cannot-read` (BFE enumeration is admin-gated; a
    * non-elevated caller can't read it — the non-elevated readiness
@@ -930,6 +953,7 @@ type RawWfpStatus = {
   filters: number
   port_range?: [number, number]
   user_sid?: string
+  fence_mode?: string
   hint?: string
 }
 
@@ -945,6 +969,11 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
     filters: raw.filters,
     ...(raw.port_range && { portRange: raw.port_range }),
     ...(raw.user_sid && { userSid: raw.user_sid }),
+    // A word this library does not know is dropped, not passed on as
+    // if it were one of the two.
+    ...((raw.fence_mode === 'positive' || raw.fence_mode === 'negative') && {
+      fenceMode: raw.fence_mode,
+    }),
     ...(raw.hint && { hint: raw.hint }),
   }
 }

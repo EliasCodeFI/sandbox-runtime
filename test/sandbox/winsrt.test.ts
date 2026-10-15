@@ -2136,6 +2136,48 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(await getWindowsWfpStatusAsync({ srtWin })).toEqual(sync)
   })
 
+  // ── fence mode: status ──────────────────────────────────────────
+  // `srt-win wfp status` names the installed filter set's mode. The
+  // library reports it and does not choose it.
+  it('getWindowsWfpStatus{,Async}: the installed fence mode is surfaced as fenceMode', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    for (const mode of ['positive', 'negative'] as const) {
+      stubSpawn(() => ({
+        status: 0,
+        stdout: JSON.stringify({
+          state: 'installed',
+          filters: 6,
+          port_range: [60080, 60089],
+          user_sid: 'S-1-5-21-1',
+          fence_mode: mode,
+        }),
+      }))
+      const sync = getWindowsWfpStatus({ srtWin })
+      expect(sync).toEqual({
+        state: 'installed',
+        filters: 6,
+        portRange: [60080, 60089],
+        userSid: 'S-1-5-21-1',
+        fenceMode: mode,
+      })
+      expect(await getWindowsWfpStatusAsync({ srtWin })).toEqual(sync)
+    }
+  })
+
+  it('getWindowsWfpStatus: no fence mode, or one this library does not know, leaves fenceMode unset', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    for (const extra of [{}, { fence_mode: 'sideways' }, { fence_mode: '' }]) {
+      stubSpawn(() => ({
+        status: 0,
+        stdout: JSON.stringify({ state: 'installed', filters: 6, ...extra }),
+      }))
+      expect(getWindowsWfpStatus({ srtWin })).toEqual({
+        state: 'installed',
+        filters: 6,
+      })
+    }
+  })
+
   it('checkWindowsDependencies{,Async}: an out-of-date fence is an error naming the reinstall', async () => {
     stubSpawn(argv => ({
       status: 0,

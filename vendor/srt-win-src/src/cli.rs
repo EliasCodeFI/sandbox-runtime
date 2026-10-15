@@ -111,7 +111,9 @@ enum Cmd {
     ///   0  — installed (or already installed with the same
     ///        port-range; no changes)
     ///   10 — UAC prompt cancelled by the user
-    ///   12 — WFP filter install failed
+    ///   12 — WFP filter install failed, or (`--fence-mode
+    ///        negative`) the installed set refused the installer's
+    ///        own connect and was removed again
     ///   13 — already installed under this sublayer with a
     ///        DIFFERENT port-range or sandbox-user name; pass
     ///        `--force` to replace
@@ -134,6 +136,19 @@ enum Cmd {
         /// sandbox-user name differs (otherwise exits 13).
         #[arg(long)]
         force: bool,
+        /// Which filter set to install: `positive` (the default)
+        /// blocks the sandbox account and leaves every other
+        /// principal alone; `negative` permits every principal that
+        /// is not the sandbox account or the anonymous token and
+        /// blocks the rest (see `srt_win::wfp`). An install in the
+        /// other mode is replaced, without `--force`.
+        ///
+        /// In `negative` mode the install connects to a loopback
+        /// listener of its own, outside the proxy port range, once
+        /// the filters are in place. If its own token is refused the
+        /// whole filter set is removed again and the install exits 12.
+        #[arg(long, value_name = "positive|negative")]
+        fence_mode: Option<String>,
     },
     /// Remove the srt-win WFP filters under the sublayer and the
     /// `srt-sandbox` account, its credential file, and the setup
@@ -747,13 +762,16 @@ fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::Wf
     use srt_win::{install, wfp};
     // No install record → nothing to compare against. A record whose
     // revision cannot be read is treated as carrying none.
-    let record = install::read_setup()
-        .ok()
-        .flatten()
+    let setup = install::read_setup().ok().flatten();
+    let record = setup
+        .as_ref()
         .map(|_| install::read_fence_revision().ok().flatten());
-    Ok(wfp::apply_recorded_revision(
-        wfp::filter_status(sublayer)?,
-        record,
+    // The mode, likewise from the record, for a caller that could not
+    // enumerate the filters.
+    let mode = setup.and_then(|_| install::read_fence_mode().ok());
+    Ok(wfp::apply_recorded_mode(
+        wfp::apply_recorded_revision(wfp::filter_status(sublayer)?, record),
+        mode,
     ))
 }
 
@@ -884,7 +902,12 @@ enum WfpCmd {
     ///     and `deny_only_probe` found open (`anonymous-loopback`,
     ///     `deny-only-user-sid`). The filters cannot close these;
     ///     they are reported, with a warning on stderr, and do not
-    ///     change the exit code.
+    ///     change the exit code. Always empty when the installed
+    ///     fence is in negative mode (`install --fence-mode
+    ///     negative`), where those two probes must be blocked like
+    ///     the rest and a connect under either exits 3.
+    ///   - `fence_mode` — `positive` or `negative`, from the install
+    ///     record: the mode the probes were judged against.
     ///
     /// Every probe but `egress_probe` makes its connect twice: once
     /// on a socket created before the token is assumed and once on a
@@ -975,8 +998,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             proxy_port_range,
             sandbox_user,
             force,
+            fence_mode,
         } => {
             use srt_win::{install, user};
+            // Parsed before the elevation hop, so a bad value fails
+            // without a UAC prompt.
+            let mode = match &fence_mode {
+                Some(s) => wfp::FenceMode::parse(s).context("invalid --fence-mode")?,
+                None => wfp::FenceMode::default(),
+            };
             if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
@@ -1049,11 +1079,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // than early-outing on "already installed".
                 // So is the fence: the enumerated set and the
                 // install record must both be at this build's
-                // revision.
+                // revision, and both in the mode asked for — a set
+                // in the other mode falls through and is replaced.
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
+                    && st.fence_mode == Some(mode.label())
+                    && install::read_fence_mode().ok() == Some(mode)
                     && install::require_current_fence().is_ok()
                     && install::cred_present()
                     && ambient_ok()
@@ -1074,8 +1107,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             eprintln!(
                                 "srt-win: already installed (sublayer={sl:?}, \
                          port_range={}-{}, sandbox_user='{name}', \
-                         filters={}); no changes",
-                                range.0, range.1, st.filters,
+                         filters={}, fence_mode={}); no changes",
+                                range.0,
+                                range.1,
+                                st.filters,
+                                mode.label(),
                             );
                             return Ok(());
                         }
@@ -1095,8 +1131,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     _ => eprintln!(
                         "srt-win: partial or out-of-date install detected \
                          (user_provisioned={}, marker_version={:?}, \
-                         fence={}) — completing",
-                        us.exists, mv, st.state,
+                         fence={}, fence_mode={} → {}) — completing",
+                        us.exists,
+                        mv,
+                        st.state,
+                        st.fence_mode.unwrap_or("none"),
+                        mode.label(),
                     ),
                 }
                 // Fall through; the steps are idempotent.
@@ -1181,13 +1221,50 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(17);
                 }
             }
-            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range) {
+            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range, mode) {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
+            // The negative set blocks every token its descriptor does
+            // not admit, on the whole machine. Before anything records
+            // or reports it as installed, show that this process — the
+            // installing user — can still connect past it. If not, the
+            // set is wrong for this machine: take all of it out again,
+            // here, and fail.
+            if mode == wfp::FenceMode::Negative
+                && let Err(why) = srt_win::probe::confirm_still_permitted(range)
+            {
+                eprintln!(
+                    "srt-win: error: negative-mode fence refused a connect it must \
+                     permit: {why}"
+                );
+                // Record first, as every filter removal does; but the
+                // filters come out whether or not the record took.
+                if let Err(e) = install::mark_fence_removed() {
+                    eprintln!("srt-win: warning: mark WFP fence removed: {e:#}");
+                }
+                match wfp::uninstall_filters(&sl) {
+                    Ok(n) => eprintln!(
+                        "srt-win: error: removed the negative-mode filter set again \
+                         ({n} filter(s)); no network fence is installed. Re-run \
+                         `srt-win install` without `--fence-mode negative`."
+                    ),
+                    Err(e) => eprintln!(
+                        "srt-win: error: COULD NOT REMOVE the negative-mode filter \
+                         set: {e:#}. Outbound connections on this machine may be \
+                         blocked until `srt-win uninstall` succeeds."
+                    ),
+                }
+                std::process::exit(12);
+            }
             // Only now that the filters are committed: record their
-            // revision for the non-elevated broker, which cannot
-            // enumerate them.
+            // mode and revision for the non-elevated broker, which
+            // cannot enumerate them. Mode first — see
+            // `install::write_fence_mode`.
+            if let Err(e) = install::write_fence_mode(mode) {
+                eprintln!("srt-win: error: record WFP fence mode: {e:#}");
+                std::process::exit(12);
+            }
             if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
                 eprintln!("srt-win: error: record WFP fence revision: {e:#}");
                 std::process::exit(12);
@@ -1201,10 +1278,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!(
                 "srt-win: installed (sublayer={sl:?}, \
-                 proxy_port_range={}-{}, filters={})",
+                 proxy_port_range={}-{}, filters={}, fence_mode={})",
                 range.0,
                 range.1,
                 wfp::FILTER_COUNT,
+                mode.label(),
             );
             eprintln!(
                 "srt-win: sandbox user '{}' provisioned (sid={}, \
@@ -1388,7 +1466,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             };
             // Every document this arm prints says which token the
             // probe was for.
+            // Which filter set the install record says is in place.
+            // The probing process makes the same attempts either way;
+            // the mode only changes which of them must be blocked, and
+            // this process is the one that judges. An unreadable
+            // record is judged as the stricter mode.
+            let fence_mode = install::read_fence_mode().unwrap_or(wfp::FenceMode::Negative);
             let finish = |mut doc: serde_json::Value, exit: i32| -> ! {
+                doc["fence_mode"] = json!(fence_mode.label());
                 if write_restricted_token {
                     doc["write_restricted_token"] = json!(true);
                 }
@@ -1499,7 +1584,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Under the write-restricted token the report is the
             // child's own, so an identity the kernel refused it is
             // closed; see `probe::verdict`.
-            let verdict = probe::verdict(&report, write_restricted_token);
+            let verdict = probe::verdict(&report, write_restricted_token, fence_mode);
             for residual in &verdict.residuals {
                 eprintln!(
                     "srt-win: warning: wfp verify: residual '{residual}': {}",
@@ -2462,6 +2547,31 @@ mod tests {
                 sublayer_guid: Some(_)
             }
         ));
+    }
+
+    /// `install --fence-mode` is optional; what it holds is checked
+    /// when the command runs, as the port range is.
+    #[test]
+    fn install_fence_mode_flag_parses() {
+        let bare = Cli::try_parse_from(["srt-win", "install"]).expect("parse");
+        assert!(matches!(
+            bare.cmd,
+            Cmd::Install {
+                fence_mode: None,
+                ..
+            }
+        ));
+        for word in ["positive", "negative"] {
+            let cli =
+                Cli::try_parse_from(["srt-win", "install", "--fence-mode", word]).expect("parse");
+            let Cmd::Install { fence_mode, .. } = cli.cmd else {
+                panic!("not an install");
+            };
+            let mode = srt_win::wfp::FenceMode::parse(&fence_mode.unwrap()).unwrap();
+            assert_eq!(mode.label(), word);
+        }
+        // The flag needs a value.
+        assert!(Cli::try_parse_from(["srt-win", "install", "--fence-mode"]).is_err());
     }
 
     /// `--quiet` on `exec` parses and defaults false. Placement

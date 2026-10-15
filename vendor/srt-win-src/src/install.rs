@@ -367,6 +367,38 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
 /// the filters.
 const FENCE_REVISION_VALUE: &str = "FenceRevision";
 
+/// Registry value holding the [`crate::wfp::FenceMode`] of the filter
+/// set the last completed `srt-win install` wrote, as its label.
+const FENCE_MODE_VALUE: &str = "FenceMode";
+
+/// Record which filter set is installed. Called by the elevated
+/// install after the WFP transaction commits and BEFORE
+/// [`write_fence_revision`], so a record at the current revision
+/// always carries the mode of the set that revision was written for.
+///
+/// An install interrupted between the filters and this value leaves
+/// the previous mode on record. Either way round, that is safe: a
+/// record that says `negative` over positive filters makes `wfp
+/// verify` demand blocks those filters do not make, and it refuses;
+/// a record that says `positive` over negative filters demands less
+/// than the filters do.
+pub fn write_fence_mode(mode: crate::wfp::FenceMode) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    base.set_sz(FENCE_MODE_VALUE, mode.label())
+}
+
+/// The recorded fence mode ([`crate::wfp::FenceMode::from_record`]):
+/// positive when no install has run or the install predates the
+/// value. This is how the non-elevated broker — which cannot
+/// enumerate filters — learns which set `wfp verify` is probing.
+pub fn read_fence_mode() -> Result<crate::wfp::FenceMode> {
+    let value = match crate::reg::Key::open(crate::reg::BASE, false)? {
+        Some(base) => base.get_sz(FENCE_MODE_VALUE)?,
+        None => None,
+    };
+    Ok(crate::wfp::FenceMode::from_record(value.as_deref()))
+}
+
 /// Record that the filter set at `rev` is installed. Called by the
 /// elevated install only AFTER the WFP transaction commits, so the
 /// value never claims filters that were not written.
@@ -566,6 +598,7 @@ pub fn clear_setup() -> Result<()> {
             "MarkerVersion",
             "CreatedAt",
             FENCE_REVISION_VALUE,
+            FENCE_MODE_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }

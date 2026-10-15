@@ -27,6 +27,15 @@
 //!     cannot be made to refuse it; a connect here is reported as the
 //!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
 //!
+//! That is the positive-mode fence. When the install record says the
+//! negative-mode set is in place ([`crate::wfp::FenceMode::Negative`])
+//! the same attempts are made, and the two residual ones are judged
+//! like the rest: that set denies the anonymous token and every token
+//! carrying the sandbox account's SID, deny-only included, so both
+//! must be blocked ([`verdict`]). The probing process is not told the
+//! mode and its report does not carry it; the broker that reads the
+//! report reads the mode from the install record.
+//!
 //! ## Two orderings per assumed identity
 //!
 //! Which token a connect is attributed to depends on when the socket
@@ -76,7 +85,10 @@
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, LUID};
+use crate::wfp::FenceMode;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, LUID,
+};
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, FD_SET, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IPPROTO_TCP,
     SO_ERROR, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET,
@@ -137,9 +149,10 @@ pub enum Outcome {
     /// a socket could not be created under it, or the thread's token
     /// read back as something else.
     Error = 6,
-    /// The kernel refused to put the token on the thread: the
-    /// impersonation call returned access-denied. The process cannot
-    /// present that identity at all, so there is no connect to fence.
+    /// The kernel refused the identity to this process: the
+    /// impersonation call returned access-denied, or the token could
+    /// not be derived at all ([`derivation_error`]). The process
+    /// cannot present that identity, so there is no connect to fence.
     /// The last value a field of [`BITS`] bits holds.
     Denied = 7,
 }
@@ -280,18 +293,24 @@ impl Report {
         })
     }
 
-    /// The attempts the filters are built to refuse, each with
-    /// whether it may have been skipped (the ones aimed at the
-    /// off-loopback target, which a machine can lack).
-    fn must_be_blocked(&self) -> [(Outcome, bool); 6] {
-        [
+    /// The attempts the filters of `mode` are built to refuse, each
+    /// with whether it may have been skipped (the ones aimed at the
+    /// off-loopback target, which a machine can lack). The negative
+    /// set refuses the two attempts the positive one cannot.
+    fn must_be_blocked(&self, mode: FenceMode) -> Vec<(Outcome, bool)> {
+        let mut must = vec![
             (self.plain, false),
             (self.anonymous, true),
             (self.low_integrity, true),
             (self.low_integrity_loopback, false),
             (self.untrusted_integrity, true),
             (self.untrusted_integrity_loopback, false),
-        ]
+        ];
+        if mode == FenceMode::Negative {
+            must.push((self.anonymous_loopback, false));
+            must.push((self.deny_only, false));
+        }
+        must
     }
 }
 
@@ -328,6 +347,11 @@ pub struct Verdict {
 /// attempts never fail it — the filters cannot refuse them — and are
 /// reported as residuals instead of passing silently.
 ///
+/// That is [`FenceMode::Positive`]. Under [`FenceMode::Negative`] the
+/// two remaining attempts decide the exit code with the others, and
+/// no residual is ever named: a connect under either is a missing
+/// fence.
+///
 /// `child_token` says the probing process held the very token a
 /// sandboxed command gets (`wfp verify --write-restricted-token`,
 /// whose attempts are made by a lockdown child). Only then does an
@@ -336,8 +360,8 @@ pub struct Verdict {
 /// the same way. When the bare runner probes on behalf of the
 /// ordinary child token, a refusal says nothing certain about the
 /// child and stays inconclusive, as every other unassumed token does.
-pub fn verdict(r: &Report, child_token: bool) -> Verdict {
-    let must = r.must_be_blocked();
+pub fn verdict(r: &Report, child_token: bool, mode: FenceMode) -> Verdict {
+    let must = r.must_be_blocked(mode);
     let closed = |o: Outcome, may_skip: bool| {
         o == Outcome::Blocked
             || (may_skip && o == Outcome::Skipped)
@@ -351,7 +375,7 @@ pub fn verdict(r: &Report, child_token: bool) -> Verdict {
         EXIT_FENCED
     };
     let mut residuals = Vec::new();
-    if exit == EXIT_FENCED {
+    if exit == EXIT_FENCED && mode == FenceMode::Positive {
         if r.anonymous_loopback.passed_fence() {
             residuals.push(RESIDUAL_ANONYMOUS_LOOPBACK);
         }
@@ -549,9 +573,11 @@ fn confirm_thread_token(expect: Expect) -> Result<()> {
     Ok(())
 }
 
-/// Context on the error of an impersonation call the kernel answered
-/// with access-denied: the process may not carry that token. Found
-/// again by [`connect_as`], which reports [`Outcome::Denied`] for it.
+/// Context on the error of a call by which the kernel refused a
+/// token to this process: an impersonation call answered with
+/// access-denied ([`impersonation_error`]) or a derivation it would
+/// not make ([`derivation_error`]). Found again by [`connect_as`],
+/// which reports [`Outcome::Denied`] for it.
 #[derive(Debug)]
 struct ImpersonationRefused(&'static str);
 
@@ -562,12 +588,33 @@ impl std::fmt::Display for ImpersonationRefused {
 }
 
 /// The error of the call that puts a token on the thread, marked
-/// [`ImpersonationRefused`] when it is access-denied. Only these
-/// calls are marked: access-denied while BUILDING a token (opening,
-/// copying, restricting, relabelling) is a step the probe could not
-/// take, not the kernel's answer about the finished token.
+/// [`ImpersonationRefused`] when it is access-denied. Access-denied
+/// while BUILDING a token (opening, copying, relabelling) is not
+/// marked: it is a step the probe could not take, not the kernel's
+/// answer about the finished token. The one building step that is
+/// marked is [`derivation_error`]'s.
 fn impersonation_error(call: &'static str, e: windows::core::Error) -> anyhow::Error {
     let refused = e.code() == ERROR_ACCESS_DENIED.to_hresult();
+    let e = anyhow::Error::new(e);
+    if refused {
+        e.context(ImpersonationRefused(call))
+    } else {
+        e.context(call)
+    }
+}
+
+/// The error of the `CreateRestrictedToken` call that derives the
+/// deny-only copy, marked [`ImpersonationRefused`] when it is
+/// invalid-parameter. The arguments are the same for every caller and
+/// are accepted from a process holding the ordinary child token; the
+/// write-restricted child token is answered with invalid-parameter
+/// instead. That is the kernel declining to derive this token from
+/// that one — the process cannot make the copy, so it cannot present
+/// it — and it is reported as [`Outcome::Denied`], which [`verdict`]
+/// counts as closed only when the probing process held the child's
+/// own token.
+fn derivation_error(call: &'static str, e: windows::core::Error) -> anyhow::Error {
+    let refused = e.code() == ERROR_INVALID_PARAMETER.to_hresult();
     let e = anyhow::Error::new(e);
     if refused {
         e.context(ImpersonationRefused(call))
@@ -633,7 +680,7 @@ fn assume(id: Identity) -> Result<Option<Assumed>> {
                         None,
                         &mut restricted,
                     )
-                    .context("CreateRestrictedToken")?;
+                    .map_err(|e| derivation_error("CreateRestrictedToken", e))?;
                     DuplicateTokenEx(
                         restricted,
                         TOKEN_ALL_ACCESS,
@@ -966,6 +1013,103 @@ pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
     })
 }
 
+/// A listener on `bind` (a loopback address, port 0) whose port is
+/// outside `port_range`, so a connect to it is not covered by the
+/// loopback PERMIT.
+fn out_of_range_listener(bind: &str, port_range: (u16, u16)) -> Result<std::net::TcpListener> {
+    // The OS picks the port; draw again in the unlikely case it
+    // picked one inside the range.
+    for _ in 0..16 {
+        let l = std::net::TcpListener::bind(bind).with_context(|| format!("bind {bind}"))?;
+        let port = l.local_addr().context("local_addr")?.port();
+        if !(port_range.0..=port_range.1).contains(&port) {
+            return Ok(l);
+        }
+    }
+    Err(anyhow!(
+        "no port outside {}-{} could be bound on {bind}",
+        port_range.0,
+        port_range.1
+    ))
+}
+
+/// The check `srt-win install --fence-mode negative` makes after the
+/// filters are committed and before it reports success: that tokens
+/// the negative set must PERMIT still connect.
+///
+/// The negative set ends in a BLOCK with no conditions, so a token
+/// its descriptor fails to admit loses its outbound connects — and a
+/// descriptor that admitted nobody would cut the machine off. This
+/// function makes real connects, from the installing process, to
+/// loopback listeners it binds outside `port_range`: connects the
+/// loopback PERMIT does not cover, which therefore succeed only if
+/// the token passes [`crate::wfp::sddl_negative`]. On IPv4 and, where
+/// a listener can be bound, IPv6:
+///
+///   - under the process's **own token** — must connect. Any other
+///     outcome is a failure.
+///   - under a **low-integrity copy** of it, on a socket created
+///     under the copy — must not be refused by a filter. This is the
+///     one way the descriptor could turn away whole classes of other
+///     processes (every low-integrity and AppContainer one) while
+///     still admitting the installer; see [`crate::wfp::sddl_negative`].
+///     A copy that could not be made or assumed is logged and is not
+///     a failure: nothing was learned, and the own-token connect
+///     stands.
+///
+/// `Err` carries what was refused, for the caller to print before it
+/// removes the filter set. Each connect is logged to stderr.
+pub fn confirm_still_permitted(port_range: (u16, u16)) -> std::result::Result<(), String> {
+    winsock_startup().map_err(|e| format!("{e:#}"))?;
+    let mut failures: Vec<String> = Vec::new();
+    for (family, bind, required) in [("IPv4", "127.0.0.1:0", true), ("IPv6", "[::1]:0", false)] {
+        let listener = match out_of_range_listener(bind, port_range) {
+            Ok(l) => l,
+            Err(e) if !required => {
+                eprintln!("srt-win: install: permit check [{family}]: SKIPPED ({e:#})");
+                continue;
+            }
+            Err(e) => return Err(format!("no {family} loopback listener to test with: {e:#}")),
+        };
+        let target = listener
+            .local_addr()
+            .map_err(|e| format!("{family} listener address: {e}"))?;
+        let (own, detail) = connect_as(Identity::Own, &target, SocketOrder::BeforeToken);
+        eprintln!(
+            "srt-win: install: permit check [own token] {target}: {} ({detail})",
+            own.label().to_uppercase()
+        );
+        if own != Outcome::Connected {
+            failures.push(format!(
+                "the installing user's own token did not connect to {target} ({}; {detail})",
+                own.label()
+            ));
+        }
+        let (low, detail) = connect_as(
+            Identity::LoweredIntegrity(IL_LOW),
+            &target,
+            SocketOrder::AfterToken,
+        );
+        eprintln!(
+            "srt-win: install: permit check [low-integrity copy of own token] {target}: {} \
+             ({detail})",
+            low.label().to_uppercase()
+        );
+        if low == Outcome::Blocked {
+            failures.push(format!(
+                "a low-integrity copy of the installing user's token was refused by a \
+                 filter at {target} ({detail})"
+            ));
+        }
+        drop(listener);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,7 +1239,96 @@ mod tests {
 
     /// The verdict when the bare runner probed (the ordinary token).
     fn verdict_runner(r: &Report) -> Verdict {
-        verdict(r, false)
+        verdict(r, false, FenceMode::Positive)
+    }
+
+    /// The verdict over a negative-mode fence.
+    fn verdict_negative(r: &Report, child_token: bool) -> Verdict {
+        verdict(r, child_token, FenceMode::Negative)
+    }
+
+    #[test]
+    fn negative_mode_requires_the_residual_attempts_blocked() {
+        // Everything blocked is fenced in either mode.
+        let all = report(Blocked, Blocked, Blocked, Blocked);
+        for child_token in [true, false] {
+            assert_eq!(
+                verdict_negative(&all, child_token),
+                Verdict {
+                    exit: EXIT_FENCED,
+                    residuals: vec![]
+                }
+            );
+        }
+        // What positive mode names as a residual is a missing fence
+        // here, and no residual is named.
+        for through in [Connected, Refused] {
+            for r in [
+                report(Blocked, Blocked, through, Blocked),
+                report(Blocked, Blocked, Blocked, through),
+                report(Blocked, Blocked, through, through),
+            ] {
+                let positive = verdict_runner(&r);
+                assert_eq!(positive.exit, EXIT_FENCED, "{r:?}");
+                assert!(!positive.residuals.is_empty(), "{r:?}");
+                for child_token in [true, false] {
+                    assert_eq!(
+                        verdict_negative(&r, child_token),
+                        Verdict {
+                            exit: EXIT_NOT_FENCED,
+                            residuals: vec![]
+                        },
+                        "{r:?}"
+                    );
+                }
+            }
+        }
+        // Neither may go unmeasured, and neither may be skipped: both
+        // aim at the loopback target, which is always there.
+        for odd in [Error, Unreachable, Skipped] {
+            for r in [
+                report(Blocked, Blocked, odd, Blocked),
+                report(Blocked, Blocked, Blocked, odd),
+            ] {
+                assert_eq!(verdict_runner(&r).exit, EXIT_FENCED, "{r:?}");
+                for child_token in [true, false] {
+                    assert_eq!(
+                        verdict_negative(&r, child_token).exit,
+                        EXIT_INCONCLUSIVE,
+                        "{r:?}"
+                    );
+                }
+            }
+        }
+        // An identity the kernel refused the child is closed for the
+        // child's own token only — the write-restricted child cannot
+        // derive the deny-only copy at all.
+        let r = report(Blocked, Blocked, Denied, Denied);
+        assert_eq!(verdict_negative(&r, true).exit, EXIT_FENCED);
+        assert_eq!(verdict_negative(&r, false).exit, EXIT_INCONCLUSIVE);
+        // The attempts positive mode requires are still required.
+        assert_eq!(
+            verdict_negative(&report(Connected, Blocked, Blocked, Blocked), false).exit,
+            EXIT_NOT_FENCED
+        );
+        assert_eq!(
+            verdict_negative(&report(Blocked, Skipped, Blocked, Blocked), false).exit,
+            EXIT_FENCED
+        );
+    }
+
+    #[test]
+    fn derivation_error_marks_only_invalid_parameter() {
+        let refused = derivation_error(
+            "CreateRestrictedToken",
+            windows::core::Error::from(ERROR_INVALID_PARAMETER),
+        );
+        assert!(refused.downcast_ref::<ImpersonationRefused>().is_some());
+        let other = derivation_error(
+            "CreateRestrictedToken",
+            windows::core::Error::from(ERROR_ACCESS_DENIED),
+        );
+        assert!(other.downcast_ref::<ImpersonationRefused>().is_none());
     }
 
     #[test]
@@ -1114,16 +1347,20 @@ mod tests {
             cases.push(lowered(all_blocked, l));
         }
         for r in &cases {
-            let v = verdict(r, true);
+            let v = verdict(r, true, FenceMode::Positive);
             assert_eq!(v.exit, EXIT_FENCED, "{r:?}");
             assert!(v.residuals.is_empty());
-            assert_eq!(verdict(r, false).exit, EXIT_INCONCLUSIVE, "{r:?}");
+            assert_eq!(
+                verdict(r, false, FenceMode::Positive).exit,
+                EXIT_INCONCLUSIVE,
+                "{r:?}"
+            );
         }
         // Refused everywhere it can be: still fenced, no residual —
         // a token that cannot be assumed leaves nothing open.
         let r = lowered(report(Blocked, Denied, Denied, Denied), [Denied; 4]);
         assert_eq!(
-            verdict(&r, true),
+            verdict(&r, true, FenceMode::Positive),
             Verdict {
                 exit: EXIT_FENCED,
                 residuals: vec![]
@@ -1136,11 +1373,21 @@ mod tests {
                 report(Blocked, Denied, Blocked, Blocked),
                 [Connected, Blocked, Blocked, Blocked],
             );
-            assert_eq!(verdict(&leak, child_token).exit, EXIT_NOT_FENCED);
+            assert_eq!(
+                verdict(&leak, child_token, FenceMode::Positive).exit,
+                EXIT_NOT_FENCED
+            );
             let odd = report(Blocked, Error, Denied, Denied);
-            assert_eq!(verdict(&odd, child_token).exit, EXIT_INCONCLUSIVE);
+            assert_eq!(
+                verdict(&odd, child_token, FenceMode::Positive).exit,
+                EXIT_INCONCLUSIVE
+            );
             // A residual is still named beside a refusal.
-            let v = verdict(&report(Blocked, Blocked, Denied, Connected), child_token);
+            let v = verdict(
+                &report(Blocked, Blocked, Denied, Connected),
+                child_token,
+                FenceMode::Positive,
+            );
             assert_eq!(v.exit, EXIT_FENCED);
             assert_eq!(v.residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
         }
