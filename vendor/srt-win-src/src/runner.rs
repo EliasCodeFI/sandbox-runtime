@@ -44,10 +44,14 @@ pub enum RunnerCmd {
     /// `target` (`host:port`) is the loopback probe target;
     /// `anonymous_target` the off-loopback one for the attempt made
     /// while impersonating the anonymous token (`None` skips it).
+    /// With a loopback port range configured,
+    /// `range_off_loopback_target` is an off-loopback address at a
+    /// port inside it and `range_loopback_target` the broker's own
+    /// loopback listener inside it (`None` skips each).
     ///
     /// A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
     /// leaves — so a fenced connect yields WSAEACCES immediately. The
-    /// runner exits with the four results encoded
+    /// runner exits with the results encoded
     /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
     /// the runner's own anyhow `Err` path, and never decodes as a
     /// report. No desk/grants/lockdown — the probe runs as the bare
@@ -57,6 +61,10 @@ pub enum RunnerCmd {
         target: String,
         #[serde(default)]
         anonymous_target: Option<String>,
+        #[serde(default)]
+        range_off_loopback_target: Option<String>,
+        #[serde(default)]
+        range_loopback_target: Option<String>,
     },
 }
 
@@ -139,7 +147,15 @@ pub fn run() -> Result<u32> {
         RunnerCmd::ProbeEgress {
             target,
             anonymous_target,
-        } => Ok(crate::probe::run(&target, anonymous_target.as_deref())?.encode()),
+            range_off_loopback_target,
+            range_loopback_target,
+        } => Ok(crate::probe::run(crate::probe::Targets {
+            target: &target,
+            anonymous: anonymous_target.as_deref(),
+            range_off_loopback: range_off_loopback_target.as_deref(),
+            range_loopback: range_loopback_target.as_deref(),
+        })?
+        .encode()),
     }
 }
 
@@ -177,22 +193,33 @@ mod tests {
         let probe = RunnerCmd::ProbeEgress {
             target: "127.0.0.1:49999".into(),
             anonymous_target: Some("192.0.2.7:49999".into()),
+            range_off_loopback_target: Some("192.0.2.7:3000".into()),
+            range_loopback_target: Some("127.0.0.1:3000".into()),
         };
         let bytes = encode_cmd(&probe).unwrap();
         let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back,
-            RunnerCmd::ProbeEgress { target, anonymous_target }
+            RunnerCmd::ProbeEgress {
+                target,
+                anonymous_target,
+                range_off_loopback_target,
+                range_loopback_target,
+            }
                 if target == "127.0.0.1:49999"
                     && anonymous_target.as_deref() == Some("192.0.2.7:49999")
+                    && range_off_loopback_target.as_deref() == Some("192.0.2.7:3000")
+                    && range_loopback_target.as_deref() == Some("127.0.0.1:3000")
         ));
-        // The off-loopback target is optional on the wire.
+        // Every target but the first is optional on the wire.
         let back: RunnerCmd =
             serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
         assert!(matches!(
             back,
             RunnerCmd::ProbeEgress {
                 anonymous_target: None,
+                range_off_loopback_target: None,
+                range_loopback_target: None,
                 ..
             }
         ));

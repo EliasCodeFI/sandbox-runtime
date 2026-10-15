@@ -760,10 +760,11 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 **Network isolation** is a three-filter WFP set at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`, installed machine-wide:
 
 - a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`);
+- optionally, a second PERMIT for loopback destinations inside `windows.loopbackPortRange` — absent unless configured (see [Local servers on Windows](#local-servers-on-windows));
 - a BLOCK for any connect whose token is the `srt-sandbox` account — including an AppContainer process started under that account;
 - a BLOCK for any connect to a non-loopback address made while impersonating the anonymous token (`ANONYMOUS LOGON`). The filtering engine checks the connecting thread's effective token, so without this filter a sandboxed thread could impersonate anonymous and stop being recognised as `srt-sandbox`. This filter is not keyed on the sandbox account: it applies to every process on the machine that connects off-machine while impersonating anonymous.
 
-The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel. `initialize()` proves this each session by running connects as the sandbox account — one with its own token and one impersonating anonymous — and refuses to start if either gets out. A filter set written by an earlier version lacks the anonymous BLOCK: `srt-win status` reports it as `outdated`, and `initialize()` and `srt-win exec` refuse to run until `windows-install` is re-run.
+The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel. `initialize()` proves this each session by running connects as the sandbox account — one with its own token and one impersonating anonymous — and refuses to start if either gets out. With a loopback port range configured it also connects to a port of the range on a non-loopback address of the machine (which must be blocked) and to a loopback listener it binds inside the range for the probe (which must connect). A filter set written by an earlier version lacks the anonymous BLOCK: `srt-win status` reports it as `outdated`, and `initialize()` and `srt-win exec` refuse to run until `windows-install` is re-run.
 
 The fence blocks the identities it can name and lets everything else through, which leaves two gaps (see [Known limitations](#known-limitations)).
 
@@ -796,8 +797,35 @@ OpenSSL-backed clients (msys2 `curl`, `git -c http.sslBackend=openssl`, Node, Py
 The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
 
 - `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
+- `windows.loopbackPortRange` — `[low, high]` inclusive range of loopback ports sandboxed commands may connect to directly. Unset by default. **Must match** the range passed to `windows-install --loopback-port-range` — see [Local servers on Windows](#local-servers-on-windows).
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
+
+### Local servers on Windows
+
+By default a sandboxed command cannot connect to anything on `localhost` except the sandbox's own proxies: not a development server, not a database, not a server another sandboxed command started. `windows.loopbackPortRange` opens one contiguous range of loopback ports for that:
+
+```powershell
+npx @anthropic-ai/sandbox-runtime windows-install --loopback-port-range 3000-3099
+```
+
+```json
+{ "windows": { "loopbackPortRange": [3000, 3099] } }
+```
+
+**What it opens.** The filter added is a PERMIT for a remote address in `127.0.0.0/8` or `::1` **and** a remote port inside the range. It is keyed on the destination, not on who is listening: **any listener of any user on those loopback ports becomes reachable from the sandbox**, including ones started after the install and ones that trust loopback callers. In particular, a local forward proxy (or SSH/SOCKS tunnel, or port-forward) listening inside the range gives the sandbox unfiltered egress through it — the domain allowlist does not apply to connections that never pass through the sandbox's own proxy. Pick a range nothing else on the machine uses, and run only the servers you mean to expose there. Ports outside the range, and the same ports on any non-loopback address of the machine, stay blocked. Listening is not filtered, with or without a range.
+
+**Set at install time.** The range is part of the machine-wide filter set, so adding, changing or removing it means running `windows-install` again — with `--force`, as for any other change to an existing install (omit `--loopback-port-range` to remove the range). `srt-win status` reports the installed range as `wfp.loopback_port_range` (`null` for none). A session whose `windows.loopbackPortRange` differs from the installed range — in either direction, including a session with no range on a machine that has one — does not run with the wrong fence: `initialize()` rejects with `wfp_fence_outdated`, `srt-win exec` exits 19 without launching anything, and the dependency check reports it as an error when it is given the configuration — each naming the install command to re-run.
+
+**Validation.** Checked by the config schema and again by `srt-win install`:
+
+- `low ≤ high`, at most 512 ports, and `low ≥ 1024`;
+- no port in common with `windows.proxyPortRange`;
+- none of these ports, which belong to local services that hand control to whoever connects: `3389` (remote desktop), `5985`, `5986` and `47001` (remote management), `2375` and `2376` (container engine API), `9222` (browser remote debugging), `9229` (JavaScript runtime inspector).
+
+**Servers started inside the sandbox.** A server started by one sandboxed command is reachable from other sandboxed commands only on a port inside the range (on `127.0.0.1` or `::1`); on any other port the second command's connect is blocked like any other. Connections to it from your own, unsandboxed programs are not filtered. An application embedding this library should tell whatever generates its commands to run local servers on ports in the range.
+
+**`NO_PROXY`.** Without a range the sandbox sets no `NO_PROXY`, so HTTP clients send `localhost` requests to the proxy like any other, where the domain allowlist decides them. With a range, the sandbox sets `NO_PROXY=localhost,127.0.0.1,::1` so that proxy-aware clients connect to local servers directly. The rule is per host, not per port, so it has one consequence to know about: a `localhost` port **outside** the range is then blocked by the fence rather than sent through the proxy. If you allow-list `localhost` to reach local services through the proxy, those services keep working for clients that ignore `NO_PROXY` or are told to use the proxy for that request (`curl --noproxy ''`, or clearing `NO_PROXY` for that command), but ordinary proxy-aware clients will only reach the ports inside the range — move the service into the range, or leave `loopbackPortRange` unset.
 
 ### Known limitations
 

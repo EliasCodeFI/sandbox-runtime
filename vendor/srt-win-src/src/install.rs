@@ -333,6 +333,59 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
 /// the filters.
 const FENCE_REVISION_VALUE: &str = "FenceRevision";
 
+/// Registry value holding the configured loopback port range the last
+/// completed `srt-win install` opened, as `LOW-HIGH`. Absent when the
+/// installed filter set opens none.
+const LOOPBACK_PORT_RANGE_VALUE: &str = "LoopbackPortRange";
+
+/// Record the loopback port range the filters just committed open
+/// (`None` deletes the value). Called by the elevated install after
+/// the WFP transaction commits and BEFORE [`write_fence_revision`]:
+/// the revision is the commit point, so a record that reads as
+/// current always carries the range of the filters it describes.
+pub fn write_loopback_port_range(range: Option<(u16, u16)>) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    match range {
+        Some((lo, hi)) => base.set_sz(LOOPBACK_PORT_RANGE_VALUE, &format!("{lo}-{hi}")),
+        None => crate::reg::delete_value(&base, LOOPBACK_PORT_RANGE_VALUE),
+    }
+}
+
+/// The recorded loopback port range. `Ok(None)` when no install has
+/// run or the installed filter set opens none. A value that does not
+/// parse is an error, never "none": the broker must not guess what
+/// the filters open.
+pub fn read_loopback_port_range() -> Result<Option<(u16, u16)>> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
+        return Ok(None);
+    };
+    match base.get_sz(LOOPBACK_PORT_RANGE_VALUE)? {
+        Some(s) => crate::wfp::parse_loopback_port_range(&s, None)
+            .map(Some)
+            .with_context(|| format!("recorded loopback port range '{s}'")),
+        None => Ok(None),
+    }
+}
+
+/// `Err` with the operator-facing explanation unless the loopback
+/// port range this session is configured with (`None` for none) is
+/// exactly the one the install record says the filters open. A
+/// session configured with a range the filters lack would find its
+/// local servers unreachable; one configured without a range the
+/// filters have would run with loopback ports open that it was not
+/// told about. Neither runs.
+pub fn require_loopback_port_range(
+    configured: Option<(u16, u16)>,
+) -> std::result::Result<(), String> {
+    let installed =
+        read_loopback_port_range().map_err(|e| format!("read loopback port range: {e:#}"))?;
+    if installed == configured {
+        Ok(())
+    } else {
+        Err(crate::wfp::loopback_range_hint(installed, configured))
+    }
+}
+
 /// Record that the filter set at `rev` is installed. Called by the
 /// elevated install only AFTER the WFP transaction commits, so the
 /// value never claims filters that were not written.
@@ -342,8 +395,14 @@ pub fn write_fence_revision(rev: u32) -> Result<()> {
 }
 
 /// Record that the filters are being removed: the value is reset to
-/// [`crate::wfp::FENCE_REVISION_REMOVED`]. No-op when the machine has
-/// no install record.
+/// [`crate::wfp::FENCE_REVISION_REMOVED`], and the recorded loopback
+/// port range goes with it. No-op when the machine has no install
+/// record.
+///
+/// The elevated install also calls this before it replaces a filter
+/// set whose loopback port range is changing, so that no failure
+/// between the WFP commit and the record update can leave a record
+/// that reads as current beside filters with a different range.
 ///
 /// Every path that deletes filters calls this FIRST and deletes the
 /// filters only if it succeeded. The record and the filters are two
@@ -359,7 +418,12 @@ pub fn write_fence_revision(rev: u32) -> Result<()> {
 /// way, and re-running `srt-win install` restores the record.
 pub fn mark_fence_removed() -> Result<()> {
     match crate::reg::Key::open(crate::reg::BASE, true)? {
-        Some(base) => base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED),
+        Some(base) => {
+            // Revision first: once it reads as removed, nothing
+            // consults the range.
+            base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED)?;
+            crate::reg::delete_value(&base, LOOPBACK_PORT_RANGE_VALUE)
+        }
         None => Ok(()),
     }
 }
@@ -545,6 +609,7 @@ pub fn clear_setup() -> Result<()> {
             "MarkerVersion",
             "CreatedAt",
             FENCE_REVISION_VALUE,
+            LOOPBACK_PORT_RANGE_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }
