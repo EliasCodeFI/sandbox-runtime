@@ -755,6 +755,15 @@ enum WfpCmd {
     ///     token, to `target`.
     ///   - `deny_only_probe` — a copy of the own token with the user
     ///     SID deny-only, to `target`.
+    ///   - `low_integrity_probe`, `low_integrity_loopback_probe` — a
+    ///     copy of the own token at low integrity, to
+    ///     `lowered_integrity_target` and to `target`.
+    ///     `lowered_integrity_target` is `anonymous_target`, or with
+    ///     `--loopback-port-range` the same address at a port inside
+    ///     the range (`range_off_loopback_target`).
+    ///   - `untrusted_integrity_probe`,
+    ///     `untrusted_integrity_loopback_probe` — the same at
+    ///     untrusted integrity.
     ///   - `range_off_loopback_probe` — own token, to
     ///     `range_off_loopback_target`: a non-loopback address of this
     ///     machine at a port inside `--loopback-port-range`. `skipped`
@@ -763,18 +772,24 @@ enum WfpCmd {
     ///     `range_loopback_target`: a loopback listener this command
     ///     binds inside the range for the probe. `skipped` without a
     ///     range, or when no port of it was free.
-    ///   - `residuals` — names of the gaps the last two found open
-    ///     (`anonymous-loopback`, `deny-only-user-sid`). The filters
-    ///     cannot close these; they are reported, with a warning on
-    ///     stderr, and do not change the exit code.
+    ///   - `residuals` — names of the gaps `anonymous_loopback_probe`
+    ///     and `deny_only_probe` found open (`anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters cannot close these;
+    ///     they are reported, with a warning on stderr, and do not
+    ///     change the exit code.
     ///
-    /// Exits **0** (the first two and `range_off_loopback_probe`
-    /// were blocked, and `range_loopback_probe` connected = fence
-    /// active), **3** (one that must be blocked got past the filters
-    /// = fence MISSING), **2** (one was inconclusive; treat as
-    /// failure), **19** when the install record says the filter set
-    /// predates this build or opens a different loopback port range
-    /// than `--loopback-port-range` names, or when the range's own
+    /// Every other probe but `range_loopback_probe` must be blocked:
+    /// `egress_probe`, `anonymous_probe`, the four lowered-integrity
+    /// ones, whose token still carries the sandbox account's SID, and
+    /// `range_off_loopback_probe`. Exits **0** (all of them were
+    /// blocked, or skipped for want of an off-loopback address or of
+    /// a range, and `range_loopback_probe` connected or was skipped =
+    /// fence active), **3** (one got past the filters = fence
+    /// MISSING), **2** (one was inconclusive — `error` means the token
+    /// could not be assumed, which is not a block; treat as failure),
+    /// **19** when the install record says the filter set predates
+    /// this build or opens a different loopback port range than
+    /// `--loopback-port-range` names, or when the range's own
     /// listener was blocked (`outdated: true`, with a `hint`; the
     /// two range cases also carry `loopback_port_range_mismatch:
     /// true`), or
@@ -800,7 +815,8 @@ enum WfpCmd {
         #[arg(long, value_name = "LOW-HIGH")]
         loopback_port_range: Option<String>,
         /// Off-loopback target (`host:port`) for the attempt made
-        /// while impersonating the anonymous token. Default: this
+        /// while impersonating the anonymous token, and for the
+        /// lowered-integrity attempts' off-loopback half. Default: this
         /// machine's own outbound address at `target`'s port —
         /// nothing needs to listen there, since a refused connect
         /// shows the filters let it through just as a completed one
@@ -1356,6 +1372,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             )
             .context("spawn runner for egress probe")?;
             drop(range_listener);
+            // Where the runner aimed the lowered-integrity attempts'
+            // off-loopback half.
+            let lowered_integrity_target = probe::lowered_off_loopback(
+                range_off_loopback_target.clone(),
+                anonymous_target.clone(),
+            );
             let Some(report) = probe::Report::decode(code) else {
                 // 1 is the runner's own anyhow `Err` path (`main()`
                 // → `eprintln!` + `exit(1)`); anything else is an
@@ -1366,8 +1388,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         "anonymous_probe": "error",
                         "anonymous_loopback_probe": "error",
                         "deny_only_probe": "error",
+                        "low_integrity_probe": "error",
+                        "low_integrity_loopback_probe": "error",
+                        "untrusted_integrity_probe": "error",
+                        "untrusted_integrity_loopback_probe": "error",
                         "range_off_loopback_probe": "error",
                         "range_loopback_probe": "error",
+                        "lowered_integrity_target": lowered_integrity_target,
                         "target": target,
                         "anonymous_target": anonymous_target,
                         "loopback_port_range": range_json,
@@ -1398,6 +1425,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 "anonymous_probe": report.anonymous.label(),
                 "anonymous_loopback_probe": report.anonymous_loopback.label(),
                 "deny_only_probe": report.deny_only.label(),
+                "low_integrity_probe": report.low_integrity.label(),
+                "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
+                "untrusted_integrity_probe": report.untrusted_integrity.label(),
+                "untrusted_integrity_loopback_probe":
+                    report.untrusted_integrity_loopback.label(),
+                "lowered_integrity_target": lowered_integrity_target,
                 "range_off_loopback_probe": report.range_off_loopback.label(),
                 "range_loopback_probe": report.range_loopback.label(),
                 "target": target,

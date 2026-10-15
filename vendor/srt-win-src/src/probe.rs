@@ -17,6 +17,15 @@
 //!     control for the attempt above: it shows that an anonymous
 //!     connect is refused off-loopback because of the filter, not
 //!     because impersonating anonymous cannot connect at all.
+//!   - **low integrity** and **untrusted integrity** — under a copy
+//!     of its own token whose integrity level has been lowered, to the
+//!     off-loopback target and to the loopback probe target (two
+//!     connects per level). The copy still carries the sandbox
+//!     account's SID, so the sandbox-user BLOCK must refuse all four.
+//!     They are probed because an access check applies the mandatory
+//!     integrity rule before it reads a descriptor's entries, and a
+//!     process may lower the integrity level of a copy of its own
+//!     token without any privilege.
 //!   - **deny-only** — under a restricted copy of its own token whose
 //!     user SID is deny-only, to the loopback probe target. A
 //!     deny-only SID is matched by no ALLOW ACE, so the filters
@@ -36,6 +45,14 @@
 //!     It must connect; a block here means the filters in place do not
 //!     carry the configured range.
 //!
+//! It also moves the off-loopback half of the lowered-integrity
+//! attempts onto that in-range port ([`lowered_off_loopback`]): the
+//! address is the same, so nothing is lost, and the attempts then
+//! also show that the range's PERMIT stays closed off loopback for a
+//! lowered token. (The report is the runner's exit code, and ten
+//! three-bit results fill it; aiming the existing attempts at the
+//! stricter destination adds the check without another result.)
+//!
 //! The socket is always created BEFORE the identity is assumed, the
 //! way a process trying to get out would do it: only the connect
 //! itself runs under the other token.
@@ -54,18 +71,24 @@ use windows::Win32::Networking::WinSock::{
     WSAGetLastError, WSAStartup, closesocket, connect, getsockopt, ioctlsocket, select, socket,
 };
 use windows::Win32::Security::{
-    CREATE_RESTRICTED_TOKEN_FLAGS, CreateRestrictedToken, DuplicateTokenEx,
+    CREATE_RESTRICTED_TOKEN_FLAGS, CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation,
     ImpersonateAnonymousToken, RevertToSelf, SID_AND_ATTRIBUTES, SecurityImpersonation,
-    TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenImpersonation,
+    TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TokenImpersonation, TokenImpersonationLevel, TokenIntegrityLevel,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadToken,
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
 /// Name of the residual reported when a connect to a loopback
 /// destination made while impersonating the anonymous token is not
 /// blocked.
 pub const RESIDUAL_ANONYMOUS_LOOPBACK: &str = "anonymous-loopback";
+
+/// The low mandatory level, as the last part of `S-1-16-<n>`.
+const IL_LOW: u32 = 0x1000;
+/// The untrusted mandatory level — the lowest.
+const IL_UNTRUSTED: u32 = 0;
 
 /// How long one connect may take. A refused or filtered connect
 /// returns at once; the bound only matters for a destination that
@@ -133,6 +156,14 @@ pub struct Report {
     pub anonymous: Outcome,
     pub anonymous_loopback: Outcome,
     pub deny_only: Outcome,
+    /// Low integrity, to the off-loopback target.
+    pub low_integrity: Outcome,
+    /// Low integrity, to the loopback target.
+    pub low_integrity_loopback: Outcome,
+    /// Untrusted integrity, to the off-loopback target.
+    pub untrusted_integrity: Outcome,
+    /// Untrusted integrity, to the loopback target.
+    pub untrusted_integrity_loopback: Outcome,
     /// Own token, to a non-loopback address on a port inside the
     /// configured loopback port range.
     pub range_off_loopback: Outcome,
@@ -141,27 +172,42 @@ pub struct Report {
     pub range_loopback: Outcome,
 }
 
-/// Marks a runner exit code as an encoded [`Report`]. Above every
-/// code the runner exits with for another reason (0, and 1 for its
-/// own error path), so an unrelated exit never decodes.
-const REPORT_BASE: u32 = 1 << (FIELDS * BITS);
-const FIELDS: u32 = 6;
 const BITS: u32 = 3;
 const MASK: u32 = (1 << BITS) - 1;
+/// Number of [`Outcome`] fields in a [`Report`].
+const FIELDS: u32 = 10;
+/// Marks a runner exit code as an encoded [`Report`]: the bit just
+/// above the fields. Above every code the runner exits with for
+/// another reason (0, and 1 for its own error path), so an unrelated
+/// exit never decodes. With ten three-bit fields this is bit 30 of
+/// the 32 an exit code has; a decoded code also has bit 31 clear, so
+/// the `0xC000_0000` failure codes a killed process exits with never
+/// decode. There is room for no further field at this width.
+const REPORT_BASE: u32 = 1 << (FIELDS * BITS);
 
 impl Report {
-    pub fn encode(&self) -> u32 {
+    fn fields(&self) -> [Outcome; FIELDS as usize] {
         [
             self.plain,
             self.anonymous,
             self.anonymous_loopback,
             self.deny_only,
+            self.low_integrity,
+            self.low_integrity_loopback,
+            self.untrusted_integrity,
+            self.untrusted_integrity_loopback,
             self.range_off_loopback,
             self.range_loopback,
         ]
-        .into_iter()
-        .zip(0u32..)
-        .fold(REPORT_BASE, |code, (o, i)| code | (o as u32) << (i * BITS))
+    }
+
+    pub fn encode(&self) -> u32 {
+        self.fields()
+            .into_iter()
+            .enumerate()
+            .fold(REPORT_BASE, |code, (i, o)| {
+                code | (o as u32) << (i as u32 * BITS)
+            })
     }
 
     pub fn decode(code: u32) -> Option<Self> {
@@ -174,9 +220,30 @@ impl Report {
             anonymous: field(1)?,
             anonymous_loopback: field(2)?,
             deny_only: field(3)?,
-            range_off_loopback: field(4)?,
-            range_loopback: field(5)?,
+            low_integrity: field(4)?,
+            low_integrity_loopback: field(5)?,
+            untrusted_integrity: field(6)?,
+            untrusted_integrity_loopback: field(7)?,
+            range_off_loopback: field(8)?,
+            range_loopback: field(9)?,
         })
+    }
+
+    /// The attempts the filters are built to refuse, each with
+    /// whether it may have been skipped (the ones aimed at the
+    /// off-loopback target, which a machine can lack, and the one
+    /// aimed at a port of the loopback range, which need not be
+    /// configured).
+    fn must_be_blocked(&self) -> [(Outcome, bool); 7] {
+        [
+            (self.plain, false),
+            (self.anonymous, true),
+            (self.low_integrity, true),
+            (self.low_integrity_loopback, false),
+            (self.untrusted_integrity, true),
+            (self.untrusted_integrity_loopback, false),
+            (self.range_off_loopback, true),
+        ]
     }
 }
 
@@ -206,12 +273,14 @@ pub struct Verdict {
     pub residuals: Vec<&'static str>,
 }
 
-/// Three attempts must be blocked: the plain one, the off-loopback
-/// anonymous one, and the off-loopback one at a port of the configured
-/// loopback range. Any of them getting past the filters is a missing
-/// fence ([`EXIT_NOT_FENCED`]), whatever else was observed. An
-/// off-loopback attempt that was skipped (the machine has no
-/// off-loopback address to aim at, or no range is configured) does not
+/// The plain, the off-loopback anonymous, the four lowered-integrity
+/// attempts and the off-loopback one at a port of the configured
+/// loopback range decide whether the fence is there: any one getting
+/// past the filters is a missing fence ([`EXIT_NOT_FENCED`]), and any
+/// one that neither got past nor was blocked — the token could not be
+/// assumed, the connect timed out — leaves the probe inconclusive. An
+/// attempt at an off-loopback target that was skipped (the machine
+/// has no such address to aim at, or no range is configured) does not
 /// fail the probe.
 ///
 /// With those settled, the attempt at the broker's own listener inside
@@ -224,15 +293,12 @@ pub struct Verdict {
 /// refuse them — and are reported as residuals instead of passing
 /// silently.
 pub fn verdict(r: &Report) -> Verdict {
-    let blocked_or_skipped = |o: Outcome| matches!(o, Outcome::Blocked | Outcome::Skipped);
-    let exit = if r.plain.passed_fence()
-        || r.anonymous.passed_fence()
-        || r.range_off_loopback.passed_fence()
-    {
+    let must = r.must_be_blocked();
+    let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
         EXIT_NOT_FENCED
-    } else if r.plain != Outcome::Blocked
-        || !blocked_or_skipped(r.anonymous)
-        || !blocked_or_skipped(r.range_off_loopback)
+    } else if must
+        .iter()
+        .any(|(o, may_skip)| !(*o == Outcome::Blocked || (*may_skip && *o == Outcome::Skipped)))
     {
         EXIT_INCONCLUSIVE
     } else {
@@ -255,7 +321,8 @@ pub fn verdict(r: &Report) -> Verdict {
 }
 
 /// An off-loopback destination on this machine for the anonymous
-/// attempt and the off-loopback range attempt: the address the machine would use as the source of an
+/// attempt, the lowered-integrity attempts and the off-loopback range
+/// attempt: the address the machine would use as the source of an
 /// outbound connection, at `port`. Nothing needs to listen there —
 /// refused is as good an answer as connected.
 ///
@@ -317,6 +384,55 @@ enum Identity {
     Own,
     Anonymous,
     DenyOnlyUser,
+    /// A copy of the own token at this mandatory level.
+    LoweredIntegrity(u32),
+}
+
+/// Check that the thread now carries a token at mandatory level
+/// `rid` and at impersonation level. Setting a thread token can
+/// succeed and still leave the thread with less than was asked for;
+/// a connect made then would say nothing about the token shape under
+/// test.
+fn confirm_thread_integrity(rid: u32) -> Result<()> {
+    let mut tok = HANDLE::default();
+    // open_as_self: checked against the process token, not the
+    // lowered one the thread carries.
+    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut tok) }
+        .context("OpenThreadToken")?;
+    let tok = crate::util::OwnedHandle(tok);
+    let mut level = 0u32;
+    let mut len = 0u32;
+    // u64 elements: the buffer starts with a struct holding a pointer.
+    let mut buf = [0u64; 16];
+    let integrity = unsafe {
+        GetTokenInformation(
+            tok.raw(),
+            TokenImpersonationLevel,
+            Some(&mut level as *mut u32 as *mut std::ffi::c_void),
+            size_of::<u32>() as u32,
+            &mut len,
+        )
+        .context("GetTokenInformation(TokenImpersonationLevel)")?;
+        GetTokenInformation(
+            tok.raw(),
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            size_of_val(&buf) as u32,
+            &mut len,
+        )
+        .context("GetTokenInformation(TokenIntegrityLevel)")?;
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        crate::sid::psid_to_string(label.Label.Sid)?
+    };
+    let want = format!("S-1-16-{rid}");
+    if level < SecurityImpersonation.0 as u32 || integrity != want {
+        return Err(anyhow!(
+            "thread token is at impersonation level {level}, integrity {integrity}; \
+             wanted level {} or above, integrity {want}",
+            SecurityImpersonation.0
+        ));
+    }
+    Ok(())
 }
 
 fn assume(id: Identity) -> Result<Option<Reverted>> {
@@ -376,6 +492,42 @@ fn assume(id: Identity) -> Result<Option<Reverted>> {
                 }
             }
             r.map(|()| Some(Reverted))
+        }
+        Identity::LoweredIntegrity(rid) => {
+            let mut own = HANDLE::default();
+            let mut imp = HANDLE::default();
+            let r = (|| -> Result<Reverted> {
+                unsafe {
+                    OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own)
+                        .context("OpenProcessToken")?;
+                    DuplicateTokenEx(
+                        own,
+                        TOKEN_ALL_ACCESS,
+                        None,
+                        SecurityImpersonation,
+                        TokenImpersonation,
+                        &mut imp,
+                    )
+                    .context("DuplicateTokenEx")?;
+                    // Lowering a token's integrity level takes no
+                    // privilege.
+                    crate::token::set_il(imp, rid)?;
+                    SetThreadToken(None, Some(imp)).context("SetThreadToken")?;
+                }
+                // From here the thread is impersonating: revert on
+                // every path, including a failed confirmation.
+                let reverted = Reverted;
+                confirm_thread_integrity(rid)?;
+                Ok(reverted)
+            })();
+            unsafe {
+                for h in [own, imp] {
+                    if !h.is_invalid() {
+                        let _ = CloseHandle(h);
+                    }
+                }
+            }
+            r.map(Some)
         }
     }
 }
@@ -529,15 +681,28 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     outcome
 }
 
+/// The off-loopback target of the lowered-integrity attempts: the
+/// one at a port inside the configured loopback range when there is
+/// one, else the anonymous attempt's. Both are the same address; the
+/// in-range port is the stricter destination, since it is the one a
+/// PERMIT names. Shared by the runner, which aims the attempts, and
+/// the broker, which reports where they went.
+pub fn lowered_off_loopback<T>(range_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
+    range_off_loopback.or(anonymous)
+}
+
 /// Where each attempt is aimed. `None` skips that attempt.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Targets<'a> {
     /// The loopback probe target: outside every permitted port range.
     pub target: &'a str,
     /// Off-loopback, for the attempt made while impersonating the
-    /// anonymous token.
+    /// anonymous token — and for the lowered-integrity attempts when
+    /// `range_off_loopback` is `None`.
     pub anonymous: Option<&'a str>,
     /// Off-loopback, at a port inside the configured loopback range.
+    /// Also where the lowered-integrity attempts' off-loopback half
+    /// goes ([`lowered_off_loopback`]).
     pub range_off_loopback: Option<&'a str>,
     /// The broker's loopback listener inside the configured range.
     pub range_loopback: Option<&'a str>,
@@ -562,20 +727,28 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
     if rc != 0 {
         return Err(anyhow!("WSAStartup: {rc}"));
     }
+    let lowered_target = lowered_off_loopback(range_off_loopback, anonymous_target);
+    let off_loopback_at = |name: &str, id: Identity, t: &Option<SocketAddr>| match t {
+        Some(t) => attempt(name, id, t),
+        None => {
+            eprintln!(
+                "srt-win: runner: egress probe [{name}]: SKIPPED \
+                 (no off-loopback target)"
+            );
+            Outcome::Skipped
+        }
+    };
+    let low = Identity::LoweredIntegrity(IL_LOW);
+    let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
     Ok(Report {
         plain: attempt("plain", Identity::Own, &target),
-        anonymous: match &anonymous_target {
-            Some(t) => attempt("anonymous", Identity::Anonymous, t),
-            None => {
-                eprintln!(
-                    "srt-win: runner: egress probe [anonymous]: SKIPPED \
-                     (no off-loopback target)"
-                );
-                Outcome::Skipped
-            }
-        },
+        anonymous: off_loopback_at("anonymous", Identity::Anonymous, &anonymous_target),
         anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target),
         deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target),
+        low_integrity: off_loopback_at("low integrity", low, &lowered_target),
+        low_integrity_loopback: attempt("low integrity, loopback", low, &target),
+        untrusted_integrity: off_loopback_at("untrusted integrity", untrusted, &lowered_target),
+        untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target),
         range_off_loopback: optional("loopback range, off-loopback", &range_off_loopback),
         range_loopback: optional("loopback range, loopback", &range_loopback),
     })
@@ -585,15 +758,36 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
 mod tests {
     use super::*;
 
-    /// A report with no loopback port range configured.
+    /// A report with no loopback port range configured: the four
+    /// lowered-integrity attempts blocked, the two range attempts
+    /// skipped, the rest as given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
+        lowered(
+            Report {
+                plain: p,
+                anonymous: a,
+                anonymous_loopback: al,
+                deny_only: d,
+                low_integrity: Outcome::Blocked,
+                low_integrity_loopback: Outcome::Blocked,
+                untrusted_integrity: Outcome::Blocked,
+                untrusted_integrity_loopback: Outcome::Blocked,
+                range_off_loopback: Outcome::Skipped,
+                range_loopback: Outcome::Skipped,
+            },
+            [Outcome::Blocked; 4],
+        )
+    }
+
+    /// `r` with the four lowered-integrity attempts replaced, in
+    /// field order.
+    fn lowered(r: Report, l: [Outcome; 4]) -> Report {
         Report {
-            plain: p,
-            anonymous: a,
-            anonymous_loopback: al,
-            deny_only: d,
-            range_off_loopback: Outcome::Skipped,
-            range_loopback: Outcome::Skipped,
+            low_integrity: l[0],
+            low_integrity_loopback: l[1],
+            untrusted_integrity: l[2],
+            untrusted_integrity_loopback: l[3],
+            ..r
         }
     }
 
@@ -617,12 +811,17 @@ mod tests {
             for a in Outcome::ALL {
                 for al in Outcome::ALL {
                     for d in Outcome::ALL {
+                        // The four lowered-integrity fields take the
+                        // same values in a different order, so every
+                        // field sees every outcome beside differing
+                        // neighbours; the two range fields take every
+                        // pair.
                         for ro in Outcome::ALL {
                             for rl in Outcome::ALL {
                                 let r = Report {
                                     range_off_loopback: ro,
                                     range_loopback: rl,
-                                    ..report(p, a, al, d)
+                                    ..lowered(report(p, a, al, d), [d, al, a, p])
                                 };
                                 assert_eq!(Report::decode(r.encode()), Some(r));
                             }
@@ -671,6 +870,33 @@ mod tests {
     }
 
     #[test]
+    fn lowered_attempts_go_to_the_in_range_port_when_there_is_one() {
+        assert_eq!(
+            lowered_off_loopback(Some("10.0.0.5:3000"), Some("10.0.0.5:49999")),
+            Some("10.0.0.5:3000")
+        );
+        assert_eq!(
+            lowered_off_loopback(None, Some("10.0.0.5:49999")),
+            Some("10.0.0.5:49999")
+        );
+        assert_eq!(lowered_off_loopback::<&str>(None, None), None);
+    }
+
+    #[test]
+    fn every_field_fits_below_the_marker_in_an_exit_code() {
+        const { assert!(FIELDS * BITS < 31) };
+        assert_eq!(REPORT_BASE, 0x4000_0000);
+        // The widest report still has bit 31 clear.
+        let all_error = Report {
+            range_off_loopback: Error,
+            range_loopback: Error,
+            ..lowered(report(Error, Error, Error, Error), [Error; 4])
+        };
+        assert_eq!(all_error.encode() >> 31, 0);
+        assert_eq!(Report::decode(all_error.encode()), Some(all_error));
+    }
+
+    #[test]
     fn probe_target_inside_the_range_is_a_conflict() {
         let t = |s: &str| s.parse::<SocketAddr>().unwrap();
         let range = (3000, 3099);
@@ -709,7 +935,7 @@ mod tests {
             0x1000,
             0x2000,
             REPORT_BASE - 1,
-            2 * REPORT_BASE,
+            REPORT_BASE << 1,
             0xC000_0005,
         ] {
             assert_eq!(Report::decode(code), None, "{code:#x}");
@@ -763,6 +989,45 @@ mod tests {
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             // Residuals qualify a pass; a failure reports none.
             assert!(v.residuals.is_empty());
+        }
+    }
+
+    #[test]
+    fn verdict_lowered_integrity_getting_out_is_not_fenced() {
+        let all_blocked = report(Blocked, Blocked, Blocked, Blocked);
+        for field in 0..4 {
+            for through in [Connected, Refused] {
+                let mut l = [Blocked; 4];
+                l[field] = through;
+                let v = verdict(&lowered(all_blocked, l));
+                assert_eq!(v.exit, EXIT_NOT_FENCED, "field {field} {through:?}");
+                assert!(v.residuals.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn verdict_lowered_integrity_not_assumed_is_inconclusive() {
+        let all_blocked = report(Blocked, Blocked, Blocked, Blocked);
+        for field in 0..4 {
+            // A token that could not be assumed is not a block.
+            for odd in [Error, Unreachable] {
+                let mut l = [Blocked; 4];
+                l[field] = odd;
+                assert_eq!(
+                    verdict(&lowered(all_blocked, l)).exit,
+                    EXIT_INCONCLUSIVE,
+                    "field {field} {odd:?}"
+                );
+            }
+        }
+        // Only the attempts at the off-loopback target can be skipped.
+        let v = verdict(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
+        assert_eq!(v.exit, EXIT_FENCED);
+        for loopback in [1, 3] {
+            let mut l = [Blocked; 4];
+            l[loopback] = Skipped;
+            assert_eq!(verdict(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
         }
     }
 

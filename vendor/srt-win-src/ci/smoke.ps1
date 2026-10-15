@@ -280,7 +280,8 @@ function WfpVerify([string]$tgt) {
 $v = WfpVerify $probeTgt
 if ($v.exit -ne 0 -or $v.json.egress_probe -ne 'blocked') {
   throw ("wfp verify (fence-active): expected exit 0 + blocked, " +
-         "got exit=$($v.exit) probe='$($v.json.egress_probe)'")
+         "got exit=$($v.exit) probe='$($v.json.egress_probe)'. " +
+         "Every attempt: $($v.json | ConvertTo-Json -Compress)")
 }
 if ($v.json.target -ne $probeTgt) {
   throw "wfp verify: --target not honoured; got '$($v.json.target)'"
@@ -393,6 +394,13 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
+# Control for the lowered-integrity attempts, recorded and not
+# asserted: with no filters they should connect too, which shows that
+# `blocked` for them with the fence active is the filter's doing and
+# not something a lowered-integrity token cannot do anyway.
+Write-Host ("wfp verify control (fence-inactive): " +
+            "low_integrity_loopback_probe=$($v.json.low_integrity_loopback_probe) " +
+            "untrusted_integrity_loopback_probe=$($v.json.untrusted_integrity_loopback_probe)")
 $probeLsn.Stop()
 
 # Re-install to set up for the full uninstall below.

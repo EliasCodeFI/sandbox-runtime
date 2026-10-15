@@ -47,7 +47,10 @@
 //!     LOGON`, which the sandbox-user SD does not grant. This filter
 //!     is what refuses that connect. It is machine-wide — it applies
 //!     to ANY thread impersonating anonymous, whoever owns the
-//!     process — so it is confined to non-loopback destinations.
+//!     process — so it is confined to non-loopback destinations. The
+//!     SD carries an untrusted-level mandatory label, because the
+//!     anonymous token's integrity level is below the level an
+//!     unlabelled descriptor is given (see [`sddl_anonymous`]).
 //!
 //! ## What the filters do not cover
 //!
@@ -511,6 +514,10 @@ pub fn filter_count(loopback_range: Option<(u16, u16)>) -> usize {
 ///      the PERMIT has the same filters as revision 2; the number
 ///      moves so that a build which does not know about the range
 ///      never accepts a set that may carry one.
+///      It is also the first revision at which the anonymous BLOCK's
+///      descriptor always carries its integrity label
+///      ([`sddl_anonymous`]): a revision-2 set may predate the label,
+///      and re-running the install rewrites it.
 ///
 /// Recorded twice: in every filter's tag (what an elevated `wfp
 /// status` reads) and in the install record (what the non-elevated
@@ -742,15 +749,40 @@ fn add_filter(
 /// themselves: a token outside an AppContainer does not carry either
 /// SID, and an AppContainer token of any OTHER user still fails the
 /// first half.
+///
+/// Unlike [`sddl_anonymous`] this descriptor carries no mandatory
+/// label: a process of the sandbox account runs at medium integrity,
+/// the level an unlabelled descriptor is given. A copy of its token
+/// with the integrity level lowered is below that level; whether the
+/// BLOCK still matches it is measured by the fence probe
+/// ([`crate::probe`]), which requires it to.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }
 
 /// SDDL for the anonymous BLOCK filter — ALLOW `ANONYMOUS LOGON`
-/// (`S-1-5-7`). Matches the anonymous token and nothing else: no
+/// (`S-1-5-7`), under a mandatory label at the untrusted level
+/// (`S-1-16-0`). Matches the anonymous token and nothing else: no
 /// other token carries that SID.
+///
+/// The label is what lets the ALLOW ACE be reached. An access check
+/// runs the mandatory integrity check before it reads the DACL. A
+/// descriptor with no label is treated as medium integrity, no
+/// write-up; the anonymous token's integrity level is untrusted, the
+/// lowest. A token below the descriptor's level is left only the
+/// rights the checker's generic mapping files under read and execute,
+/// whatever the DACL says. Which rights those are is the checker's
+/// choice, so without a label the match would depend on a mapping
+/// this crate does not control — and under a mapping that files the
+/// match right elsewhere, the anonymous token would never match.
+/// Every integrity level dominates the untrusted level, so with this
+/// label the mandatory check always passes and the DACL alone
+/// decides.
+///
+/// The label widens nothing: it grants no access, and the DACL still
+/// names `ANONYMOUS LOGON` only.
 pub fn sddl_anonymous() -> String {
-    "O:LSG:LSD:(A;;CC;;;S-1-5-7)".to_string()
+    "O:LSG:LSD:(A;;CC;;;S-1-5-7)S:(ML;;NW;;;S-1-16-0)".to_string()
 }
 
 // "Not loopback" for the anonymous BLOCK.
@@ -1366,6 +1398,16 @@ mod tests {
     fn anonymous_sddl_parses() {
         let sd = OwnedSd::from_sddl(&sddl_anonymous()).expect("sddl");
         assert!(sd.len > 0);
+    }
+
+    #[test]
+    fn anonymous_sddl_grants_anonymous_logon_under_an_untrusted_label() {
+        let s = sddl_anonymous();
+        assert!(s.contains("D:(A;;CC;;;S-1-5-7)"));
+        // Without the label the anonymous token, whose integrity
+        // level is untrusted, is stopped before the DACL is read.
+        assert!(s.contains("S:(ML;;NW;;;S-1-16-0)"));
+        assert!(!s.contains("(D;"));
     }
 
     #[test]
