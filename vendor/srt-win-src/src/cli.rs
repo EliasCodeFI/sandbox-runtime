@@ -723,14 +723,26 @@ enum WfpCmd {
     ///     token, to `target`.
     ///   - `deny_only_probe` — a copy of the own token with the user
     ///     SID deny-only, to `target`.
-    ///   - `residuals` — names of the gaps the last two found open
-    ///     (`anonymous-loopback`, `deny-only-user-sid`). The filters
-    ///     cannot close these; they are reported, with a warning on
-    ///     stderr, and do not change the exit code.
+    ///   - `low_integrity_probe`, `low_integrity_loopback_probe` — a
+    ///     copy of the own token at low integrity, to
+    ///     `anonymous_target` and to `target`.
+    ///   - `untrusted_integrity_probe`,
+    ///     `untrusted_integrity_loopback_probe` — the same at
+    ///     untrusted integrity.
+    ///   - `residuals` — names of the gaps `anonymous_loopback_probe`
+    ///     and `deny_only_probe` found open (`anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters cannot close these;
+    ///     they are reported, with a warning on stderr, and do not
+    ///     change the exit code.
     ///
-    /// Exits **0** (the first two were blocked = fence active),
-    /// **3** (either got past the filters = fence MISSING), **2**
-    /// (either was inconclusive; treat as failure), **19** when the
+    /// Every other probe must be blocked: `egress_probe`,
+    /// `anonymous_probe` and the four lowered-integrity ones, whose
+    /// token still carries the sandbox account's SID. Exits **0**
+    /// (all of them were blocked, or skipped for want of an
+    /// off-loopback address = fence active), **3** (one got past the
+    /// filters = fence MISSING), **2** (one was inconclusive — `error`
+    /// means the token could not be assumed, which is not a block;
+    /// treat as failure), **19** when the
     /// install record says the filter set predates this build, or
     /// **15** when the sandbox user is not provisioned. A runner
     /// exit that is not a probe report prints every probe as
@@ -746,7 +758,8 @@ enum WfpCmd {
         #[arg(long)]
         target: String,
         /// Off-loopback target (`host:port`) for the attempt made
-        /// while impersonating the anonymous token. Default: this
+        /// while impersonating the anonymous token, and for the
+        /// lowered-integrity attempts' off-loopback half. Default: this
         /// machine's own outbound address at `target`'s port —
         /// nothing needs to listen there, since a refused connect
         /// shows the filters let it through just as a completed one
@@ -1210,6 +1223,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         "anonymous_probe": "error",
                         "anonymous_loopback_probe": "error",
                         "deny_only_probe": "error",
+                        "low_integrity_probe": "error",
+                        "low_integrity_loopback_probe": "error",
+                        "untrusted_integrity_probe": "error",
+                        "untrusted_integrity_loopback_probe": "error",
                         "target": target,
                         "anonymous_target": anonymous_target,
                         "residuals": [],
@@ -1238,6 +1255,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     "anonymous_probe": report.anonymous.label(),
                     "anonymous_loopback_probe": report.anonymous_loopback.label(),
                     "deny_only_probe": report.deny_only.label(),
+                    "low_integrity_probe": report.low_integrity.label(),
+                    "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
+                    "untrusted_integrity_probe": report.untrusted_integrity.label(),
+                    "untrusted_integrity_loopback_probe":
+                        report.untrusted_integrity_loopback.label(),
                     "target": target,
                     "anonymous_target": anonymous_target,
                     "residuals": verdict.residuals,

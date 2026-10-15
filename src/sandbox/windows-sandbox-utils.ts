@@ -231,8 +231,9 @@ export type WindowsWfpResidual = 'anonymous-loopback' | 'deny-only-user-sid'
 /**
  * Result of `srt-win wfp verify` on success (exit 0) — see
  * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
- * return path `probes.plain` is always `blocked` and
- * `probes.anonymous` is `blocked` or `skipped`.
+ * return path `probes.plain` and the two lowered-integrity loopback
+ * attempts are always `blocked`, and `probes.anonymous` and the two
+ * lowered-integrity off-loopback attempts are `blocked` or `skipped`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -248,6 +249,14 @@ export interface WindowsWfpVerifyResult {
     anonymousLoopback: WindowsWfpProbeOutcome
     /** The sandbox token with its user SID deny-only, to the loopback target. */
     denyOnly: WindowsWfpProbeOutcome
+    /** The sandbox token at low integrity, to an off-loopback target. */
+    lowIntegrity: WindowsWfpProbeOutcome
+    /** The sandbox token at low integrity, to the loopback target. */
+    lowIntegrityLoopback: WindowsWfpProbeOutcome
+    /** The sandbox token at untrusted integrity, to an off-loopback target. */
+    untrustedIntegrity: WindowsWfpProbeOutcome
+    /** The sandbox token at untrusted integrity, to the loopback target. */
+    untrustedIntegrityLoopback: WindowsWfpProbeOutcome
   }
   /**
    * Gaps the probe found open. NOT a clean pass when non-empty: the
@@ -256,8 +265,8 @@ export interface WindowsWfpVerifyResult {
    */
   residuals: WindowsWfpResidual[]
   /**
-   * Human-readable warnings: one per residual, plus one when the
-   * anonymous attempt was skipped (no off-loopback address to aim
+   * Human-readable warnings: one per residual, plus one per attempt
+   * that was skipped (no off-loopback address to aim
    * at). `initialize()` logs them.
    */
   warnings: string[]
@@ -998,6 +1007,10 @@ type RawWfpVerify = {
   anonymous_target?: string | null
   anonymous_loopback_probe?: string
   deny_only_probe?: string
+  low_integrity_probe?: string
+  low_integrity_loopback_probe?: string
+  untrusted_integrity_probe?: string
+  untrusted_integrity_loopback_probe?: string
   residuals?: string[]
   outdated?: boolean
   hint?: string
@@ -1023,8 +1036,11 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
  * {@link verifyWindowsWfpEgress}.
  *
  * - exit 19 → `wfp_fence_outdated` (the install predates this build).
- * - exit 3 → `wfp_fence_inactive` (the plain or the off-loopback
- *   anonymous attempt got past the filters).
+ * - exit 3, or any attempt the fence must refuse reported as having
+ *   got past the filters → `wfp_fence_inactive`. Those attempts are
+ *   the plain one, the off-loopback anonymous one and the four made
+ *   under a copy of the sandbox token with its integrity level
+ *   lowered.
  * - any other non-zero exit → `wfp_verify_inconclusive`.
  * - exit 0 → the result, with any residuals and their warnings. A
  *   residual never throws: the filters cannot close it, so refusing
@@ -1060,12 +1076,21 @@ export function interpretWindowsWfpVerify(r: {
     anonymous: outcome(raw.anonymous_probe),
     anonymousLoopback: outcome(raw.anonymous_loopback_probe),
     denyOnly: outcome(raw.deny_only_probe),
+    lowIntegrity: outcome(raw.low_integrity_probe),
+    lowIntegrityLoopback: outcome(raw.low_integrity_loopback_probe),
+    untrustedIntegrity: outcome(raw.untrusted_integrity_probe),
+    untrustedIntegrityLoopback: outcome(raw.untrusted_integrity_loopback_probe),
   }
+  const offLoopback = raw.anonymous_target ?? 'no target'
   const summary =
     `plain=${probes.plain} (${raw.target}), ` +
-    `anonymous=${probes.anonymous} (${raw.anonymous_target ?? 'no target'}), ` +
+    `anonymous=${probes.anonymous} (${offLoopback}), ` +
     `anonymous-loopback=${probes.anonymousLoopback}, ` +
-    `deny-only=${probes.denyOnly}`
+    `deny-only=${probes.denyOnly}, ` +
+    `low-integrity=${probes.lowIntegrity} (${offLoopback}), ` +
+    `low-integrity-loopback=${probes.lowIntegrityLoopback}, ` +
+    `untrusted-integrity=${probes.untrustedIntegrity} (${offLoopback}), ` +
+    `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}`
   if (r.status === 19 || raw.outdated) {
     throw new WindowsSandboxError(
       'wfp_fence_outdated',
@@ -1075,18 +1100,28 @@ export function interpretWindowsWfpVerify(r: {
         `. Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`,
     )
   }
-  if (r.status === 3) {
-    const which = [
-      ['plain', probes.plain, 'the sandbox user', raw.target],
+  // The attempts the fence must refuse. One getting through rejects
+  // whatever the exit code says.
+  const lowIl = 'the sandbox user under a low-integrity copy of its token'
+  const untrustedIl =
+    'the sandbox user under an untrusted-integrity copy of its token'
+  const which = (
+    [
+      [probes.plain, 'the sandbox user', raw.target],
       [
-        'anonymous',
         probes.anonymous,
         'the sandbox user impersonating the anonymous token',
         raw.anonymous_target,
       ],
-    ]
-      .filter(([, o]) => o === 'connected' || o === 'refused')
-      .map(([, , who, tgt]) => `direct outbound from ${who} to ${tgt}`)
+      [probes.lowIntegrity, lowIl, raw.anonymous_target],
+      [probes.lowIntegrityLoopback, lowIl, raw.target],
+      [probes.untrustedIntegrity, untrustedIl, raw.anonymous_target],
+      [probes.untrustedIntegrityLoopback, untrustedIl, raw.target],
+    ] as const
+  )
+    .filter(([o]) => o === 'connected' || o === 'refused')
+    .map(([, who, tgt]) => `direct outbound from ${who} to ${tgt}`)
+  if (r.status === 3 || which.length > 0) {
     throw new WindowsSandboxError(
       'wfp_fence_inactive',
       `WFP egress fence is not active — ` +
@@ -1115,6 +1150,16 @@ export function interpretWindowsWfpVerify(r: {
         `anonymous block is unverified this run`,
     )
   }
+  if (
+    probes.lowIntegrity === 'skipped' ||
+    probes.untrustedIntegrity === 'skipped'
+  ) {
+    warnings.push(
+      `WFP egress fence: the off-loopback lowered-integrity attempts ` +
+        `were skipped (no off-loopback address on this machine, or an ` +
+        `srt-win that does not make them)`,
+    )
+  }
   return { target: raw.target, stderr: r.stderr, probes, residuals, warnings }
 }
 
@@ -1132,6 +1177,9 @@ export function interpretWindowsWfpVerify(r: {
  *    listen there);
  * 3. impersonating the anonymous token, to the listener;
  * 4. a copy of its token with the user SID deny-only, to the
+ *    listener;
+ * 5. a copy of its token at low integrity, and one at untrusted
+ *    integrity, each to the off-loopback address and to the
  *    listener.
  *
  * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
@@ -1141,8 +1189,8 @@ export function interpretWindowsWfpVerify(r: {
  * required, so the synchronous `runSrtWin` is safe). Does not require
  * elevation and does not depend on any external host.
  *
- * Attempts 1 and 2 are what the fence must refuse: either getting
- * through throws. Attempts 3 and 4 are shapes the filter set cannot
+ * Attempts 1, 2 and 5 are what the fence must refuse: any of them
+ * getting through throws. Attempts 3 and 4 are shapes the filter set cannot
  * refuse; when they get through, the result names them in
  * `residuals` (with `warnings`) rather than passing silently — see
  * {@link WindowsWfpResidual}.

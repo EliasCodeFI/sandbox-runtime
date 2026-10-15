@@ -100,10 +100,47 @@ $vout = & $Exe wfp verify --target $v1Tgt
 $vexit = $LASTEXITCODE
 $v1Lsn.Stop()
 Write-Host "V1: wfp verify --target $v1Tgt exit=$vexit stdout='$vout'"
-if ($vexit -ne 0) {
-  throw "V1: wfp verify expected exit 0 (blocked), got $vexit"
-}
 $v = $vout | ConvertFrom-Json
+
+# ── V1c: lowered-integrity copies of the sandbox token are blocked ──
+# Same run as V1, checked first so that a failure here is named for
+# what it is instead of surfacing as V1's exit code. The runner makes
+# four more connects under a copy of its own token whose integrity
+# level it has lowered: low and untrusted, each to the off-loopback
+# address and to the out-of-range loopback listener. The copy still
+# carries the sandbox account's SID, so block-user must refuse every
+# one. `error` means the runner could not assume the lowered token;
+# that is not a block and fails the row as such.
+$loweredFields = 'low_integrity_probe','low_integrity_loopback_probe',
+                 'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
+foreach ($f in $loweredFields) {
+  if ($null -eq $v.PSObject.Properties[$f]) { throw "V1c: wfp verify output lacks '$f': $vout" }
+}
+$loweredRaw = ($loweredFields | ForEach-Object { "$_=$($v.$_)" }) -join ' '
+Write-Host "V1c raw: $loweredRaw (off-loopback target=$($v.anonymous_target))"
+$loweredOpen = @($loweredFields | Where-Object { $v.$_ -in 'connected','refused' })
+if ($loweredOpen.Count -gt 0) {
+  throw "V1c: BYPASS - a connect under a lowered-integrity copy of the sandbox token was NOT blocked " +
+        "($($loweredOpen -join ', ')); block-user does not match that token. $loweredRaw exit=$vexit"
+}
+foreach ($f in $loweredFields) {
+  $got = $v.$f
+  $offLoopback = $f -notlike '*_loopback_probe'
+  if ($got -eq 'error') {
+    throw "V1c: $f=error - the runner could not assume the lowered-integrity token (see its stderr line above); " +
+          "this is NOT a block. $loweredRaw"
+  }
+  if ($got -eq 'skipped' -and $offLoopback) {
+    Write-Host "V1c note: $f skipped (no off-loopback address on this runner)"
+  } elseif ($got -ne 'blocked') {
+    throw "V1c: $f expected blocked, got '$got'. $loweredRaw"
+  }
+}
+Write-Host "V1c ok: lowered-integrity connects blocked: $loweredRaw"
+
+if ($vexit -ne 0) {
+  throw "V1: wfp verify expected exit 0 (blocked), got $vexit. stdout: $vout"
+}
 if ($v.egress_probe -ne 'blocked') {
   throw "V1: wfp verify expected egress_probe=blocked, got '$($v.egress_probe)'"
 }
@@ -460,6 +497,140 @@ try {
   }
 } finally {
   $anonLb.Stop()
+}
+
+# ── R5i: a lowered-integrity copy of the child's own token ──────────
+# The same question as V1c, asked from inside a sandboxed command. A
+# process may lower the integrity level of a copy of its own token
+# without any privilege and impersonate it; the copy still carries the
+# sandbox account's SID, so block-user must refuse a connect made
+# under it.
+#
+# One C# method does socket -> duplicate token -> set integrity level
+# -> impersonate -> connect -> revert on a single thread, with the
+# socket created BEFORE the impersonation and the connect made through
+# ws2_32 directly. It prints one line per attempt: CONNECTED,
+# WSA:<code> (10013 = refused by a filter, 10061 = refused by the
+# destination, i.e. it got past the filters), or
+# TOKEN_FAILED:<step>:<code> when the lowered token could not be
+# assumed (for the `level` step the code is the impersonation level
+# the thread ended up with, otherwise the Win32 error).
+function LoweredIntegrityProbeScript {
+  param([string] $Ip, [int] $Port)
+  return @"
+`$src = @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+public static class SrtLowIl {
+  [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+  [StructLayout(LayoutKind.Sequential)] struct TokenMandatoryLabel { public SidAndAttributes Label; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool openAsSelf, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
+  [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TokenMandatoryLabel info, int len);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int len, out int ret);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetThreadToken(IntPtr thread, IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
+  static string Fail(string step) { return "TOKEN_FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
+  // Impersonate a copy of the process token at the integrity level
+  // named by sid. Returns null on success.
+  static string Assume(string sid) {
+    IntPtr own = IntPtr.Zero, dup = IntPtr.Zero, psid = IntPtr.Zero, cur = IntPtr.Zero;
+    try {
+      // TOKEN_DUPLICATE | TOKEN_QUERY
+      if (!OpenProcessToken(GetCurrentProcess(), 0x000A, out own)) return Fail("open");
+      // TOKEN_ALL_ACCESS, SecurityImpersonation, TokenImpersonation
+      if (!DuplicateTokenEx(own, 0xF01FF, IntPtr.Zero, 2, 2, out dup)) return Fail("duplicate");
+      if (!ConvertStringSidToSidW(sid, out psid)) return Fail("sid");
+      TokenMandatoryLabel tml = new TokenMandatoryLabel();
+      tml.Label.Sid = psid;
+      tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
+      // 25 = TokenIntegrityLevel
+      if (!SetTokenInformation(dup, 25, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
+      if (!SetThreadToken(IntPtr.Zero, dup)) return Fail("impersonate");
+      // The thread must really be impersonating: a token left at
+      // identification level would make the connect say nothing.
+      int level, ret;
+      // TOKEN_QUERY; 9 = TokenImpersonationLevel
+      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) { string f = Fail("open-thread"); RevertToSelf(); return f; }
+      if (!GetTokenInformation(cur, 9, out level, 4, out ret)) { string f = Fail("query-level"); RevertToSelf(); return f; }
+      if (level < 2) { RevertToSelf(); return "TOKEN_FAILED:level:" + level; }
+      return null;
+    } finally {
+      if (cur != IntPtr.Zero) CloseHandle(cur);
+      if (psid != IntPtr.Zero) LocalFree(psid);
+      if (dup != IntPtr.Zero) CloseHandle(dup);
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // An empty integritySid connects under the process's own token.
+  public static string Go(string ip, int port, string integritySid) {
+    bool lowered = !String.IsNullOrEmpty(integritySid);
+    byte[] a = IPAddress.Parse(ip).GetAddressBytes();
+    byte[] sa = new byte[16];
+    sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
+    Array.Copy(a, 0, sa, 4, 4);
+    using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
+      if (lowered) {
+        string failed = Assume(integritySid);
+        if (failed != null) return failed;
+      }
+      int rc = connect(s.Handle, sa, sa.Length);
+      int err = Marshal.GetLastWin32Error();
+      if (lowered) RevertToSelf();
+      return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    }
+  }
+}
+'@
+Add-Type -TypeDefinition `$src
+'PLAIN=' + [SrtLowIl]::Go('$Ip', $Port, '')
+'LOW=' + [SrtLowIl]::Go('$Ip', $Port, 'S-1-16-4096')
+'UNTRUSTED=' + [SrtLowIl]::Go('$Ip', $Port, 'S-1-16-0')
+"@
+}
+
+# The destination is an out-of-range loopback listener, live from the
+# broker, so "not blocked" is an actual connect.
+$lowIlLsn = Bind-Listener (50006, 50007, 50008, 49996)
+$lowIlPort = $lowIlLsn.LocalEndpoint.Port
+try {
+  $bs = (Test-NetConnection 127.0.0.1 -Port $lowIlPort `
+         -WarningAction SilentlyContinue).TcpTestSucceeded
+  if (-not $bs) { throw "R5i: broker-side connect to 127.0.0.1:$lowIlPort failed - test invalid" }
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', (LoweredIntegrityProbeScript '127.0.0.1' $lowIlPort))
+  Write-Host "R5i probe output (127.0.0.1:$lowIlPort): $($r.out.Trim() -replace '\s+',' ')"
+  if ($r.out -notmatch 'PLAIN=WSA:10013') {
+    throw "R5i: plain connect to out-of-range loopback expected WSA:10013 (block-user). raw: $($r.raw)"
+  }
+  foreach ($shape in 'LOW','UNTRUSTED') {
+    if ($r.out -notmatch "(?m)^$shape=(\S+)") { throw "R5i: no $shape result. raw: $($r.raw)" }
+    $got = $Matches[1]
+    if ($got -in 'CONNECTED','WSA:10061') {
+      throw "R5i: BYPASS - connect under a $shape-integrity copy of the sandboxed child's token was NOT blocked " +
+            "($shape=$got); block-user does not match that token. raw: $($r.raw)"
+    } elseif ($got -like 'TOKEN_FAILED:*') {
+      # Not a block: the child could not assume the token, so this
+      # route was not exercised from inside exec. The filter's answer
+      # for this shape is V1c's (unrestricted runner).
+      Write-Host "R5i NOT EXERCISED: child could not assume the $shape-integrity token ($got); see V1c"
+    } elseif ($got -eq 'WSA:10013') {
+      Write-Host "R5i ok: connect under a $shape-integrity copy of the child's token blocked (WSA:10013)"
+    } else {
+      throw "R5i: expected $shape=WSA:10013, got '$got'. raw: $($r.raw)"
+    }
+  }
+} finally {
+  $lowIlLsn.Stop()
 }
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─

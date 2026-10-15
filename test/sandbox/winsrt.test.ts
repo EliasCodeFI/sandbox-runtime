@@ -946,6 +946,10 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
           anonymous: 'blocked',
           anonymousLoopback: 'blocked',
           denyOnly: 'blocked',
+          lowIntegrity: 'blocked',
+          lowIntegrityLoopback: 'blocked',
+          untrustedIntegrity: 'blocked',
+          untrustedIntegrityLoopback: 'blocked',
         },
         residuals: [],
         warnings: [],
@@ -1555,10 +1559,14 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       anonymous_probe: 'blocked',
       anonymous_loopback_probe: 'blocked',
       deny_only_probe: 'blocked',
+      low_integrity_probe: 'blocked',
+      low_integrity_loopback_probe: 'blocked',
+      untrusted_integrity_probe: 'blocked',
+      untrusted_integrity_loopback_probe: 'blocked',
       target: '127.0.0.1:49999',
       anonymous_target: '10.0.0.5:49999',
       residuals: [],
-      runner_exit: 4096,
+      runner_exit: 16777216,
       ...over,
     })
   const runVerify = (status: number, stdout: string) => {
@@ -1591,6 +1599,10 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       anonymous: 'blocked',
       anonymousLoopback: 'blocked',
       denyOnly: 'blocked',
+      lowIntegrity: 'blocked',
+      lowIntegrityLoopback: 'blocked',
+      untrustedIntegrity: 'blocked',
+      untrustedIntegrityLoopback: 'blocked',
     })
     expect(r.residuals).toEqual([])
     expect(r.warnings).toEqual([])
@@ -1644,6 +1656,66 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
     }
+  })
+
+  it('verifyWindowsWfpEgress: a lowered-integrity attempt getting out rejects and says which', async () => {
+    const cases: [string, RegExp][] = [
+      [
+        'low_integrity_probe',
+        /low-integrity copy of its token to 10\.0\.0\.5:49999/,
+      ],
+      [
+        'low_integrity_loopback_probe',
+        /low-integrity copy of its token to 127\.0\.0\.1:49999/,
+      ],
+      [
+        'untrusted_integrity_probe',
+        /untrusted-integrity copy of its token to 10\.0\.0\.5:49999/,
+      ],
+      [
+        'untrusted_integrity_loopback_probe',
+        /untrusted-integrity copy of its token to 127\.0\.0\.1:49999/,
+      ],
+    ]
+    for (const [field, says] of cases) {
+      // Exit 0 as well as 3: an attempt reported as through rejects
+      // whatever the exit code says.
+      for (const status of [3, 0]) {
+        for (const through of ['connected', 'refused']) {
+          const err = await runVerify(
+            status,
+            verifyOut({ [field]: through }),
+          ).catch(e => e as WindowsSandboxError)
+          expect(err).toBeInstanceOf(WindowsSandboxError)
+          expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
+          expect((err as WindowsSandboxError).message).toMatch(says)
+          spawnSpy.mockRestore()
+          spawnSyncSpy.mockRestore()
+        }
+      }
+    }
+  })
+
+  it('verifyWindowsWfpEgress: a lowered token that could not be assumed rejects (not a block)', async () => {
+    expect(
+      await verifyCode(2, verifyOut({ low_integrity_loopback_probe: 'error' })),
+    ).toBe('wfp_verify_inconclusive')
+  })
+
+  it('verifyWindowsWfpEgress: skipped off-loopback lowered-integrity attempts resolve with a warning', async () => {
+    const r = await runVerify(
+      0,
+      verifyOut({
+        anonymous_probe: 'skipped',
+        low_integrity_probe: 'skipped',
+        untrusted_integrity_probe: 'skipped',
+        anonymous_target: null,
+      }),
+    )
+    expect(r.probes.lowIntegrity).toBe('skipped')
+    expect(r.probes.lowIntegrityLoopback).toBe('blocked')
+    expect(r.warnings.length).toBe(2)
+    expect(r.warnings[1]).toMatch(/lowered-integrity/)
   })
 
   it('verifyWindowsWfpEgress: an out-of-date fence rejects (wfp_fence_outdated) with the reinstall hint', async () => {
