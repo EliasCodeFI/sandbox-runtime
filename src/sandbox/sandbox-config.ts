@@ -1099,7 +1099,12 @@ export const WindowsConfigSchema = z.object({
         'created under `C:\\`, data-drive trees, PATH directories outside ' +
         'Program Files) does not reach it, and the write grants on ' +
         '`allowWrite` roots are kept between sessions instead of being ' +
-        'rewritten at every start. Reads are unaffected. Cost: Schannel ' +
+        'rewritten at every start. A kept grant also grants read: any ' +
+        'sandboxed session on the machine can read a kept root, whether ' +
+        'or not the root is in its own lists, until the grant is removed ' +
+        '(by uninstall, `srt-win acl forget`, or opting out). Hosts that ' +
+        'run sessions for parties that must not read each other\'s ' +
+        'project roots should opt out. Cost: Schannel ' +
         'refuses restricted tokens, so System32 `curl.exe`, git with the ' +
         'schannel backend, and .NET / PowerShell web requests fail inside ' +
         'the sandbox (git is switched to its OpenSSL backend ' +
