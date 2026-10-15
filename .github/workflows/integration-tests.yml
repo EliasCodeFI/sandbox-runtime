@@ -142,6 +142,14 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
 
+      # The opt-in profile read grant, on a made-up profile tree under a
+      # scratch root (never the runner's own profile): the test-hooks
+      # build is what can be pointed at it.
+      - name: Smoke-test srt-win profile read grant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-profile-read.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
