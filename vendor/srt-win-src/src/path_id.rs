@@ -377,6 +377,20 @@ fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
     Ok(buf)
 }
 
+/// The `\\?\`-prefixed path of the object `h` is open on, as
+/// [`canonicalize_path`] would give it. For a handle opened without
+/// following a link this is where the object itself is, so comparing
+/// it with the path that was opened shows whether a directory on the
+/// way redirected the open.
+pub(crate) fn final_path_of(h: HANDLE) -> Result<String> {
+    let buf = final_path_from_handle(h)?;
+    let s = String::from_utf16_lossy(&buf);
+    if !utf16_roundtrips(&buf, &s) {
+        bail!("the path is not representable as UTF-8");
+    }
+    Ok(s)
+}
+
 /// Immediate parent of a `\\?\…` canonical path, as a string.
 /// Returns `None` when there is no targetable parent (the path is
 /// a root, or its immediate parent is a root — touching the
@@ -426,7 +440,7 @@ impl FileId {
 }
 
 /// `FILE_ID_INFO` of an already-open handle.
-fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
+pub(crate) fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
     use windows::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };

@@ -168,6 +168,18 @@ CREATE TABLE IF NOT EXISTS persistent_writes (
   spec           TEXT NOT NULL,
   done           INTEGER NOT NULL
 );
+-- Paths the profile read grant (`profile.rs`) wrote on, and what each
+-- carries: 'container', 'granted', 'file' or 'denied'. Valid for the
+-- object with this file id (empty until the object was opened).
+-- `created` is 1 for a directory the grant created empty. No holders:
+-- removed by `profile forget`. Added without a schema version change:
+-- the table is created by the first read-write open.
+CREATE TABLE IF NOT EXISTS profile_paths (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  kind           TEXT NOT NULL,
+  created        INTEGER NOT NULL
+);
 "#;
 
 /// Outcome of a crash-recovery pass.
@@ -537,6 +549,18 @@ pub(crate) fn open_db_at(
     conn.execute_batch(schema_sql).context("apply schema")?;
     conn.pragma_update(None, "user_version", schema_version)?;
     Ok(conn)
+}
+
+/// A fresh in-memory session database, for tests of the modules that
+/// keep their tables in it.
+#[cfg(test)]
+pub(crate) fn open_memory_db_for_tests() -> Connection {
+    open_db_at(
+        std::path::Path::new(":memory:"),
+        SESSION_SCHEMA_SQL,
+        SESSION_SCHEMA_VERSION,
+    )
+    .expect("in-memory session database")
 }
 
 /// The machine-wide store dir: `%ProgramData%\sandbox-runtime` —

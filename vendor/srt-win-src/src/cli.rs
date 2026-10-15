@@ -20,6 +20,8 @@
 //!                                       — additive sandbox-user ACEs,
 //!                                         and write grants kept
 //!                                         between sessions
+//!   profile grant | forget | status    — the opt-in read grant on
+//!                                         the real user's profile
 //!   exec   -- <target> [args...]       — spawn under the two-hop
 //!                                         sandbox-user lockdown
 //!
@@ -142,7 +144,8 @@ enum Cmd {
     /// `sandbox-runtime-net` discriminator group if a prior install
     /// left it behind. Unless `--keep-user`, the calling user's
     /// persistent write grants (`acl grant --persistent`) are removed
-    /// first, as by `acl forget --all`.
+    /// first, as by `acl forget --all`, and so is their profile read
+    /// grant, as by `profile forget`.
     Uninstall {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -182,6 +185,14 @@ enum Cmd {
     Acl {
         #[command(subcommand)]
         sub: AclCmd,
+    },
+    /// The profile read grant: make the calling user's profile
+    /// readable to the sandbox group, except for credential stores.
+    /// Opt-in; nothing else in `srt-win` writes it. Runs as the user
+    /// whose profile it is, without elevation.
+    Profile {
+        #[command(subcommand)]
+        sub: ProfileCmd,
     },
     /// Spawn a process inside the sandbox.
     ///
@@ -246,7 +257,11 @@ enum Cmd {
         /// Without this flag the exec is refused (exit **20**) while
         /// any persistent write grant exists (`acl grant
         /// --persistent`): such a grant lets the sandbox account
-        /// write its tree under the ordinary token.
+        /// write its tree under the ordinary token. It is refused the
+        /// same way while a profile read grant exists (`profile
+        /// grant`), or while either record cannot be read: grants that
+        /// outlive a session are made for the write-restricted token
+        /// only.
         #[arg(long)]
         write_restricted_token: bool,
         /// A write root of this command's session, granted with `acl
@@ -313,13 +328,93 @@ enum ProbeCmd {
 }
 
 #[derive(Subcommand)]
+enum ProfileCmd {
+    /// Write, or bring up to date, the read grant on the calling
+    /// user's profile for the sandbox group.
+    ///
+    /// The profile directory and every directory that could hold an
+    /// excluded path get an entry that lets the sandbox list them and
+    /// pass through; their other children are granted read + execute
+    /// one by one (a directory with one inheriting entry, a file with
+    /// its own). Excluded paths — key and credential stores, browser
+    /// and password-manager data, the registry hives, the temporary
+    /// directory, and what `--exclude` adds — are never granted and
+    /// get a read deny, written before the first allow; an excluded
+    /// directory that does not exist is created empty to carry it.
+    /// Junctions, symbolic links and cloud placeholders are skipped.
+    /// No entry grants a write, delete or change-permissions right.
+    ///
+    /// The first run touches every file under the granted
+    /// directories and can take minutes on a large profile; progress
+    /// goes to stderr. A later run writes only what changed: a new
+    /// child of the profile directory (or of another directory whose
+    /// children are granted one by one) is not readable until then.
+    /// Other `srt-win acl` commands of the same user wait while a run
+    /// is in progress.
+    ///
+    /// Exits **15** unless the install's setup marker is this
+    /// build's, and non-zero when an excluded directory could not be
+    /// denied (the grant is then recorded as incomplete).
+    Grant {
+        /// A path inside the profile to exclude in addition to the
+        /// built-in list (absolute, or relative to the profile).
+        /// Repeatable. Nothing removes a built-in exclusion.
+        #[arg(long = "exclude", value_name = "PATH")]
+        exclude: Vec<String>,
+        /// Print the result as one JSON object on stdout:
+        /// `{profile, list_version, complete, containers, granted,
+        /// files, denied, placeholders, writes, unchanged, removed,
+        /// skipped, failed, elapsed_ms}`.
+        #[arg(long)]
+        json: bool,
+        /// No progress lines on stderr.
+        #[arg(long)]
+        quiet: bool,
+        /// Treat this directory as the profile, with its `AppData`
+        /// folders beneath it. CI smoke hook: only in builds with the
+        /// `test-hooks` feature.
+        #[cfg(feature = "test-hooks")]
+        #[arg(long, value_name = "DIR")]
+        test_profile: Option<String>,
+    },
+    /// Remove the grant: the sandbox group's entry from every
+    /// recorded path (each DACL is left as it was before the grant),
+    /// the empty directories the grant created, and the record. Exits
+    /// non-zero if a path could not be completed; it stays recorded.
+    Forget {
+        /// Print `{removed, absent, placeholders_removed, failed}` on
+        /// stdout, also when exiting non-zero.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the recorded grant as JSON: `{state, reason?, profile,
+    /// list_version, recorded_list_version, extra_exclusions,
+    /// containers, granted, files, denied, env?, paths?}`. `state` is
+    /// `none`, `current`, `outdated`, `incomplete` or `unknown`; only
+    /// `current` is a grant a session may rely on. `env` lists the
+    /// configuration-file variables an embedder may set for a
+    /// sandboxed command. Reads the registry and opens the profile
+    /// directory; nothing below it. Exit 0.
+    Status {
+        /// Include every recorded path with its kind.
+        #[arg(long)]
+        paths: bool,
+        /// See `profile grant --test-profile`.
+        #[cfg(feature = "test-hooks")]
+        #[arg(long, value_name = "DIR")]
+        test_profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum UserCmd {
     /// Print the sandbox user's provisioning state as JSON:
     /// `{user: {exists, sid?, group_exists, group_sid?,
     /// in_builtin_users, in_sandbox_group, hidden_from_logon},
     /// cred_present, marker_version?, setup_version,
     /// marker_user_sid?, ca_cert_thumb?, ca_cert_pem?,
-    /// persistent_grants: {state, roots, reason?}}`. The install is
+    /// persistent_grants: {state, roots, reason?}, profile_grant:
+    /// {state, reason?}}`. The install is
     /// usable by this build only when `marker_version` equals
     /// `setup_version`; otherwise re-run `srt-win install`.
     Status,
@@ -718,6 +813,9 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // unless persistent write grants exist or cannot be ruled
         // out (`srt_win::persist`).
         "persistent_grants": srt_win::persist::status_json(),
+        // Whether a profile read grant is recorded (`none`, `present`
+        // or `unknown`); `profile status` says whether it is current.
+        "profile_grant": srt_win::profile::brief_status_json(),
     }))
 }
 
@@ -1119,6 +1217,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // uninstall: once the group is gone its ACEs match no
             // token.
             if !keep_user {
+                match srt_win::profile::forget_everything() {
+                    Ok(None) => {}
+                    Ok(Some(f)) if f.failed.is_empty() => eprintln!(
+                        "srt-win: profile read grant removed ({} path(s))",
+                        f.removed + f.absent
+                    ),
+                    Ok(Some(f)) => eprintln!(
+                        "srt-win: warning: the profile read grant could not be removed from \
+                         {} path(s), which stay recorded",
+                        f.failed.len()
+                    ),
+                    Err(e) => eprintln!("srt-win: warning: profile read grant cleanup: {e:#}"),
+                }
                 match srt_win::persist::forget_everything() {
                     Ok((0, _)) => {}
                     Ok((n, 0)) => {
@@ -1770,6 +1881,123 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
 
+        // ─── profile ───────────────────────────────────────────────
+        Cmd::Profile {
+            sub:
+                ProfileCmd::Grant {
+                    exclude,
+                    json,
+                    quiet,
+                    #[cfg(feature = "test-hooks")]
+                    test_profile,
+                },
+        } => {
+            use srt_win::{persist, profile, state_db};
+            #[cfg(not(feature = "test-hooks"))]
+            let test_profile: Option<String> = None;
+            // As for a kept write grant: only on an install of this
+            // build's setup version, checked before any state exists.
+            if let Err(e) = srt_win::install::require_current_setup() {
+                eprintln!("srt-win: error: profile grant: {e:#}");
+                std::process::exit(15);
+            }
+            let ids = persist::Ids::load()?;
+            let layout = profile::Layout::resolve(test_profile.as_deref())?;
+            let holder = state_db::HolderPid(std::process::id());
+            let (report, _) = state_db::with_init_lock(holder, false, |db| {
+                profile::grant(
+                    &profile::Store::of(db.conn()),
+                    &ids,
+                    &layout,
+                    &exclude,
+                    !quiet,
+                )
+            })?;
+            for s in &report.skipped {
+                eprintln!("srt-win: profile grant: skipped '{}': {}", s.path, s.reason);
+            }
+            for f in &report.failed {
+                eprintln!("srt-win: profile grant: FAILED '{}': {}", f.path, f.reason);
+            }
+            eprintln!(
+                "srt-win: profile grant — '{}': {} container(s), {} directory(ies) and {} \
+                 file(s) granted, {} excluded ({} created), {} skipped, {} failed; {} DACL \
+                 write(s), {} unchanged, {} stale removed; {} ms",
+                report.profile,
+                report.containers,
+                report.granted,
+                report.files,
+                report.denied,
+                report.placeholders,
+                report.skipped.len(),
+                report.failed.len(),
+                report.writes,
+                report.unchanged,
+                report.removed,
+                report.elapsed_ms,
+            );
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+            if !report.complete {
+                return Err(anyhow!(
+                    "profile grant: an excluded directory could not be denied, or a stale \
+                     entry could not be removed; the grant is recorded as incomplete"
+                ));
+            }
+        }
+        Cmd::Profile {
+            sub: ProfileCmd::Forget { json },
+        } => {
+            use srt_win::{persist, profile, state_db};
+            let ids = persist::Ids::load()?;
+            let holder = state_db::HolderPid(std::process::id());
+            let (out, _) = state_db::with_init_lock(holder, false, |db| {
+                profile::forget(&profile::Store::of(db.conn()), &ids)
+            })?;
+            eprintln!(
+                "srt-win: profile forget — {} path(s) cleared, {} carried nothing, {} empty \
+                 directory(ies) removed{}",
+                out.removed,
+                out.absent,
+                out.placeholders_removed,
+                if out.failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} FAILED (still recorded)", out.failed.len())
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            if !out.failed.is_empty() {
+                return Err(anyhow!(
+                    "profile forget: {} path(s) could not be completed",
+                    out.failed.len()
+                ));
+            }
+        }
+        Cmd::Profile {
+            sub:
+                ProfileCmd::Status {
+                    paths,
+                    #[cfg(feature = "test-hooks")]
+                    test_profile,
+                },
+        } => {
+            use srt_win::{persist, profile};
+            #[cfg(not(feature = "test-hooks"))]
+            let test_profile: Option<String> = None;
+            println!(
+                "{}",
+                profile::status_json(
+                    persist::MARKER_KEY,
+                    profile::Layout::resolve(test_profile.as_deref()),
+                    paths,
+                )
+            );
+        }
+
         // ─── runner ────────────────────────────────────────────────
         Cmd::Runner => {
             let code = srt_win::runner::run()?;
@@ -1839,9 +2067,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             } else if let Some(why) = srt_win::persist::unrestricted_block_reason() {
                 eprintln!(
                     "srt-win: error: refusing to run without \
-                     --write-restricted-token: {why}. A persistent grant lets \
-                     the sandbox account write its tree under the ordinary \
-                     token. Run `srt-win acl forget --all` first."
+                     --write-restricted-token: {why}. Grants kept between \
+                     sessions are made for that token only: a kept write \
+                     grant lets the sandbox account write its tree under the \
+                     ordinary one. Remove them first: `srt-win acl forget \
+                     --all` (write grants), `srt-win profile forget` (profile \
+                     read grant)."
                 );
                 std::process::exit(20);
             } else {
@@ -2461,6 +2692,65 @@ mod tests {
         );
         let plain: AclGrantInput = serde_json::from_str(r#"{"write":["w"]}"#).unwrap();
         assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
+    }
+
+    #[test]
+    fn profile_subcommands_parse() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.cmd);
+        match parse(&[
+            "srt-win",
+            "profile",
+            "grant",
+            "--exclude",
+            r"C:\Users\me\.myapp",
+            "--exclude",
+            ".other",
+            "--json",
+        ]) {
+            Ok(Cmd::Profile {
+                sub:
+                    ProfileCmd::Grant {
+                        exclude,
+                        json,
+                        quiet,
+                        ..
+                    },
+            }) => {
+                assert_eq!(exclude, [r"C:\Users\me\.myapp", ".other"]);
+                assert!(json && !quiet);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--quiet"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant { quiet: true, .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "forget", "--json"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Forget { json: true }
+            })
+        ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "status", "--paths"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Status { paths: true, .. }
+            })
+        ));
+        // The profile directory is the calling user's; only a
+        // `test-hooks` build can be pointed at another one.
+        for sub in ["grant", "status"] {
+            let parsed = parse(&["srt-win", "profile", sub, "--test-profile", r"C:\x"]);
+            assert_eq!(
+                parsed.is_ok(),
+                cfg!(feature = "test-hooks"),
+                "profile {sub} --test-profile"
+            );
+        }
+        // Nothing takes a list of exclusions to drop.
+        assert!(parse(&["srt-win", "profile", "grant", "--include", ".ssh"]).is_err());
     }
 
     #[test]

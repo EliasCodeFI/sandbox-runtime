@@ -66,12 +66,22 @@
 //! and `acl grant` without `--persistent` also reads the DACL of each
 //! path it is about to grant ([`clear_for_unrestricted_grant`]).
 //! `acl forget` is what removes the grants.
+//!
+//! ## The profile read grant
+//!
+//! `crate::profile` keeps a second kind of grant for the sandbox
+//! group — read access to the real user's profile — and writes it
+//! through the converge of this module: its record of a path
+//! (`profile_paths`) is one more input to the ACE list a path is to
+//! carry, so a path that is both a write root and part of that grant
+//! is written once, with one list. It is refused under the ordinary
+//! token by the same rule, and has its own removal (`profile forget`).
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 
-use crate::acl::{self, AceView, PersistentTrustees, PersistentWant, SbAce};
+use crate::acl::{self, AceView, DaclTarget, PersistentTrustees, PersistentWant, SbAce};
 use crate::path_id::{self, FileId, Located};
 use crate::reg;
 use crate::state_db::Locked;
@@ -118,9 +128,28 @@ pub fn is_capability_sid(sid: &str) -> bool {
 
 // ─── Marker ─────────────────────────────────────────────────────────
 
-const MARKER_KEY: &str = r"Software\sandbox-runtime\PersistentGrants";
+pub(crate) const MARKER_KEY: &str = r"Software\sandbox-runtime\PersistentGrants";
 const MARKER_ROOTS: &str = "Roots";
 const MARKER_EVER: &str = "EverEnabled";
+
+/// Set the marker's `EverEnabled`: from now on "nothing is recorded"
+/// is believed only from a state database that can be read.
+pub(crate) fn marker_set_ever() -> Result<()> {
+    reg::Key::create_hkcu(MARKER_KEY)?.set_dword(MARKER_EVER, 1)
+}
+
+/// Clear `EverEnabled` once nothing is recorded any more: no root in
+/// the marker or the database, and no profile read grant.
+pub(crate) fn marker_clear_ever_if_unused(conn: &Connection) -> Result<()> {
+    if read_marker()?.roots.is_empty()
+        && all_root_paths(conn)?.is_empty()
+        && !crate::profile::recorded(conn)?
+        && let Some(key) = reg::Key::open_hkcu(MARKER_KEY, true)?
+    {
+        reg::delete_value(&key, MARKER_EVER)?;
+    }
+    Ok(())
+}
 
 /// One root in the marker: where it was granted and which object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +224,7 @@ fn write_marker_roots(roots: &[MarkerRoot]) -> Result<()> {
 /// for the same path. `EverEnabled` is set first.
 fn marker_add(path: &str, file_id: FileId) -> Result<()> {
     let mut m = read_marker()?;
-    reg::Key::create_hkcu(MARKER_KEY)?.set_dword(MARKER_EVER, 1)?;
+    marker_set_ever()?;
     let entry = MarkerRoot {
         file_id,
         path: path.to_owned(),
@@ -219,11 +248,17 @@ fn marker_remove(path: &str) -> Result<()> {
 
 // ─── Running without the write-restricted token ─────────────────────
 
-/// Root paths the session database records, or `None` if it is
-/// missing, unreadable, or has no such table.
+/// Root paths the session database records — and, as one more entry,
+/// the profile directory when it records paths of a profile read
+/// grant — or `None` if it is missing, unreadable, or has no such
+/// table.
 fn db_roots_ro() -> Option<Vec<String>> {
     let conn = crate::state_db::open_db_ro().ok()??;
-    all_root_paths(&conn).ok()
+    let mut roots = all_root_paths(&conn).ok()?;
+    if crate::profile::db_has_rows(&conn).ok()? {
+        roots.push("the profile read grant".to_owned());
+    }
+    Some(roots)
 }
 
 /// Why a command that runs the sandbox account WITHOUT the
@@ -234,6 +269,13 @@ fn db_roots_ro() -> Option<Vec<String>> {
 /// and then both a root it records and its absence refuse: "nothing
 /// recorded" is accepted only from a store that is there to be read.
 pub fn unrestricted_block_reason() -> Option<String> {
+    write_grant_block_reason().or_else(crate::profile::block_reason)
+}
+
+/// [`unrestricted_block_reason`] for the write grants alone. A
+/// profile read grant refuses the ordinary token under the same rule
+/// ([`crate::profile::block_reason`]) and has its own removal.
+pub fn write_grant_block_reason() -> Option<String> {
     block_reason_from(read_marker(), db_roots_ro)
 }
 
@@ -284,7 +326,7 @@ pub fn status_json() -> serde_json::Value {
     let roots: Vec<String> = read_marker()
         .map(|m| m.roots.into_iter().map(|r| r.path).collect())
         .unwrap_or_default();
-    match unrestricted_block_reason() {
+    match write_grant_block_reason() {
         None => serde_json::json!({ "state": "none", "roots": roots }),
         Some(reason) => serde_json::json!({
             "state": if roots.is_empty() { "unknown" } else { "present" },
@@ -317,10 +359,11 @@ impl Ids {
         })
     }
 
-    fn trustees(&self) -> PersistentTrustees<'_> {
+    pub(crate) fn trustees(&self) -> PersistentTrustees<'_> {
         PersistentTrustees {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
+            sandbox_user_sid: self.sandbox_user_sid.as_deref(),
         }
     }
 }
@@ -390,7 +433,17 @@ fn wanted(conn: &Connection, ids: &Ids, canon: &str, cur: FileId) -> Result<Vec<
             SbAce::Grant(_) => bail!("persistent_denies holds a grant row for '{canon}'"),
         }
     }
-    if cap.is_none() && deny.is_none() && !deny_fdc && !deny_delete {
+    // What the profile read grant recorded for this object: an
+    // excluded path is a read deny, any other kind one allow.
+    let mut profile = None;
+    match crate::profile::recorded_kind(conn, canon, cur)? {
+        Some(crate::profile_plan::Kind::Denied) => deny = Some(acl::DenyMask::ReadDeny),
+        Some(crate::profile_plan::Kind::Container) => profile = Some(acl::ProfileAce::Container),
+        Some(crate::profile_plan::Kind::Granted) => profile = Some(acl::ProfileAce::Granted),
+        Some(crate::profile_plan::Kind::File) => profile = Some(acl::ProfileAce::File),
+        Some(crate::profile_plan::Kind::Skipped) | None => {}
+    }
+    if cap.is_none() && deny.is_none() && !deny_fdc && !deny_delete && profile.is_none() {
         return Ok(Vec::new());
     }
     let group_sid = ids.group_sid.as_deref().ok_or_else(|| {
@@ -403,6 +456,7 @@ fn wanted(conn: &Connection, ids: &Ids, canon: &str, cur: FileId) -> Result<Vec<
         deny,
         deny_fdc,
         deny_delete,
+        profile,
     }))
 }
 
@@ -427,9 +481,42 @@ fn spec_of(want: &[AceView]) -> String {
 /// Otherwise: write record with `done = 0`, the DACL write, then
 /// `done = 1`. Any failure is returned; nothing is assumed written.
 fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
-    let (cur, _links, is_dir) = path_id::capture_id_and_links(canon)?;
+    converge_on(conn, ids, canon, None)
+}
+
+/// An object that is already open, for [`converge_on`]: the handle
+/// (with `READ_CONTROL | WRITE_DAC`), and the identity read from it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenObject {
+    pub handle: windows::Win32::Foundation::HANDLE,
+    pub id: FileId,
+    pub is_dir: bool,
+}
+
+/// [`converge`], reading and writing through `on` when given instead
+/// of opening `canon` by name. The profile read grant passes a handle
+/// it opened without following a link, so what is written is the
+/// object it looked at and never the target of a link put in its
+/// place. `canon` is still the key of the records.
+pub(crate) fn converge_on(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    on: Option<&OpenObject>,
+) -> Result<bool> {
+    let (cur, is_dir) = match on {
+        Some(o) => (o.id, o.is_dir),
+        None => {
+            let (cur, _links, is_dir) = path_id::capture_id_and_links(canon)?;
+            (cur, is_dir)
+        }
+    };
+    let target = match on {
+        Some(o) => DaclTarget::Handle(o.handle, canon),
+        None => DaclTarget::Path(canon),
+    };
     let want = wanted(conn, ids, canon, cur)?;
-    let aces = acl::read_aces(canon).with_context(|| format!("read the DACL of '{canon}'"))?;
+    let aces = acl::read_aces_at(target).with_context(|| format!("read the DACL of '{canon}'"))?;
     let is_root = want.iter().any(|a| is_capability_sid(&a.sid));
     if is_root {
         // An ALLOW for the sandbox user SID (a non-persistent grant
@@ -489,7 +576,7 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
         params![canon, cur.as_bytes().as_slice(), spec],
     )
     .context("record persistent write intent")?;
-    acl::write_persistent_aces(canon, &t, &want)?;
+    acl::write_persistent_aces_at(target, &t, &want)?;
     if want.is_empty() {
         conn.execute(
             "DELETE FROM persistent_writes WHERE canonical_path = ?1",
@@ -507,6 +594,40 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
             "srt-win: persistent DACL write '{canon}' ({} ACE(s))",
             want.len()
         );
+    }
+    Ok(true)
+}
+
+/// After a [`converge_on`] that failed: whether the object itself
+/// carries exactly the wanted ACEs all the same. The system writes an
+/// object's own DACL first and then updates what is below it, so a
+/// failure further down (a descendant whose access list the caller
+/// may not change) leaves the object as wanted. The write record is
+/// then closed, so recovery does not repeat a write that cannot get
+/// further; `false` leaves it open.
+pub(crate) fn settled_on_object(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    on: &OpenObject,
+) -> Result<bool> {
+    let want = wanted(conn, ids, canon, on.id)?;
+    let aces = acl::read_aces_at(DaclTarget::Handle(on.handle, canon))?;
+    if acl::persistent_on_disk(&aces, &ids.trustees(), on.is_dir)
+        != acl::comparable(&want, on.is_dir)
+    {
+        return Ok(false);
+    }
+    if want.is_empty() {
+        conn.execute(
+            "DELETE FROM persistent_writes WHERE canonical_path = ?1",
+            params![canon],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE persistent_writes SET done = 1 WHERE canonical_path = ?1",
+            params![canon],
+        )?;
     }
     Ok(true)
 }
@@ -857,12 +978,8 @@ pub fn forget(
         };
         out.push((t, r));
     }
-    if all
-        && read_marker()?.roots.is_empty()
-        && all_root_paths(conn)?.is_empty()
-        && let Some(key) = reg::Key::open_hkcu(MARKER_KEY, true)?
-    {
-        reg::delete_value(&key, MARKER_EVER)?;
+    if all {
+        marker_clear_ever_if_unused(conn)?;
     }
     Ok(out)
 }
@@ -895,10 +1012,16 @@ pub fn forget_everything() -> Result<(usize, usize)> {
 /// removed from here and refuses. So does a target whose DACL cannot
 /// be read: "could not look" is not "no grant there".
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
-    if let Some(why) = unrestricted_block_reason() {
+    if let Some(why) = write_grant_block_reason() {
         bail!(
             "{why}; grants for the ordinary token are refused until `srt-win acl forget \
              --all` has removed them"
+        );
+    }
+    if let Some(why) = crate::profile::block_reason() {
+        bail!(
+            "{why}; grants for the ordinary token are refused until `srt-win profile \
+             forget` has removed it"
         );
     }
     let ids = Ids::load()?;

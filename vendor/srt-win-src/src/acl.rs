@@ -39,8 +39,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::c_void;
 use std::mem::size_of;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACE_HEADER, ACE_REVISION, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -124,6 +125,14 @@ impl Mask {
     /// grants. Given explicitly to the real user on a persistent path
     /// (see [`persistent_aces`]).
     pub const OWNER_IMPLICIT: Self = Self::READ_CONTROL.with(Self::WRITE_DAC);
+
+    /// `FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES |
+    /// SYNCHRONIZE` — what a container directory of the profile read
+    /// grant gives ([`ProfileAce::Container`]): its entries can be
+    /// listed and it can be passed through. `SYNCHRONIZE` is there
+    /// because every synchronous open asks for it; nothing in the mask
+    /// reads a file.
+    pub const DIR_LIST: Self = Self(0x0010_00a1);
 
     pub const fn bits(self) -> u32 {
         self.0
@@ -298,9 +307,34 @@ pub(crate) fn rebuild_acl(
     kept: &KeptAces,
     tail: &[NewAce],
 ) -> Result<BuiltAcl> {
-    let mut total = size_of::<ACL>() + kept.1;
-    for a in head.iter().chain(tail) {
-        total += ACE_FIXED + unsafe { GetLengthSid(a.sid()) } as usize;
+    rebuild_acl_seq(
+        rev,
+        &[AclPart::New(head), AclPart::Kept(kept), AclPart::New(tail)],
+    )
+}
+
+/// One run of ACEs in a [`rebuild_acl_seq`] output.
+pub(crate) enum AclPart<'a> {
+    New(&'a [NewAce]),
+    /// Raw ACEs of a source ACL ([`filter_aces`]). Every `Kept` part
+    /// of one call must come from the same source ACL, and `rev` be
+    /// that ACL's revision.
+    Kept(&'a KeptAces),
+}
+
+/// [`rebuild_acl`] for any sequence of new and kept runs, written in
+/// the order given.
+pub(crate) fn rebuild_acl_seq(rev: ACE_REVISION, parts: &[AclPart<'_>]) -> Result<BuiltAcl> {
+    let mut total = size_of::<ACL>();
+    for p in parts {
+        match p {
+            AclPart::New(aces) => {
+                for a in aces.iter() {
+                    total += ACE_FIXED + unsafe { GetLengthSid(a.sid()) } as usize;
+                }
+            }
+            AclPart::Kept(k) => total += k.1,
+        }
     }
     total = dword_align(total);
     let mut buf = vec![0u8; total];
@@ -312,11 +346,17 @@ pub(crate) fn rebuild_acl(
         NewAce::Deny(s, m, f) => unsafe { AddAccessDeniedAceEx(acl, rev, f, m, s) }
             .with_context(|| format!("AddAccessDeniedAceEx({m:#x})")),
     };
-    head.iter().try_for_each(&add)?;
-    for (ace, sz) in &kept.0 {
-        unsafe { AddAce(acl, rev, u32::MAX, *ace, *sz as u32) }.context("AddAce(keep)")?;
+    for p in parts {
+        match p {
+            AclPart::New(aces) => aces.iter().try_for_each(&add)?,
+            AclPart::Kept(k) => {
+                for (ace, sz) in &k.0 {
+                    unsafe { AddAce(acl, rev, u32::MAX, *ace, *sz as u32) }
+                        .context("AddAce(keep)")?;
+                }
+            }
+        }
     }
-    tail.iter().try_for_each(&add)?;
     Ok(BuiltAcl { buf })
 }
 
@@ -349,6 +389,86 @@ pub(crate) fn read_file_dacl(canonical_path: &str) -> Result<(OwnedSd, *mut ACL)
     };
     win32_ok(r, &format!("GetNamedSecurityInfoW('{canonical_path}')"))?;
     Ok((OwnedSd::from_raw(psd), dacl))
+}
+
+/// [`read_file_dacl`] for an object that is already open: the DACL
+/// of exactly that object, whatever its path resolves to now. The
+/// handle needs `READ_CONTROL`.
+pub(crate) fn read_handle_dacl(h: HANDLE, label: &str) -> Result<(OwnedSd, *mut ACL)> {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetSecurityInfo(
+            h,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut psd),
+        )
+    };
+    win32_ok(r, &format!("GetSecurityInfo('{label}')"))?;
+    Ok((OwnedSd::from_raw(psd), dacl))
+}
+
+/// [`write_file_dacl`] for an object that is already open. The
+/// handle needs `WRITE_DAC`. As with the by-name call, the system
+/// then brings the inherited ACEs of the objects below up to date.
+pub(crate) fn write_handle_dacl(
+    h: HANDLE,
+    label: &str,
+    acl: *const ACL,
+    p: Protection,
+) -> Result<()> {
+    let prot = match p {
+        Protection::Protected => PROTECTED_DACL_SECURITY_INFORMATION,
+        Protection::Unprotected => UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let r = unsafe {
+        SetSecurityInfo(
+            h,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | prot,
+            None,
+            None,
+            Some(acl),
+            None,
+        )
+    };
+    win32_ok(r, &format!("SetSecurityInfo('{label}')"))
+}
+
+/// The object a persistent ACE list is read from and written to: a
+/// path, opened by name for each call, or an open handle (with the
+/// path it was opened by, for messages).
+#[derive(Debug, Clone, Copy)]
+pub enum DaclTarget<'a> {
+    Path(&'a str),
+    Handle(HANDLE, &'a str),
+}
+
+impl DaclTarget<'_> {
+    fn label(&self) -> &str {
+        match self {
+            DaclTarget::Path(p) | DaclTarget::Handle(_, p) => p,
+        }
+    }
+
+    fn read(&self) -> Result<(OwnedSd, *mut ACL)> {
+        match self {
+            DaclTarget::Path(p) => read_file_dacl(p),
+            DaclTarget::Handle(h, p) => read_handle_dacl(*h, p),
+        }
+    }
+
+    fn write(&self, acl: *const ACL, prot: Protection) -> Result<()> {
+        match self {
+            DaclTarget::Path(p) => write_file_dacl(p, acl, prot),
+            DaclTarget::Handle(h, p) => write_handle_dacl(*h, p, acl, prot),
+        }
+    }
 }
 
 /// Whether `sd`'s DACL carries `SE_DACL_PROTECTED` — inheritance from
@@ -572,7 +692,6 @@ pub fn open_for_security_no_follow(path: &str) -> Result<crate::util::OwnedHandl
 /// `SeTakeOwnershipPrivilege`/`SeRestorePrivilege` enabled unless
 /// the caller already owns the object.
 pub fn set_handle_owner_admins(h: &crate::util::OwnedHandle, label: &str) -> Result<()> {
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     let admins = crate::sid::LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
     let r = unsafe {
         SetSecurityInfo(
@@ -595,7 +714,6 @@ pub fn set_handle_dacl_from_sddl(
     sddl: &str,
     label: &str,
 ) -> Result<()> {
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::GetSecurityDescriptorDacl;
     let sd = crate::util::OwnedSd::from_sddl(sddl)
         .with_context(|| format!("{label}: build SD from SDDL"))?;
@@ -977,7 +1095,12 @@ fn ace_view(hdr: &ACE_HEADER, body: &[u8]) -> Option<AceView> {
 /// Every plain allow / deny ACE of `canonical_path`'s own DACL, in
 /// DACL order. Reads one security descriptor; touches no descendant.
 pub fn read_aces(canonical_path: &str) -> Result<Vec<AceView>> {
-    let (_sd, dacl) = read_file_dacl(canonical_path)?;
+    read_aces_at(DaclTarget::Path(canonical_path))
+}
+
+/// [`read_aces`] of a path or of an open handle.
+pub fn read_aces_at(target: DaclTarget<'_>) -> Result<Vec<AceView>> {
+    let (_sd, dacl) = target.read()?;
     let mut out = Vec::new();
     filter_aces(dacl, |hdr, body| {
         out.extend(ace_view(hdr, body));
@@ -994,6 +1117,24 @@ pub struct PersistentTrustees<'a> {
     pub group_sid: Option<&'a str>,
     /// The user the broker runs as.
     pub real_user_sid: &'a str,
+    /// The sandbox user. Its ACEs are not persistent ones (a session
+    /// writes and removes them); it is here because its DENY ACEs
+    /// have to stay ahead of the allows written for the group — see
+    /// [`write_persistent_aces_at`].
+    pub sandbox_user_sid: Option<&'a str>,
+}
+
+/// What the profile read grant (`crate::profile`) allows on a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileAce {
+    /// A directory whose children are granted one by one:
+    /// [`Mask::DIR_LIST`], on the directory only.
+    Container,
+    /// A directory granted whole: read + execute, inherited by
+    /// everything below.
+    Granted,
+    /// A single file: read + execute.
+    File,
 }
 
 /// Whether `a` is one of the ACEs [`persistent_aces`] produces: any
@@ -1018,6 +1159,9 @@ pub struct PersistentWant<'a> {
     pub deny: Option<DenyMask>,
     pub deny_fdc: bool,
     pub deny_delete: bool,
+    /// The path is part of the profile read grant. Ignored on a write
+    /// root, whose own allow for the group is wider and inherits.
+    pub profile: Option<ProfileAce>,
 }
 
 /// The explicit ACEs of a persistent path, in the order they are
@@ -1062,6 +1206,13 @@ pub struct PersistentWant<'a> {
 /// `WRITE_DAC` as owner and no longer has it. None of the denies
 /// written here name the real user.
 ///
+/// A path of the profile read grant that is not a write root carries
+/// one ALLOW for the sandbox group and nothing else: read + execute
+/// at most, never a write, delete or change-permissions right. Under
+/// the write-restricted token it passes the ordinary check only, and
+/// a read needs no more than that (the restricting SIDs are checked
+/// for write access alone).
+///
 /// No ACE names the sandbox USER SID: it is a restricting SID of
 /// every session, so an ALLOW for it would pass both checks for all
 /// of them.
@@ -1086,6 +1237,13 @@ pub fn persistent_aces(w: &PersistentWant<'_>) -> Vec<AceView> {
         v.push(AceView::explicit(false, SID_OWNER_RIGHTS, rc, OICI));
         let keep = Mask::OWNER_IMPLICIT.bits();
         v.push(AceView::explicit(false, w.real_user_sid, keep, OICI));
+    } else if let Some(p) = w.profile {
+        let rx = Mask::FILE_READ_EXEC.bits();
+        v.push(match p {
+            ProfileAce::Container => AceView::explicit(false, g, Mask::DIR_LIST.bits(), NO_INHERIT),
+            ProfileAce::Granted => AceView::explicit(false, g, rx, OICI),
+            ProfileAce::File => AceView::explicit(false, g, rx, NO_INHERIT),
+        });
     }
     v
 }
@@ -1149,48 +1307,87 @@ pub fn owner_write_paths(aces: &[AceView]) -> Vec<String> {
 }
 
 /// Converge `canonical_path`'s explicit persistent ACEs (see
-/// [`is_persistent_ace`]) to exactly `want`, written at the head of
-/// the DACL in the given order; an empty `want` removes them. Every
-/// other explicit ACE is kept, and the DACL's protection state is
-/// preserved, as in [`apply_sandbox_aces`]. On a directory the write
-/// re-derives the inherited ACEs of everything below it, so its cost
-/// is linear in the tree.
+/// [`is_persistent_ace`]) to exactly `want`; an empty `want` removes
+/// them. Every other explicit ACE is kept, and the DACL's protection
+/// state is preserved, as in [`apply_sandbox_aces`]. On a directory
+/// the write re-derives the inherited ACEs of everything below it, so
+/// its cost is linear in the tree.
 pub fn write_persistent_aces(
     canonical_path: &str,
     t: &PersistentTrustees<'_>,
     want: &[AceView],
 ) -> Result<()> {
-    let (sd, old) = read_file_dacl(canonical_path)
-        .with_context(|| format!("persistent ACEs '{canonical_path}'"))?;
+    write_persistent_aces_at(DaclTarget::Path(canonical_path), t, want)
+}
+
+/// [`write_persistent_aces`] on a path or on an open handle.
+///
+/// Order of the explicit ACEs written: the wanted DENY ACEs, then the
+/// DENY ACEs the object already has for the sandbox user, then the
+/// wanted ALLOW ACEs, then every other explicit ACE that was there,
+/// in its old order. The second run is what a session's read or write
+/// deny on this object is (`apply_sandbox_aces` puts it at the head):
+/// an ALLOW for the sandbox group written in front of it would be
+/// reached first and decide the access check, so a session's deny on
+/// a path the group may read would stop denying whenever this
+/// function ran during the session.
+pub fn write_persistent_aces_at(
+    target: DaclTarget<'_>,
+    t: &PersistentTrustees<'_>,
+    want: &[AceView],
+) -> Result<()> {
+    let label = target.label();
+    let (sd, old) = target
+        .read()
+        .with_context(|| format!("persistent ACEs '{label}'"))?;
     let protected = sd_dacl_protected(&sd)?;
-    let kept = filter_aces(old, |hdr, body| {
+    let sb = t
+        .sandbox_user_sid
+        .map(crate::sid::sid_bytes)
+        .transpose()
+        .context("parse the sandbox user SID")?;
+    let is_sb_deny = |hdr: &ACE_HEADER, body: &[u8]| {
+        u32::from(hdr.AceType) == ACCESS_DENIED_ACE_TYPE
+            && sb.as_deref().is_some_and(|sb| ace_sid_is(body, sb))
+    };
+    let stays = |hdr: &ACE_HEADER, body: &[u8]| {
         hdr.AceFlags & INHERITED_ACE == 0
             && !ace_view(hdr, body).is_some_and(|a| is_persistent_ace(&a, t))
-    })?;
+    };
+    let kept_denies = filter_aces(old, |h, b| stays(h, b) && is_sb_deny(h, b))?;
+    let kept_rest = filter_aces(old, |h, b| stays(h, b) && !is_sb_deny(h, b))?;
     let sids: Vec<LocalPsid> = want
         .iter()
         .map(|a| LocalPsid::from_string(&a.sid))
         .collect::<Result<_>>()?;
-    let head: Vec<NewAce> = want
-        .iter()
-        .zip(&sids)
-        .map(|(a, s)| {
-            let fl = ACE_FLAGS(u32::from(a.flags));
-            if a.deny {
-                NewAce::Deny(s.as_psid(), a.mask, fl)
-            } else {
-                NewAce::Allow(s.as_psid(), a.mask, fl)
-            }
-        })
-        .collect();
-    let new = rebuild_acl(kept.2, &head, &kept, &[])?;
+    let new_ace = |(a, s): (&AceView, &LocalPsid)| {
+        let fl = ACE_FLAGS(u32::from(a.flags));
+        if a.deny {
+            NewAce::Deny(s.as_psid(), a.mask, fl)
+        } else {
+            NewAce::Allow(s.as_psid(), a.mask, fl)
+        }
+    };
+    let pairs = || want.iter().zip(&sids);
+    let denies: Vec<NewAce> = pairs().filter(|(a, _)| a.deny).map(new_ace).collect();
+    let allows: Vec<NewAce> = pairs().filter(|(a, _)| !a.deny).map(new_ace).collect();
+    let new = rebuild_acl_seq(
+        kept_rest.2,
+        &[
+            AclPart::New(&denies),
+            AclPart::Kept(&kept_denies),
+            AclPart::New(&allows),
+            AclPart::Kept(&kept_rest),
+        ],
+    )?;
     let prot = if protected {
         Protection::Protected
     } else {
         Protection::Unprotected
     };
-    write_file_dacl(canonical_path, new.as_ptr(), prot)
-        .with_context(|| format!("persistent ACEs '{canonical_path}'"))
+    target
+        .write(new.as_ptr(), prot)
+        .with_context(|| format!("persistent ACEs '{label}'"))
 }
 
 const INHERITED_ACE: u8 = 0x10;
@@ -1311,6 +1508,7 @@ mod tests {
     const T: PersistentTrustees<'static> = PersistentTrustees {
         group_sid: Some(GROUP),
         real_user_sid: REAL,
+        sandbox_user_sid: None,
     };
 
     fn root_want<'a>(cap: &'a str) -> PersistentWant<'a> {
@@ -1321,6 +1519,7 @@ mod tests {
             deny: None,
             deny_fdc: false,
             deny_delete: false,
+            profile: None,
         }
     }
 
@@ -1522,6 +1721,7 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
+            sandbox_user_sid: None,
         };
         let dir = std::env::temp_dir().join(format!("srtwin-persist-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1536,6 +1736,7 @@ mod tests {
             deny: None,
             deny_fdc: true,
             deny_delete: false,
+            profile: None,
         });
         for _ in 0..2 {
             write_persistent_aces(path, &t, &want).unwrap();
@@ -1574,6 +1775,146 @@ mod tests {
         assert!(!below.iter().any(|a| a.sid == cap || a.sid == GROUP));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the profile read grant writes, per kind of path: one
+    /// ALLOW for the group, read + execute at most, inheriting only
+    /// on a directory granted whole.
+    #[test]
+    fn profile_ace_lists_are_pinned() {
+        let list = |profile: Option<ProfileAce>, deny: Option<DenyMask>, cap: Option<&str>| {
+            persistent_aces(&PersistentWant {
+                capability_sid: cap,
+                deny,
+                profile,
+                ..root_want(CAP)
+            })
+            .iter()
+            .map(AceView::sddl)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            list(Some(ProfileAce::Container), None, None),
+            [format!("(A;;0x1000a1;;;{GROUP})")]
+        );
+        assert_eq!(
+            list(Some(ProfileAce::Granted), None, None),
+            [format!("(A;OICI;0x1200a9;;;{GROUP})")]
+        );
+        assert_eq!(
+            list(Some(ProfileAce::File), None, None),
+            [format!("(A;;0x1200a9;;;{GROUP})")]
+        );
+        // An excluded path: the read deny, inheriting, and no allow.
+        assert_eq!(
+            list(None, Some(DenyMask::ReadDeny), None),
+            [format!("(D;OICI;0x1f01ff;;;{GROUP})")]
+        );
+        // A session's deny kept on a granted path leads.
+        assert_eq!(
+            list(Some(ProfileAce::Granted), Some(DenyMask::WriteDeny), None),
+            [
+                format!("(D;OICI;{:#x};;;{GROUP})", DenyMask::WriteDeny.bits()),
+                format!("(A;OICI;0x1200a9;;;{GROUP})"),
+            ]
+        );
+        // On a write root the root's own ACEs stand; the group gets
+        // no second allow.
+        assert_eq!(
+            list(Some(ProfileAce::Container), None, Some(CAP)),
+            list(None, None, Some(CAP))
+        );
+        // No profile entry carries a right to write, delete, or
+        // change the permissions or the owner.
+        const WRITE_BITS: u32 = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x1_0000 | 0x4_0000 | 0x8_0000;
+        const GENERIC_BITS: u32 = 0xf000_0000;
+        for p in [ProfileAce::Container, ProfileAce::Granted, ProfileAce::File] {
+            for a in persistent_aces(&PersistentWant {
+                capability_sid: None,
+                profile: Some(p),
+                ..root_want(CAP)
+            }) {
+                assert!(!a.deny && a.sid == GROUP);
+                assert_eq!(a.mask & (WRITE_BITS | GENERIC_BITS), 0, "{p:?}");
+            }
+        }
+        // The container entry: list, traverse, read attributes,
+        // synchronize — and it reads no file data on a file, where
+        // the list bit would mean read data, because it never
+        // inherits.
+        assert_eq!(Mask::DIR_LIST.bits(), 0x1 | 0x20 | 0x80 | 0x10_0000);
+    }
+
+    /// A session's deny for the sandbox user stays in front of the
+    /// group's allow, whichever of the two is written last, and
+    /// removing the group's ACEs leaves it.
+    #[test]
+    fn a_session_deny_stays_ahead_of_the_group_allow() {
+        // Guests stands in for the sandbox group and Power Users for
+        // the sandbox user: resolvable, and never the test's identity.
+        const GROUP: &str = "S-1-5-32-546";
+        const SB: &str = "S-1-5-32-547";
+        let real = crate::sid::current_user_sid().unwrap();
+        let t = PersistentTrustees {
+            group_sid: Some(GROUP),
+            real_user_sid: &real,
+            sandbox_user_sid: Some(SB),
+        };
+        let want = persistent_aces(&PersistentWant {
+            group_sid: GROUP,
+            real_user_sid: &real,
+            capability_sid: None,
+            deny: None,
+            deny_fdc: false,
+            deny_delete: false,
+            profile: Some(ProfileAce::Granted),
+        });
+        let deny = SbAceSet {
+            deny: Some(DenyMask::ReadDeny),
+            ..Default::default()
+        };
+        let check = |path: &str, when: &str| {
+            let aces: Vec<AceView> = read_aces(path)
+                .unwrap()
+                .into_iter()
+                .filter(|a| !a.inherited)
+                .collect();
+            let d = aces.iter().position(|a| a.deny && a.sid == SB);
+            let a = aces.iter().position(|a| !a.deny && a.sid == GROUP);
+            assert!(
+                matches!((d, a), (Some(d), Some(a)) if d < a),
+                "{when}: {aces:?}"
+            );
+            assert_eq!(
+                persistent_on_disk(&aces, &t, true),
+                comparable(&want, true),
+                "{when}"
+            );
+        };
+        let base = std::env::temp_dir().join(format!("srtwin-order-{}", std::process::id()));
+        // The deny is there first, then the group's allow is written.
+        let a = base.join("deny-first");
+        std::fs::create_dir_all(&a).unwrap();
+        let a = a.to_str().unwrap();
+        apply_sandbox_aces(a, SB, deny).unwrap();
+        write_persistent_aces(a, &t, &want).unwrap();
+        check(a, "allow written after the deny");
+        // The other way round.
+        let b = base.join("allow-first");
+        std::fs::create_dir_all(&b).unwrap();
+        let b = b.to_str().unwrap();
+        write_persistent_aces(b, &t, &want).unwrap();
+        apply_sandbox_aces(b, SB, deny).unwrap();
+        check(b, "deny written after the allow");
+        // … and a rewrite of the same list keeps it so.
+        write_persistent_aces(b, &t, &want).unwrap();
+        check(b, "allow rewritten");
+        // Removing the group's ACEs leaves the session's deny.
+        write_persistent_aces(b, &t, &[]).unwrap();
+        let left = read_aces(b).unwrap();
+        assert!(left.iter().any(|a| a.deny && !a.inherited && a.sid == SB));
+        assert!(!left.iter().any(|a| a.sid == GROUP));
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
