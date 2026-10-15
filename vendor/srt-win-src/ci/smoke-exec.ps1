@@ -755,17 +755,32 @@ function Seclogon-Err {
 # ERROR_INVALID_SERVICE_CONTROL (1052) — "Cannot stop 'seclogon'
 # service". Wait until the service accepts STOP again, then stop it;
 # retry a stop that still loses the race.
+#
+# The service also stays unstoppable for as long as a process it
+# launched is alive. An earlier row that left one behind would keep it
+# that way, so after a few seconds any process still owned by the
+# sandbox account is listed and ended, and the wait goes on.
 function Stop-Seclogon {
-  param([int] $TimeoutSec = 30)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+  param([int] $TimeoutSec = 60)
+  $start    = [DateTime]::UtcNow
+  $deadline = $start.AddSeconds($TimeoutSec)
+  $swept    = $false
   while ($true) {
     $s = Get-Service seclogon
     if ($s.Status -eq 'Stopped') { return }
     if ($s.CanStop) {
       try { Stop-Service seclogon -Force -ErrorAction Stop; return }
       catch { if ([DateTime]::UtcNow -ge $deadline) { throw } }
+    } elseif (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
+      $swept = $true
+      $left = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+                Where-Object { $_.UserName -like '*\srt-sandbox' })
+      Write-Host "S: seclogon not stoppable after 5s; processes owned by the sandbox account: $(
+        if ($left) { ($left | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ' } else { '(none)' })"
+      foreach ($p in $left) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
     } elseif ([DateTime]::UtcNow -ge $deadline) {
-      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status))"
+      $q = (& sc.exe queryex seclogon 2>&1 | Out-String) -replace '\s+', ' '
+      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status)); sc queryex: $q"
     }
     Start-Sleep -Milliseconds 20
   }
