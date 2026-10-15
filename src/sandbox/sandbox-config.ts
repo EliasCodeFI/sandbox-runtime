@@ -1103,7 +1103,7 @@ export const WindowsConfigSchema = z.object({
         'sandboxed session on the machine can read a kept root, whether ' +
         'or not the root is in its own lists, until the grant is removed ' +
         '(by uninstall, `srt-win acl forget`, or opting out). Hosts that ' +
-        'run sessions for parties that must not read each other\'s ' +
+        "run sessions for parties that must not read each other's " +
         'project roots should opt out. Cost: Schannel ' +
         'refuses restricted tokens, so System32 `curl.exe`, git with the ' +
         'schannel backend, and .NET / PowerShell web requests fail inside ' +
