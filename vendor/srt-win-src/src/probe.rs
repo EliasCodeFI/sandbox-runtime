@@ -96,24 +96,27 @@ const IL_UNTRUSTED: u32 = 0;
 const CONNECT_TIMEOUT_SECS: i32 = 4;
 
 /// Result of one connect attempt.
+///
+/// No outcome is numbered zero, so an exit code whose field bits are
+/// all clear is not a report of "everything blocked".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// `WSAEACCES` — a BLOCK filter refused the connect.
-    Blocked = 0,
+    Blocked = 1,
     /// The connect completed.
-    Connected = 1,
+    Connected = 2,
     /// `WSAECONNREFUSED` — nothing was listening, which the
     /// destination can only say once the connect got past the
     /// filters. For the fence this is the same answer as
     /// [`Outcome::Connected`].
-    Refused = 2,
+    Refused = 3,
     /// Timed out or failed some other way; says nothing about the
     /// fence.
-    Unreachable = 3,
+    Unreachable = 4,
     /// The attempt was not made (no target for it).
-    Skipped = 4,
+    Skipped = 5,
     /// The token shape could not be assumed, so no connect was made.
-    Error = 5,
+    Error = 6,
 }
 
 impl Outcome {
@@ -934,6 +937,7 @@ mod tests {
             0x0FFF,
             0x1000,
             0x2000,
+            REPORT_BASE,
             REPORT_BASE - 1,
             REPORT_BASE << 1,
             0xC000_0005,
