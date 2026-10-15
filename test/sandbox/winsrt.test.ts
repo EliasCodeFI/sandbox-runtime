@@ -41,6 +41,7 @@ import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
 import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
+import * as javaAgent from '../../src/sandbox/java-proxy-agent.js'
 import {
   getJavaProxyAgentJarPathAsync,
   JAVA_PROXY_AGENT_JAR_NAME,
@@ -1082,6 +1083,13 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       }),
       spyOn(winUtils, 'revokeWindowsAcl').mockReturnValue([]),
       spyOn(winUtils, 'restoreWindowsAcl').mockReturnValue([]),
+      // The JVM agent jar is the one a test's config names, or none. The
+      // default lookup finds a jar wherever one has been built (`npm run
+      // build:java-agent`), and initialize() stages what it finds: the
+      // session's grants would then depend on the machine.
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
+        explicitPath => Promise.resolve(explicitPath ?? null),
+      ),
     )
   })
 
@@ -1143,6 +1151,25 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     )
     expect(granted).toBeUndefined()
     expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
+  })
+
+  it('the session: the JVM agent jar is staged, read-granted and write-denied beneath an allowWrite', async () => {
+    const jar = join(root, JAVA_PROXY_AGENT_JAR_NAME)
+    writeFileSync(jar, 'JAR-BYTES')
+    // The staged copy lands in the temp root, which this session may write.
+    const temp = dirname(root)
+    await SandboxManager.initialize({
+      ...configOf({ allowWrite: [temp] }),
+      javaAgentJarPath: jar,
+    })
+    const staged = stamped?.denyWrite[0] ?? ''
+    expect(dirname(staged)).toBe(temp)
+    expect(staged).not.toBe(root)
+    expect(readdirSync(staged)).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
+    expect(granted).toMatchObject({ read: [staged], write: [temp] })
+    expect(stamped).toMatchObject({ denyRead: [], denyWrite: [staged] })
+    await SandboxManager.reset()
+    expect(existsSync(staged)).toBe(false)
   })
 
   it('onExtractNoMatch "error": initialize() resolves and the wrap throws', async () => {
