@@ -790,10 +790,16 @@ $slSvc        = Get-Service seclogon
 $slStartType  = [string]$slSvc.StartType
 $slWasRunning = $slSvc.Status -eq 'Running'
 Write-Host "S: seclogon before: StartType=$slStartType Status=$($slSvc.Status)"
+$slSkipped = $false
 try {
   # ── S1: Manual + stopped → ok; the launch demand-starts it ─────
   Set-Service seclogon -StartupType Manual
-  Stop-Seclogon
+  # A machine whose own session was started through this service
+  # keeps it unstoppable for as long as that session lives. The rows
+  # cannot run there; they are skipped by name, not passed. Only this
+  # first stop is excused — once it has succeeded, a later stop that
+  # fails is a failure.
+  try { Stop-Seclogon -TimeoutSec 20 } catch { throw "SECLOGON-UNSTOPPABLE: $_" }
   $st = Seclogon-State
   if ($st -ne 'ok') { throw "S1: Manual+stopped expected seclogon=ok, got '$st'" }
   $r = RExec @('--', $cmd, '/c', 'echo S1-RAN')
@@ -862,6 +868,10 @@ try {
     throw "S3b: wfp verify stderr has no seclogon_disabled JSON line. stderr: $verr"
   }
   Write-Host 'S3b ok: wfp verify exits 18 with seclogon_disabled'
+} catch {
+  if ("$_" -notlike 'SECLOGON-UNSTOPPABLE:*') { throw }
+  $slSkipped = $true
+  Write-Host "S1-S3 SKIPPED: the Secondary Logon service cannot be stopped on this machine. $_"
 } finally {
   # Restore the original start type and run state. Warn rather than
   # throw so an S-row failure above is not masked; S4 is the check.
@@ -890,4 +900,5 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b, S1-S4)'
+$slRows = if ($slSkipped) { 'S4; S1-S3 SKIPPED' } else { 'S1-S4' }
+Write-Host "smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b, $slRows)"
