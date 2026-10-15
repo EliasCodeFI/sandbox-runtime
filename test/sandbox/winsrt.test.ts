@@ -6366,6 +6366,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
     it('a failed elevated step: no grant is attempted', async () => {
       installCode = 14
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toMatchObject() as void; the await is required at runtime
       await expect(
         winUtils.installWindowsSandboxAsync({ srtWin }),
       ).rejects.toMatchObject({ code: 'install_user_failed' })
