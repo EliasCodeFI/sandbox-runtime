@@ -38,6 +38,10 @@
         (in the root and in a container).
     N   a new top-level child is unreadable until `profile grant` is
         run again, and readable after.
+    E   a path added with `--exclude` becomes unreadable; a refresh
+        that does not name it keeps it excluded, and the record lists
+        it beside the built-in exclusions; only `--replace-excludes`
+        re-admits it, and no built-in exclusion goes with it.
     W   it cannot write, create, delete, rename or mkdir under a
         granted child, a container, or the profile root.
     J   a junction inside a granted directory pointing at an excluded
@@ -53,8 +57,8 @@
         profile directory alone leaves readable.
     O   an exec under the ordinary token is refused (exit 20) while
         the grant exists.
-    F   `profile forget` (what a session without the option runs
-        first): nothing is readable any more, every touched DACL is
+    F   `profile forget` (what a session under the ordinary token
+        runs first): nothing is readable any more, every touched DACL is
         what it was before the grant, the empty directories the grant
         created are gone, nothing is recorded, and the ordinary token
         runs again.
@@ -431,6 +435,26 @@ try {
   else { Fail "N: an idle refresh wrote $($g3.json.writes) DACL(s): $($g3.raw)" }
   Outside-Unchanged 'after the refresh'
 
+  # ── E: added exclusions ──────────────────────────────────────────
+  $ge = Grant @('--exclude', (Join-Path $prof 'NewTop'))
+  if ($ge.exit -ne 0) { Fail "E: grant --exclude exit=$($ge.exit) raw: $($ge.raw)" }
+  Expect-NoRead 'E (an added exclusion)' $newFile 'NEWTOP-CONTENT'
+  $ge = Grant
+  if ($ge.exit -ne 0) { Fail "E: refresh exit=$($ge.exit) raw: $($ge.raw)" }
+  Expect-NoRead 'E (kept by a refresh that does not name it)' $newFile 'NEWTOP-CONTENT'
+  $st = Status
+  $listed = @($st.exclusions)
+  if (@($st.extra_exclusions) -contains 'NewTop' -and
+      @($listed | Where-Object { $_ -match '\\NewTop$' }).Count -eq 1 -and
+      @($listed | Where-Object { $_ -match '\\\.ssh$' }).Count -eq 1 -and
+      @($listed | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -ge 1) {
+    Ok "E: the record lists the added exclusion with the built-in ones ($($listed.Count) in all)"
+  } else { Fail "E: recorded exclusions: extra=$($st.extra_exclusions -join ',') all=$($listed -join ' | ')" }
+  $ge = Grant @('--replace-excludes')
+  if ($ge.exit -ne 0) { Fail "E: grant --replace-excludes exit=$($ge.exit) raw: $($ge.raw)" }
+  Expect-Read 'E (re-admitted by replacing the added list)' $newFile 'NEWTOP-CONTENT'
+  Expect-NoRead 'E (a built-in exclusion is not replaceable)' $sshKey 'SSH2-CONTENT'
+
   # ── W: nothing is writable ───────────────────────────────────────
   foreach ($case in @(
       @{ tag = 'a granted child'; dir = (Join-Path $prof 'Documents'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
@@ -554,4 +578,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, X2, N, W, J, D, O, F, U)'
+Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, X2, N, E, W, J, D, O, F, U)'

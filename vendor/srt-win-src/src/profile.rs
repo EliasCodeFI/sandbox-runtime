@@ -363,6 +363,7 @@ impl Tree for DiskTree<'_> {
 const VAL_HEADER: &str = "Profile";
 const VAL_EXTRA: &str = "ProfileExtra";
 const VAL_PATHS: &str = "ProfilePaths";
+const VAL_EXCLUSIONS: &str = "ProfileExclusions";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -485,8 +486,16 @@ impl Recorded {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Marker {
     pub header: Option<Header>,
-    /// Exclusions configuration added, as paths beneath the profile.
+    /// Exclusions added to the built-in list when the grant was made,
+    /// as paths beneath the profile. A later run keeps them unless it
+    /// is told to replace them.
     pub extra: Vec<String>,
+    /// Every exclusion the grant was made with — the built-in list of
+    /// the build that made it, at this profile's locations, and
+    /// `extra` — as absolute paths, wildcards as written. Whether
+    /// each exists is beside the point: this is what must never be
+    /// granted, by this grant or by a session on top of it.
+    pub exclusions: Vec<String>,
     pub paths: Vec<Recorded>,
 }
 
@@ -527,6 +536,7 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .map(|s| Header::decode(&s))
             .transpose()?,
         extra: k.get_multi_sz(VAL_EXTRA)?.unwrap_or_default(),
+        exclusions: k.get_multi_sz(VAL_EXCLUSIONS)?.unwrap_or_default(),
         paths: k
             .get_multi_sz(VAL_PATHS)?
             .unwrap_or_default()
@@ -543,6 +553,7 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
     let paths: Vec<String> = m.paths.iter().map(Recorded::encode).collect();
     k.set_multi_sz(VAL_PATHS, &paths)?;
     k.set_multi_sz(VAL_EXTRA, &m.extra)?;
+    k.set_multi_sz(VAL_EXCLUSIONS, &m.exclusions)?;
     match &m.header {
         Some(h) => k.set_sz(VAL_HEADER, &h.encode()),
         None => reg::delete_value(&k, VAL_HEADER),
@@ -551,7 +562,7 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
 
 fn clear_marker(key: &str) -> Result<()> {
     if let Some(k) = reg::Key::open_hkcu(key, true)? {
-        for v in [VAL_HEADER, VAL_EXTRA, VAL_PATHS] {
+        for v in [VAL_HEADER, VAL_EXTRA, VAL_EXCLUSIONS, VAL_PATHS] {
             reg::delete_value(&k, v)?;
         }
     }
@@ -826,7 +837,7 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
     Ok(removed)
 }
 
-/// Exclusions added by configuration, as components beneath the
+/// Exclusions added by the caller, as components beneath the
 /// profile. A path that exists is resolved first, so a short name or
 /// a link names the directory it stands for; one that is not inside
 /// the profile is an error.
@@ -865,11 +876,17 @@ fn resolve_extra(profile: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
 /// one path is reported and the run goes on; the run is complete
 /// unless an excluded directory could not be denied or a stale entry
 /// could not be removed.
+///
+/// `extra_raw` adds exclusions to the built-in list. The ones an
+/// earlier run recorded stay in force as well — a refresh that names
+/// none does not re-admit what an earlier run excluded — unless
+/// `replace_extra`, with which `extra_raw` is the whole added list.
 pub fn grant(
     store: &Store<'_>,
     ids: &Ids,
     layout: &Layout,
     extra_raw: &[String],
+    replace_extra: bool,
     progress: bool,
 ) -> Result<Report> {
     let started = std::time::Instant::now();
@@ -887,7 +904,27 @@ pub fn grant(
     let root_id = root.id;
     drop(root);
 
-    let extra = resolve_extra(profile, extra_raw)?;
+    let old = read_marker_at(store.key)?;
+    let mut extra: Vec<Vec<String>> = if replace_extra {
+        Vec::new()
+    } else {
+        old.extra
+            .iter()
+            .map(|x| plan::split_path(x))
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
+    for x in resolve_extra(profile, extra_raw)? {
+        let same = |a: &Vec<String>| {
+            a.len() == x.len()
+                && a.iter()
+                    .zip(&x)
+                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
+        };
+        if !extra.iter().any(same) {
+            extra.push(x);
+        }
+    }
     let rules = Rules::new(
         layout.rel(&layout.roaming).as_deref(),
         layout.rel(&layout.local).as_deref(),
@@ -919,12 +956,16 @@ pub fn grant(
 
     // The record, before anything is written: every path this run may
     // write, and every path an earlier run recorded.
-    let old = read_marker_at(store.key)?;
     let before = all_recorded(store, &old)?;
     if store.key == persist::MARKER_KEY {
         persist::marker_set_ever()?;
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
+    let exclusions: Vec<String> = rules
+        .spelled()
+        .iter()
+        .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
+        .collect();
     let mut header = Header {
         list_version: plan::LIST_VERSION,
         complete: false,
@@ -948,6 +989,7 @@ pub fn grant(
         &Marker {
             header: Some(header.clone()),
             extra: extra_strings.clone(),
+            exclusions: exclusions.clone(),
             paths: pre,
         },
     )?;
@@ -1115,6 +1157,7 @@ pub fn grant(
         &Marker {
             header: Some(header),
             extra: extra_strings,
+            exclusions,
             paths,
         },
     )?;
@@ -1205,6 +1248,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                     ..h
                 }),
                 extra: marker.extra,
+                exclusions: marker.exclusions,
                 paths: all
                     .iter()
                     .filter(|r| failed_paths.contains(r.path.as_str()))
@@ -1279,6 +1323,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
+        "exclusions": m.exclusions,
         "containers": count(Kind::Container),
         "granted": count(Kind::Granted),
         "files": count(Kind::File),
@@ -1670,7 +1715,7 @@ mod tests {
         clear_marker(TEST_KEY).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(report.failed.is_empty(), "{report:?}");
 
@@ -1792,14 +1837,14 @@ mod tests {
         // exclusions: they are denied again, nothing else is written.
         write(&prof, r"NewTop\n.txt");
         assert!(group_aces(&prof.join("NewTop")).is_empty());
-        let again = grant(&store, &ids, &layout, &[], false).unwrap();
+        let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(again.complete && again.failed.is_empty(), "{again:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
         assert!(group_aces(&prof.join(".netrc")).iter().all(|a| a.1));
         // .ssh, .netrc, credentials.toml, NewTop.
         assert_eq!(again.writes, 4, "{again:?}");
-        let third = grant(&store, &ids, &layout, &[], false).unwrap();
+        let third = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert_eq!(third.writes, 0, "{third:?}");
         assert_eq!(explicit(&outside), outside_before);
 
@@ -1819,10 +1864,48 @@ mod tests {
 
         // A new exclusion from configuration turns a granted
         // directory into a denied one in one run.
-        let with_extra = grant(&store, &ids, &layout, &["NewTop".to_owned()], false).unwrap();
+        let with_extra =
+            grant(&store, &ids, &layout, &["NewTop".to_owned()], false, false).unwrap();
         assert!(with_extra.complete, "{with_extra:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
         assert!(group_aces(&prof.join(r"NewTop\n.txt")).iter().all(|a| a.1));
+
+        // A refresh that names no exclusion keeps the one an earlier
+        // run added, and the record lists it with the built-in ones.
+        let kept = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert!(kept.complete, "{kept:?}");
+        assert_eq!(kept.writes, 0, "{kept:?}");
+        assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
+        let st = status_json(TEST_KEY, Ok(layout.clone()), false);
+        assert_eq!(st["extra_exclusions"], serde_json::json!(["NewTop"]));
+        let listed: Vec<String> = st["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+        for want in [
+            r"\newtop",
+            r"\.ssh",
+            r"\appdata\local\temp",
+            r"\ntuser.dat*",
+        ] {
+            let full = format!("{}{want}", layout.profile.to_lowercase());
+            assert!(listed.contains(&full), "{full} not in {listed:?}");
+        }
+        // Naming it again changes nothing; replacing the added list
+        // with an empty one is what re-admits it.
+        let same = grant(&store, &ids, &layout, &["newtop".to_owned()], false, false).unwrap();
+        assert_eq!(same.writes, 0, "{same:?}");
+        let replaced = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        assert!(replaced.complete, "{replaced:?}");
+        assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
+        assert_eq!(
+            status_json(TEST_KEY, Ok(layout.clone()), false)["extra_exclusions"],
+            serde_json::json!([])
+        );
+        // No built-in exclusion went with it.
+        assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
 
         // Forget: every touched DACL is what it was, the created
         // directories are gone, nothing is recorded.

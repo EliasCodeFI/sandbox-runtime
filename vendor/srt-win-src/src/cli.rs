@@ -353,14 +353,22 @@ enum ProfileCmd {
     /// is in progress.
     ///
     /// Exits **15** unless the install's setup marker is this
-    /// build's, and non-zero when an excluded directory could not be
-    /// denied (the grant is then recorded as incomplete).
+    /// build's, **21** when run as a service account (LocalSystem,
+    /// LocalService, NetworkService), and non-zero when an excluded
+    /// directory could not be denied (the grant is then recorded as
+    /// incomplete).
     Grant {
         /// A path inside the profile to exclude in addition to the
         /// built-in list (absolute, or relative to the profile).
-        /// Repeatable. Nothing removes a built-in exclusion.
+        /// Repeatable. The exclusions added by earlier runs stay in
+        /// force as well. Nothing removes a built-in exclusion.
         #[arg(long = "exclude", value_name = "PATH")]
         exclude: Vec<String>,
+        /// Make the `--exclude` paths of this run the whole added
+        /// list, dropping the ones earlier runs recorded (with no
+        /// `--exclude`: drop them all).
+        #[arg(long)]
+        replace_excludes: bool,
         /// Print the result as one JSON object on stdout:
         /// `{profile, list_version, complete, containers, granted,
         /// files, denied, placeholders, writes, unchanged, removed,
@@ -371,8 +379,10 @@ enum ProfileCmd {
         #[arg(long)]
         quiet: bool,
         /// Treat this directory as the profile, with its `AppData`
-        /// folders beneath it. CI smoke hook: only in builds with the
-        /// `test-hooks` feature.
+        /// folders beneath it; the `SRT_WIN_TEST_PROFILE` environment
+        /// variable does the same when the flag is absent. CI hook:
+        /// only in builds with the `test-hooks` feature — a default
+        /// build has neither the flag nor the variable.
         #[cfg(feature = "test-hooks")]
         #[arg(long, value_name = "DIR")]
         test_profile: Option<String>,
@@ -389,7 +399,9 @@ enum ProfileCmd {
     },
     /// Print the recorded grant as JSON: `{state, reason?, profile,
     /// list_version, recorded_list_version, extra_exclusions,
-    /// containers, granted, files, denied, env?, paths?}`. `state` is
+    /// exclusions, containers, granted, files, denied, env?, paths?}`.
+    /// `exclusions` is every path the grant was made to keep
+    /// unreadable (wildcards as written), existing or not. `state` is
     /// `none`, `current`, `outdated`, `incomplete` or `unknown`; only
     /// `current` is a grant a session may rely on. `env` lists the
     /// configuration-file variables an embedder may set for a
@@ -1886,6 +1898,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub:
                 ProfileCmd::Grant {
                     exclude,
+                    replace_excludes,
                     json,
                     quiet,
                     #[cfg(feature = "test-hooks")]
@@ -1895,6 +1908,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             use srt_win::{persist, profile, state_db};
             #[cfg(not(feature = "test-hooks"))]
             let test_profile: Option<String> = None;
+            #[cfg(feature = "test-hooks")]
+            let test_profile = test_profile.or_else(test_profile_from_env);
+            // The grant is for the profile of a person who runs
+            // sessions. A service account has none to speak of, and a
+            // grant made as one would be recorded where no session
+            // looks for it.
+            let me = srt_win::sid::current_user_sid()?;
+            if test_profile.is_none() && is_service_account(&me) {
+                eprintln!(
+                    "srt-win: error: profile grant: running as the service account {me}; \
+                     run it as the user whose sessions are to read their profile"
+                );
+                std::process::exit(21);
+            }
             // As for a kept write grant: only on an install of this
             // build's setup version, checked before any state exists.
             if let Err(e) = srt_win::install::require_current_setup() {
@@ -1910,6 +1937,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     &ids,
                     &layout,
                     &exclude,
+                    replace_excludes,
                     !quiet,
                 )
             })?;
@@ -1988,6 +2016,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             use srt_win::{persist, profile};
             #[cfg(not(feature = "test-hooks"))]
             let test_profile: Option<String> = None;
+            #[cfg(feature = "test-hooks")]
+            let test_profile = test_profile.or_else(test_profile_from_env);
             println!(
                 "{}",
                 profile::status_json(
@@ -2245,6 +2275,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `SRT_WIN_TEST_PROFILE`, for a `test-hooks` build whose caller
+/// cannot pass `--test-profile` (the library, driven by a test suite).
+#[cfg(feature = "test-hooks")]
+fn test_profile_from_env() -> Option<String> {
+    std::env::var("SRT_WIN_TEST_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// LocalSystem, LocalService or NetworkService.
+fn is_service_account(sid: &str) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
 }
 
 fn is_elevated() -> anyhow::Result<bool> {
@@ -2724,9 +2768,24 @@ mod tests {
         assert!(matches!(
             parse(&["srt-win", "profile", "grant", "--quiet"]),
             Ok(Cmd::Profile {
-                sub: ProfileCmd::Grant { quiet: true, .. }
+                sub: ProfileCmd::Grant {
+                    quiet: true,
+                    replace_excludes: false,
+                    ..
+                }
             })
         ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--replace-excludes"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant {
+                    replace_excludes: true,
+                    ..
+                }
+            })
+        ));
+        assert!(is_service_account("S-1-5-18"));
+        assert!(!is_service_account("S-1-5-21-1-2-3-1001"));
         assert!(matches!(
             parse(&["srt-win", "profile", "forget", "--json"]),
             Ok(Cmd::Profile {

@@ -417,6 +417,21 @@ impl Rules {
         Rules { rules }
     }
 
+    /// Every exclusion in force, as written: components beneath the
+    /// profile joined by `\\`, wildcards included. Recorded with a
+    /// grant, so that what a grant excluded can be read back from its
+    /// record rather than from the list of whichever build asks.
+    pub fn spelled(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in &self.rules {
+            let s = r.spelled.join("\\");
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// Whether `rel` (components beneath the profile) is an exclusion
     /// or lies beneath one. Matches each rule against the whole path;
     /// the walk matches incrementally and must agree with this.
@@ -1053,6 +1068,24 @@ mod tests {
         assert!(!r.excludes(&names(&split_path("Documents"))));
         // Nothing configuration passes removes a built-in entry.
         assert!(r.excludes(&names(&split_path(".ssh"))));
+        // The list as recorded: the added entry, the built-in ones
+        // at their locations, wildcards as written, each once.
+        let spelled = r.spelled();
+        for want in [
+            ".myapp",
+            ".ssh",
+            r"AppData\Local\Temp",
+            r"AppData\Roaming\Microsoft\Credentials",
+            r"AppData\Local\*\EBWebView",
+            "NTUSER.DAT*",
+            r"AppData\Local\sandbox-runtime",
+        ] {
+            assert_eq!(
+                spelled.iter().filter(|s| s.as_str() == want).count(),
+                1,
+                "{want}"
+            );
+        }
     }
 
     /// Both spellings of an application-data location are covered:
