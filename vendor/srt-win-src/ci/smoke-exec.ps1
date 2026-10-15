@@ -748,6 +748,28 @@ function Seclogon-Err {
   if (-not $line) { return $null }
   return $line | ConvertFrom-Json
 }
+# seclogon stops accepting SERVICE_CONTROL_STOP for a few milliseconds
+# after every launch it serviced: the broker has already returned (the
+# runner exited) while the service is still finishing that launch. A
+# Stop-Service issued straight after an exec fails with
+# ERROR_INVALID_SERVICE_CONTROL (1052) — "Cannot stop 'seclogon'
+# service". Wait until the service accepts STOP again, then stop it;
+# retry a stop that still loses the race.
+function Stop-Seclogon {
+  param([int] $TimeoutSec = 30)
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+  while ($true) {
+    $s = Get-Service seclogon
+    if ($s.Status -eq 'Stopped') { return }
+    if ($s.CanStop) {
+      try { Stop-Service seclogon -Force -ErrorAction Stop; return }
+      catch { if ([DateTime]::UtcNow -ge $deadline) { throw } }
+    } elseif ([DateTime]::UtcNow -ge $deadline) {
+      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status))"
+    }
+    Start-Sleep -Milliseconds 20
+  }
+}
 $slSvc        = Get-Service seclogon
 $slStartType  = [string]$slSvc.StartType
 $slWasRunning = $slSvc.Status -eq 'Running'
@@ -755,7 +777,7 @@ Write-Host "S: seclogon before: StartType=$slStartType Status=$($slSvc.Status)"
 try {
   # ── S1: Manual + stopped → ok; the launch demand-starts it ─────
   Set-Service seclogon -StartupType Manual
-  Stop-Service seclogon -Force
+  Stop-Seclogon
   $st = Seclogon-State
   if ($st -ne 'ok') { throw "S1: Manual+stopped expected seclogon=ok, got '$st'" }
   $r = RExec @('--', $cmd, '/c', 'echo S1-RAN')
@@ -783,7 +805,7 @@ try {
   # Stop-Service refuses a service whose start type is Disabled, so
   # stop it under Manual first and disable it once it is down.
   Set-Service seclogon -StartupType Manual
-  Stop-Service seclogon -Force
+  Stop-Seclogon
   (Get-Service seclogon).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
   Set-Service seclogon -StartupType Disabled
   $st = Seclogon-State
@@ -829,7 +851,7 @@ try {
   # throw so an S-row failure above is not masked; S4 is the check.
   try {
     Set-Service seclogon -StartupType $slStartType
-    if ($slWasRunning) { Start-Service seclogon } else { Stop-Service seclogon -Force }
+    if ($slWasRunning) { Start-Service seclogon } else { Stop-Seclogon }
   } catch {
     Write-Host "S: WARNING: restoring seclogon (StartType=$slStartType running=$slWasRunning): $_"
   }
