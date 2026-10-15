@@ -3,7 +3,7 @@
 //! match — and only those.
 //!
 //! WFP's `ALE_USER_ID` `FWP_MATCH_EQUAL` condition runs `AccessCheck`
-//! on the connecting thread's effective token against the filter's
+//! on the token the connect is attributed to against the filter's
 //! SD; the filter matches iff the check grants. This test calls
 //! `AccessCheck` directly — no live WFP engine — so it pins the SD
 //! semantics independent of the network stack.

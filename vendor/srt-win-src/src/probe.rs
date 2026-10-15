@@ -1,8 +1,9 @@
 //! The behavioural fence probe behind `srt-win wfp verify`.
 //!
-//! The runner — a process of the sandbox account — makes one TCP
-//! connect per token shape a sandboxed process can present to the
-//! filtering engine, and reports each result separately:
+//! The runner — a process of the sandbox account — makes TCP connects
+//! under each token shape a sandboxed process can present to the
+//! filtering engine, and reports one result per shape and
+//! destination:
 //!
 //!   - **plain** — its own token, to the loopback probe target: a
 //!     loopback port outside the proxy port range and outside the
@@ -13,19 +14,15 @@
 //!   - **anonymous, loopback** — while impersonating the anonymous
 //!     token, to the loopback probe target. No filter covers this
 //!     (see the `wfp` module doc), so a connect here is reported as
-//!     the [`RESIDUAL_ANONYMOUS_LOOPBACK`] residual. It doubles as the
-//!     control for the attempt above: it shows that an anonymous
-//!     connect is refused off-loopback because of the filter, not
-//!     because impersonating anonymous cannot connect at all.
+//!     the [`RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
 //!   - **low integrity** and **untrusted integrity** — under a copy
 //!     of its own token whose integrity level has been lowered, to the
-//!     off-loopback target and to the loopback probe target (two
-//!     connects per level). The copy still carries the sandbox
-//!     account's SID, so the sandbox-user BLOCK must refuse all four.
-//!     They are probed because an access check applies the mandatory
-//!     integrity rule before it reads a descriptor's entries, and a
-//!     process may lower the integrity level of a copy of its own
-//!     token without any privilege.
+//!     off-loopback target and to the loopback probe target. The copy
+//!     still carries the sandbox account's SID, so the sandbox-user
+//!     BLOCK must refuse all four. They are probed because an access
+//!     check applies the mandatory integrity rule before it reads a
+//!     descriptor's entries, and a process may lower the integrity
+//!     level of a copy of its own token without any privilege.
 //!   - **deny-only** — under a restricted copy of its own token whose
 //!     user SID is deny-only, to the loopback probe target. A
 //!     deny-only SID is matched by no ALLOW ACE, so the filters
@@ -49,13 +46,39 @@
 //! attempts onto that in-range port ([`lowered_off_loopback`]): the
 //! address is the same, so nothing is lost, and the attempts then
 //! also show that the range's PERMIT stays closed off loopback for a
-//! lowered token. (The report is the runner's exit code, and ten
-//! three-bit results fill it; aiming the existing attempts at the
-//! stricter destination adds the check without another result.)
+//! lowered token, in both socket orderings described below. (The
+//! report is the runner's exit code, and ten three-bit results fill
+//! it; aiming the existing attempts at the stricter destination adds
+//! the check without another result.) The two range attempts
+//! themselves run under the runner's own token, where there is no
+//! ordering to vary: one connect each.
 //!
-//! The socket is always created BEFORE the identity is assumed, the
-//! way a process trying to get out would do it: only the connect
-//! itself runs under the other token.
+//! ## Two orderings per assumed identity
+//!
+//! Which token a connect is attributed to depends on when the socket
+//! was created. A socket the process creates under its own token and
+//! then connects while impersonating can be attributed to the
+//! process — and refused by the sandbox-user BLOCK — whatever the
+//! thread's token is at the connect. That ordering alone therefore
+//! says nothing about the assumed identity. Every attempt made under
+//! an assumed identity is run twice, on the one thread that holds the
+//! token ([`SocketOrder`]):
+//!
+//!   - **socket after token** — assume the identity, create the
+//!     socket, connect. The socket itself belongs to the assumed
+//!     identity; this is the ordering a process trying to get out
+//!     would use.
+//!   - **socket before token** — create the socket, assume the
+//!     identity, connect. Kept because an engine that attributes at
+//!     connect time would let this one through instead.
+//!
+//! In both, the thread's token is read back after the socket exists
+//! and the identity is assumed, immediately before the connect; an
+//! attempt whose token is not the one asked for is an `error`, never
+//! a `blocked`. Each ordering's own result is logged to stderr with
+//! the ordering named, and the attempt reports the WORSE of the two
+//! for the fence ([`Outcome::worse`]): one ordering getting through
+//! is the attempt getting through.
 //!
 //! The runner's stdout is the broker's stdout, so the results
 //! travel back in the runner's exit code ([`Report::encode`]).
@@ -63,7 +86,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, FD_SET, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IPPROTO_TCP,
     SO_ERROR, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET,
@@ -74,7 +97,8 @@ use windows::Win32::Security::{
     CREATE_RESTRICTED_TOKEN_FLAGS, CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation,
     ImpersonateAnonymousToken, RevertToSelf, SID_AND_ATTRIBUTES, SecurityImpersonation,
     TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TokenImpersonation, TokenImpersonationLevel, TokenIntegrityLevel,
+    TOKEN_STATISTICS, TOKEN_USER, TokenImpersonation, TokenIntegrityLevel, TokenStatistics,
+    TokenUser,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
@@ -84,6 +108,9 @@ use windows::Win32::System::Threading::{
 /// destination made while impersonating the anonymous token is not
 /// blocked.
 pub const RESIDUAL_ANONYMOUS_LOOPBACK: &str = "anonymous-loopback";
+
+/// The user SID of the anonymous token (`ANONYMOUS LOGON`).
+const ANONYMOUS_SID: &str = "S-1-5-7";
 
 /// The low mandatory level, as the last part of `S-1-16-<n>`.
 const IL_LOW: u32 = 0x1000;
@@ -115,7 +142,9 @@ pub enum Outcome {
     Unreachable = 4,
     /// The attempt was not made (no target for it).
     Skipped = 5,
-    /// The token shape could not be assumed, so no connect was made.
+    /// No connect was made under the token shape: it could not be
+    /// assumed, a socket could not be created under it, or the
+    /// thread's token read back as something else.
     Error = 6,
 }
 
@@ -148,6 +177,36 @@ impl Outcome {
     /// Whether the connect got past the filters.
     pub fn passed_fence(self) -> bool {
         matches!(self, Outcome::Connected | Outcome::Refused)
+    }
+
+    /// How bad this outcome is for the fence; higher is worse.
+    ///
+    ///   - `Connected`, then `Refused`: the connect got past the
+    ///     filters.
+    ///   - `Error`, then `Unreachable`, then `Skipped`: nothing was
+    ///     learned. These rank above `Blocked` so that a block in one
+    ///     ordering cannot stand in for an ordering that was never
+    ///     measured.
+    ///   - `Blocked`: the only outcome that is good for the fence, so
+    ///     the combined result is `Blocked` only when every part was.
+    fn severity(self) -> u8 {
+        match self {
+            Outcome::Blocked => 0,
+            Outcome::Skipped => 1,
+            Outcome::Unreachable => 2,
+            Outcome::Error => 3,
+            Outcome::Refused => 4,
+            Outcome::Connected => 5,
+        }
+    }
+
+    /// The worse of two outcomes for the fence ([`Self::severity`]).
+    pub fn worse(self, other: Self) -> Self {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -391,67 +450,179 @@ enum Identity {
     LoweredIntegrity(u32),
 }
 
-/// Check that the thread now carries a token at mandatory level
-/// `rid` and at impersonation level. Setting a thread token can
-/// succeed and still leave the thread with less than was asked for;
-/// a connect made then would say nothing about the token shape under
-/// test.
-fn confirm_thread_integrity(rid: u32) -> Result<()> {
-    let mut tok = HANDLE::default();
-    // open_as_self: checked against the process token, not the
-    // lowered one the thread carries.
-    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut tok) }
-        .context("OpenThreadToken")?;
-    let tok = crate::util::OwnedHandle(tok);
-    let mut level = 0u32;
+/// When the socket is created, relative to assuming the identity. See
+/// the module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketOrder {
+    /// Create the socket, assume the identity, connect.
+    BeforeToken,
+    /// Assume the identity, create the socket, connect.
+    AfterToken,
+}
+
+impl SocketOrder {
+    const BOTH: [SocketOrder; 2] = [SocketOrder::BeforeToken, SocketOrder::AfterToken];
+
+    /// The name used in the stderr line for this ordering.
+    fn label(self) -> &'static str {
+        match self {
+            SocketOrder::BeforeToken => "socket before token",
+            SocketOrder::AfterToken => "socket after token",
+        }
+    }
+}
+
+/// What the thread's token must read back as while an identity is
+/// assumed.
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// The anonymous token: its user is `ANONYMOUS LOGON`.
+    Anonymous,
+    /// The token object that was set on the thread, and the mandatory
+    /// level it was given, if one was.
+    Token { id: LUID, integrity: Option<u32> },
+}
+
+/// An identity in effect on this thread. Reverts on drop.
+struct Assumed {
+    expect: Expect,
+    _reverted: Reverted,
+}
+
+/// Room for a token property struct and the SID it points to.
+/// u64 elements: these structs hold pointers.
+type TokenInfoBuf = [u64; 16];
+
+/// Read a token property into `buf` and return a view of it. `T`
+/// must be the struct `class` returns. A SID pointer inside the
+/// result points into `buf`, which the borrow keeps in place.
+unsafe fn token_info<'a, T>(
+    token: HANDLE,
+    class: windows::Win32::Security::TOKEN_INFORMATION_CLASS,
+    what: &'static str,
+    buf: &'a mut TokenInfoBuf,
+) -> Result<&'a T> {
     let mut len = 0u32;
-    // u64 elements: the buffer starts with a struct holding a pointer.
-    let mut buf = [0u64; 16];
-    let integrity = unsafe {
+    unsafe {
         GetTokenInformation(
-            tok.raw(),
-            TokenImpersonationLevel,
-            Some(&mut level as *mut u32 as *mut std::ffi::c_void),
-            size_of::<u32>() as u32,
-            &mut len,
-        )
-        .context("GetTokenInformation(TokenImpersonationLevel)")?;
-        GetTokenInformation(
-            tok.raw(),
-            TokenIntegrityLevel,
+            token,
+            class,
             Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
-            size_of_val(&buf) as u32,
+            size_of_val(buf) as u32,
             &mut len,
         )
-        .context("GetTokenInformation(TokenIntegrityLevel)")?;
-        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
-        crate::sid::psid_to_string(label.Label.Sid)?
+        .with_context(|| format!("GetTokenInformation({what})"))?;
+        Ok(&*(buf.as_ptr() as *const T))
+    }
+}
+
+/// The identity of a token object, which a thread keeps when the
+/// token is set on it.
+fn token_id(token: HANDLE) -> Result<LUID> {
+    let mut buf = TokenInfoBuf::default();
+    let stats = unsafe {
+        token_info::<TOKEN_STATISTICS>(token, TokenStatistics, "TokenStatistics", &mut buf)?
     };
-    let want = format!("S-1-16-{rid}");
-    if level < SecurityImpersonation.0 as u32 || integrity != want {
+    Ok(stats.TokenId)
+}
+
+/// Check that the thread carries the token `expect` describes, at
+/// impersonation level. Setting a thread token can succeed and still
+/// leave the thread with less than was asked for, and a call made in
+/// between can drop the impersonation; a connect made then would say
+/// nothing about the token shape under test.
+fn confirm_thread_token(expect: Expect) -> Result<()> {
+    let mut tok = HANDLE::default();
+    // open_as_self: checked against the process token, not the one
+    // the thread carries. Fails when the thread carries none.
+    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut tok) }
+        .context("OpenThreadToken (is the thread still impersonating?)")?;
+    let tok = crate::util::OwnedHandle(tok);
+    let mut buf = TokenInfoBuf::default();
+    let stats = *unsafe {
+        token_info::<TOKEN_STATISTICS>(tok.raw(), TokenStatistics, "TokenStatistics", &mut buf)?
+    };
+    if stats.ImpersonationLevel.0 < SecurityImpersonation.0 {
         return Err(anyhow!(
-            "thread token is at impersonation level {level}, integrity {integrity}; \
-             wanted level {} or above, integrity {want}",
+            "thread token is at impersonation level {}; wanted {} or above",
+            stats.ImpersonationLevel.0,
             SecurityImpersonation.0
         ));
+    }
+    match expect {
+        Expect::Anonymous => {
+            let user = unsafe {
+                let user = token_info::<TOKEN_USER>(tok.raw(), TokenUser, "TokenUser", &mut buf)?;
+                crate::sid::psid_to_string(user.User.Sid)?
+            };
+            if user != ANONYMOUS_SID {
+                return Err(anyhow!(
+                    "thread token's user is {user}; wanted {ANONYMOUS_SID}"
+                ));
+            }
+        }
+        Expect::Token { id, integrity } => {
+            let got = stats.TokenId;
+            if (got.LowPart, got.HighPart) != (id.LowPart, id.HighPart) {
+                return Err(anyhow!(
+                    "thread token is not the one that was set on the thread"
+                ));
+            }
+            if let Some(rid) = integrity {
+                let got = unsafe {
+                    let label = token_info::<TOKEN_MANDATORY_LABEL>(
+                        tok.raw(),
+                        TokenIntegrityLevel,
+                        "TokenIntegrityLevel",
+                        &mut buf,
+                    )?;
+                    crate::sid::psid_to_string(label.Label.Sid)?
+                };
+                let want = format!("S-1-16-{rid}");
+                if got != want {
+                    return Err(anyhow!("thread token is at integrity {got}; wanted {want}"));
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn assume(id: Identity) -> Result<Option<Reverted>> {
+/// Put `imp` on the thread and confirm it took.
+fn impersonate(imp: HANDLE, integrity: Option<u32>) -> Result<Assumed> {
+    let id = token_id(imp)?;
+    unsafe { SetThreadToken(None, Some(imp)) }.context("SetThreadToken")?;
+    // From here the thread is impersonating: revert on every path,
+    // including a failed confirmation.
+    let assumed = Assumed {
+        expect: Expect::Token { id, integrity },
+        _reverted: Reverted,
+    };
+    confirm_thread_token(assumed.expect)?;
+    Ok(assumed)
+}
+
+/// Assume `id` on the current thread. `None` for the process's own
+/// token, which needs nothing.
+fn assume(id: Identity) -> Result<Option<Assumed>> {
     match id {
         Identity::Own => Ok(None),
         Identity::Anonymous => {
             unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }
                 .context("ImpersonateAnonymousToken")?;
-            Ok(Some(Reverted))
+            let assumed = Assumed {
+                expect: Expect::Anonymous,
+                _reverted: Reverted,
+            };
+            confirm_thread_token(assumed.expect)?;
+            Ok(Some(assumed))
         }
         Identity::DenyOnlyUser => {
             let user = crate::sid::LocalPsid::from_string(&crate::sid::current_user_sid()?)?;
             let mut own = HANDLE::default();
             let mut restricted = HANDLE::default();
             let mut imp = HANDLE::default();
-            let r = (|| -> Result<()> {
+            let r = (|| -> Result<Assumed> {
                 unsafe {
                     OpenProcessToken(
                         GetCurrentProcess(),
@@ -483,9 +654,8 @@ fn assume(id: Identity) -> Result<Option<Reverted>> {
                         &mut imp,
                     )
                     .context("DuplicateTokenEx")?;
-                    SetThreadToken(None, Some(imp)).context("SetThreadToken")?;
                 }
-                Ok(())
+                impersonate(imp, None)
             })();
             unsafe {
                 for h in [own, restricted, imp] {
@@ -494,12 +664,12 @@ fn assume(id: Identity) -> Result<Option<Reverted>> {
                     }
                 }
             }
-            r.map(|()| Some(Reverted))
+            r.map(Some)
         }
         Identity::LoweredIntegrity(rid) => {
             let mut own = HANDLE::default();
             let mut imp = HANDLE::default();
-            let r = (|| -> Result<Reverted> {
+            let r = (|| -> Result<Assumed> {
                 unsafe {
                     OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own)
                         .context("OpenProcessToken")?;
@@ -512,16 +682,11 @@ fn assume(id: Identity) -> Result<Option<Reverted>> {
                         &mut imp,
                     )
                     .context("DuplicateTokenEx")?;
-                    // Lowering a token's integrity level takes no
-                    // privilege.
-                    crate::token::set_il(imp, rid)?;
-                    SetThreadToken(None, Some(imp)).context("SetThreadToken")?;
                 }
-                // From here the thread is impersonating: revert on
-                // every path, including a failed confirmation.
-                let reverted = Reverted;
-                confirm_thread_integrity(rid)?;
-                Ok(reverted)
+                // Lowering a token's integrity level takes no
+                // privilege.
+                crate::token::set_il(imp, rid)?;
+                impersonate(imp, Some(rid))
             })();
             unsafe {
                 for h in [own, imp] {
@@ -650,38 +815,97 @@ fn connect_bounded(sock: &Sock, addr: &SocketAddr) -> (Outcome, i32) {
     }
 }
 
-/// One attempt: create the socket as the process, assume `id`, connect.
-fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
-    let (outcome, detail) = (|| -> Result<(Outcome, String)> {
-        let af = match target {
-            SocketAddr::V4(_) => AF_INET,
-            SocketAddr::V6(_) => AF_INET6,
-        };
-        let sock = Sock(
-            unsafe { socket(af.0 as i32, SOCK_STREAM, IPPROTO_TCP.0) }
-                .map_err(|e| anyhow!("socket: {e}"))?,
-        );
-        let mut nonblocking: u32 = 1;
-        if unsafe { ioctlsocket(sock.0, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
-            return Err(anyhow!("ioctlsocket(FIONBIO): {:?}", unsafe {
-                WSAGetLastError()
-            }));
+/// A non-blocking TCP socket for `target`'s address family, created
+/// under whatever token the calling thread carries.
+fn new_socket(target: &SocketAddr) -> Result<Sock> {
+    let af = match target {
+        SocketAddr::V4(_) => AF_INET,
+        SocketAddr::V6(_) => AF_INET6,
+    };
+    let sock = Sock(
+        unsafe { socket(af.0 as i32, SOCK_STREAM, IPPROTO_TCP.0) }
+            .map_err(|e| anyhow!("socket: {e}"))?,
+    );
+    let mut nonblocking: u32 = 1;
+    if unsafe { ioctlsocket(sock.0, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+        return Err(anyhow!("ioctlsocket(FIONBIO): {:?}", unsafe {
+            WSAGetLastError()
+        }));
+    }
+    Ok(sock)
+}
+
+/// One connect under `id`, with the socket created before or after
+/// the identity is assumed. Everything runs on the calling thread,
+/// which is the one that holds the assumed token. Returns the outcome
+/// and what is behind it.
+fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome, String) {
+    let error = |what: &str, e: anyhow::Error| (Outcome::Error, format!("{what}: {e:#}"));
+    let (sock, assumed) = match order {
+        SocketOrder::BeforeToken => {
+            let sock = match new_socket(target) {
+                Ok(s) => s,
+                Err(e) => return error("socket under the process token", e),
+            };
+            match assume(id) {
+                Ok(a) => (sock, a),
+                Err(e) => return error("assuming the token", e),
+            }
         }
-        let _reverted = match assume(id) {
-            Ok(g) => g,
-            Err(e) => return Ok((Outcome::Error, format!("{e:#}"))),
-        };
-        let (o, code) = connect_bounded(&sock, target);
-        Ok((o, format!("winsock error {code}")))
-    })()
-    .unwrap_or_else(|e| (Outcome::Error, format!("{e:#}")));
+        SocketOrder::AfterToken => {
+            let assumed = match assume(id) {
+                Ok(a) => a,
+                Err(e) => return error("assuming the token", e),
+            };
+            match new_socket(target) {
+                Ok(s) => (s, assumed),
+                Err(e) => return error("socket under the assumed token", e),
+            }
+        }
+    };
+    // The socket exists and the identity is assumed: the token must
+    // still be the one asked for, or the connect measures nothing.
+    if let Some(a) = &assumed
+        && let Err(e) = confirm_thread_token(a.expect)
+    {
+        return error("token not in effect before the connect", e);
+    }
+    let (o, code) = connect_bounded(&sock, target);
+    // Close the socket, then revert.
+    drop(sock);
+    drop(assumed);
+    (o, format!("winsock error {code}"))
+}
+
+/// One attempt. Under the process's own token that is one connect;
+/// under an assumed identity it is one per [`SocketOrder`], each
+/// logged, and the result is the worse of the two for the fence.
+fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     // stderr, never stdout: the runner's stdout is the broker's, and
     // the broker prints its own JSON there.
+    if matches!(id, Identity::Own) {
+        let (outcome, detail) = connect_as(id, target, SocketOrder::BeforeToken);
+        eprintln!(
+            "srt-win: runner: egress probe [{name}] {target}: {} ({detail})",
+            outcome.label().to_uppercase(),
+        );
+        return outcome;
+    }
+    let mut worst = Outcome::Blocked;
+    for order in SocketOrder::BOTH {
+        let (outcome, detail) = connect_as(id, target, order);
+        eprintln!(
+            "srt-win: runner: egress probe [{name}; {}] {target}: {} ({detail})",
+            order.label(),
+            outcome.label().to_uppercase(),
+        );
+        worst = worst.worse(outcome);
+    }
     eprintln!(
-        "srt-win: runner: egress probe [{name}] {target}: {} ({detail})",
-        outcome.label().to_uppercase(),
+        "srt-win: runner: egress probe [{name}] {target}: {} (the worse of both orderings)",
+        worst.label().to_uppercase(),
     );
-    outcome
+    worst
 }
 
 /// The off-loopback target of the lowered-integrity attempts: the
@@ -958,6 +1182,45 @@ mod tests {
     }
 
     use Outcome::*;
+
+    #[test]
+    fn worse_ranks_outcomes_for_the_fence() {
+        // Worst first. Each one beats everything after it, whichever
+        // side it is on.
+        let ranked = [Connected, Refused, Error, Unreachable, Skipped, Blocked];
+        assert_eq!(ranked.len(), Outcome::ALL.len());
+        for (i, a) in ranked.iter().enumerate() {
+            assert_eq!(a.worse(*a), *a);
+            for b in &ranked[i + 1..] {
+                assert_eq!(a.worse(*b), *a, "{a:?} vs {b:?}");
+                assert_eq!(b.worse(*a), *a, "{b:?} vs {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn worse_of_two_orderings() {
+        // One ordering getting through is the attempt getting through.
+        assert!(Blocked.worse(Connected).passed_fence());
+        assert!(Refused.worse(Blocked).passed_fence());
+        // A block in one ordering does not stand in for an ordering
+        // that was not measured.
+        assert_eq!(Blocked.worse(Error), Error);
+        assert_eq!(Unreachable.worse(Blocked), Unreachable);
+        // Blocked only when both were.
+        assert_eq!(Blocked.worse(Blocked), Blocked);
+        // A leak is not hidden by the other ordering failing.
+        assert_eq!(Error.worse(Connected), Connected);
+    }
+
+    #[test]
+    fn socket_orders_are_named_apart() {
+        assert_eq!(SocketOrder::BOTH.len(), 2);
+        assert_ne!(
+            SocketOrder::BeforeToken.label(),
+            SocketOrder::AfterToken.label()
+        );
+    }
 
     #[test]
     fn verdict_fenced_without_residuals() {

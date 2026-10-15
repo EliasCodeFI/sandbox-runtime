@@ -41,28 +41,36 @@
 //!   - **BLOCK anonymous, off-loopback** (weight [`W_BLOCK`]) —
 //!     `ALE_USER_ID` SD = [`sddl_anonymous`] **and** `IP_REMOTE_ADDRESS`
 //!     outside loopback ([`non_loopback_v4_ranges`] /
-//!     [`non_loopback_v6_ranges`]). The identity WFP checks is the
-//!     connecting thread's *effective* token, so a sandboxed thread
-//!     that impersonates the anonymous token presents `ANONYMOUS
-//!     LOGON`, which the sandbox-user SD does not grant. This filter
-//!     is what refuses that connect. It is machine-wide — it applies
-//!     to ANY thread impersonating anonymous, whoever owns the
-//!     process — so it is confined to non-loopback destinations. The
-//!     SD carries an untrusted-level mandatory label, because the
-//!     anonymous token's integrity level is below the level an
-//!     unlabelled descriptor is given (see [`sddl_anonymous`]).
+//!     [`non_loopback_v6_ranges`]). The identity WFP checks for a
+//!     connect is the token that was in effect when the SOCKET was
+//!     created, so a sandboxed thread that impersonates the anonymous
+//!     token and then creates its socket presents `ANONYMOUS LOGON`,
+//!     which the sandbox-user SD does not grant. This filter is what
+//!     refuses that connect. It is machine-wide — it applies to ANY
+//!     socket created while impersonating anonymous, whoever owns the
+//!     process — so it is confined to non-loopback destinations. (A
+//!     socket the process created under its own token stays
+//!     attributed to the sandbox account, and to the sandbox-user
+//!     BLOCK, even when the connect is made while impersonating.)
 //!
 //! ## What the filters do not cover
 //!
-//!   - A connect to a **loopback** destination made while
-//!     impersonating anonymous matches neither BLOCK: local listeners
-//!     outside the permitted port ranges are reachable that way.
+//!   - A connect to a **loopback** destination on a socket created
+//!     while impersonating anonymous matches neither BLOCK: local
+//!     listeners outside the permitted port ranges are reachable that
+//!     way.
+//!     `srt-win wfp verify` probes this and reports a connect as the
+//!     [`crate::probe::RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
 //!   - A token whose user SID has been made **deny-only**
 //!     (`CreateRestrictedToken`) is matched by no ALLOW ACE, so the
-//!     sandbox-user BLOCK does not match it. No descriptor can fix
-//!     that: the filter set blocks what it can name and permits the
-//!     rest. `srt-win wfp verify` probes this shape and reports it as
-//!     the [`RESIDUAL_DENY_ONLY`] residual.
+//!     sandbox-user BLOCK does not match a socket created under it.
+//!     No descriptor can fix that: the filter set blocks what it can
+//!     name and permits the rest. `srt-win wfp verify` probes this
+//!     shape and reports a connect as the [`RESIDUAL_DENY_ONLY`]
+//!     residual.
+//!
+//! The probe makes each of these connects with the socket created
+//! after the token is assumed as well as before; see [`crate::probe`].
 //!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
@@ -514,10 +522,6 @@ pub fn filter_count(loopback_range: Option<(u16, u16)>) -> usize {
 ///      the PERMIT has the same filters as revision 2; the number
 ///      moves so that a build which does not know about the range
 ///      never accepts a set that may carry one.
-///      It is also the first revision at which the anonymous BLOCK's
-///      descriptor always carries its integrity label
-///      ([`sddl_anonymous`]): a revision-2 set may predate the label,
-///      and re-running the install rewrites it.
 ///
 /// Recorded twice: in every filter's tag (what an elevated `wfp
 /// status` reads) and in the install record (what the non-elevated
@@ -535,7 +539,8 @@ const REQUIRED_BLOCK_KINDS: [&str; 2] = [KIND_BLOCK_USER, KIND_BLOCK_ANONYMOUS];
 
 /// Name of the residual `srt-win wfp verify` reports when a connect
 /// made under a copy of the sandbox token whose user SID is deny-only
-/// is not blocked. See the module doc.
+/// is not blocked, in either socket ordering the probe tries. See the
+/// module doc.
 pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 
 // Filter weights — kept below 2^60 so they stay in WFP's

@@ -240,6 +240,9 @@ export type WindowsWfpProbeOutcome =
  *   listeners outside the proxy port range are reachable that way.
  * - `deny-only-user-sid` — a connect made under a copy of the sandbox
  *   token whose user SID is deny-only is not blocked.
+ *
+ * Each is probed on a socket created before the token is assumed and
+ * on one created after; the residual is named when either connects.
  */
 export type WindowsWfpResidual = 'anonymous-loopback' | 'deny-only-user-sid'
 
@@ -1295,6 +1298,14 @@ export function interpretWindowsWfpVerify(r: {
  * 5. a copy of its token at low integrity, and one at untrusted
  *    integrity, each to the off-loopback address and to the
  *    listener.
+ *
+ * Attempts 2 to 5 each connect twice: on a socket created before the
+ * token is assumed and on one created after. The filtering engine
+ * attributes a connect to the token in effect when its socket was
+ * created, so only the second is a connect by the assumed identity;
+ * the first is kept in case that attribution differs. Each attempt
+ * reports the worse of its two results, and `stderr` carries one line
+ * per ordering.
  *
  * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
  * leaves — so a fenced connect yields WSAEACCES immediately and an
