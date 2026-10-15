@@ -67,6 +67,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'validateCaPair',
   'verifyWindowsWfpEgress',
   'windowsInstallInstructions',
+  'windowsProfileExclusionConflicts',
   'windowsProfileReadEnv',
   'windowsProfileReadExclusions',
   'windowsStateDir',

@@ -1113,41 +1113,11 @@ export const WindowsConfigSchema = z.object({
         'back to the ordinary token. Set `false` to opt out: the child ' +
         'then runs under the ordinary token with per-session grants, and ' +
         '`initialize()` first removes the kept grants (one walk of each ' +
-        'kept root).',
-    ),
-  profileRead: z
-    .boolean()
-    .optional()
-    .describe(
-      'Default false. When true, sandboxed commands may read your user ' +
-        'profile (so tools installed under it run, and npm, pip, NuGet, ' +
-        'Maven, Gradle and git find your configuration), except for the ' +
-        'credential stores on a built-in exclusion list. The read access ' +
-        'is a grant kept on disk, written by ' +
-        '`grantWindowsProfileRead()` (`srt-win profile grant`), which the ' +
-        'embedding program runs at install time and to refresh; ' +
-        '`initialize()` writes nothing and rejects with ' +
-        '`profile_grant_missing` / `profile_grant_outdated` until a ' +
-        'current grant exists. Some readable configuration files ' +
-        '(`.npmrc`, `pip.ini`, `NuGet.Config`, Maven `settings.xml`, ' +
-        '`gradle.properties`, `.gitconfig`) can hold package-feed ' +
-        'tokens. Once granted, any sandboxed session on the machine can ' +
-        'read the profile, not only sessions of this configuration, ' +
-        'until the grant is removed (`forgetWindowsProfileRead()`, ' +
-        '`srt-win profile forget`, or uninstall). When unset or false, ' +
-        '`initialize()` removes a grant it finds before granting ' +
-        'anything. Requires the write-restricted token (the default).',
-    ),
-  profileReadExclude: z
-    .array(z.string().min(1))
-    .optional()
-    .describe(
-      'Paths inside the user profile that `windows.profileRead` must not ' +
-        'make readable, in addition to the built-in list: absolute, or ' +
-        "relative to the profile (for example the embedding program's own " +
-        'configuration directory). Passed to `grantWindowsProfileRead()`; ' +
-        'a grant made without one of them is reported as outdated. ' +
-        'Entries only add exclusions — nothing removes a built-in one.',
+        'kept root). The read access to your user profile that the ' +
+        'install grants (see `grantWindowsProfileRead()`) exists only ' +
+        'with the write-restricted token: with `false`, `initialize()` ' +
+        'removes that grant as well, and sandboxed commands read nothing ' +
+        'in your profile beyond `allowRead`.',
     ),
 })
 
@@ -1320,21 +1290,6 @@ export const SandboxRuntimeConfigSchema = z
         if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
       }
-    }
-
-    // The profile read grant is kept on disk for the sandbox group, and
-    // srt-win refuses the ordinary token while it exists.
-    if (
-      cfg.windows?.profileRead === true &&
-      cfg.windows.writeRestrictedToken === false
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['windows', 'profileRead'],
-        message:
-          'windows.profileRead requires the write-restricted token; it ' +
-          'cannot be combined with windows.writeRestrictedToken: false',
-      })
     }
 
     const creds = cfg.credentials

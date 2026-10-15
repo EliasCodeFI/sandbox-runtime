@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
 import { windowsWriteRestrictedTokenEnabled } from '../src/sandbox/windows-sandbox-utils.js'
+import { WindowsConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2360,7 +2361,7 @@ describe('Config Validation', () => {
     })
   })
 
-  describe('windows.profileRead', () => {
+  describe('reading the user profile on Windows is not a setting', () => {
     const parse = (windows?: unknown) =>
       SandboxRuntimeConfigSchema.safeParse({
         network: { allowedDomains: [], deniedDomains: [] },
@@ -2368,62 +2369,27 @@ describe('Config Validation', () => {
         ...(windows !== undefined && { windows }),
       })
 
-    test('is off unless set to true', () => {
-      for (const windows of [undefined, {}, { profileRead: false }]) {
-        const r = parse(windows)
-        expect(r.success).toBe(true)
-        expect(r.success && r.data.windows?.profileRead === true).toBe(false)
+    test('the windows block has no key that turns it on, lists exclusions, or re-admits one', () => {
+      const keys = Object.keys(WindowsConfigSchema.shape)
+      for (const gone of [
+        'profileRead',
+        'profileReadExclude',
+        'profileReadInclude',
+        'dangerouslyAllowReadOfProfileExclusions',
+      ]) {
+        expect(keys).not.toContain(gone)
       }
-      const on = parse({ profileRead: true })
-      expect(on.success && on.data.windows?.profileRead).toBe(true)
+      // A configuration written for the earlier flag still parses; the
+      // keys are dropped, not honoured.
+      const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
+      expect(r.success).toBe(true)
+      expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
     })
 
-    test('rejects a value that is not a boolean', () => {
-      for (const bad of ['true', 1, 'on', null, {}]) {
-        expect(parse({ profileRead: bad }).success).toBe(false)
-      }
-    })
-
-    test('cannot be combined with the ordinary token', () => {
-      const r = parse({ profileRead: true, writeRestrictedToken: false })
-      expect(r.success).toBe(false)
-      expect(!r.success && r.error.issues.map(i => i.path.join('.'))).toEqual([
-        'windows.profileRead',
-      ])
-      // Each of the two alone is accepted, and so is the default token
-      // spelled out.
+    test('the token opt-out is the one switch, and stands alone', () => {
       expect(parse({ writeRestrictedToken: false }).success).toBe(true)
-      expect(
-        parse({ profileRead: false, writeRestrictedToken: false }).success,
-      ).toBe(true)
-      expect(
-        parse({ profileRead: true, writeRestrictedToken: true }).success,
-      ).toBe(true)
-    })
-
-    test('profileReadExclude adds paths; there is nothing that lists paths to re-admit', () => {
-      const r = parse({
-        profileRead: true,
-        profileReadExclude: [
-          '.myapp',
-          'C:\\Users\\me\\AppData\\Roaming\\MyApp',
-        ],
-      })
-      expect(r.success && r.data.windows?.profileReadExclude).toEqual([
-        '.myapp',
-        'C:\\Users\\me\\AppData\\Roaming\\MyApp',
-      ])
-      for (const bad of ['.myapp', [''], [1], null]) {
-        expect(parse({ profileReadExclude: bad }).success).toBe(false)
-      }
-      const shape = Object.keys(
-        SandboxRuntimeConfigSchema.safeParse({
-          network: { allowedDomains: [], deniedDomains: [] },
-          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-          windows: { profileRead: true, profileReadInclude: ['.ssh'] },
-        }).data?.windows ?? {},
-      )
-      expect(shape).not.toContain('profileReadInclude')
+      expect(parse({ writeRestrictedToken: true }).success).toBe(true)
+      expect(parse({}).success).toBe(true)
     })
   })
 })

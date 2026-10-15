@@ -121,23 +121,29 @@ export type WindowsSandboxErrorCode =
   /** `srt-win acl forget` could not remove every persistent grant. */
   | 'acl_forget_failed'
   /**
-   * `windows.profileRead` is on and no profile read grant is recorded:
-   * run {@link grantWindowsProfileRead}.
+   * No profile read grant is recorded for this user. The install
+   * applies it ({@link installWindowsSandbox}); run the install again,
+   * or {@link grantWindowsProfileRead}. `initialize()` never does.
    */
   | 'profile_grant_missing'
   /**
-   * `windows.profileRead` is on and the recorded grant cannot be relied
-   * on: made with another exclusion list or for another profile
-   * directory, not finished, unreadable, or made without an entry of
-   * `windows.profileReadExclude`. Run {@link grantWindowsProfileRead}.
+   * The recorded profile read grant cannot be relied on: made with
+   * another exclusion list or for another profile directory, not
+   * finished, or unreadable. Same remedy as `profile_grant_missing`.
    */
   | 'profile_grant_outdated'
-  /** `srt-win profile grant` did not complete. */
+  /**
+   * `srt-win profile grant` did not complete. From an install: the
+   * account and the filters are installed, the grant is not.
+   */
   | 'profile_grant_failed'
   /** `srt-win profile forget` could not remove the whole grant. */
   | 'profile_forget_failed'
-  /** `windows.profileRead` together with `windows.writeRestrictedToken: false`. */
-  | 'profile_read_needs_write_restricted_token'
+  /**
+   * A session `filesystem.allowRead` path is, contains, or lies inside
+   * a path the profile read grant excludes. Nothing is granted.
+   */
+  | 'profile_exclusion_read_grant'
   /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
   | 'argv_too_long'
   /** Sandbox user account / credential not present — run install. */
@@ -286,12 +292,12 @@ export interface WindowsSandboxUserStatus {
     reason?: string
   }
   /**
-   * Set when a profile read grant (`windows.profileRead`) is recorded
-   * (`present`) or cannot be ruled out (`unknown`). Whether it is
-   * current is {@link getWindowsProfileReadStatus}'s to say. While it
-   * is set, `srt-win` refuses to run a command under the ordinary
-   * token, and `initialize()` without the option removes the grant
-   * first.
+   * Set when a profile read grant is recorded (`present`) or cannot
+   * be ruled out (`unknown`). Whether it is current is
+   * {@link getWindowsProfileReadStatus}'s to say. While it is set,
+   * `srt-win` refuses to run a command under the ordinary token, and
+   * `initialize()` with `windows.writeRestrictedToken: false` removes
+   * the grant first.
    */
   profileGrant?: {
     state: 'present' | 'unknown'
@@ -1579,15 +1585,62 @@ export interface WindowsInstallOptions {
    * Defaults to {@link INSTALL_TIMEOUT_MS}.
    */
   timeoutMs?: number
+  /**
+   * Leave the profile read grant unapplied. The install then only
+   * provisions the account and the filters, and `initialize()` rejects
+   * with `profile_grant_missing` until {@link grantWindowsProfileRead}
+   * has run as the user who starts sessions.
+   */
+  skipProfileGrant?: boolean
+  /**
+   * Paths inside the profile to keep unreadable in addition to the
+   * built-in exclusions — {@link WindowsProfileGrantOptions.exclude}.
+   */
+  profileExclude?: readonly string[]
+  /**
+   * How long the profile read grant may take. Default 30 minutes; the
+   * first grant touches every file under the granted directories.
+   */
+  profileGrantTimeoutMs?: number
+  /**
+   * Called with each progress line of the profile read grant (a count
+   * of top-level items done). The synchronous install delivers the
+   * lines only when the grant has finished.
+   */
+  onProfileGrantProgress?: (line: string) => void
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
 }
+
+/**
+ * What an install did about the profile read grant. It is applied by
+ * this process, as the user this process runs as, to that user's own
+ * profile — never by the elevated step, which may run as another
+ * (administrator) account.
+ */
+export type WindowsInstallProfileGrant =
+  | {
+      applied: true
+      /** SID of the user whose profile was granted. */
+      userSid: string
+      result: WindowsProfileGrantResult
+    }
+  | {
+      applied: false
+      /**
+       * Why not. That user's `initialize()` rejects with
+       * `profile_grant_missing` until the grant is applied.
+       */
+      reason: string
+    }
 
 export interface WindowsInstallResult {
   /** Post-install WFP state. */
   wfp: WindowsWfpStatusResult
   /** Post-install sandbox-user state. */
   user: WindowsSandboxUserStatus
+  /** The profile read grant; absent when the install was cancelled. */
+  profileGrant?: WindowsInstallProfileGrant
   /**
    * `true` if the user dismissed the UAC prompt. Not an error —
    * the install simply didn't happen. Re-run when the user is
@@ -1730,7 +1783,20 @@ export function installWindowsSandbox(
     sublayerGuid: opts.sublayerGuid,
     srtWin,
   })
-  return r.status === 10 ? { ...state, cancelled: true } : state
+  if (r.status === 10) return { ...state, cancelled: true }
+  const skip = installProfileGrantSkip(opts, state.user)
+  if (skip) return { ...state, profileGrant: skip }
+  try {
+    const result = grantWindowsProfileReadSync(
+      installProfileGrantOptions(opts, srtWin),
+    )
+    return {
+      ...state,
+      profileGrant: { applied: true, userSid: state.user.realUserSid, result },
+    }
+  } catch (e) {
+    throwInstallProfileGrantFailure(e)
+  }
 }
 
 /**
@@ -1757,7 +1823,92 @@ export async function installWindowsSandboxAsync(
     sublayerGuid: opts.sublayerGuid,
     srtWin,
   })
-  return r.status === 10 ? { ...state, cancelled: true } : state
+  if (r.status === 10) return { ...state, cancelled: true }
+  const skip = installProfileGrantSkip(opts, state.user)
+  if (skip) return { ...state, profileGrant: skip }
+  try {
+    const result = await grantWindowsProfileRead(
+      installProfileGrantOptions(opts, srtWin),
+    )
+    return {
+      ...state,
+      profileGrant: { applied: true, userSid: state.user.realUserSid, result },
+    }
+  } catch (e) {
+    throwInstallProfileGrantFailure(e)
+  }
+}
+
+/** LocalSystem, LocalService, NetworkService: accounts no one runs sessions as. */
+const WINDOWS_SERVICE_ACCOUNT_SIDS: ReadonlySet<string> = new Set([
+  'S-1-5-18',
+  'S-1-5-19',
+  'S-1-5-20',
+])
+
+/**
+ * Why an install leaves the profile read grant unapplied, if it does.
+ *
+ * The grant is made by this process — unelevated unless the whole
+ * process already is — as the user it runs as, for that user's
+ * profile. That is the user who will run sessions when the embedding
+ * program installs for itself, whoever approved the elevation prompt.
+ * It is not when the install runs as a service account (a machine-wide
+ * deployment): there is no profile to grant, so each user's grant is
+ * left to {@link grantWindowsProfileRead} in their own session.
+ */
+function installProfileGrantSkip(
+  opts: WindowsInstallOptions,
+  user: WindowsSandboxUserStatus,
+): WindowsInstallProfileGrant | undefined {
+  if (opts.skipProfileGrant) {
+    return { applied: false, reason: 'skipProfileGrant was set' }
+  }
+  if (WINDOWS_SERVICE_ACCOUNT_SIDS.has(user.realUserSid)) {
+    return {
+      applied: false,
+      reason:
+        `the install ran as the service account ${user.realUserSid}, which ` +
+        `runs no sessions; each user's profile read grant has to be ` +
+        `applied as that user (grantWindowsProfileRead(), or \`srt-win ` +
+        `profile grant\`)`,
+    }
+  }
+  return undefined
+}
+
+function installProfileGrantOptions(
+  opts: WindowsInstallOptions,
+  srtWin: SrtWinSpawn,
+): WindowsProfileGrantOptions {
+  return {
+    exclude: opts.profileExclude,
+    timeoutMs: opts.profileGrantTimeoutMs,
+    onProgress: opts.onProfileGrantProgress,
+    srtWin,
+  }
+}
+
+/**
+ * The account and the filters are installed and the profile read
+ * grant is not: its own error, so the caller does not take the whole
+ * install for failed. An interrupted grant is recorded as incomplete —
+ * no session starts on it — and running the install or the grant
+ * again finishes it; `forgetWindowsProfileRead()` takes it back.
+ */
+function throwInstallProfileGrantFailure(e: unknown): never {
+  const cause = e as Error
+  const timedOut =
+    cause instanceof WindowsSandboxError && cause.code === 'srt_win_timeout'
+  throw new WindowsSandboxError(
+    'profile_grant_failed',
+    `The Windows sandbox is installed, but the read grant on your user ` +
+      `profile ${timedOut ? 'did not finish in time' : 'could not be applied'}` +
+      `: ${cause.message}\nNo session starts until it is complete. Run the ` +
+      `install again, or grantWindowsProfileRead(), to finish it; ` +
+      `forgetWindowsProfileRead() removes what was written.`,
+    'profile',
+  )
 }
 
 /**
@@ -2559,7 +2710,7 @@ export function revokeWindowsAcl(opts: {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Profile read grant (`windows.profileRead`)
+// Profile read grant
 // ────────────────────────────────────────────────────────────────────
 
 /**
@@ -2592,8 +2743,15 @@ export interface WindowsProfileGrantStatus {
   reason?: string
   /** The profile directory the grant was made for. */
   profile?: string
-  /** Exclusions added by configuration when the grant was made, relative to the profile. */
+  /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
+  /**
+   * Every path the grant was made to keep unreadable — the built-in
+   * list of the `srt-win` that made it and the added ones — as
+   * absolute paths, existing or not. A component that is `*` stands
+   * for any one name, one ending in `*` for any name with that prefix.
+   */
+  exclusions: string[]
   counts: { containers: number; granted: number; files: number; denied: number }
   /**
    * Configuration-file variables for a sandboxed command — see
@@ -2609,6 +2767,7 @@ type RawProfileStatus = {
   reason?: string
   profile?: string | null
   extra_exclusions?: string[]
+  exclusions?: string[]
   containers?: number
   granted?: number
   files?: number
@@ -2663,6 +2822,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     ...(raw.reason && { reason: raw.reason }),
     ...(raw.profile && { profile: raw.profile }),
     extraExclusions: raw.extra_exclusions ?? [],
+    exclusions: raw.exclusions ?? [],
     counts: {
       containers: raw.containers ?? 0,
       granted: raw.granted ?? 0,
@@ -2702,11 +2862,19 @@ export function getWindowsProfileReadStatus(
 
 export interface WindowsProfileGrantOptions {
   /**
-   * Paths inside the profile to exclude in addition to the built-in
-   * list (absolute, or relative to the profile) — normally
-   * {@link windowsProfileReadExclusions} of the session configuration.
+   * Paths inside the profile to keep unreadable in addition to the
+   * built-in list (absolute, or relative to the profile): for example
+   * the embedding program's own configuration directory, or
+   * {@link windowsProfileReadExclusions} of a session configuration.
+   * They are recorded with the grant and stay in force on later runs
+   * that do not name them. Nothing removes a built-in exclusion.
    */
   exclude?: readonly string[]
+  /**
+   * Make `exclude` the whole added list, dropping the entries earlier
+   * runs recorded. Without it a run only ever adds.
+   */
+  replaceExclusions?: boolean
   /**
    * Kill `srt-win` after this long. Default 30 minutes: the first run
    * touches every file under the granted directories.
@@ -2748,11 +2916,12 @@ const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
 
 /**
  * Write the profile read grant, or bring it up to date
- * (`srt-win profile grant`). Run it as the user whose profile it is,
- * without elevation: at install time, and again to refresh — a new
- * item at the top of the profile (or in another directory whose
- * children are granted one by one) is not readable until then.
- * `initialize()` never runs it.
+ * (`srt-win profile grant`). {@link installWindowsSandbox} runs it
+ * after the elevated step; call it yourself to refresh — a new item
+ * at the top of the profile (or in another directory whose children
+ * are granted one by one) is not readable until then — or to add
+ * exclusions. It runs as the user of this process, without elevation,
+ * and grants that user's profile. `initialize()` never runs it.
  *
  * The first run can take minutes on a large profile; `onProgress`
  * receives a line per top-level item. Other sessions of the same user
@@ -2766,8 +2935,7 @@ export async function grantWindowsProfileRead(
   opts: WindowsProfileGrantOptions = {},
 ): Promise<WindowsProfileGrantResult> {
   const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
-  const args = ['profile', 'grant', '--json']
-  for (const e of opts.exclude ?? []) args.push('--exclude', e)
+  const args = profileGrantArgs(opts)
   const timeoutMs = opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS
   const r = await new Promise<RunResult>((resolve, reject) => {
     const child = spawn(exe, [...prependArgs, ...args], { windowsHide: true })
@@ -2821,6 +2989,20 @@ export async function grantWindowsProfileRead(
       resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
     })
   })
+  return profileGrantResult(args, r)
+}
+
+function profileGrantArgs(opts: WindowsProfileGrantOptions): string[] {
+  const args = ['profile', 'grant', '--json']
+  for (const e of opts.exclude ?? []) args.push('--exclude', e)
+  if (opts.replaceExclusions) args.push('--replace-excludes')
+  return args
+}
+
+function profileGrantResult(
+  args: string[],
+  r: RunResult,
+): WindowsProfileGrantResult {
   logForDebugging(
     `[Sandbox Windows] profile grant exit=${r.status}: ${r.stderr.slice(-2000)}`,
   )
@@ -2832,6 +3014,7 @@ export async function grantWindowsProfileRead(
       'profile',
     )
   }
+  // stdout carries one JSON object; `--json` puts nothing else there.
   const raw = parseSrtWinJson<{
     profile: string
     containers: number
@@ -2863,12 +3046,30 @@ export async function grantWindowsProfileRead(
 }
 
 /**
+ * {@link grantWindowsProfileRead} for the synchronous install: blocks
+ * until `srt-win` exits, and hands `onProgress` its lines only then.
+ */
+function grantWindowsProfileReadSync(
+  opts: WindowsProfileGrantOptions,
+): WindowsProfileGrantResult {
+  const args = profileGrantArgs(opts)
+  const r = runSrtWin(args, {
+    timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
+  for (const line of r.stderr.split(/\r?\n/)) {
+    if (line.trim() !== '') opts.onProgress?.(line)
+  }
+  return profileGrantResult(args, r)
+}
+
+/**
  * Remove the profile read grant (`srt-win profile forget`): the
  * sandbox group's entry from every recorded path — each access list
  * is left as it was before the grant — and the empty directories the
  * grant created. `initialize()` runs this itself when it finds a
- * grant and `windows.profileRead` is not set; uninstall removes the
- * grant too.
+ * grant and `windows.writeRestrictedToken` is `false`; uninstall
+ * removes the grant too.
  *
  * @throws `profile_forget_failed` if any path could not be completed;
  *   the grant then still counts as existing.
@@ -2910,22 +3111,22 @@ function relativeToProfile(profile: string, p: string): string | undefined {
 }
 
 /**
- * The exclusions a session configuration implies for the profile read
- * grant, to pass to {@link grantWindowsProfileRead} as `exclude`:
- * `windows.profileReadExclude`, and every `credentials.files` path and
- * `filesystem.denyRead` path that lies inside the profile. A session
- * also denies those itself (see {@link windowsProfileGrantDenyTargets});
- * excluding them when the grant is made keeps them unreadable for
- * every other session too.
+ * The paths a session configuration keeps unreadable that lie inside
+ * the profile — every `credentials.files` path and
+ * `filesystem.denyRead` path — to pass to
+ * {@link grantWindowsProfileRead} (or the install) as `exclude`. A
+ * session denies those itself (see
+ * {@link windowsProfileGrantDenyTargets}); excluding them when the
+ * grant is made keeps them unreadable for every other session too.
  *
  * `profileDir` is the profile of the user running this; globs are
  * expanded as of now.
  */
 export function windowsProfileReadExclusions(
-  config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials' | 'windows'>,
+  config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>,
   profileDir: string,
 ): string[] {
-  const out = new Set<string>(config.windows?.profileReadExclude ?? [])
+  const out = new Set<string>()
   const named: FilesystemPathEntry[] = [
     ...(config.filesystem?.disabled ? [] : (config.filesystem?.denyRead ?? [])),
     ...(config.credentials?.files ?? []).map(f => f.path),
@@ -2936,21 +3137,82 @@ export function windowsProfileReadExclusions(
   return [...out]
 }
 
+/** How a path a session wants to grant stands to a profile exclusion. */
+export interface WindowsProfileExclusionConflict {
+  /** The path as the session configuration resolved it. */
+  path: string
+  /** The exclusion, as the grant recorded it. */
+  exclusion: string
+  /**
+   * `equal`: the path is the excluded one. `inside`: it lies beneath
+   * an excluded directory. `above`: an excluded path lies beneath it.
+   */
+  relation: 'equal' | 'inside' | 'above'
+}
+
+/** One component of a recorded exclusion against one of a path; both lower case. */
+function exclusionComponentMatches(pattern: string, name: string): boolean {
+  if (pattern === '*') return true
+  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1))
+  return pattern === name
+}
+
 /**
- * The entries of `configured` (`windows.profileReadExclude`) that the
- * recorded grant was made without.
+ * The paths among `paths` that a session must not grant read access
+ * to while the profile read grant exists, with the exclusion each
+ * collides with (`exclusions` as
+ * {@link WindowsProfileGrantStatus.exclusions} records them).
+ *
+ * A path is compared as the object it resolves to: links, junctions,
+ * 8.3 names and case are resolved first, the way `srt-win` resolves a
+ * path it is asked to grant. It collides when it is an excluded path,
+ * lies inside one, or lies above one. Above counts because a session
+ * grant inherits: an excluded store that is deleted and created again
+ * beneath it would be readable, which is what the grant's own layout
+ * never allows.
+ *
+ * `override` (the embedder's
+ * `dangerouslyAllowReadOfProfileExclusions`) takes a path out of the
+ * result when one of its entries resolves to the same object and the
+ * path is an excluded path or lies inside one. It never takes out a
+ * path above an exclusion.
  */
-export function windowsProfileExclusionsMissing(
-  status: WindowsProfileGrantStatus,
-  configured: readonly string[],
-): string[] {
-  const recorded = new Set(status.extraExclusions.map(profilePathKey))
-  return configured.filter(c => {
-    const rel =
-      (status.profile && relativeToProfile(status.profile, c)) ??
-      profilePathKey(c)
-    return !recorded.has(rel)
-  })
+export function windowsProfileExclusionConflicts(
+  paths: readonly string[],
+  exclusions: readonly string[],
+  override: readonly string[] = [],
+): WindowsProfileExclusionConflict[] {
+  if (paths.length === 0 || exclusions.length === 0) return []
+  const admitted = new Set(override.map(windowsPathKey))
+  const rules = exclusions.map(e => ({
+    exclusion: e,
+    parts: normalizeCaseForComparison(profilePathKey(e)).split('/'),
+  }))
+  const out: WindowsProfileExclusionConflict[] = []
+  for (const p of paths) {
+    const key = windowsPathKey(p)
+    const parts = key.split('/')
+    for (const r of rules) {
+      const shared = Math.min(parts.length, r.parts.length)
+      let related = true
+      for (let i = 0; related && i < shared; i++) {
+        related = exclusionComponentMatches(r.parts[i]!, parts[i]!)
+      }
+      if (!related) continue
+      const relation =
+        parts.length === r.parts.length
+          ? 'equal'
+          : parts.length > r.parts.length
+            ? 'inside'
+            : 'above'
+      // An admitted path is still checked against the other
+      // exclusions: it may lie above one of them.
+      if (relation !== 'above' && admitted.has(key)) continue
+      out.push({ path: p, exclusion: r.exclusion, relation })
+      break
+    }
+  }
+  return out
 }
 
 /**

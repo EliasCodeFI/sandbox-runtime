@@ -235,12 +235,52 @@ function onOrdinaryToken(cfg: SandboxRuntimeConfig): SandboxRuntimeConfig {
   return { ...cfg, windows: { ...cfg.windows, writeRestrictedToken: false } }
 }
 
+// What `srt-win profile status` prints for a current profile read
+// grant with nothing recorded: a default session does not start
+// without one, so every mocked `srt-win` answers with it.
+const CURRENT_PROFILE_GRANT = JSON.stringify({
+  state: 'current',
+  extra_exclusions: [],
+  exclusions: [],
+  paths: [],
+  env: {},
+})
+
 // Direct helper calls (and SandboxManager configs) must thread an
 // explicit srt-win path — there is no ambient vendor fallback.
 // getSrtWinPath() picks the built exe (vendored or cargo
 // target/release) on the CI runner.
+//
+// A default session needs a current read grant on the user's profile,
+// and the install applies one. The rows below must never grant the
+// profile of whoever runs them, so on Windows they need a made-up
+// profile directory, and that takes a test-hooks build of srt-win: the
+// shipped build has no way to be pointed at another directory. CI
+// passes both — SRT_WIN_TEST_HOOKS_EXE (the build) and
+// SRT_WIN_TEST_PROFILE (the directory, which that build reads from
+// the environment of every `profile` call the library makes). The
+// rows then run that build throughout. Without the two, every install
+// here skips the grant and the rows that start a session fail with
+// profile_grant_missing rather than touch a real profile.
+const SUITE_HOOKS_EXE = process.env.SRT_WIN_TEST_HOOKS_EXE
+const SUITE_HAS_PROFILE =
+  isWindows && !!SUITE_HOOKS_EXE && !!process.env.SRT_WIN_TEST_PROFILE
+function suiteSrtWinPath(): string {
+  return SUITE_HAS_PROFILE ? SUITE_HOOKS_EXE! : getSrtWinPath()
+}
+/** Spread into every real install of this file. */
+const SUITE_INSTALL: { skipProfileGrant?: boolean } = SUITE_HAS_PROFILE
+  ? {}
+  : { skipProfileGrant: true }
+if (isWindows && !SUITE_HAS_PROFILE) {
+  console.error(
+    '[winsrt] SRT_WIN_TEST_HOOKS_EXE / SRT_WIN_TEST_PROFILE are not set: ' +
+      'installs skip the profile read grant, and rows that start a ' +
+      'default session will fail with profile_grant_missing',
+  )
+}
 const TEST_SRT_WIN = isWindows
-  ? resolveSrtWin({ path: getSrtWinPath() })
+  ? resolveSrtWin({ path: suiteSrtWinPath() })
   : undefined
 
 function createTestConfig(
@@ -260,7 +300,7 @@ function createTestConfig(
     windows: {
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
-      srtWin: isWindows ? { path: getSrtWinPath() } : undefined,
+      srtWin: isWindows ? { path: suiteSrtWinPath() } : undefined,
     },
   }
 }
@@ -1288,6 +1328,14 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         target: '',
         stderr: '',
       }),
+      spyOn(winUtils, 'getWindowsProfileReadStatus').mockReturnValue({
+        state: 'current',
+        extraExclusions: [],
+        exclusions: [],
+        counts: { containers: 0, granted: 0, files: 0, denied: 0 },
+        env: {},
+        paths: [],
+      }),
       spyOn(winUtils, 'grantWindowsAcl').mockImplementation(o => {
         expect(writeRestrictedToken).toBe(false)
         granted = o
@@ -1851,6 +1899,9 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       proxyPortRange: [60080, 60089] as const,
       sandboxUser: 'srt-sb-test',
       force: true,
+      // The elevated step is what is compared here; the profile read
+      // grant that follows it has rows of its own.
+      skipProfileGrant: true,
       srtWin,
     }
     const sync = installWindowsSandbox(opts)
@@ -1880,10 +1931,14 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     // variant computes its budget through the same installTimeoutMs
     // helper (it arms its own timer instead of a spawn option, so
     // there is no opts.timeout to observe there).
-    installWindowsSandbox({ srtWin })
+    installWindowsSandbox({ srtWin, skipProfileGrant: true })
     expect(spawnSyncSpy.mock.calls[0][2].timeout).toBe(120_000)
     // Explicit override.
-    installWindowsSandbox({ srtWin, timeoutMs: 300_000 })
+    installWindowsSandbox({
+      srtWin,
+      timeoutMs: 300_000,
+      skipProfileGrant: true,
+    })
     expect(spawnSyncSpy.mock.calls.at(-2)?.[2].timeout).toBe(300_000)
   })
 
@@ -2151,13 +2206,15 @@ describe('Windows write-restricted token, the default: write roots are granted o
         persistent_grants: persistentGrants,
       }),
     }
-    return argv.includes('user')
-      ? JSON.stringify(user)
-      : argv.includes('wfp')
-        ? JSON.stringify(RAW_WFP)
-        : argv.includes('status')
-          ? JSON.stringify({ user, wfp: RAW_WFP })
-          : ''
+    return argv.includes('profile')
+      ? CURRENT_PROFILE_GRANT
+      : argv.includes('user')
+        ? JSON.stringify(user)
+        : argv.includes('wfp')
+          ? JSON.stringify(RAW_WFP)
+          : argv.includes('status')
+            ? JSON.stringify({ user, wfp: RAW_WFP })
+            : ''
   }
   /** Every `acl` spawn: subcommand, flags after it, parsed stdin. */
   let acl: { sub: string; argv: string[]; stdin: unknown }[]
@@ -2589,13 +2646,15 @@ function restoreGatedOnACompletedRevoke(
     user_sid: SID,
   }
   const stdoutFor = (argv: readonly string[]): string =>
-    argv.includes('user')
-      ? JSON.stringify(RAW_USER)
-      : argv.includes('wfp')
-        ? JSON.stringify(RAW_WFP)
-        : argv.includes('status')
-          ? JSON.stringify({ user: RAW_USER, wfp: RAW_WFP })
-          : ''
+    argv.includes('profile')
+      ? CURRENT_PROFILE_GRANT
+      : argv.includes('user')
+        ? JSON.stringify(RAW_USER)
+        : argv.includes('wfp')
+          ? JSON.stringify(RAW_WFP)
+          : argv.includes('status')
+            ? JSON.stringify({ user: RAW_USER, wfp: RAW_WFP })
+            : ''
 
   type SyncResult = {
     status: number | null
@@ -2992,6 +3051,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('verifyWindowsWfpEgress: blocked after install; throws after uninstall --keep-user', async () => {
     const sl = '6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60'
     installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: sl,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3019,6 +3079,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       // (`could not be verified`) messages — either is correct
       // fail-closed behaviour.
       uninstallWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: sl,
         keepUser: true,
         srtWin: TEST_SRT_WIN,
@@ -3034,7 +3095,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         ).rejects.toThrow(/WFP egress fence/i)
       }
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
+      uninstallWindowsSandbox({
+        ...SUITE_INSTALL,
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      })
     }
   }, 60_000)
 
@@ -3045,6 +3110,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const sl = '8d2f1e91-4b3c-5a6e-af9d-2e3f4a5b6c7d'
     try {
       const r = installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -3078,6 +3144,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       )
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -3085,7 +3152,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r2.cancelled).toBeUndefined()
       expect(r2.wfp.state).toBe('installed')
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
+      uninstallWindowsSandbox({
+        ...SUITE_INSTALL,
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      })
     }
     expect(
       getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }).state,
@@ -3100,6 +3171,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const sl = '9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e'
     try {
       installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -3110,6 +3182,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       let err: unknown
       try {
         installWindowsSandbox({
+          ...SUITE_INSTALL,
           sublayerGuid: sl,
           proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
           srtWin: TEST_SRT_WIN,
@@ -3121,6 +3194,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect((err as WindowsSandboxError).code).toBe('install_config_conflict')
       // With force → succeeds and replaces.
       const r = installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: sl,
         proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
         force: true,
@@ -3128,7 +3202,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[0] + 1])
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
+      uninstallWindowsSandbox({
+        ...SUITE_INSTALL,
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      })
     }
   })
 
@@ -3144,6 +3222,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('initialize() with filesystem.denyRead applies the DENY ACE', async () => {
     // Re-provision so the not-provisioned gate doesn't fire first.
     installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3170,6 +3249,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
 
   it('default token: initialize() verifies the fence with it, exec carries the flag, a per-command override is refused; writeRestrictedToken: false gives the ordinary token back', async () => {
     installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3235,6 +3315,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
 
   it('default token: a write root is writable to its own session only and readable from any, is kept at reset(), and is removed by a session with writeRestrictedToken: false', async () => {
     installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3296,6 +3377,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
 
   it('an install of the previous setup version: nothing is granted or run until the install is re-run, which upgrades it in place', async () => {
     installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3388,6 +3470,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
 
       // The repair: the same install command, which upgrades in place.
       const r = installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -3418,6 +3501,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     // helpers describe above may have left it installed).
     console.error('[winsrt beforeAll] install: begin')
     const r = installWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
@@ -3443,6 +3527,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   afterAll(async () => {
     await SandboxManager.reset()
     uninstallWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
     })
@@ -3982,7 +4067,7 @@ describe.if(isWindows)(
     let sbSid: string
 
     beforeAll(() => {
-      exe = getSrtWinPath()
+      exe = suiteSrtWinPath()
       // Full install under the test sublayer — provisions
       // srt-sandbox + cred + user-SID WFP filters. Idempotent.
       const inst = spawnSync(
@@ -3998,6 +4083,19 @@ describe.if(isWindows)(
       )
       if (inst.status !== 0) {
         throw new Error(`srt-win install failed: ${inst.stderr || inst.stdout}`)
+      }
+      // `srt-win install` itself applies no profile read grant (the
+      // library's install does); rows here that start a session need
+      // one. On the made-up profile only.
+      if (SUITE_HAS_PROFILE) {
+        const grant = spawnSync(exe, ['profile', 'grant', '--quiet'], {
+          encoding: 'utf8',
+        })
+        if (grant.status !== 0) {
+          throw new Error(
+            `srt-win profile grant failed: ${grant.stderr || grant.stdout}`,
+          )
+        }
       }
       const us = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
       if (!us.provisioned || !us.sid || !us.credPresent) {
@@ -4829,6 +4927,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     })
     if (wfp.state !== 'installed') {
       installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -4857,6 +4956,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     // re-provisions if it needs to; in CI `cleanup.ps1` sweeps
     // regardless.
     uninstallWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
     })
@@ -5032,6 +5132,7 @@ describe.if(isWindows)(
       // G's afterAll uninstalled — re-provision and trust the fixture
       // CA again (the trust went with the account's profile).
       installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -5050,6 +5151,7 @@ describe.if(isWindows)(
     afterAll(async () => {
       await SandboxManager.reset()
       uninstallWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
         srtWin: TEST_SRT_WIN,
       })
@@ -5168,6 +5270,7 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     })
     if (wfp.state !== 'installed') {
       installWindowsSandbox({
+        ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
         srtWin: TEST_SRT_WIN,
@@ -5184,6 +5287,7 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     rmSync(caDir, { recursive: true, force: true })
     // Last describe in the file → owns final teardown.
     uninstallWindowsSandbox({
+      ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
     })
@@ -5296,24 +5400,9 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
   }, 30_000)
 })
 
-describe('Windows profile read grant, windows.profileRead (pure, all platforms)', () => {
+describe('Windows profile read grant (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
-  const RAW_USER = {
-    user: {
-      exists: true,
-      sid: SID,
-      group_exists: true,
-      group_sid: 'S-1-5-21-2',
-      in_builtin_users: true,
-      in_sandbox_group: true,
-      hidden_from_logon: true,
-    },
-    cred_present: true,
-    marker_version: 1,
-    real_user_sid: 'S-1-5-21-3',
-    ca_cert_thumb: null,
-    ca_cert_pem: null,
-  }
+  const REAL_USER = 'S-1-5-21-3'
   type SyncResult = { status: number; stdout: string; stderr: string }
   const exit = (status: number, stdout = '', stderr = ''): SyncResult => ({
     status,
@@ -5323,6 +5412,8 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
 
   /** `profile_grant` of `user status`; `undefined` = no field. */
   let briefGrant: unknown
+  /** `real_user_sid` of `user status`. */
+  let realUserSid: string
   /** stdout of `profile status`. */
   let profileStatus: Record<string, unknown>
   /** Every sync `acl` / `profile` spawn, in order. */
@@ -5330,8 +5421,10 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
   let syncResult: Record<string, SyncResult>
   /** Every async spawn's argv (after the dispatch sentinel). */
   let asyncCalls: string[][]
-  /** What an async `profile grant` does. */
+  /** What an async `profile grant` does; `code: null` never exits. */
   let grantRun: { stderr: string[]; stdout: string; code: number | null }
+  /** Exit code of `install`, sync and async. */
+  let installCode: number
   let spies: { mockRestore(): void }[]
   /** Stands in for the profile directory. */
   let home: string
@@ -5357,12 +5450,21 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     rec('denied', '.cargo', 'credentials.toml'),
     rec('denied', '.ssh'),
   ]
-  const current = (extra: string[] = []) => ({
+  /** What the grant excludes: built-in entries and one added one. */
+  const exclusions = () => [
+    join(home, '.ssh'),
+    join(home, '.cargo', 'credentials.toml'),
+    join(home, 'NTUSER.DAT*'),
+    join(home, 'AppData', 'Local', '*', 'EBWebView'),
+    join(home, '.myapp'),
+  ]
+  const current = (extra: string[] = ['.myapp']) => ({
     state: 'current',
     profile: home,
     list_version: 1,
     recorded_list_version: 1,
     extra_exclusions: extra,
+    exclusions: exclusions(),
     containers: 2,
     granted: 1,
     files: 2,
@@ -5370,23 +5472,61 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     env: { NPM_CONFIG_USERCONFIG: join(home, '.npmrc') },
     paths: recorded(),
   })
+  const grantJson = () =>
+    JSON.stringify({
+      profile: home,
+      list_version: 1,
+      complete: true,
+      containers: 4,
+      granted: 30,
+      files: 6,
+      denied: 50,
+      placeholders: 20,
+      writes: 90,
+      unchanged: 0,
+      removed: 1,
+      skipped: [{ path: join(home, 'link'), reason: 'reparse point' }],
+      failed: [],
+      elapsed_ms: 1234,
+    })
 
   beforeEach(() => {
     briefGrant = undefined
+    realUserSid = REAL_USER
     calls = []
     syncResult = {}
     asyncCalls = []
-    grantRun = { stderr: [], stdout: '{}', code: 0 }
+    installCode = 0
     winUtils.clearWindowsAclIncompleteRevokesForTesting()
     home = realpathSync(mkdtempSync(join(tmpdir(), 'srt-profile-')))
     work = realpathSync(mkdtempSync(join(tmpdir(), 'srt-profile-work-')))
     mkdirSync(join(home, 'Documents', 'sub'), { recursive: true })
     mkdirSync(join(home, '.cargo'))
+    mkdirSync(join(home, '.ssh', 'keys'), { recursive: true })
+    mkdirSync(join(home, '.myapp'))
+    mkdirSync(join(home, 'AppData', 'Local', 'App', 'EBWebView'), {
+      recursive: true,
+    })
+    mkdirSync(join(home, 'AppData', 'Local', 'App', 'data'))
     writeFileSync(join(home, '.npmrc'), '//feed/:_authToken=t\n')
     profileStatus = current()
+    grantRun = { stderr: [], stdout: grantJson(), code: 0 }
     const stdoutFor = (argv: readonly string[]): string => {
       const user = {
-        ...RAW_USER,
+        user: {
+          exists: true,
+          sid: SID,
+          group_exists: true,
+          group_sid: 'S-1-5-21-2',
+          in_builtin_users: true,
+          in_sandbox_group: true,
+          hidden_from_logon: true,
+        },
+        cred_present: true,
+        marker_version: 1,
+        real_user_sid: realUserSid,
+        ca_cert_thumb: null,
+        ca_cert_pem: null,
         ...(briefGrant !== undefined && { profile_grant: briefGrant }),
       }
       const wfp = {
@@ -5395,13 +5535,15 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         port_range: [60080, 60089],
         user_sid: SID,
       }
-      return argv.includes('user')
-        ? JSON.stringify(user)
-        : argv.includes('wfp')
-          ? JSON.stringify(wfp)
-          : argv.includes('status')
-            ? JSON.stringify({ user, wfp })
-            : ''
+      return argv.includes('install')
+        ? ''
+        : argv.includes('user')
+          ? JSON.stringify(user)
+          : argv.includes('wfp')
+            ? JSON.stringify(wfp)
+            : argv.includes('status')
+              ? JSON.stringify({ user, wfp })
+              : ''
     }
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
@@ -5444,7 +5586,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         } else {
           setImmediate(() => {
             child.stdout.emit('data', stdoutFor(argv))
-            child.emit('close', 0, null)
+            child.emit('close', own[0] === 'install' ? installCode : 0, null)
           })
         }
         return child
@@ -5456,6 +5598,10 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       ) => {
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         const [cmd, sub] = own
+        if (cmd === 'install') {
+          calls.push({ cmd, sub: '', argv: own.slice(1), stdin: undefined })
+          return exit(installCode)
+        }
         if (cmd !== 'acl' && cmd !== 'profile') return exit(0, stdoutFor(argv))
         calls.push({
           cmd,
@@ -5468,6 +5614,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         if (key === 'profile status') {
           return exit(0, JSON.stringify(profileStatus))
         }
+        if (key === 'profile grant') return exit(0, grantJson())
         return exit(0, cmd === 'acl' ? '[]' : '{}')
       }) as never),
     ]
@@ -5482,10 +5629,9 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     rmSync(work, { recursive: true, force: true })
   })
 
+  // A plain configuration: nothing about the profile is in it.
   const config = (
-    windows: Partial<NonNullable<SandboxRuntimeConfig['windows']>> = {
-      profileRead: true,
-    },
+    windows: Partial<NonNullable<SandboxRuntimeConfig['windows']>> = {},
     filesystem: Partial<SandboxRuntimeConfig['filesystem']> = {},
   ): SandboxRuntimeConfig => ({
     network: {
@@ -5503,35 +5649,41 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     },
     windows: { srtWin: { path: process.execPath }, ...windows },
   })
+  const ORDINARY = { writeRestrictedToken: false }
   const rejection = async (
     cfg: SandboxRuntimeConfig,
+    options?: Parameters<typeof SandboxManager.initialize>[3],
   ): Promise<WindowsSandboxError> => {
     try {
-      await SandboxManager.initialize(cfg)
+      await SandboxManager.initialize(cfg, undefined, false, options)
     } catch (e) {
       return e as WindowsSandboxError
     }
     throw new Error('expected initialize() to reject')
   }
 
-  describe('the option on: initialize() checks the record and writes no grant', () => {
+  describe('a default session: initialize() checks the record and never writes the grant', () => {
     it('a current grant: one `profile status --paths`, then the session as usual', async () => {
       await SandboxManager.initialize(config())
       expect(names()).toEqual(['profile status', 'acl grant'])
       expect(calls[0].argv).toEqual(['--paths'])
-      // Nothing here runs the grant itself.
       expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(names()).not.toContain('profile grant')
       expect(names()).not.toContain('profile forget')
+      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(argv).toContain('--write-restricted-token')
     })
 
-    it('no grant recorded → profile_grant_missing, naming the call to make; nothing granted', async () => {
+    it('no grant recorded → profile_grant_missing, naming the install and the grant call; nothing granted', async () => {
       profileStatus = { state: 'none', list_version: 1 }
       const e = await rejection(config())
       expect(e).toBeInstanceOf(WindowsSandboxError)
       expect(e.code).toBe('profile_grant_missing')
+      expect(e.message).toContain('windows-install')
       expect(e.message).toContain('grantWindowsProfileRead()')
+      // It reports; it does not repair.
       expect(names()).toEqual(['profile status'])
+      expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
@@ -5542,39 +5694,17 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       // A state this library does not know is not a usable grant.
       ['fine-probably', undefined],
     ] as const) {
-      it(`a recorded grant that is ${state} → profile_grant_outdated; nothing granted`, async () => {
+      it(`a recorded grant that is ${state} → profile_grant_outdated; not refreshed, nothing granted`, async () => {
         profileStatus = { ...current(), state, ...(reason && { reason }) }
         const e = await rejection(config())
         expect(e.code).toBe('profile_grant_outdated')
         if (reason) expect(e.message).toContain(reason)
+        expect(e.message).toContain('windows-install')
         expect(names()).toEqual(['profile status'])
+        expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
         expect(SandboxManager.getConfig()).toBeUndefined()
       })
     }
-
-    it('an exclusion the configuration names and the grant lacks → profile_grant_outdated', async () => {
-      const e = await rejection(
-        config({ profileRead: true, profileReadExclude: ['.myapp'] }),
-      )
-      expect(e.code).toBe('profile_grant_outdated')
-      expect(e.message).toContain('.myapp')
-      expect(names()).toEqual(['profile status'])
-    })
-
-    it('exclusions the grant was made with are found, absolute or relative, in any case', async () => {
-      profileStatus = current(['.myapp', 'AppData\\Roaming\\MyApp'])
-      await SandboxManager.initialize(
-        config({
-          profileRead: true,
-          profileReadExclude: [
-            join(home, '.MyApp'),
-            'appdata/roaming/myapp',
-            '.myapp\\',
-          ],
-        }),
-      )
-      expect(names()).toEqual(['profile status', 'acl grant'])
-    })
 
     it('`profile status` failing → initialize() rejects; nothing granted', async () => {
       syncResult['profile status'] = exit(1, '', 'boom')
@@ -5584,13 +5714,13 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
-    it('with writeRestrictedToken: false → rejected before any srt-win call for the grant', async () => {
-      const e = await rejection(
-        config({ profileRead: true, writeRestrictedToken: false }),
+    it('there is no setting for it: the schema has no profile key', () => {
+      expect(Object.keys(WindowsConfigSchema.shape)).not.toContain(
+        'profileRead',
       )
-      expect(e.code).toBe('profile_read_needs_write_restricted_token')
-      expect(names()).toEqual([])
-      expect(SandboxManager.getConfig()).toBeUndefined()
+      expect(Object.keys(WindowsConfigSchema.shape)).not.toContain(
+        'profileReadExclude',
+      )
     })
   })
 
@@ -5598,23 +5728,40 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     const denyRead = async (
       ...paths: string[]
     ): Promise<string[] | undefined> => {
-      await SandboxManager.initialize(config(undefined, { denyRead: paths }))
+      await SandboxManager.initialize(config({}, { denyRead: paths }))
       return stdinOf('acl grant')?.denyRead
     }
+    const readable = [
+      () => home,
+      () => join(home, 'Documents'),
+      () => join(home, '.npmrc'),
+      () => join(home, '.cargo'),
+      () => join(home, '.cargo', 'config.toml'),
+    ]
 
     it('on the profile directory: stamped on every path the grant made readable, and on none it excluded', async () => {
       const stamped = await denyRead(home)
-      expect(new Set(stamped)).toEqual(
-        new Set([
-          home,
-          join(home, 'Documents'),
-          join(home, '.npmrc'),
-          join(home, '.cargo'),
-          join(home, '.cargo', 'config.toml'),
-        ]),
-      )
+      expect(new Set(stamped)).toEqual(new Set(readable.map(p => p())))
       // Each once: the profile directory is itself a recorded path.
       expect(stamped).toHaveLength(5)
+    })
+
+    it('denyRead of the profile directory holds for that session only: the next one stamps nothing', async () => {
+      await denyRead(home)
+      await SandboxManager.reset()
+      // Everything the session stamped is released with it …
+      expect(names()).toEqual([
+        'profile status',
+        'acl grant',
+        'acl revoke',
+        'acl restore',
+      ])
+      // … and a session without the deny puts no deny on the profile:
+      // the grant reads again.
+      calls = []
+      await SandboxManager.initialize(config())
+      expect(names()).toEqual(['profile status', 'acl grant'])
+      expect(stdinOf('acl grant')?.denyRead).toEqual([])
     })
 
     it('on a granted directory: that directory, once', async () => {
@@ -5647,36 +5794,24 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         cfg.credentials = { files: [{ path: join(home, '.npmrc'), mode }] }
         await SandboxManager.initialize(cfg)
         expect(stdinOf('acl grant')?.denyRead).toEqual([join(home, '.npmrc')])
-        // … and it is no grant of the session's either.
         expect(stdinOf('acl grant')?.read).toEqual([])
         await SandboxManager.reset()
       }
     })
 
-    it('reset() releases the session’s stamps; the grant itself is left alone', async () => {
-      await denyRead(home)
-      await SandboxManager.reset()
-      expect(names()).toEqual([
-        'profile status',
-        'acl grant',
-        'acl revoke',
-        'acl restore',
-      ])
-    })
-
     it('the stamps cannot be written → initialize() rejects', async () => {
       syncResult['acl grant'] = exit(1, '', 'access denied')
-      const e = await rejection(config(undefined, { denyRead: [home] }))
+      const e = await rejection(config({}, { denyRead: [home] }))
       expect(e.code).toBe('acl_grant_failed')
       expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
     it('a per-command read deny is stamped on the covered paths for that command', async () => {
       await SandboxManager.initialize(config())
-      const cfg = config(undefined, {
-        denyRead: [join(home, '.cargo')],
-        allowWrite: [],
-      })
+      const cfg = config(
+        {},
+        { denyRead: [join(home, '.cargo')], allowWrite: [] },
+      )
       const { argv } = await SandboxManager.wrapWithSandboxArgv(
         'echo x',
         undefined,
@@ -5688,25 +5823,164 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       )
     })
 
-    it('without the option nothing is added to a deny', async () => {
+    it('under the ordinary token there is no grant, and nothing is added to a deny', async () => {
       await SandboxManager.initialize(
-        config({}, { denyRead: [join(home, '.cargo')] }),
+        config(ORDINARY, { denyRead: [join(home, '.cargo')] }),
       )
-      expect(stdinOf('acl grant')?.denyRead).toEqual([join(home, '.cargo')])
+      expect(stdinOf('acl stamp')?.denyRead).toEqual([join(home, '.cargo')])
     })
   })
 
-  describe('the option off: a recorded grant is removed before anything is granted', () => {
+  describe('a session allowRead against the exclusions the grant recorded', () => {
+    const allowRead = (...paths: string[]) => config({}, { allowRead: paths })
+    const refused = async (
+      cfg: SandboxRuntimeConfig,
+      options?: Parameters<typeof SandboxManager.initialize>[3],
+    ) => {
+      const e = await rejection(cfg, options)
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('profile_exclusion_read_grant')
+      // Refused before anything is granted.
+      expect(names()).toEqual(['profile status'])
+      expect(SandboxManager.getConfig()).toBeUndefined()
+      return e
+    }
+
+    it('equal to an exclusion → refused', async () => {
+      const e = await refused(allowRead(join(home, '.ssh')))
+      expect(e.message).toContain('is the excluded')
+    })
+
+    it('inside an exclusion → refused', async () => {
+      const e = await refused(allowRead(join(home, '.ssh', 'keys')))
+      expect(e.message).toContain('lies inside the excluded')
+    })
+
+    it('above an exclusion → refused: a store created again beneath it would inherit the grant', async () => {
+      const e = await refused(allowRead(home))
+      expect(e.message).toContain('contains the excluded')
+    })
+
+    it('an exclusion added when the grant was made, not a built-in one → refused', async () => {
+      await refused(allowRead(join(home, '.myapp')))
+    })
+
+    it('the exclusions are the recorded ones: with none recorded nothing is refused', async () => {
+      profileStatus = { ...current([]), exclusions: [] }
+      await SandboxManager.initialize(allowRead(join(home, '.ssh')))
+      expect(stdinOf('acl grant')?.read).toEqual([join(home, '.ssh')])
+    })
+
+    it('a wildcard entry: the matching directory and the one above it → refused; its sibling is granted', async () => {
+      const app = join(home, 'AppData', 'Local', 'App')
+      await refused(allowRead(join(app, 'EBWebView')))
+      await SandboxManager.reset()
+      calls = []
+      await refused(allowRead(app))
+      await SandboxManager.reset()
+      calls = []
+      await SandboxManager.initialize(allowRead(join(app, 'data')))
+      expect(stdinOf('acl grant')?.read).toEqual([join(app, 'data')])
+    })
+
+    it('a link that resolves into an excluded store → refused (a junction, and a name spelled like an 8.3 short name: both are resolved by the final-path lookup)', async () => {
+      for (const name of ['to-ssh', 'SSH~1']) {
+        calls = []
+        const link = join(home, 'Documents', name)
+        symlinkSync(join(home, '.ssh'), link, 'junction')
+        const e = await refused(allowRead(link))
+        expect(e.message).toContain('is the excluded')
+        await SandboxManager.reset()
+      }
+    })
+
+    it('another case → refused', async () => {
+      // As a recorded exclusion spelled in another case …
+      expect(
+        winUtils.windowsProfileExclusionConflicts(
+          [join(home, '.ssh')],
+          [join(home, '.SSH').toUpperCase()],
+        ),
+      ).toHaveLength(1)
+      // … and, where the filesystem folds case, as the session's path.
+      const upper = join(home, '.SSH')
+      if (existsSync(upper)) {
+        await refused(allowRead(upper))
+      }
+    })
+
+    it('the embedder’s override admits an excluded path and one inside it, by the object it resolves to', async () => {
+      const link = join(home, 'Documents', 'to-ssh')
+      symlinkSync(join(home, '.ssh'), link, 'junction')
+      for (const [path, override] of [
+        [join(home, '.ssh'), join(home, '.ssh')],
+        [join(home, '.ssh', 'keys'), join(home, '.ssh', 'keys')],
+        // Named through the link, admitted by the store's own path.
+        [link, join(home, '.ssh')],
+      ]) {
+        calls = []
+        await SandboxManager.initialize(allowRead(path), undefined, false, {
+          dangerouslyAllowReadOfProfileExclusions: [override],
+        })
+        expect(stdinOf('acl grant')?.read).toEqual([path])
+        await SandboxManager.reset()
+      }
+    })
+
+    it('the override admits only what it names', async () => {
+      await refused(allowRead(join(home, '.ssh'), join(home, '.myapp')), {
+        dangerouslyAllowReadOfProfileExclusions: [join(home, '.ssh')],
+      })
+      await SandboxManager.reset()
+      calls = []
+      // Naming the store does not admit what lies inside it.
+      await refused(allowRead(join(home, '.ssh', 'keys')), {
+        dangerouslyAllowReadOfProfileExclusions: [join(home, '.ssh')],
+      })
+    })
+
+    it('the override never admits a path above an exclusion', async () => {
+      const e = await refused(allowRead(home), {
+        dangerouslyAllowReadOfProfileExclusions: [home],
+      })
+      expect(e.message).toContain('contains the excluded')
+    })
+
+    it('the override is not a configuration key', () => {
+      const r = WindowsConfigSchema.safeParse({
+        dangerouslyAllowReadOfProfileExclusions: ['x'],
+      })
+      expect(r.success && Object.keys(r.data)).not.toContain(
+        'dangerouslyAllowReadOfProfileExclusions',
+      )
+    })
+
+    it('a path that reaches no exclusion is granted as before', async () => {
+      const docs = join(home, 'Documents', 'sub')
+      await SandboxManager.initialize(allowRead(docs, work))
+      expect(new Set(stdinOf('acl grant')?.read)).toEqual(new Set([docs, work]))
+    })
+
+    it('under the ordinary token there is no grant and no such refusal', async () => {
+      await SandboxManager.initialize(
+        config(ORDINARY, { allowRead: [join(home, '.ssh')] }),
+      )
+      expect(stdinOf('acl grant')?.read).toEqual([join(home, '.ssh')])
+    })
+  })
+
+  describe('the token opt-out: a recorded grant is removed before anything is granted', () => {
     for (const [what, brief] of [
       ['a grant is recorded', { state: 'present' }],
       ['the record cannot be read', { state: 'unknown', reason: 'denied' }],
       ['the state is one this library does not know', { state: 'partial' }],
     ] as const) {
-      it(`${what}: profile forget runs first`, async () => {
+      it(`${what}: profile forget runs first, and nothing asks for a grant`, async () => {
         briefGrant = brief
-        await SandboxManager.initialize(config({}))
+        await SandboxManager.initialize(config(ORDINARY))
         expect(names()).toEqual(['profile forget', 'acl grant'])
         expect(calls[0].argv).toEqual(['--json'])
+        expect(calls[1].argv).not.toContain('--persistent')
       })
     }
 
@@ -5717,7 +5991,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         '',
         '2 path(s) could not be completed',
       )
-      const e = await rejection(config({}))
+      const e = await rejection(config(ORDINARY))
       expect(e.code).toBe('profile_forget_failed')
       expect(e.message).toContain('2 path(s)')
       expect(names()).toEqual(['profile forget'])
@@ -5728,17 +6002,161 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       ['no grant', { state: 'none' }],
       ['an srt-win that reports none', undefined],
     ] as const) {
-      it(`${what}: no profile call at all`, async () => {
+      it(`${what}: no profile call at all, and no grant is required`, async () => {
         briefGrant = brief
-        await SandboxManager.initialize(config({}))
+        profileStatus = { state: 'none' }
+        await SandboxManager.initialize(config(ORDINARY))
         expect(names()).toEqual(['acl grant'])
       })
     }
 
-    it('with the ordinary token: the profile grant goes before the kept write grants', async () => {
+    it('with the default token a recorded grant is kept, not removed', async () => {
       briefGrant = { state: 'present' }
-      await SandboxManager.initialize(config({ writeRestrictedToken: false }))
-      expect(names()[0]).toBe('profile forget')
+      await SandboxManager.initialize(config())
+      expect(names()).toEqual(['profile status', 'acl grant'])
+    })
+  })
+
+  describe('the install applies the grant', () => {
+    const srtWin = { exe: process.execPath, prependArgs: [] }
+
+    it('installWindowsSandboxAsync: after the elevated step, the grant runs as this process, with progress and the exclusions', async () => {
+      grantRun.stderr = [
+        'srt-win: profile grant: 1/2 top-level item(s) done\n',
+        'srt-win: profile grant: 2/2 top-level item(s) done\n',
+      ]
+      const progress: string[] = []
+      const r = await winUtils.installWindowsSandboxAsync({
+        srtWin,
+        profileExclude: ['.myapp'],
+        onProfileGrantProgress: l => progress.push(l),
+      })
+      expect(asyncCalls.map(a => a.slice(0, 2).join(' '))).toEqual([
+        'install',
+        'status',
+        'profile grant',
+      ])
+      expect(asyncCalls[2]).toEqual([
+        'profile',
+        'grant',
+        '--json',
+        '--exclude',
+        '.myapp',
+      ])
+      expect(progress).toHaveLength(2)
+      expect(r.profileGrant).toEqual({
+        applied: true,
+        userSid: REAL_USER,
+        result: expect.objectContaining({ profile: home, granted: 30 }),
+      })
+      expect(r.user.provisioned).toBe(true)
+    })
+
+    it('installWindowsSandbox (sync): the same calls, progress delivered at the end', () => {
+      syncResult['profile grant'] = exit(
+        0,
+        grantJson(),
+        'srt-win: profile grant: 1/1 top-level item(s) done',
+      )
+      const progress: string[] = []
+      const r = installWindowsSandbox({
+        srtWin,
+        profileExclude: ['.myapp'],
+        onProfileGrantProgress: l => progress.push(l),
+      })
+      expect(names()).toEqual(['install ', 'profile grant'])
+      expect(calls[1].argv).toEqual(['--json', '--exclude', '.myapp'])
+      expect(progress).toEqual([
+        'srt-win: profile grant: 1/1 top-level item(s) done',
+      ])
+      expect(r.profileGrant?.applied).toBe(true)
+    })
+
+    it('a re-run of an existing install refreshes the grant: the grant call is the same', async () => {
+      await winUtils.installWindowsSandboxAsync({ srtWin })
+      await winUtils.installWindowsSandboxAsync({ srtWin })
+      expect(
+        asyncCalls.filter(a => a[0] === 'profile').map(a => a.join(' ')),
+      ).toEqual(['profile grant --json', 'profile grant --json'])
+    })
+
+    it('a cancelled elevation prompt: nothing was installed, no grant is attempted', async () => {
+      installCode = 10
+      const r = await winUtils.installWindowsSandboxAsync({ srtWin })
+      expect(r.cancelled).toBe(true)
+      expect(r.profileGrant).toBeUndefined()
+      expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
+      expect(installWindowsSandbox({ srtWin }).profileGrant).toBeUndefined()
+      expect(names()).not.toContain('profile grant')
+    })
+
+    it('a failed elevated step: no grant is attempted', async () => {
+      installCode = 14
+      await expect(
+        winUtils.installWindowsSandboxAsync({ srtWin }),
+      ).rejects.toMatchObject({ code: 'install_user_failed' })
+      expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
+    })
+
+    it('an install run as a service account leaves the grant unapplied and says so', async () => {
+      for (const sid of ['S-1-5-18', 'S-1-5-19', 'S-1-5-20']) {
+        realUserSid = sid
+        asyncCalls = []
+        calls = []
+        const r = await winUtils.installWindowsSandboxAsync({ srtWin })
+        expect(r.profileGrant).toEqual({
+          applied: false,
+          reason: expect.stringContaining('service account'),
+        })
+        expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
+        expect(installWindowsSandbox({ srtWin }).profileGrant?.applied).toBe(
+          false,
+        )
+        expect(names()).not.toContain('profile grant')
+      }
+    })
+
+    it('skipProfileGrant: installed without the grant, and the next initialize() reports it missing', async () => {
+      const r = await winUtils.installWindowsSandboxAsync({
+        srtWin,
+        skipProfileGrant: true,
+      })
+      expect(r.profileGrant).toEqual({
+        applied: false,
+        reason: expect.stringContaining('skipProfileGrant'),
+      })
+      expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
+      profileStatus = { state: 'none' }
+      expect((await rejection(config())).code).toBe('profile_grant_missing')
+    })
+
+    it('the grant fails → profile_grant_failed, saying the sandbox itself is installed', async () => {
+      grantRun = {
+        stderr: ['an excluded directory could not be denied'],
+        stdout: '',
+        code: 1,
+      }
+      const e = (await winUtils
+        .installWindowsSandboxAsync({ srtWin })
+        .catch(e => e)) as WindowsSandboxError
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('profile_grant_failed')
+      expect(e.message).toContain('is installed, but')
+      expect(e.message).toContain('could not be denied')
+      syncResult['profile grant'] = exit(1, '', 'boom')
+      expect(() => installWindowsSandbox({ srtWin })).toThrow(
+        expect.objectContaining({ code: 'profile_grant_failed' }),
+      )
+    })
+
+    it('the grant has its own timeout', async () => {
+      grantRun = { stderr: [], stdout: '', code: null }
+      const e = (await winUtils
+        .installWindowsSandboxAsync({ srtWin, profileGrantTimeoutMs: 20 })
+        .catch(e => e)) as WindowsSandboxError
+      expect(e.code).toBe('profile_grant_failed')
+      expect(e.message).toContain('did not finish in time')
+      expect(e.message).toContain('20ms')
     })
   })
 
@@ -5746,30 +6164,11 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
     const srtWin = { exe: process.execPath, prependArgs: [] }
 
     it('grantWindowsProfileRead: argv, progress lines, result', async () => {
-      grantRun = {
-        stderr: [
-          'srt-win: profile grant: 1/3 top-level item(s) done\nsrt-win: profile gr',
-          'ant: 2/3 top-level item(s) done\n',
-          'srt-win: profile grant: 3/3 top-level item(s) done',
-        ],
-        stdout: JSON.stringify({
-          profile: home,
-          list_version: 1,
-          complete: true,
-          containers: 4,
-          granted: 30,
-          files: 6,
-          denied: 50,
-          placeholders: 20,
-          writes: 90,
-          unchanged: 0,
-          removed: 1,
-          skipped: [{ path: join(home, 'link'), reason: 'reparse point' }],
-          failed: [],
-          elapsed_ms: 1234,
-        }),
-        code: 0,
-      }
+      grantRun.stderr = [
+        'srt-win: profile grant: 1/3 top-level item(s) done\nsrt-win: profile gr',
+        'ant: 2/3 top-level item(s) done\n',
+        'srt-win: profile grant: 3/3 top-level item(s) done',
+      ]
       const progress: string[] = []
       const r = await winUtils.grantWindowsProfileRead({
         exclude: [join(home, '.myapp'), '.other'],
@@ -5808,9 +6207,24 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       })
     })
 
-    it('grantWindowsProfileRead: no exclusions → none on the command line', async () => {
-      await winUtils.grantWindowsProfileRead({ srtWin }).catch(() => {})
-      expect(asyncCalls).toEqual([['profile', 'grant', '--json']])
+    it('grantWindowsProfileRead: a refresh names no exclusion and drops none; replacing them is explicit', async () => {
+      await winUtils.grantWindowsProfileRead({ srtWin })
+      await winUtils.grantWindowsProfileRead({
+        srtWin,
+        exclude: ['.only'],
+        replaceExclusions: true,
+      })
+      expect(asyncCalls).toEqual([
+        ['profile', 'grant', '--json'],
+        [
+          'profile',
+          'grant',
+          '--json',
+          '--exclude',
+          '.only',
+          '--replace-excludes',
+        ],
+      ])
     })
 
     it('grantWindowsProfileRead: non-zero exit → profile_grant_failed with srt-win’s words', async () => {
@@ -5848,7 +6262,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
 
     it('getWindowsProfileReadStatus: argv and mapping', () => {
       profileStatus = {
-        ...current(['.myapp']),
+        ...current(),
         env: {
           NPM_CONFIG_USERCONFIG: 'C:\\Users\\me\\.npmrc',
           GIT_CONFIG_GLOBAL: 'C:\\Users\\me\\.gitconfig',
@@ -5864,6 +6278,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       expect(st.state).toBe('current')
       expect(st.profile).toBe(home)
       expect(st.extraExclusions).toEqual(['.myapp'])
+      expect(st.exclusions).toEqual(exclusions())
       expect(st.counts).toEqual({
         containers: 2,
         granted: 1,
@@ -5881,9 +6296,36 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       profileStatus = { ...profileStatus, state: 'outdated' }
       expect(winUtils.getWindowsProfileReadStatus({ srtWin }).env).toEqual({})
       profileStatus = { state: 'brand-new' }
-      expect(winUtils.getWindowsProfileReadStatus({ srtWin }).state).toBe(
-        'unknown',
+      const odd = winUtils.getWindowsProfileReadStatus({ srtWin })
+      expect(odd.state).toBe('unknown')
+      expect(odd.exclusions).toEqual([])
+    })
+
+    it('windowsProfileExclusionConflicts: equal, inside, above, wildcards, and what is unrelated', () => {
+      const rel = (p: string) =>
+        winUtils.windowsProfileExclusionConflicts([p], exclusions())[0]
+          ?.relation
+      expect(rel(join(home, '.ssh'))).toBe('equal')
+      expect(rel(join(home, '.ssh', 'keys'))).toBe('inside')
+      expect(rel(home)).toBe('above')
+      expect(rel(join(home, '.cargo'))).toBe('above')
+      expect(rel(join(home, '.cargo', 'credentials.toml'))).toBe('equal')
+      expect(rel(join(home, 'ntuser.dat.LOG1'))).toBe('equal')
+      expect(rel(join(home, 'AppData', 'Local'))).toBe('above')
+      expect(rel(join(home, 'AppData', 'Local', 'App', 'EBWebView'))).toBe(
+        'equal',
       )
+      expect(rel(join(home, 'Documents'))).toBeUndefined()
+      expect(rel(join(home, '.sshx'))).toBeUndefined()
+      expect(rel(join(home, 'AppData', 'Local', 'App', 'data'))).toBeUndefined()
+      expect(rel(work)).toBeUndefined()
+      // A recorded path with the extended prefix compares the same.
+      expect(
+        winUtils.windowsProfileExclusionConflicts(
+          [join(home, '.ssh', 'keys')],
+          ['\\\\?\\' + join(home, '.ssh')],
+        )[0]?.relation,
+      ).toBe('inside')
     })
 
     it('windowsProfileReadEnv: the pointers, minus what the embedder sets itself; none without a current grant', () => {
@@ -5892,6 +6334,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       ): winUtils.WindowsProfileGrantStatus => ({
         state,
         extraExclusions: [],
+        exclusions: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {
           NPM_CONFIG_USERCONFIG: 'n',
@@ -5916,8 +6359,6 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       for (const s of ['none', 'outdated', 'incomplete', 'unknown'] as const) {
         expect(winUtils.windowsProfileReadEnv(status(s))).toEqual({})
       }
-      // The directories a tool writes under are never pointed at the
-      // real profile.
       for (const v of [
         'USERPROFILE',
         'HOME',
@@ -5949,11 +6390,11 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
       }
     })
 
-    it('windowsProfileReadExclusions: the configured ones, and the credential files and read denies inside the profile', () => {
+    it('windowsProfileReadExclusions: the credential files and read denies inside the profile', () => {
       mkdirSync(join(home, '.secrets'))
       mkdirSync(join(work, 'private'))
       const cfg = config(
-        { profileRead: true, profileReadExclude: ['.myapp'] },
+        {},
         { denyRead: [join(home, '.secrets'), join(work, 'private'), home] },
       )
       cfg.credentials = {
@@ -5963,7 +6404,7 @@ describe('Windows profile read grant, windows.profileRead (pure, all platforms)'
         ],
       }
       expect(new Set(winUtils.windowsProfileReadExclusions(cfg, home))).toEqual(
-        new Set(['.myapp', join(home, '.secrets'), join(home, '.npmrc')]),
+        new Set([join(home, '.secrets'), join(home, '.npmrc')]),
       )
     })
 
