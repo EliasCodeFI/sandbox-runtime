@@ -279,6 +279,31 @@ if (isWindows && !SUITE_HAS_PROFILE) {
       'default session will fail with profile_grant_missing',
   )
 }
+// A session under the ordinary token removes the profile read grant
+// (that is what the opt-out does), and several rows below run one and
+// then go back to the default token. The library never re-applies the
+// grant by itself, so the suite does it for them: before each default
+// session on the real srt-win, the grant on the made-up profile is
+// brought back (a no-op when it is there). Rows that drive a mocked
+// srt-win are not touched — they name another executable.
+if (SUITE_HAS_PROFILE) {
+  const initialize = SandboxManager.initialize.bind(SandboxManager)
+  SandboxManager.initialize = async (cfg, ...rest) => {
+    if (
+      cfg.windows?.srtWin?.path === SUITE_HOOKS_EXE &&
+      cfg.windows.writeRestrictedToken !== false
+    ) {
+      // Best-effort: with nothing installed this exits non-zero, and
+      // initialize() then reports what is missing in its own words.
+      spawnSync(
+        SUITE_HOOKS_EXE,
+        [SRT_WIN_DISPATCH_ARG1, 'profile', 'grant', '--quiet'],
+        { encoding: 'utf8', timeout: 120_000 },
+      )
+    }
+    return initialize(cfg, ...rest)
+  }
+}
 const TEST_SRT_WIN = isWindows
   ? resolveSrtWin({ path: suiteSrtWinPath() })
   : undefined
