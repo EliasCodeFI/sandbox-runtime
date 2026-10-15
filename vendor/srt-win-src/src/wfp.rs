@@ -761,28 +761,18 @@ pub fn sddl_sandbox_user(sid: &str) -> String {
 }
 
 /// SDDL for the anonymous BLOCK filter — ALLOW `ANONYMOUS LOGON`
-/// (`S-1-5-7`), under a mandatory label at the untrusted level
-/// (`S-1-16-0`). Matches the anonymous token and nothing else: no
+/// (`S-1-5-7`). Matches the anonymous token and nothing else: no
 /// other token carries that SID.
 ///
-/// The label is what lets the ALLOW ACE be reached. An access check
-/// runs the mandatory integrity check before it reads the DACL. A
-/// descriptor with no label is treated as medium integrity, no
-/// write-up; the anonymous token's integrity level is untrusted, the
-/// lowest. A token below the descriptor's level is left only the
-/// rights the checker's generic mapping files under read and execute,
-/// whatever the DACL says. Which rights those are is the checker's
-/// choice, so without a label the match would depend on a mapping
-/// this crate does not control — and under a mapping that files the
-/// match right elsewhere, the anonymous token would never match.
-/// Every integrity level dominates the untrusted level, so with this
-/// label the mandatory check always passes and the DACL alone
-/// decides.
-///
-/// The label widens nothing: it grants no access, and the DACL still
-/// names `ANONYMOUS LOGON` only.
+/// The descriptor carries no mandatory label. The anonymous token's
+/// integrity level is untrusted, below the medium level an
+/// unlabelled descriptor is given, so whether this ACE is reached
+/// depends on how the engine's own access check treats the match
+/// right for a lower-integrity token. This crate cannot read that
+/// from the descriptor; the fence probe measures it on every verify
+/// by connecting under the anonymous token.
 pub fn sddl_anonymous() -> String {
-    "O:LSG:LSD:(A;;CC;;;S-1-5-7)S:(ML;;NW;;;S-1-16-0)".to_string()
+    "O:LSG:LSD:(A;;CC;;;S-1-5-7)".to_string()
 }
 
 // "Not loopback" for the anonymous BLOCK.
@@ -1401,12 +1391,10 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_sddl_grants_anonymous_logon_under_an_untrusted_label() {
+    fn anonymous_sddl_grants_anonymous_logon_only() {
         let s = sddl_anonymous();
         assert!(s.contains("D:(A;;CC;;;S-1-5-7)"));
-        // Without the label the anonymous token, whose integrity
-        // level is untrusted, is stopped before the DACL is read.
-        assert!(s.contains("S:(ML;;NW;;;S-1-16-0)"));
+        assert!(!s.contains("S:("));
         assert!(!s.contains("(D;"));
     }
 

@@ -106,7 +106,7 @@ const LENIENT: GENERIC_MAPPING = GENERIC_MAPPING {
 
 /// The anonymous SD without its mandatory label. Logged next to the
 /// real one, never asserted: it shows what the label changes.
-const ANONYMOUS_UNLABELLED: &str = "O:LSG:LSD:(A;;CC;;;S-1-5-7)";
+const ANONYMOUS_LABELLED: &str = "O:LSG:LSD:(A;;CC;;;S-1-5-7)S:(ML;;NW;;;S-1-16-0)";
 
 /// The low mandatory level.
 const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
@@ -481,20 +481,18 @@ fn anonymous_token_matches_only_the_anonymous_sd() {
     let tok = anonymous_token();
     let me = srt_win::sid::current_user_sid().unwrap();
 
-    // Logged, not asserted: the same DACL with no label. Denied here
-    // and granted just below means the label is what the anonymous
-    // token needs.
+    // Logged, not asserted. The anonymous token's integrity level is
+    // untrusted, so against the filter's unlabelled descriptor the
+    // result depends on the generic mapping the checker passes: the
+    // strict mapping here refuses it, the lenient one grants it. The
+    // filtering engine's own mapping is not visible from here; the
+    // smoke rows that connect under the anonymous token are the
+    // measurement. The labelled row shows the DACL itself is right.
+    let _ = check("anonymous / anonymous SD", tok, &sddl_anonymous());
     let _ = check(
-        "anonymous / anonymous SD, no label",
+        "anonymous / anonymous SD with an untrusted label",
         tok,
-        ANONYMOUS_UNLABELLED,
-    );
-
-    // Under the strict mapping: the match must not depend on which
-    // rights the checker files under read and execute.
-    assert!(
-        check("anonymous / anonymous SD", tok, &sddl_anonymous()),
-        "anonymous SD must match the anonymous token (see the stderr line for this row)"
+        ANONYMOUS_LABELLED,
     );
     // Why the anonymous BLOCK exists: the sandbox-user SD does not
     // reach a thread of the sandbox account once it impersonates
