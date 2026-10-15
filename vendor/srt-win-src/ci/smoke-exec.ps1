@@ -765,13 +765,14 @@ function Stop-Seclogon {
   $start    = [DateTime]::UtcNow
   $deadline = $start.AddSeconds($TimeoutSec)
   $swept    = $false
+  $last     = ''
   while ($true) {
     $s = Get-Service seclogon
     if ($s.Status -eq 'Stopped') { return }
-    if ($s.CanStop) {
-      try { Stop-Service seclogon -Force -ErrorAction Stop; return }
-      catch { if ([DateTime]::UtcNow -ge $deadline) { throw } }
-    } elseif (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
+    # CanStop is not consulted: on some machines it stays false while
+    # a stop request is in fact accepted.
+    try { Stop-Service seclogon -Force -ErrorAction Stop; return } catch { $last = "$_" }
+    if (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
       $swept = $true
       $left = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
                 Where-Object { $_.UserName -like '*\srt-sandbox' })
@@ -780,7 +781,7 @@ function Stop-Seclogon {
       foreach ($p in $left) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
     } elseif ([DateTime]::UtcNow -ge $deadline) {
       $q = (& sc.exe queryex seclogon 2>&1 | Out-String) -replace '\s+', ' '
-      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status)); sc queryex: $q"
+      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status)); last error: $last; sc queryex: $q"
     }
     Start-Sleep -Milliseconds 20
   }
