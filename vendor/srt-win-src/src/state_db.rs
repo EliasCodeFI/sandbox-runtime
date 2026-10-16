@@ -448,13 +448,13 @@ use crate::profile::is_access_denied;
 /// look at before they change anything: they run only on a quiet
 /// machine, where no session and no sandboxed command exists.
 pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
-    live_holders_with(db.conn(), except, DISK.alive)
+    live_holders_with(db.conn(), except, alive_by_one_snapshot())
 }
 
 fn live_holders_with(
     conn: &Connection,
     except: Option<u32>,
-    alive: fn(u32, i64) -> bool,
+    alive: impl Fn(u32, i64) -> bool,
 ) -> Result<Vec<KeptHolder>> {
     let rows: Vec<(i64, i64, String, String)> = query_vec(
         conn,
@@ -616,7 +616,7 @@ pub struct KeptHolder {
 fn kept_holders_with(
     conn: &Connection,
     except: i64,
-    alive: fn(u32, i64) -> bool,
+    alive: impl Fn(u32, i64) -> bool,
 ) -> Result<Vec<KeptHolder>> {
     let rows: Vec<(i64, i64, String, String)> = query_vec(
         conn,
@@ -1056,7 +1056,11 @@ impl Locked {
     /// kept grant. Crash recovery has already run under this lock, so
     /// a holder that died is not among them.
     pub fn other_kept_holders(&self) -> Result<Vec<KeptHolder>> {
-        kept_holders_with(&self.conn, self.holder_pid.0 as i64, DISK.alive)
+        kept_holders_with(
+            &self.conn,
+            self.holder_pid.0 as i64,
+            alive_by_one_snapshot(),
+        )
     }
 
     /// Remove the holder's `brokers` row. CASCADE drops its
@@ -1929,6 +1933,18 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
         // counts as alive — better a stale row than a live holder
         // reaped and its files restored under it.
         Err(_) => is_process_alive_by_opening(pid, expected_create_filetime),
+    }
+}
+
+/// [`is_process_alive`] over ONE reading of the process list, for a
+/// query that judges a holder per row: a session with hundreds of
+/// rows is one reading, not hundreds.
+fn alive_by_one_snapshot() -> impl Fn(u32, i64) -> bool {
+    let all = process_create_times();
+    move |pid, created| match &all {
+        _ if pid == std::process::id() => true,
+        Ok(all) => all.get(&pid) == Some(&created),
+        Err(_) => is_process_alive_by_opening(pid, created),
     }
 }
 

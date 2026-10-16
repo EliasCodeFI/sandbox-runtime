@@ -7259,9 +7259,47 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           )
           expect(names()).not.toContain('profile forget')
           expect(stdinOf('acl stamp')?.denyRead).toEqual([join(home, '.cargo')])
+          // It is sent nothing it would not know. An srt-win from
+          // before this list existed refuses an argument it has not
+          // heard of, for every command: what it is handed is checked
+          // against what it took then — the calls, and each flag.
+          const known: Record<string, string[]> = {
+            'acl grant': ['--holder-pid', '--sandbox-user-sid'],
+            'acl stamp': ['--holder-pid', '--sandbox-user-sid'],
+            'acl revoke': ['--holder-pid', '--sandbox-user-sid', '--json'],
+            'acl restore': ['--holder-pid', '--sandbox-user-sid', '--json'],
+          }
+          const unknown = () =>
+            calls.flatMap(c =>
+              c.argv
+                .filter(a => a.startsWith('--'))
+                .filter(a => !(known[`${c.cmd} ${c.sub}`] ?? []).includes(a))
+                .map(a => `${c.cmd} ${c.sub} ${a}`),
+            )
+          expect(unknown()).toEqual([])
+          const execFlags = (argv: readonly string[]) => {
+            const own = argv.slice(argv.indexOf('exec') + 1, argv.indexOf('--'))
+            return own.filter(
+              (a, i) => a.startsWith('--') && own[i - 1] !== '--env',
+            )
+          }
+          const execKnown = ['--quiet', '--env', '--deny-read', '--deny-write']
+          // In the session: grants beneath a per-command deny, which
+          // under the other token would name `--deny-read-except`.
+          const inSession = await SandboxManager.wrapWithSandboxArgv(
+            'echo x',
+            undefined,
+            config(ORDINARY, {
+              denyRead: [join(home, '.cargo'), dirname(work), work],
+              allowWrite: [],
+            }),
+          )
+          expect(
+            execFlags(inSession.argv).filter(f => !execKnown.includes(f)),
+          ).toEqual([])
           // Nor is it asked for a per-command read deny there.
           calls = []
-          await SandboxManager.wrapWithSandboxArgv(
+          const alone = await SandboxManager.wrapWithSandboxArgv(
             'echo x',
             undefined,
             config(ORDINARY, {
@@ -7270,6 +7308,19 @@ describe('Windows profile read grant (pure, all platforms)', () => {
             }),
           )
           expect(names()).toEqual([])
+          expect(
+            execFlags(alone.argv).filter(f => !execKnown.includes(f)),
+          ).toEqual([])
+          await SandboxManager.reset()
+          expect(unknown()).toEqual([])
+          // With nothing to grant, it is not called to record a
+          // session either: it records none.
+          calls = []
+          await SandboxManager.initialize(config(ORDINARY, { allowWrite: [] }))
+          expect(names()).not.toContain('acl grant')
+          expect(
+            (await SandboxManager.wrapWithSandboxArgv('echo x')).argv,
+          ).not.toContain('--held-by')
           await SandboxManager.reset()
         }
       })

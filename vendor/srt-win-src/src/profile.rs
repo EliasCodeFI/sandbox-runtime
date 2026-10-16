@@ -2677,26 +2677,25 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
             // the entry is seen to be gone — then it is judged like
             // any exclusion without a deny. An access list that
             // cannot be read does not take back what the run found.
-            (NoteClass::OurAllow, Some(ids))
-                if !matches!(
-                    own_access(&n.path, ids),
-                    Ok(Some(Access { ours: None, .. })) | Ok(None)
-                ) =>
-            {
-                let entry = match own_access(&n.path, ids) {
-                    Ok(Some(Access { ours: Some(e), .. })) => e,
-                    _ => "explicit",
-                };
-                (
-                    NoteClass::Unprotected,
-                    Item {
-                        path: n.path.clone(),
-                        reason: n.reason.clone(),
-                        protected_exclusion: Some(true),
-                        entry: Some(entry),
-                        ..Default::default()
-                    },
-                )
+            (NoteClass::OurAllow, Some(ids)) => {
+                // Looked at once.
+                let probe =
+                    exclusion_as_it_is(&n.path, ids, "could not be written when the grant ran");
+                let stands = probe.entry.is_some() || probe.class == NoteClass::Unverifiable;
+                if stands {
+                    (
+                        NoteClass::Unprotected,
+                        Item {
+                            path: n.path.clone(),
+                            reason: n.reason.clone(),
+                            protected_exclusion: Some(true),
+                            entry: Some(probe.entry.unwrap_or("explicit")),
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    (probe.class, probe.item(&n.path))
+                }
             }
             (_, Some(ids)) => {
                 let probe =

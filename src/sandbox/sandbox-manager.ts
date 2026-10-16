@@ -208,6 +208,10 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
 let windowsFsSbUserSid: string | undefined
+// Whether initialize() registered this process with srt-win as a
+// session: always under the write-restricted token; under the
+// ordinary one only with an srt-win that says it keeps such records.
+let windowsSessionRegistered = false
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -1655,6 +1659,14 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
+      const anyApplied =
+        grantRead.length > 0 ||
+        acc.grantWrite.length > 0 ||
+        acc.denyRead.length > 0 ||
+        acc.denyWrite.length > 0
+      const registersUnderOrdinaryToken =
+        !writeRestricted &&
+        u.capabilities.includes(WINDOWS_SRT_WIN_CAPABILITIES.execHolder)
       if (writeRestricted) {
         // One call: the write roots are granted persistently (kept at
         // reset(); a root granted before costs one DACL read), the
@@ -1695,15 +1707,24 @@ async function initializeSteps(
         // the time the deny stamp runs. The two are independent
         // refcounted state-DB sets keyed on the same holder PID.
         //
-        // Made always, with nothing to grant too: the call records
-        // this process as a session, and the profile read grant is
-        // not made or removed while one exists.
-        grantWindowsAcl({
-          sandboxUserSid: sb,
-          read: grantRead,
-          write: acc.grantWrite,
-          srtWin,
-        })
+        // With an srt-win that records sessions it is made with
+        // nothing to grant too: the call is what records this process
+        // as one, and the profile read grant is not made or removed
+        // while one exists. An srt-win that does not say so is asked
+        // for nothing it was not asked for before: this token needs
+        // no capability of it.
+        if (
+          registersUnderOrdinaryToken ||
+          grantRead.length > 0 ||
+          acc.grantWrite.length > 0
+        ) {
+          grantWindowsAcl({
+            sandboxUserSid: sb,
+            read: grantRead,
+            write: acc.grantWrite,
+            srtWin,
+          })
+        }
         if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
           stampWindowsAcl({
             sandboxUserSid: sb,
@@ -1716,10 +1737,11 @@ async function initializeSteps(
       // Gates running revoke/restore at reset(). Recorded AFTER
       // success — the catch below clears `config`, and a non-undefined
       // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed. Recorded always: a session under either
-      // token registered itself with srt-win, whatever it was given,
-      // and releases that the same way.
-      {
+      // that never landed. Recorded whenever something was applied or
+      // the session registered itself with srt-win, which it releases
+      // the same way.
+      windowsSessionRegistered = writeRestricted || registersUnderOrdinaryToken
+      if (anyApplied || windowsSessionRegistered) {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
@@ -1743,6 +1765,7 @@ async function initializeSteps(
         }
       }
       windowsFsSbUserSid = undefined
+      windowsSessionRegistered = false
       windowsProfileRead = undefined
       config = undefined
       throw e
@@ -3168,13 +3191,17 @@ async function wrapWithSandboxArgv(
       // The session's own grants beneath those denies keep their
       // rank: srt-win leaves the recorded profile paths they cover
       // out of what it denies for this command.
-      denyReadExcept: windowsGrantsBeneathDenies(
-        [
-          ...(windowsFsStampedSet?.grantRead ?? []),
-          ...(windowsFsStampedSet?.grantWrite ?? []),
-        ],
-        perExecDenyRead,
-      ),
+      // (Under the ordinary token there is no profile grant and
+      // nothing to leave out; the flag is not sent.)
+      denyReadExcept: writeRestrictedToken
+        ? windowsGrantsBeneathDenies(
+            [
+              ...(windowsFsStampedSet?.grantRead ?? []),
+              ...(windowsFsStampedSet?.grantWrite ?? []),
+            ],
+            perExecDenyRead,
+          )
+        : undefined,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -3190,8 +3217,13 @@ async function wrapWithSandboxArgv(
       // checks that it really holds — an embedder that revoked the
       // session's grants in the middle of it no longer does — and
       // otherwise, as for a command with no session behind it, holds
-      // for the command itself.
-      heldBy: windowsFsSbUserSid !== undefined ? process.pid : undefined,
+      // for the command itself. Named only where the session did
+      // register: under the ordinary token an srt-win that keeps no
+      // such records does not know the flag.
+      heldBy:
+        windowsSessionRegistered && windowsFsSbUserSid !== undefined
+          ? process.pid
+          : undefined,
       // The roots initialize() granted persistently; their capability
       // SIDs are what let this command write them.
       writeRoots: writeRestrictedToken
@@ -3447,6 +3479,7 @@ async function reset(): Promise<void> {
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
+  windowsSessionRegistered = false
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
