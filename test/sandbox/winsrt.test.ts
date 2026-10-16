@@ -9,6 +9,7 @@ import {
   spyOn,
 } from 'bun:test'
 import * as child_process from 'node:child_process'
+import * as fs from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
@@ -6115,6 +6116,173 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       calls = []
       await SandboxManager.initialize(allowRead(join(app, 'data')))
       expect(stdinOf('acl grant')?.read).toEqual([join(app, 'data')])
+    })
+
+    describe('the look beneath a path above a wildcard entry', () => {
+      // Lists of their own, so that a directory two levels above the
+      // wildcard's last component is not also above a literal entry.
+      const own = () => ({
+        exclusions: [join(home, 'apps', '*', '*', 'store')],
+        ungrantedOnly: [],
+      })
+      const apps = () => join(home, 'apps')
+      const check = (p: string, write = false) =>
+        winUtils.windowsProfileExclusionConflicts([p], own(), { write })
+
+      it('admits a path that was looked at and holds no match, or is not there', () => {
+        mkdirSync(join(apps(), 'a', 'b', 'other'), { recursive: true })
+        writeFileSync(join(apps(), 'file'), '')
+        expect(check(apps())).toEqual([])
+        expect(check(join(apps(), 'a'))).toEqual([])
+        // Not there (yet): nothing can lie beneath it.
+        expect(check(join(apps(), 'not-yet'))).toEqual([])
+        expect(check(join(apps(), 'file', 'x'))).toEqual([])
+        // And refuses once something matches.
+        mkdirSync(join(apps(), 'a', 'b', 'store'))
+        expect(check(apps())).toMatchObject([{ relation: 'above' }])
+        expect(check(apps())[0]!.unexamined).toBeUndefined()
+        expect(check(join(apps(), 'a'), true)).toMatchObject([
+          { relation: 'above', access: 'write' },
+        ])
+      })
+
+      // Every way of not being able to look refuses: "could not look"
+      // is not "nothing there".
+      const failing = (
+        code: string,
+        on: 'realpath' | 'lstat' | 'readdir',
+        match: (p: string) => boolean,
+      ) => {
+        const err = () =>
+          Object.assign(new Error(`${code}: simulated`), { code })
+        if (on === 'realpath') {
+          const real = fs.realpathSync.native
+          return spyOn(fs.realpathSync, 'native').mockImplementation(((
+            p: string,
+          ) => {
+            if (match(String(p))) throw err()
+            return real(p)
+          }) as typeof fs.realpathSync.native)
+        }
+        const real = fs[`${on}Sync`] as (...a: unknown[]) => unknown
+        return spyOn(fs, `${on}Sync`).mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          if (match(String(p))) throw err()
+          return real(p, ...rest)
+        }) as never)
+      }
+
+      for (const [code, on, where] of [
+        ['EACCES', 'readdir', 'the path itself'],
+        ['EIO', 'readdir', 'the path itself'],
+        ['EPERM', 'lstat', 'the path itself'],
+        ['EACCES', 'realpath', 'the path itself'],
+        ['EIO', 'realpath', 'the path itself'],
+        ['ELOOP', 'realpath', 'the path itself'],
+        ['EACCES', 'readdir', 'a level beneath it'],
+        ['EBUSY', 'lstat', 'a level beneath it'],
+      ] as const) {
+        it(`refuses when ${on} fails with ${code} on ${where}`, () => {
+          mkdirSync(join(apps(), 'a', 'b'), { recursive: true })
+          const target =
+            where === 'the path itself' ? apps() : join(apps(), 'a')
+          const spy = failing(code, on, p => p === target)
+          try {
+            for (const write of [false, true]) {
+              const got = check(apps(), write)
+              expect(got).toMatchObject([{ relation: 'above' }])
+              expect(got[0]!.unexamined).toContain(code)
+            }
+          } finally {
+            spy.mockRestore()
+          }
+          // The same tree, readable: admitted.
+          expect(check(apps())).toEqual([])
+        })
+      }
+
+      it('a level that is not there, or not a directory, is no match and no failure', () => {
+        mkdirSync(join(apps(), 'a'), { recursive: true })
+        for (const code of ['ENOENT', 'ENOTDIR']) {
+          const spy = failing(code, 'readdir', p => p === join(apps(), 'a'))
+          try {
+            expect(check(apps())).toEqual([])
+          } finally {
+            spy.mockRestore()
+          }
+        }
+      })
+
+      it('refuses a path that turns out to be a link when it is listed', () => {
+        mkdirSync(apps(), { recursive: true })
+        const real = fs.lstatSync
+        const spy = spyOn(fs, 'lstatSync').mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          const st = (real as (...a: unknown[]) => fs.Stats)(p, ...rest)
+          if (String(p) === apps()) st.isSymbolicLink = () => true
+          return st
+        }) as never)
+        try {
+          expect(check(apps())[0]?.unexamined).toContain('is a link')
+        } finally {
+          spy.mockRestore()
+        }
+      })
+
+      it('never opens, lists or resolves a path on a share or in the device namespace', () => {
+        const spies = [
+          spyOn(fs.realpathSync, 'native'),
+          spyOn(fs, 'realpathSync'),
+          spyOn(fs, 'lstatSync'),
+          spyOn(fs, 'statSync'),
+          spyOn(fs, 'readdirSync'),
+          spyOn(fs, 'existsSync'),
+        ]
+        try {
+          for (const p of [
+            '\\\\server\\share\\x',
+            '\\\\?\\UNC\\server\\share\\x',
+            '\\\\.\\UNC\\server\\share\\x',
+            '//server/share/x',
+            '\\\\?\\GLOBALROOT\\Device\\Mup\\server\\share',
+            '\\\\.\\pipe\\x',
+          ]) {
+            for (const write of [false, true]) {
+              // A profile on a local drive has no exclusion a share
+              // could be related to: nothing to refuse, nothing read.
+              expect(
+                winUtils.windowsProfileExclusionConflicts([p], lists(), {
+                  write,
+                }),
+              ).toEqual([])
+            }
+          }
+          // A profile that is itself on a share: the wildcard entry
+          // could lie beneath the path, which is not looked at, so it
+          // is refused unseen.
+          const shared = {
+            exclusions: [
+              '\\\\?\\UNC\\server\\profiles\\me\\AppData\\Local\\*\\EBWebView',
+            ],
+            ungrantedOnly: [],
+          }
+          for (const p of [
+            '\\\\server\\profiles\\me\\AppData\\Local\\tool',
+            '\\\\?\\UNC\\server\\profiles\\me\\AppData\\Local\\tool',
+          ]) {
+            const got = winUtils.windowsProfileExclusionConflicts([p], shared)
+            expect(got).toMatchObject([{ relation: 'above' }])
+            expect(got[0]!.unexamined).toContain('not on a local drive')
+          }
+          for (const s of spies) expect(s).not.toHaveBeenCalled()
+        } finally {
+          for (const s of spies) s.mockRestore()
+        }
+      })
     })
 
     it('a wildcard entry refuses a directory above it only while something beneath it matches', async () => {

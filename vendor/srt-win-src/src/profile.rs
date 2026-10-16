@@ -341,18 +341,95 @@ struct DiskTree<'a> {
     profile: &'a str,
 }
 
+/// The object `path` names, with every link on the way resolved —
+/// one link at a time, each from the link's own data, and only for as
+/// long as the way stays on drive letters of this machine.
+///
+/// An ordinary open of `path` would do the same in one step, but it
+/// follows a link wherever it leads: a symbolic link to
+/// `\\\\server\\share` makes the opener contact that server with the
+/// user's credentials. A link in the profile can be made by whatever
+/// may write there, so a link is never followed by opening it. Each
+/// component is opened as itself (a link is opened, not followed);
+/// the first link met is read (`FSCTL_GET_REPARSE_POINT`), its
+/// destination worked out from that ([`plan::link_destination`]) and
+/// refused unless it is on a local drive; and the walk starts over on
+/// the destination, a bounded number of times. The spelling of the
+/// result comes from a handle on the object opened the same way.
+fn resolve_on_local_drives(path: &str) -> std::result::Result<String, String> {
+    const MAX_LINKS: usize = 32;
+    let mut cur = path.to_owned();
+    for _ in 0..MAX_LINKS {
+        if !path_id::is_drive_path(&cur) || path_id::on_network_drive(&cur) {
+            return Err(format!(
+                "leads to '{cur}', which is not on a local drive; not followed"
+            ));
+        }
+        let (root, tail) = cur.split_at(7);
+        let comps: Vec<&str> = tail.split('\\').filter(|c| !c.is_empty()).collect();
+        let mut link = None;
+        for i in 0..comps.len() {
+            let prefix = format!("{root}{}", comps[..=i].join("\\"));
+            let o = open_no_follow(&prefix, FILE_READ_ATTRIBUTES)
+                .map_err(|e| format!("cannot be resolved: {e:#}"))?;
+            if o.attrs & ATTR_REPARSE_POINT != 0 {
+                let rest: Vec<String> = comps[i + 1..].iter().map(|c| (*c).to_owned()).collect();
+                link = Some((prefix, o, rest));
+                break;
+            }
+            if i + 1 == comps.len() {
+                return path_id::final_path_of(o.h.raw())
+                    .map_err(|e| format!("cannot be resolved: {e:#}"));
+            }
+        }
+        let Some((at, o, rest)) = link else {
+            // The root of a drive.
+            return Ok(cur);
+        };
+        let data = read_reparse(o.h.raw()).map_err(|e| format!("'{at}': {e:#}"))?;
+        cur = plan::link_destination(&at, &data, &rest)?;
+    }
+    Err(format!(
+        "'{path}' leads through more than {MAX_LINKS} links"
+    ))
+}
+
+/// The reparse data of the link open on `h`.
+fn read_reparse(h: HANDLE) -> Result<plan::LinkData> {
+    use windows::Win32::System::IO::DeviceIoControl;
+    const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+    // MAXIMUM_REPARSE_DATA_BUFFER_SIZE.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut returned = 0u32;
+    // SAFETY: `buf` is writable for the length passed and outlives
+    // the call; `returned` receives how much of it was filled.
+    unsafe {
+        DeviceIoControl(
+            h,
+            FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            Some(buf.as_mut_ptr().cast()),
+            buf.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .context("read the link")?;
+    buf.truncate(returned as usize);
+    plan::parse_reparse(&buf).map_err(|e| anyhow!(e))
+}
+
 impl Tree for DiskTree<'_> {
-    /// Where the link at `rel` leads: the final path of an open that
-    /// follows it and every link after it, placed against the
-    /// profile. Only read; nothing is written at either end here.
+    /// Where the link at `rel` leads, placed against the profile. Only
+    /// read; nothing is written at either end here.
     fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
-        let path = join(self.profile, rel);
-        match path_id::canonicalize_path(&path) {
-            Ok((target, _)) => match plan::rel_components(self.profile, &target) {
+        match resolve_on_local_drives(&join(self.profile, rel)) {
+            Ok(real) => match plan::rel_components(self.profile, &real) {
                 Ok(inside) => LinkTarget::Inside(inside),
-                Err(_) => LinkTarget::Elsewhere(format!("leads to '{target}'")),
+                Err(_) => LinkTarget::Elsewhere(format!("leads to '{real}'")),
             },
-            Err(e) => LinkTarget::Elsewhere(format!("cannot be resolved: {e}")),
+            Err(why) => LinkTarget::Elsewhere(why),
         }
     }
 
@@ -770,26 +847,43 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
     )
 }
 
-/// The entry names of the directory `dir`, read through a handle
-/// opened without following a link; nothing for a link, a file, or a
-/// directory that cannot be opened.
-fn entry_names(dir: &str) -> Vec<String> {
-    let Ok(o) = open_no_follow(dir, ACCESS_LIST) else {
-        return Vec::new();
-    };
-    if !o.is_dir || skip_reason(o.attrs, true).is_some() {
-        return Vec::new();
+/// The entries of the directory `dir`, read through a handle opened
+/// without following a link.
+///
+/// Only a path on a drive letter of this machine is opened. A share
+/// (`\\\\?\\UNC\\…`, or a drive letter mapped to one) and anything else
+/// in the device namespace is reported as not listable without being
+/// touched: opening it would send the user's credentials to whatever
+/// server the path names. (A profile on a local drive has no exclusion
+/// such a path could lie above, so this is reached only for a profile
+/// that is itself on a share.)
+fn entry_names(dir: &str) -> plan::Listing {
+    use plan::Listing;
+    if !path_id::is_drive_path(dir) || path_id::on_network_drive(dir) {
+        return Listing::Failed("not on a local drive, and not examined".to_owned());
     }
-    list_dir(o.h.raw())
-        .map(|entries| entries.into_iter().map(|e| e.name.long).collect())
-        .unwrap_or_default()
+    let o = match open_no_follow(dir, ACCESS_LIST) {
+        Ok(o) => o,
+        Err(e) if path_id::is_not_found(&e) => return Listing::Nothing,
+        Err(e) => return Listing::Failed(format!("{e:#}")),
+    };
+    if skip_reason(o.attrs, o.is_dir).is_some() {
+        return Listing::Link;
+    }
+    if !o.is_dir {
+        return Listing::Nothing;
+    }
+    match list_dir(o.h.raw()) {
+        Ok(entries) => Listing::Entries(entries.into_iter().map(|e| e.name.long).collect()),
+        Err(e) => Listing::Failed(format!("{e:#}")),
+    }
 }
 
 fn check_grants_against(
     marker: Result<Marker>,
     grants: &[(String, bool)],
     admitted: &[String],
-    list: &dyn Fn(&str) -> Vec<String>,
+    list: &dyn Fn(&str) -> plan::Listing,
 ) -> Result<()> {
     let m = marker.map_err(|e| {
         anyhow!(
@@ -1749,7 +1843,7 @@ mod tests {
             paths: Vec::new(),
         };
         let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
-            check_grants_against(m, g, admitted, &|_| Vec::new())
+            check_grants_against(m, g, admitted, &|_| plan::Listing::Nothing)
         };
         // No grant recorded: nothing in the profile is readable by
         // default, and there is no list to check against.
@@ -2013,7 +2107,7 @@ mod tests {
                 .0;
         let refused =
             check_grants_against(read_marker_at(&key), &[(through_link, false)], &[], &|_| {
-                Vec::new()
+                plan::Listing::Nothing
             });
         assert!(
             refused.is_err(),

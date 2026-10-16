@@ -2129,28 +2129,76 @@ export function expandWindowsFsPaths(
 }
 
 /**
+ * A path that names a network share (`\\\\server\\share\\…`, `\\\\?\\UNC\\…`) or
+ * anything in the device namespace other than a drive (`\\\\.\\pipe\\…`,
+ * `\\\\?\\GLOBALROOT\\…`). Such a path is never opened, listed or
+ * resolved by the checks here: for a share that would send the real
+ * user's credentials to whatever server a session's configuration
+ * names (see {@link isUncPath}).
+ */
+function isUnprobedWindowsPath(p: string): boolean {
+  return isUncPath(p) || /^[\\/]{2}[?.][\\/](?![a-z]:)/i.test(p)
+}
+
+/** What the one look at a path on disk found. */
+type ResolvedWindowsPath =
+  /** The object it names, with links, 8.3 names and case resolved. */
+  | { state: 'resolved'; path: string }
+  /** Nothing is there (or a parent is not a directory). */
+  | { state: 'absent' }
+  /** Not looked at: see {@link isUnprobedWindowsPath}. */
+  | { state: 'unprobed' }
+  /** Looking failed for another reason: access denied, an I/O error. */
+  | { state: 'error'; code: string }
+
+/** "Does not exist" as opposed to "could not look". */
+function isAbsentError(e: unknown): boolean {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+/**
+ * The single place a path of a session's configuration is resolved on
+ * disk for comparison: the same final-path lookup `srt-win` makes.
+ */
+function resolveWindowsPath(p: string): ResolvedWindowsPath {
+  if (isUnprobedWindowsPath(p)) return { state: 'unprobed' }
+  try {
+    // The final-path lookup itself, which also resolves 8.3 names and the
+    // case on disk.
+    // eslint-disable-next-line no-restricted-properties
+    return { state: 'resolved', path: fs.realpathSync.native(p) }
+  } catch (e) {
+    return isAbsentError(e)
+      ? { state: 'absent' }
+      : {
+          state: 'error',
+          code: (e as NodeJS.ErrnoException | undefined)?.code ?? 'unknown',
+        }
+  }
+}
+
+/**
  * `p` for comparison with another path, as the object `srt-win` opens for it:
  * links, junctions, 8.3 names and the case on disk are resolved by the same
  * final-path lookup the helper makes. On top of that, lower case, `/`
  * separators and none at the end. A path that cannot be opened is compared as
- * spelled, and so is a UNC path, which is never probed (see
- * {@link isUncPath}).
+ * spelled, and so is one that is never probed (see
+ * {@link isUnprobedWindowsPath}).
  */
 function windowsPathKey(p: string): string {
-  let resolved = p
-  if (!isUncPath(p)) {
-    try {
-      // The final-path lookup itself, which also resolves 8.3 names and the
-      // case on disk.
-      // eslint-disable-next-line no-restricted-properties
-      resolved = fs.realpathSync.native(p)
-    } catch {
-      // Not there, so nothing lies beneath it either.
-    }
-  }
+  return windowsPathKeyOf(p, resolveWindowsPath(p))
+}
+
+/** {@link windowsPathKey} from a look at the path already taken. */
+function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
   return normalizeCaseForComparison(
     path.win32
-      .normalize(stripExtendedPathPrefix(resolved))
+      .normalize(
+        stripExtendedPathPrefix(
+          resolved.state === 'resolved' ? resolved.path : p,
+        ),
+      )
       .replace(/\\/g, '/')
       .replace(/\/+$/, ''),
   )
@@ -3306,6 +3354,13 @@ export interface WindowsProfileExclusionConflict {
    * lies beneath it.
    */
   relation: 'equal' | 'inside' | 'above'
+  /**
+   * Set on an `above` conflict with a wildcard exclusion when the path
+   * could not be examined for what the exclusion covers beneath it —
+   * access denied, an I/O error, a path on a share — with the reason.
+   * "Could not look" is treated as "something may match".
+   */
+  unexamined?: string
 }
 
 /** One component of a recorded exclusion against one of a path; both lower case. */
@@ -3320,24 +3375,53 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
  * `rest`, the components of an exclusion that `dir` lies above. No
  * link is followed out of `dir`, and the lookup goes exactly as deep
  * as the exclusion has components left.
+ *
+ * - `none`: every level that could lead to a match was listed, and
+ *   nothing matches — including when `dir` is not a directory.
+ * - `match`: something does.
+ * - an object with `unexamined`: a level could not be listed for a
+ *   reason other than not being there (access denied, an I/O error),
+ *   or `dir` itself turned out to be a link. The caller treats that as
+ *   a possible match: a path is admitted only when it was looked at
+ *   and found empty of matches, never because looking failed.
  */
 function exclusionMatchedBeneath(
   dir: string,
   rest: readonly string[],
-): boolean {
-  if (rest.length === 0) return true
+  top = true,
+): 'none' | 'match' | { unexamined: string } {
+  if (rest.length === 0) return 'match'
   let entries: fs.Dirent[]
   try {
-    if (fs.lstatSync(dir).isSymbolicLink()) return false
+    const st = fs.lstatSync(dir)
+    if (st.isSymbolicLink()) {
+      // Beneath `dir`, a link is simply not followed. `dir` itself was
+      // resolved a moment ago and should not be one.
+      return top ? { unexamined: `'${dir}' is a link` } : 'none'
+    }
+    if (!st.isDirectory()) return 'none'
     entries = fs.readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return false
+  } catch (e) {
+    if (isAbsentError(e)) return 'none'
+    const code = (e as NodeJS.ErrnoException | undefined)?.code ?? 'error'
+    return { unexamined: `'${dir}' could not be listed (${code})` }
   }
-  return entries.some(
-    e =>
-      exclusionComponentMatches(rest[0]!, normalizeCaseForComparison(e.name)) &&
-      exclusionMatchedBeneath(path.join(dir, e.name), rest.slice(1)),
-  )
+  let unexamined: { unexamined: string } | undefined
+  for (const e of entries) {
+    if (
+      !exclusionComponentMatches(rest[0]!, normalizeCaseForComparison(e.name))
+    ) {
+      continue
+    }
+    const found = exclusionMatchedBeneath(
+      path.join(dir, e.name),
+      rest.slice(1),
+      false,
+    )
+    if (found === 'match') return 'match'
+    if (found !== 'none') unexamined ??= found
+  }
+  return unexamined ?? 'none'
 }
 
 /**
@@ -3359,7 +3443,21 @@ function exclusionMatchedBeneath(
  *   it, and would otherwise make every directory under `Local`
  *   ungrantable: a path counts as above one only while something that
  *   exists beneath the path matches it. `srt-win` applies the same
- *   rule.
+ *   rule. The look is taken when a session starts — for every read
+ *   and write path of its configuration, so also for a write root kept
+ *   from an earlier session — and not continuously: a store that
+ *   appears beneath a root later is found at the next start, which is
+ *   then refused. It fails closed: a path that exists and cannot be
+ *   listed (access denied, an I/O error) is refused like one with a
+ *   match, and a path on a share or in the device namespace is never
+ *   opened at all and refused if a wildcard exclusion could lie
+ *   beneath it (it cannot, for a profile on a local drive). A path
+ *   that does not exist has nothing beneath it and is admitted.
+ *
+ *   A store the sandboxed command itself creates beneath its own
+ *   write root is that command's own data: nothing here tries to keep
+ *   a command from reading what it wrote, and the next start's
+ *   refusal is about the root, not about that command.
  * - Against an UNGRANTED-ONLY directory (the temporary directory) it
  *   collides when it is that directory or lies above it: the grant
  *   would cover everything in it. A path INSIDE one does not collide:
@@ -3415,16 +3513,11 @@ export function windowsProfileExclusionConflicts(
   )
   const out: WindowsProfileExclusionConflict[] = []
   for (const p of paths) {
-    const key = windowsPathKey(p)
+    // One guarded look at the path: the comparison key and the
+    // lookups beneath it use the same result.
+    const onDisk = resolveWindowsPath(p)
+    const key = windowsPathKeyOf(p, onDisk)
     const parts = key.split('/')
-    // The object itself, for the lookups beneath it.
-    let onDisk = p
-    try {
-      // eslint-disable-next-line no-restricted-properties
-      onDisk = fs.realpathSync.native(p)
-    } catch {
-      // Not there: nothing lies beneath it.
-    }
     for (const r of rules) {
       const shared = Math.min(parts.length, r.parts.length)
       let related = true
@@ -3439,12 +3532,24 @@ export function windowsProfileExclusionConflicts(
             ? 'inside'
             : 'above'
       if (r.onlyEqual && relation !== 'equal') continue
-      if (
-        relation === 'above' &&
-        r.exclusion.includes('*') &&
-        !exclusionMatchedBeneath(onDisk, r.parts.slice(parts.length))
-      ) {
-        continue
+      let unexamined: string | undefined
+      if (relation === 'above' && r.exclusion.includes('*')) {
+        if (onDisk.state === 'absent') continue
+        if (onDisk.state === 'resolved') {
+          const found = exclusionMatchedBeneath(
+            onDisk.path,
+            r.parts.slice(parts.length),
+          )
+          if (found === 'none') continue
+          if (found !== 'match') unexamined = found.unexamined
+        } else {
+          // Never opened (a share, the device namespace) or not
+          // openable: nothing was looked at, so nothing is admitted.
+          unexamined =
+            onDisk.state === 'unprobed'
+              ? `'${p}' is not on a local drive and is not examined`
+              : `'${p}' could not be resolved (${onDisk.code})`
+        }
       }
       if (r.kind === 'ungranted-only') {
         if (relation === 'inside') continue
@@ -3459,6 +3564,7 @@ export function windowsProfileExclusionConflicts(
         kind: r.kind,
         access,
         relation,
+        ...(unexamined === undefined ? {} : { unexamined }),
       })
       break
     }

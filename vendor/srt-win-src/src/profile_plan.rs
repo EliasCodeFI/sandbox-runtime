@@ -644,28 +644,70 @@ pub fn relation(path: &str, rule: &str) -> Option<Relation> {
     })
 }
 
+/// What listing a directory gave ([`session_grant_refusal`]'s `list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// Its entry names.
+    Entries(Vec<String>),
+    /// Nothing to list: the path is not there, or is a file.
+    Nothing,
+    /// A link: not followed.
+    Link,
+    /// It is there and could not be listed — access denied, an I/O
+    /// error, a path that is not looked at at all — with the reason.
+    Failed(String),
+}
+
+/// What lies beneath a path that is above a wildcard rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Beneath {
+    /// Every level that could lead to a match was listed; none does.
+    NoMatch,
+    /// Something that exists matches the rule.
+    Match,
+    /// A level could not be listed. Treated as a possible match: a
+    /// path is admitted because it was looked at and found empty of
+    /// matches, never because looking failed.
+    Unexamined(String),
+}
+
 /// Whether something that exists beneath the directory `path` matches
-/// the rest of `rule`, which `path` lies above. `list` gives the entry
-/// names of a directory (nothing for a file, a link, or a directory
-/// that cannot be read), so the lookup never leaves `path` through a
-/// link, and it goes exactly as deep as the rule has components left.
-fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Vec<String>) -> bool {
-    fn go(dir: &str, rest: &[Pat], list: &dyn Fn(&str) -> Vec<String>) -> bool {
+/// the rest of `rule`, which `path` lies above. The lookup never
+/// leaves `path` through a link — a link beneath it is not followed —
+/// and goes exactly as deep as the rule has components left. `path`
+/// itself being a link is a failure to look: it was resolved before
+/// it got here and should not be one.
+fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Listing) -> Beneath {
+    fn go(dir: &str, rest: &[Pat], top: bool, list: &dyn Fn(&str) -> Listing) -> Beneath {
         let Some((first, rest)) = rest.split_first() else {
-            return true;
+            return Beneath::Match;
         };
-        list(dir).iter().any(|name| {
-            first.matches(&norm_component(name))
-                && go(
-                    &format!("{}\\{name}", dir.trim_end_matches('\\')),
-                    rest,
-                    list,
-                )
-        })
+        let names = match list(dir) {
+            Listing::Entries(names) => names,
+            Listing::Nothing => return Beneath::NoMatch,
+            Listing::Link if top => return Beneath::Unexamined(format!("'{dir}' is a link")),
+            Listing::Link => return Beneath::NoMatch,
+            Listing::Failed(why) => {
+                return Beneath::Unexamined(format!("'{dir}' could not be listed: {why}"));
+            }
+        };
+        let mut unexamined = None;
+        for name in names.iter().filter(|n| first.matches(&norm_component(n))) {
+            let child = format!("{}\\{name}", dir.trim_end_matches('\\'));
+            match go(&child, rest, false, list) {
+                Beneath::Match => return Beneath::Match,
+                Beneath::NoMatch => {}
+                u @ Beneath::Unexamined(_) => unexamined = unexamined.or(Some(u)),
+            }
+        }
+        unexamined.unwrap_or(Beneath::NoMatch)
     }
     let depth = split_path(path).len();
     let pats: Vec<Pat> = split_path(rule).iter().map(|c| Pat::parse(c)).collect();
-    pats.len() > depth && go(path, &pats[depth..], list)
+    if pats.len() <= depth {
+        return Beneath::NoMatch;
+    }
+    go(path, &pats[depth..], true, list)
 }
 
 /// Why a session must not be granted `path` (canonical) while a
@@ -685,9 +727,21 @@ fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Vec<String>) -
 /// names no path until something matches it, and read the same way it
 /// would make every directory beneath `Local` ungrantable; so `path`
 /// counts as above such a rule only while something that exists
-/// beneath it matches ([`matched_beneath`], through `list`). The
-/// grant's own walk does not make that concession: it treats every
-/// such level as a container. `admitted` are the paths the
+/// beneath it matches ([`matched_beneath`], through `list`). That
+/// includes a path that is not there yet: nothing lies beneath it. It
+/// fails closed — a level that exists and cannot be listed refuses the
+/// path like a match does. The grant's own walk does not make the
+/// concession at all: it treats every such level as a container.
+///
+/// The look is taken when a grant is asked for, which is at every
+/// session start and for every path of the session, a write root kept
+/// from an earlier session included — before its DACL is read and
+/// found to need no write. It is not continuous: a store that appears
+/// beneath a kept root later is found at the next start, which is
+/// then refused until the root is narrowed or forgotten. A store the
+/// sandboxed command ITSELF creates beneath its own write root is that
+/// command's own data; nothing here is meant to keep a command from
+/// reading what it wrote. `admitted` are the paths the
 /// caller explicitly asked to open (`acl grant
 /// --allow-profile-exclusion`); they count for a READ grant that is a
 /// protected path or lies inside one, and for nothing else — a write
@@ -698,7 +752,7 @@ pub fn session_grant_refusal(
     protected: &[String],
     ungranted: &[String],
     admitted: &[String],
-    list: &dyn Fn(&str) -> Vec<String>,
+    list: &dyn Fn(&str) -> Listing,
 ) -> Option<String> {
     let what = if write { "write" } else { "read" };
     for u in ungranted {
@@ -716,7 +770,22 @@ pub fn session_grant_refusal(
     for r in protected {
         match relation(path, r) {
             None => {}
-            Some(Relation::Above) if r.contains('*') && !matched_beneath(path, r, list) => {}
+            Some(Relation::Above) if r.contains('*') => match matched_beneath(path, r, list) {
+                Beneath::NoMatch => {}
+                Beneath::Match => {
+                    return Some(format!(
+                        "a {what} grant on '{path}' would be inherited by what the excluded \
+                         '{r}' covers beneath it; choose a narrower directory"
+                    ));
+                }
+                Beneath::Unexamined(why) => {
+                    return Some(format!(
+                        "'{path}' may lie above something '{r}' excludes from the profile \
+                         read grant, and could not be examined ({why}); a {what} grant is \
+                         made only on a path that was looked at"
+                    ));
+                }
+            },
             Some(Relation::Above) => {
                 return Some(format!(
                     "a {what} grant on '{path}' would be inherited by the excluded '{r}' \
@@ -769,6 +838,145 @@ pub enum LinkTarget {
     /// Outside the profile, or nowhere that can be resolved (a
     /// dangling link, a cycle), with a word about it.
     Elsewhere(String),
+}
+
+/// What a reparse point says about where it leads, as read from the
+/// link itself ([`parse_reparse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkData {
+    /// A junction, with its target in the object namespace
+    /// (`\??\C:\dir`).
+    Junction(String),
+    /// A symbolic link, with its target as stored and whether that is
+    /// relative to the link's directory.
+    Symlink { target: String, relative: bool },
+    /// Some other kind of reparse point (a cloud placeholder, an
+    /// application link), by tag. Not a redirection to follow.
+    Other(u32),
+}
+
+/// Read a reparse data buffer (`FSCTL_GET_REPARSE_POINT`).
+pub fn parse_reparse(buf: &[u8]) -> Result<LinkData, String> {
+    const TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const TAG_SYMLINK: u32 = 0xA000_000C;
+    let u16_at = |at: usize| -> Result<usize, String> {
+        buf.get(at..at + 2)
+            .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+            .ok_or_else(|| "truncated reparse data".to_owned())
+    };
+    let tag = buf
+        .get(0..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or("truncated reparse data")?;
+    // Header: tag, data length, reserved. Then, for both kinds, the
+    // offset and length of the substitute name and of the print name;
+    // a symbolic link has a flags word before the names.
+    let names_at = match tag {
+        TAG_MOUNT_POINT => 16,
+        TAG_SYMLINK => 20,
+        other => return Ok(LinkData::Other(other)),
+    };
+    let (off, len) = (u16_at(8)?, u16_at(10)?);
+    let bytes = buf
+        .get(names_at + off..names_at + off + len)
+        .ok_or("truncated reparse data")?;
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let target = String::from_utf16(&wide).map_err(|_| "a link target that is not valid UTF-16")?;
+    Ok(if tag == TAG_MOUNT_POINT {
+        LinkData::Junction(target)
+    } else {
+        let flags = buf
+            .get(16..20)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or("truncated reparse data")?;
+        LinkData::Symlink {
+            target,
+            relative: flags & 1 != 0,
+        }
+    })
+}
+
+/// Where the link at `link` (`\\?\X:\…`) leads, with `rest` — the
+/// components that followed it — appended: a path on a drive letter,
+/// in the same form. Worked out from the link's own data, without
+/// opening anything.
+///
+/// Only a target on a drive letter is a destination. A share
+/// (`\??\UNC\…`, `\\server\share`), a volume without a letter and
+/// anything else in the object namespace are refused, so that the
+/// caller never opens them: resolving a link must not be a way to
+/// make the grant contact a server.
+pub fn link_destination(link: &str, data: &LinkData, rest: &[String]) -> Result<String, String> {
+    let drive_of = |p: &str| -> Option<(char, String)> {
+        let b = p.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+            .then(|| (b[0] as char, p[3..].to_owned()))
+    };
+    let link_plain = link
+        .strip_prefix(r"\\?\")
+        .ok_or_else(|| format!("'{link}' is not a drive path"))?;
+    let (link_drive, link_tail) =
+        drive_of(link_plain).ok_or_else(|| format!("'{link}' is not a drive path"))?;
+    let absolute = |target: &str| -> Result<(char, String), String> {
+        let plain = target
+            .strip_prefix(r"\??\")
+            .or_else(|| target.strip_prefix(r"\\?\"))
+            .unwrap_or(target);
+        drive_of(plain).ok_or_else(|| {
+            format!("leads to '{target}', which is not on a drive of this machine; not followed")
+        })
+    };
+    let (drive, tail) = match data {
+        LinkData::Other(tag) => {
+            return Err(format!(
+                "a reparse point of another kind ({tag:#x}); not followed"
+            ));
+        }
+        LinkData::Junction(target) => absolute(target)?,
+        LinkData::Symlink {
+            target,
+            relative: false,
+        } => absolute(target)?,
+        LinkData::Symlink {
+            target,
+            relative: true,
+        } => {
+            if let Some(rooted) = target.strip_prefix('\\') {
+                // Relative to the root of the link's drive.
+                if rooted.starts_with('\\') {
+                    return Err(format!("leads to '{target}'; not followed"));
+                }
+                (link_drive, rooted.to_owned())
+            } else {
+                let parent = link_tail.rsplit_once('\\').map_or("", |(p, _)| p);
+                (link_drive, format!("{parent}\\{target}"))
+            }
+        }
+    };
+    // Lexical `.` and `..`, as the system resolves a link's target.
+    let mut comps: Vec<&str> = Vec::new();
+    for c in tail
+        .split(['\\', '/'])
+        .chain(rest.iter().map(String::as_str))
+    {
+        match c {
+            "" | "." => {}
+            ".." => {
+                comps
+                    .pop()
+                    .ok_or_else(|| format!("'{link}' leads above the root of its drive"))?;
+            }
+            c => comps.push(c),
+        }
+    }
+    Ok(format!(
+        r"\\?\{}:\{}",
+        drive.to_ascii_uppercase(),
+        comps.join("\\")
+    ))
 }
 
 /// What the walk reads the tree through. `list` is called for the
@@ -1521,6 +1729,104 @@ mod tests {
         assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Granted));
     }
 
+    /// A link's destination is worked out from the link's own data,
+    /// and is a destination only on a drive letter.
+    #[test]
+    fn a_link_is_followed_only_to_a_drive_of_this_machine() {
+        let link = r"\\?\C:\Users\me\.ssh";
+        let rest = ["keys".to_owned(), "id".to_owned()];
+        let j = |t: &str| LinkData::Junction(t.to_owned());
+        let sym = |t: &str, relative: bool| LinkData::Symlink {
+            target: t.to_owned(),
+            relative,
+        };
+        let to = |d: &LinkData| link_destination(link, d, &rest);
+        assert_eq!(
+            to(&j(r"\??\C:\Users\me\dotfiles\.ssh")).unwrap(),
+            r"\\?\C:\Users\me\dotfiles\.ssh\keys\id"
+        );
+        assert_eq!(
+            to(&j(r"\??\d:\elsewhere\")).unwrap(),
+            r"\\?\D:\elsewhere\keys\id"
+        );
+        assert_eq!(to(&sym(r"\??\C:\x", false)).unwrap(), r"\\?\C:\x\keys\id");
+        // Relative to the link's directory, with `..`.
+        assert_eq!(
+            to(&sym(r"dotfiles\.ssh", true)).unwrap(),
+            r"\\?\C:\Users\me\dotfiles\.ssh\keys\id"
+        );
+        assert_eq!(
+            to(&sym(r"..\shared\.\ssh", true)).unwrap(),
+            r"\\?\C:\Users\shared\ssh\keys\id"
+        );
+        // Relative to the root of the link's drive.
+        assert_eq!(
+            to(&sym(r"\data\ssh", true)).unwrap(),
+            r"\\?\C:\data\ssh\keys\id"
+        );
+        assert_eq!(
+            link_destination(link, &sym("..", true), &[]).unwrap(),
+            r"\\?\C:\Users"
+        );
+        // Never a share, a volume without a letter, another namespace,
+        // above the drive's root, or another kind of reparse point.
+        for d in [
+            j(r"\??\UNC\server\share\x"),
+            sym(r"\??\UNC\server\share\x", false),
+            sym(r"\\server\share\x", false),
+            sym(r"\\server\share\x", true),
+            sym(r"\\?\UNC\server\share", false),
+            j(r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\x"),
+            sym(r"\Device\Mup\server\share", false),
+            sym(r"..\..\..\..\x", true),
+            LinkData::Other(0x9000_001A),
+        ] {
+            assert!(to(&d).is_err(), "{d:?} was followed to {:?}", to(&d));
+        }
+        // A link that is not itself on a drive path is not followed.
+        assert!(link_destination(r"\\?\UNC\s\h\l", &sym("x", true), &[]).is_err());
+
+        // The data as the system returns it.
+        let wide = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let buffer = |tag: u32, flags: Option<u32>, subst: &str, print: &str| {
+            let (s, p) = (wide(subst), wide(print));
+            let mut b = Vec::new();
+            b.extend(tag.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend((s.len() as u16).to_le_bytes());
+            b.extend((s.len() as u16).to_le_bytes());
+            b.extend((p.len() as u16).to_le_bytes());
+            if let Some(f) = flags {
+                b.extend(f.to_le_bytes());
+            }
+            b.extend(&s);
+            b.extend(&p);
+            b
+        };
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_0003, None, r"\??\C:\t", r"C:\t")),
+            Ok(j(r"\??\C:\t"))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_000C, Some(1), r"..\t", r"..\t")),
+            Ok(sym(r"..\t", true))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_000C, Some(0), r"\??\UNC\s\h", "")),
+            Ok(sym(r"\??\UNC\s\h", false))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0x9000_001A, None, "", "")),
+            Ok(LinkData::Other(0x9000_001A))
+        );
+        assert!(parse_reparse(&[0x03, 0, 0, 0xA0, 0, 0]).is_err());
+        let mut cut = buffer(0xA000_0003, None, r"\??\C:\t", "");
+        cut.truncate(cut.len() - 4);
+        assert!(parse_reparse(&cut).is_err());
+    }
+
     #[test]
     fn links_in_chains_upwards_outwards_and_in_circles() {
         // A chain: `.config` → `a\cfg`, and in there `gh` → `b\gh`.
@@ -2239,7 +2545,7 @@ mod tests {
         let ungranted = vec![p(r"AppData\Local\Temp")];
         // What is on disk, for the wildcard rules: `App` has an
         // EBWebView directory, `Tool` and `npm-cache` do not.
-        let on_disk = |dir: &str| -> Vec<String> {
+        let on_disk = |dir: &str| -> Listing {
             let d = dir.to_lowercase();
             let names: &[&str] = if d.ends_with(r"\appdata\local") {
                 &["App", "Tool", "npm-cache", "Temp"]
@@ -2252,9 +2558,9 @@ mod tests {
             } else if d.ends_with(r"\users\me") {
                 &["AppData", "Documents"]
             } else {
-                &[]
+                return Listing::Nothing;
             };
-            names.iter().map(|n| (*n).to_owned()).collect()
+            Listing::Entries(names.iter().map(|n| (*n).to_owned()).collect())
         };
         let check = |rel: &str, write: bool, admitted: &[String]| {
             session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted, &on_disk)
@@ -2317,7 +2623,7 @@ mod tests {
         assert!(check(r"AppData\Local\Temp", false, &temp).is_some());
         // With nothing on disk only the rules that name their path
         // refuse a directory above them; the wildcard ones do not.
-        let empty = |_: &str| Vec::new();
+        let empty = |_: &str| Listing::Nothing;
         let bare = |rel: &str| {
             session_grant_refusal(&p(rel), true, &protected, &ungranted, &[], &empty).is_some()
         };
@@ -2327,14 +2633,14 @@ mod tests {
         assert!(bare(""));
         // The lookup goes no deeper than the rule: `x\y\EBWebView`
         // beneath Local does not make Local's child `x` refused.
-        let deep = |dir: &str| -> Vec<String> {
+        let deep = |dir: &str| -> Listing {
             let d = dir.to_lowercase();
             if d.ends_with(r"\local\x") {
-                vec!["y".to_owned()]
+                Listing::Entries(vec!["y".to_owned()])
             } else if d.ends_with(r"\local\x\y") {
-                vec!["EBWebView".to_owned()]
+                Listing::Entries(vec!["EBWebView".to_owned()])
             } else {
-                Vec::new()
+                Listing::Nothing
             }
         };
         assert_eq!(
@@ -2348,6 +2654,81 @@ mod tests {
             ),
             None
         );
+        // Failing closed. A rule two levels deep, so that a level
+        // BENEATH the path can fail too: `apps\*\*\store`.
+        let two = vec![p(r"apps\*\*\store")];
+        let with = |at_apps: Listing, at_a: Listing| {
+            move |dir: &str| -> Listing {
+                let d = dir.to_lowercase();
+                if d.ends_with(r"\apps") {
+                    at_apps.clone()
+                } else if d.ends_with(r"\apps\a") {
+                    at_a.clone()
+                } else {
+                    Listing::Nothing
+                }
+            }
+        };
+        let names = |n: &[&str]| Listing::Entries(n.iter().map(|s| (*s).to_owned()).collect());
+        let verdict = |list: &dyn Fn(&str) -> Listing| {
+            session_grant_refusal(&p("apps"), true, &two, &[], &[], list)
+        };
+        // Looked at, nothing matches: admitted. Not there: admitted.
+        assert_eq!(verdict(&with(names(&["a"]), names(&["b"]))), None);
+        assert_eq!(verdict(&with(names(&["a"]), Listing::Nothing)), None);
+        assert_eq!(verdict(&with(Listing::Nothing, Listing::Nothing)), None);
+        // A link beneath the path is not followed, and is no failure.
+        assert_eq!(verdict(&with(names(&["a"]), Listing::Link)), None);
+        // Could not look — at the path itself, or at a level beneath
+        // it that could lead to a match: refused, and the message says
+        // it was not examined rather than that something was found.
+        for (at_apps, at_a) in [
+            (Listing::Failed("access denied".into()), Listing::Nothing),
+            (Listing::Failed("i/o error".into()), Listing::Nothing),
+            (names(&["a"]), Listing::Failed("access denied".into())),
+            (
+                names(&["a", "z"]),
+                Listing::Failed("sharing violation".into()),
+            ),
+            // The path itself turning out to be a link.
+            (Listing::Link, Listing::Nothing),
+        ] {
+            let why = verdict(&with(at_apps.clone(), at_a.clone()))
+                .unwrap_or_else(|| panic!("{at_apps:?}/{at_a:?} was admitted"));
+            assert!(why.contains("could not be examined"), "{why}");
+        }
+        // A failure where the rule cannot match anyway does not count:
+        // `a` is never listed for a rule whose next component is not
+        // matched by it.
+        let narrow = vec![p(r"apps\b\*\store")];
+        assert_eq!(
+            session_grant_refusal(
+                &p("apps"),
+                true,
+                &narrow,
+                &[],
+                &[],
+                &with(names(&["a"]), Listing::Failed("access denied".into()))
+            ),
+            None
+        );
+        // And a match found elsewhere wins over a failure.
+        let found = |dir: &str| -> Listing {
+            let d = dir.to_lowercase();
+            if d.ends_with(r"\apps") {
+                names(&["a", "c"])
+            } else if d.ends_with(r"\apps\a") {
+                Listing::Failed("access denied".into())
+            } else if d.ends_with(r"\apps\c") {
+                names(&["d"])
+            } else if d.ends_with(r"\apps\c\d") {
+                names(&["store"])
+            } else {
+                Listing::Nothing
+            }
+        };
+        let why = verdict(&found).unwrap();
+        assert!(why.contains("narrower"), "{why}");
         // The message for a write root above an exclusion says what
         // to do about it.
         let why = check("AppData", true, &[]).unwrap();

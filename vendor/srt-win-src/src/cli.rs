@@ -1607,7 +1607,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     )?;
                     // Before anything is granted, in either mode: no
                     // grant may reach what a recorded profile read
-                    // grant excludes.
+                    // grant excludes. This is every session start, and
+                    // every path of the session — a write root kept
+                    // from an earlier session included, before its
+                    // DACL is read and found to need no write: what
+                    // lies beneath it is looked at again each time.
                     let grants: Vec<(String, bool)> = at
                         .targets
                         .iter()

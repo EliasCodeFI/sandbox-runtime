@@ -1364,7 +1364,11 @@ async function initializeSteps(
                 ? `is the excluded ${c.exclusion}`
                 : c.relation === 'inside'
                   ? `lies inside the excluded ${c.exclusion}`
-                  : `contains the excluded ${c.exclusion}`
+                  : c.unexamined !== undefined
+                    ? `may contain the excluded ${c.exclusion}: ` +
+                      `${c.unexamined}, and a path is granted only once ` +
+                      `it has been looked at`
+                    : `contains the excluded ${c.exclusion}`
           return (
             `${list} ${c.path} ${what}` +
             (c.access === 'write' && c.relation === 'above'
