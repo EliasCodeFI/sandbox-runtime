@@ -486,6 +486,15 @@ export interface WindowsSandboxParams {
    * a caller bug.
    */
   denyRead?: readonly string[]
+  /**
+   * Paths the session is granted (read or write) that lie beneath a
+   * {@link denyRead} path — see {@link windowsGrantsBeneathDenies}.
+   * `srt-win` writes a read deny on the recorded paths of the profile
+   * read grant beneath it, and leaves out those at or beneath one of
+   * these: the session's own allow there ranks above a deny set
+   * further up.
+   */
+  denyReadExcept?: readonly string[]
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
@@ -2299,6 +2308,26 @@ function coveringWindowsPath(
   }
 }
 
+/**
+ * The ones of `grants` that lie strictly beneath one of `denies`: the
+ * grants that rank above those denies, an allow set further down
+ * being the one that counts. `srt-win` is told about them with a
+ * per-command read deny, so that it does not carry the deny onto a
+ * recorded path of the profile read grant that the session's own
+ * allow covers.
+ */
+export function windowsGrantsBeneathDenies(
+  grants: readonly string[],
+  denies: readonly string[],
+): string[] {
+  if (grants.length === 0 || denies.length === 0) return []
+  const denyKeys = denies.map(windowsPathKey)
+  return grants.filter(g => {
+    const key = windowsPathKey(g)
+    return denyKeys.some(d => key !== d && isAtOrUnder(key, d))
+  })
+}
+
 /** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
 export interface WindowsFsAccessSet {
   grantRead: string[]
@@ -3845,6 +3874,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
   }
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
+  for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as

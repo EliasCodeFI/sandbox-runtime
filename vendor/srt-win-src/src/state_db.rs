@@ -844,6 +844,23 @@ impl Locked {
         sandbox_sid: &str,
         targets: &[(String, SbAce)],
     ) -> Result<(Vec<AceWitness>, usize)> {
+        self.apply_aces_and(sandbox_sid, targets, &[])
+    }
+
+    /// [`Self::apply_aces`], plus a read deny on each of `also`: the
+    /// recorded paths of the profile read grant that a read deny among
+    /// `targets` has to be written on as well. They are held and
+    /// released like any other deny of the holder, and differ in two
+    /// ways: their parent gets no delete-child deny (nothing in the
+    /// profile is writable to begin with), and one that is no longer
+    /// there — removed since the grant recorded it — is passed over
+    /// instead of failing the batch.
+    pub fn apply_aces_and(
+        &self,
+        sandbox_sid: &str,
+        targets: &[(String, SbAce)],
+        also: &[String],
+    ) -> Result<(Vec<AceWitness>, usize)> {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
             let mut failed = 0usize;
@@ -872,6 +889,17 @@ impl Locked {
                     && let Some(p) = path_id::canonical_parent_of(canon)
                 {
                     one(&p, SbAce::DenyFdc);
+                }
+            }
+            let read_deny = SbAce::Deny(crate::acl::DenyMask::ReadDeny);
+            for canon in also {
+                match db.ensure_ace(canon, read_deny, sandbox_sid) {
+                    Ok(w) => witnesses.push(w),
+                    Err(e) if path_id::is_not_found(&e) => {}
+                    Err(e) => {
+                        eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
+                        failed += 1;
+                    }
                 }
             }
             Ok((witnesses, failed))

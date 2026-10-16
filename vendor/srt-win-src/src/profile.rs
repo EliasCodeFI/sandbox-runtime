@@ -933,24 +933,18 @@ pub fn held_profile() -> Option<String> {
     }
 }
 
-/// The recorded paths a session's read deny on `deny` (canonical) is
-/// written on as well ([`plan::covered_by_read_deny`]), among those
-/// that still exist. Nothing when no grant is recorded. A record that
-/// cannot be read is an error: a deny that silently covered less than
-/// it says is worse than a command that does not start.
-pub fn read_deny_also(deny: &str) -> Result<Vec<String>> {
+/// The recorded paths that carry an allow of their own, for working
+/// out what a session's read denies are also written on
+/// ([`plan::RecordedAllows::covered`]). Read from the record ONCE per
+/// command, however many denies it carries. Empty when no grant is
+/// recorded. A record that cannot be read is an error: a deny that
+/// silently covered less than it says is worse than a command that
+/// does not start.
+pub fn recorded_allows() -> Result<plan::RecordedAllows> {
     let m = read_marker_at(persist::MARKER_KEY).context("read the profile read grant record")?;
-    Ok(
-        plan::covered_by_read_deny(deny, m.paths.iter().map(|r| (r.path.as_str(), r.kind)))
-            .into_iter()
-            .filter(|p| match open_no_follow(p, FILE_READ_ATTRIBUTES) {
-                Ok(_) => true,
-                // Gone since it was recorded: nothing to deny.
-                Err(e) => !path_id::is_not_found(&e),
-            })
-            .map(str::to_owned)
-            .collect(),
-    )
+    Ok(plan::RecordedAllows::new(
+        m.paths.iter().map(|r| (r.path.as_str(), r.kind)),
+    ))
 }
 
 /// The entries of the directory `dir`, read through a handle opened

@@ -1361,37 +1361,98 @@ fn walk(
 
 // ─── A session's read deny on top of the grant ─────────────────────────
 
-/// The recorded paths a read deny on `deny` has to be written on as
-/// well, for it to hold against the grant.
-///
-/// A container, a granted directory and a granted file each carry an
-/// ALLOW of their own for the sandbox group. A deny on the same path
-/// comes first and wins, and a deny on a granted directory reaches
-/// everything beneath it, where nothing carries an entry of its own.
-/// A deny on a directory ABOVE a recorded path reaches that path only
-/// by inheritance, behind its own allow, and loses. So each recorded
-/// path that carries an allow and lies beneath `deny` gets the deny
-/// itself. That is the smallest set: one entry per recorded allow,
-/// none for what lies beneath a granted directory.
-///
-/// This is worked out by `srt-win`, which holds the record, from the
-/// deny alone — so the caller passes one path however many recorded
-/// paths it covers, and no list has to travel on a command line.
+/// The recorded paths of a profile read grant that carry an allow of
+/// their own — containers, granted directories, granted files — held
+/// in the form they are compared in. Built once per command from the
+/// record and asked once per read deny ([`RecordedAllows::covered`]).
+#[derive(Debug, Clone, Default)]
+pub struct RecordedAllows {
+    /// `(as recorded, normalized components)`.
+    paths: Vec<(String, Vec<String>)>,
+}
+
+fn norm_path(p: &str) -> Vec<String> {
+    split_path(p).iter().map(|c| norm_component(c)).collect()
+}
+
+impl RecordedAllows {
+    pub fn new<'a>(recorded: impl IntoIterator<Item = (&'a str, Kind)>) -> Self {
+        Self {
+            paths: recorded
+                .into_iter()
+                .filter(|(_, kind)| matches!(kind, Kind::Container | Kind::Granted | Kind::File))
+                .map(|(path, _)| (path.to_owned(), norm_path(path)))
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// The recorded paths a read deny on `deny` has to be written on
+    /// as well, for it to hold against the grant.
+    ///
+    /// A container, a granted directory and a granted file each carry
+    /// an ALLOW of their own for the sandbox group. A deny on the same
+    /// path comes first and wins, and a deny on a granted directory
+    /// reaches everything beneath it, where nothing carries an entry
+    /// of its own. A deny on a directory ABOVE a recorded path reaches
+    /// that path only by inheritance, behind its own allow, and loses.
+    /// So each recorded path that carries an allow and lies beneath
+    /// `deny` gets the deny itself: one entry per recorded allow, none
+    /// for what lies beneath a granted directory.
+    ///
+    /// Except where the same session allows more specifically.
+    /// `allows` are the paths the session is granted (read or write).
+    /// An allow set beneath a deny is the one that counts there — that
+    /// is how the session's lists rank, and what the access lists say
+    /// on their own for a path nothing is recorded on. A deny written
+    /// here on a recorded path at or beneath such an allow would be an
+    /// explicit deny in front of the session's explicit allow, and
+    /// take away what the session was given: its working directory,
+    /// under a deny on the profile. So a recorded path at or beneath
+    /// an allow that lies strictly beneath `deny` is left out. (An
+    /// allow ON the denied path does not outrank it, and one above it
+    /// changes nothing beneath it.) A deny set again beneath such an
+    /// allow is asked for on its own, and covers what lies beneath it.
+    ///
+    /// The paths returned are denied for the session only; they are
+    /// never part of what is kept with a write root.
+    pub fn covered(&self, deny: &str, allows: &[String]) -> Vec<&str> {
+        let deny = norm_path(deny);
+        let beneath = |path: &[String], dir: &[String]| {
+            path.len() >= dir.len() && path[..dir.len()] == dir[..]
+        };
+        let spared: Vec<Vec<String>> = allows
+            .iter()
+            .map(|a| norm_path(a))
+            .filter(|a| a.len() > deny.len() && beneath(a, &deny))
+            .collect();
+        self.paths
+            .iter()
+            .filter(|(_, path)| path.len() > deny.len() && beneath(path, &deny))
+            .filter(|(_, path)| !spared.iter().any(|a| beneath(path, a)))
+            .map(|(recorded, _)| recorded.as_str())
+            .collect()
+    }
+}
+
+/// [`RecordedAllows::covered`] for one deny and no session allows.
 pub fn covered_by_read_deny<'a>(
     deny: &str,
     recorded: impl IntoIterator<Item = (&'a str, Kind)>,
 ) -> Vec<&'a str> {
-    let norm =
-        |p: &str| -> Vec<String> { split_path(p).iter().map(|c| norm_component(c)).collect() };
-    let deny = norm(deny);
-    recorded
+    let all: Vec<(&'a str, Kind)> = recorded.into_iter().collect();
+    let index = RecordedAllows::new(all.iter().copied());
+    let covered: Vec<String> = index
+        .covered(deny, &[])
         .into_iter()
-        .filter(|(_, kind)| matches!(kind, Kind::Container | Kind::Granted | Kind::File))
-        .filter(|(path, _)| {
-            let path = norm(path);
-            path.len() > deny.len() && path[..deny.len()] == deny[..]
-        })
-        .map(|(path, _)| path)
+        .map(str::to_owned)
+        .collect();
+    all.into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| covered.iter().any(|c| c == p))
         .collect()
 }
 
@@ -3023,6 +3084,98 @@ mod tests {
             many.iter().map(|(p, k)| (p.as_str(), *k)),
         );
         assert_eq!(one.len(), 150);
+    }
+
+    /// The case table the library's tests read too
+    /// (`tests/data/read-deny-cases.txt`): given what the library
+    /// hands over after ranking a session's lists, the recorded paths
+    /// that end up carrying a read deny.
+    #[test]
+    fn read_denies_and_session_allows_rank_as_the_library_ranks_them() {
+        let table = include_str!("../tests/data/read-deny-cases.txt");
+        let path = |p: &str| -> String {
+            let p = p.trim();
+            match p.strip_prefix('P') {
+                Some(rest) => format!(r"\\?\C:\Users\me{rest}"),
+                None => panic!("'{p}' is not beneath P"),
+            }
+        };
+        let list = |v: &str| -> Vec<String> {
+            v.split(" | ")
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(path)
+                .collect()
+        };
+        let mut recorded: Vec<(String, Kind)> = Vec::new();
+        #[derive(Default)]
+        struct Case {
+            name: String,
+            /// Handed read and write grants.
+            allows: Vec<String>,
+            denies: Vec<String>,
+            expect: Vec<String>,
+        }
+        let mut cases: Vec<Case> = Vec::new();
+        for line in table.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, value) = line.split_once(':').expect("key: value");
+            let value = value.trim();
+            match key {
+                "recorded" => {
+                    for item in value.split(" | ") {
+                        let (kind, p) = item.trim().split_once(' ').unwrap();
+                        recorded.push((path(p), Kind::parse(kind).unwrap()));
+                    }
+                }
+                "case" => cases.push(Case {
+                    name: value.to_owned(),
+                    ..Default::default()
+                }),
+                "handed-read" | "handed-write" => {
+                    cases.last_mut().unwrap().allows.extend(list(value))
+                }
+                "handed-deny" => cases.last_mut().unwrap().denies = list(value),
+                "expect" => cases.last_mut().unwrap().expect = list(value),
+                // What the session configured: the library's side.
+                "read" | "write" | "deny" | "credential" => {}
+                other => panic!("unknown key '{other}'"),
+            }
+        }
+        assert!(cases.len() >= 12 && recorded.len() >= 10);
+        let index = RecordedAllows::new(recorded.iter().map(|(p, k)| (p.as_str(), *k)));
+        for Case {
+            name,
+            allows,
+            denies,
+            expect,
+        } in &cases
+        {
+            // srt-win writes each handed deny on itself and on what
+            // `covered` returns for it.
+            let mut got: Vec<String> = Vec::new();
+            for d in denies {
+                let d_norm = norm_path(d);
+                got.extend(
+                    recorded
+                        .iter()
+                        .filter(|(p, k)| {
+                            matches!(k, Kind::Container | Kind::Granted | Kind::File)
+                                && norm_path(p) == d_norm
+                        })
+                        .map(|(p, _)| p.clone()),
+                );
+                got.extend(index.covered(d, allows).into_iter().map(str::to_owned));
+            }
+            let sorted = |mut v: Vec<String>| {
+                v.sort();
+                v.dedup();
+                v
+            };
+            assert_eq!(sorted(got), sorted(expect.clone()), "case: {name}");
+        }
     }
 
     #[test]

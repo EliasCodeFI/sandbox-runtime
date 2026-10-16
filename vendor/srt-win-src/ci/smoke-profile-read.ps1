@@ -670,6 +670,41 @@ try {
   if ($r.out -notmatch 'NPM-TOOL' -and $r.exit -ne 0) { Ok 'D: a per-command deny on a container reaches the granted directory beneath it' }
   else { Fail "D: per-command deny on AppData: exit=$($r.exit) raw: $($r.raw)" }
   Expect-Read 'D (after that command)' $npmTool 'NPM-TOOL'
+  # A deny on the profile together with a write root that is one of
+  # its granted directories: the session's own allow there outranks
+  # the deny set further up, so the root stays readable and writable
+  # while the rest of the profile is denied …
+  $ownRoot = Split-Path $newFile
+  $json = @{ read = @(); write = @($ownRoot); denyRead = @($prof); denyWrite = @() } | ConvertTo-Json -Compress
+  $raw = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { Fail "D: a deny on the profile with a write root inside it: $raw" }
+  else {
+    $r = Sb @($cmd, '/d', '/s', '/c', "type `"$newFile`" & echo W> `"$ownRoot\d-own.txt`"") -WriteRoots @($ownRoot)
+    if ($r.out -match 'NEWTOP-CONTENT' -and (Test-Path -LiteralPath (Join-Path $ownRoot 'd-own.txt'))) {
+      Ok 'D: under a deny on the profile, the write root inside it is still read and written'
+    } else { Fail "D: write root under a profile deny: raw: $($r.raw)  Sddl=$(Sddl $ownRoot)" }
+    Expect-NoRead 'D (the rest of the profile under that deny)' $note 'NOTE-CONTENT'
+    # … for one command too, told which grant lies beneath the deny.
+    End-Session
+    $null = Session-Grant -write @($ownRoot)
+    $r = Sb @('--write-root', $ownRoot, '--deny-read', $prof, '--deny-read-except', $ownRoot, '--', $cmd, '/d', '/s', '/c', "type `"$newFile`" & type `"$note`"") -ExecFlagsFirst
+    if ($r.out -match 'NEWTOP-CONTENT' -and $r.out -notmatch 'NOTE-CONTENT') { Ok 'D: a per-command deny on the profile spares the session write root named with it' }
+    else { Fail "D: per-command deny with --deny-read-except: raw: $($r.raw)" }
+  }
+  End-Session
+  # Nothing of that deny is kept with the root: the next session on
+  # it, without the deny, reads the root and the rest.
+  $code = Session-Grant -write @($ownRoot)
+  if ($code -ne 0) { Fail "D: the write root again: $($script:lastGrant)" }
+  else {
+    $r = Sb @($cmd, '/d', '/s', '/c', "type `"$newFile`"") -WriteRoots @($ownRoot)
+    if ($r.out -match 'NEWTOP-CONTENT') { Ok 'D: the root is readable in the next session — the deny was not kept with it' }
+    else { Fail "D: the root after a session that denied the profile: raw: $($r.raw)  Sddl=$(Sddl $ownRoot)" }
+    Expect-Read 'D (and so is the rest)' $note 'NOTE-CONTENT'
+  }
+  End-Session
+  & $Exe acl forget $ownRoot 2>&1 | Out-Null
+  Remove-Item -Force -LiteralPath (Join-Path $ownRoot 'd-own.txt') -ErrorAction SilentlyContinue
   # On a granted child.
   $docs = Join-Path $prof 'Documents'
   if ((Session-Deny @($docs)) -ne 0) { Fail 'D: the session stamp for a deny on a granted child could not be written' }

@@ -92,6 +92,7 @@ import {
   WINDOWS_SRT_WIN_CAPABILITIES,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
+  windowsGrantsBeneathDenies,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -3022,6 +3023,16 @@ async function wrapWithSandboxArgv(
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
+      // The session's own grants beneath those denies keep their
+      // rank: srt-win leaves the recorded profile paths they cover
+      // out of what it denies for this command.
+      denyReadExcept: windowsGrantsBeneathDenies(
+        [
+          ...(windowsFsStampedSet?.grantRead ?? []),
+          ...(windowsFsStampedSet?.grantWrite ?? []),
+        ],
+        perExecDenyRead,
+      ),
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree

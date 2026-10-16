@@ -224,6 +224,15 @@ enum Cmd {
         /// caller error, not a skip).
         #[arg(long = "deny-read")]
         deny_read: Vec<String>,
+        /// A path the caller's session is granted (read or write)
+        /// that lies beneath a `--deny-read` path. While a profile
+        /// read grant is recorded, a read deny is also written on the
+        /// recorded paths beneath it; one at or beneath a path given
+        /// here is left out, as the session's own allow there ranks
+        /// above a deny set further up. Repeatable. A path that
+        /// cannot be resolved spares nothing.
+        #[arg(long = "deny-read-except", value_name = "PATH")]
+        deny_read_except: Vec<String>,
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
@@ -646,6 +655,12 @@ struct AceTargets {
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
     bad_inputs: Vec<(String, String)>,
+    /// Recorded paths of the profile read grant that a read deny among
+    /// `targets` is written on as well — for
+    /// `Locked::apply_aces_and`. They exist only because of the
+    /// expansion: they are denied for the holder's session, and are
+    /// never handed to `persist::apply` to be kept with a write root.
+    also_read_deny: Vec<String>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -679,10 +694,16 @@ struct AceTargets {
 /// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
+///
+/// `allows` are the canonical paths the same session is granted (read
+/// or write): a read deny is not carried onto a recorded profile path
+/// that such a grant allows more specifically
+/// (`RecordedAllows::covered`).
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
+    allows: &[String],
 ) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
     use srt_win::acl::SbAce;
@@ -692,6 +713,10 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut also_read_deny: Vec<String> = Vec::new();
+    // The profile read grant's record, read at the first read deny
+    // and once for all of them.
+    let mut recorded: Option<srt_win::profile_plan::RecordedAllows> = None;
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -776,11 +801,18 @@ fn canonicalize_ace_targets(
         targets.push((canon.clone(), ace));
         // A read deny holds against the profile read grant only if it
         // is also on each recorded path beneath it that carries an
-        // allow of its own. Worked out here, from the record, so the
+        // allow of its own — other than those the session allows more
+        // specifically. Worked out here, from the record, so the
         // caller names the deny once whatever it covers.
         if matches!(ace, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)) {
-            for also in srt_win::profile::read_deny_also(&canon)? {
-                targets.push((also, ace));
+            let recorded = match &recorded {
+                Some(r) => r,
+                None => recorded.insert(srt_win::profile::recorded_allows()?),
+            };
+            for also in recorded.covered(&canon, allows) {
+                if !also_read_deny.iter().any(|p| p == also) {
+                    also_read_deny.push(also.to_owned());
+                }
             }
         }
         // Full-chain hold (see doc). Duplicates are merged below.
@@ -790,9 +822,17 @@ fn canonicalize_ace_targets(
             }
         }
     }
+    let targets = merge_ace_targets(targets);
+    // A path named outright is not also an expansion.
+    also_read_deny.retain(|p| {
+        !targets
+            .iter()
+            .any(|(t, a)| t == p && matches!(a, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)))
+    });
     Ok(AceTargets {
-        targets: merge_ace_targets(targets),
+        targets,
         bad_inputs,
+        also_read_deny,
     })
 }
 
@@ -1535,16 +1575,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 acl::SbAce::Deny(acl::DenyMask::WriteDeny),
                             ),
                         ],
+                        &[],
                     )?;
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
@@ -1624,6 +1667,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
                         ],
+                        &[],
                     )?;
                     // Before anything is granted, in either mode: no
                     // grant may reach what a recorded profile read
@@ -1659,6 +1703,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                              sandbox user"
                         ));
                     }
+                    // What this same call grants: a read deny is not
+                    // carried onto a recorded profile path one of
+                    // these allows more specifically.
+                    let allowed: Vec<String> = grants.iter().map(|(p, _)| p.clone()).collect();
                     let denies = canonicalize_ace_targets(
                         db,
                         "deny",
@@ -1669,6 +1717,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 acl::SbAce::Deny(acl::DenyMask::WriteDeny),
                             ),
                         ],
+                        &allowed,
                     )?;
                     at.bad_inputs.extend(denies.bad_inputs);
                     for (p, e) in &at.bad_inputs {
@@ -1699,13 +1748,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .cloned()
                         .collect();
                     rest.extend(per_session_denies);
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &rest)?;
+                    // With them, for this session only, the recorded
+                    // profile paths the read denies cover. These never
+                    // went through `persist::apply`: a deny that
+                    // exists only because of the expansion is not kept
+                    // with a root, whatever root it lies under.
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &rest, &denies.also_read_deny)?;
                     at.targets.extend(denies.targets);
                     Ok((at, w, f, Some(kept)))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             if let Some(k) = kept {
@@ -2149,6 +2205,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             deny_read,
+            deny_read_except,
             deny_write,
             env,
             quiet,
@@ -2245,6 +2302,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             } else {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
+                let deny_read_except: Vec<String> = deny_read_except
+                    .iter()
+                    .filter_map(|p| srt_win::path_id::canonicalize_path(p).ok())
+                    .map(|(canon, _)| canon)
+                    .collect();
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
                     let at = canonicalize_ace_targets(
                         db,
@@ -2253,11 +2315,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
                             (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
                         ],
+                        &deny_read_except,
                     )?;
                     if let Some((p, e)) = at.bad_inputs.first() {
                         return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                     }
-                    let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
+                    let (w, f) = db.apply_aces_and(&sb_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })
                 .context("per-exec deny-ace")?;
