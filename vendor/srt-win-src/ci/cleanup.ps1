@@ -29,7 +29,9 @@ param(
   # Must match smoke-write-restricted.ps1.
   [string]$WriteRestrictedSublayer = 'c8f3a1d5-2e6b-4a97-b0c4-5d1e7f9a3b62',
   # Must match smoke-profile-read.ps1.
-  [string]$ProfileReadSublayer = 'e1a47c93-5d28-4b6f-a3c1-7f0e9d2b4a58'
+  [string]$ProfileReadSublayer = 'e1a47c93-5d28-4b6f-a3c1-7f0e9d2b4a58',
+  # Must match smoke-residual-egress.ps1.
+  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -48,6 +50,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
 & $Exe wfp uninstall --sublayer-guid $WriteRestrictedSublayer
 & $Exe wfp uninstall --sublayer-guid $ProfileReadSublayer
+& $Exe wfp uninstall --sublayer-guid $ResidualSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
@@ -86,6 +89,10 @@ Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-pr-smoke-*' | ForEach-
 # --all` above could not clear it.
 Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
+# smoke-residual-egress.ps1 removes its share and account in its own
+# `finally`; this covers a run that was killed before reaching it.
+Get-SmbShare -Name 'srtresid*' | Remove-SmbShare -Force -Confirm:$false
+Get-LocalUser -Name 'srt-resid-*' | Remove-LocalUser
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
 Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
   -Name srt-sandbox -ea SilentlyContinue
