@@ -1,12 +1,21 @@
 /*
- * Seccomp BPF filter generator to block Unix domain socket creation
+ * Seccomp BPF filter generator for the sandbox's syscall rules
  *
- * This program generates a seccomp-bpf filter that blocks the socket() syscall
- * when called with AF_UNIX or AF_VSOCK as the domain argument. This prevents creation
- * of Unix domain sockets and VM sockets while allowing all other socket types
- * (AF_INET, AF_INET6, etc.) and all other syscalls.
+ * This program generates the seccomp-bpf filters that apply-seccomp stacks:
  *
- * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
+ *   host        the calls that reach past every namespace the sandbox makes:
+ *               socket() with AF_VSOCK as the domain argument, io_uring, and
+ *               the kernel-keyring calls. Every command gets this one.
+ *   unix        socket() with AF_UNIX as the domain argument: local IPC.
+ *               Kept apart from `host` so that an embedder who must allow
+ *               Unix sockets does not lose the host rules with them.
+ *   namespaces  keeps the command in the namespaces the sandbox made for it
+ *               (apply-seccomp.c says why).
+ *
+ * Everything else (AF_INET, AF_INET6, other syscalls) is allowed.
+ *
+ * The filters are exported in a format compatible with bubblewrap's --seccomp
+ * flag.
  *
  * SECURITY LIMITATION - 32-bit x86 (ia32):
  * TODO: This filter does NOT block socketcall() syscall, which is a security issue
@@ -27,18 +36,14 @@
  *   gcc -o seccomp-unix-block seccomp-unix-block.c -lseccomp
  *
  * Usage:
- *   ./seccomp-unix-block <output-file> [arch] [unix|namespaces]
+ *   ./seccomp-unix-block <output-file> <x86_64|aarch64> <host|unix|namespaces>
  *
- * If arch is given (x86_64 or aarch64), the filter is generated for that
- * architecture instead of the native one. Lets a single-arch builder emit
+ * The architecture and the rule set are required: an older invocation that
+ * left them out got one filter with all the socket and io_uring rules, and a
+ * default taken today — `unix` alone — would be silently weaker. Naming an
+ * architecture other than the builder's own lets a single-arch builder emit
  * filters for both x64 and arm64; for `namespaces`, only with a libseccomp
  * that names every call in it (2.6.1 and later).
- *
- * The third argument picks the rule set: `unix` (the default) is the filter
- * above; `namespaces` is a second one, which apply-seccomp stacks on it to
- * keep the command in the namespaces the sandbox made for it (apply-seccomp.c
- * says why). Two filters, so that a command opted out of the second keeps the
- * first.
  *
  * Dependencies:
  *   - libseccomp (libseccomp-dev package on Debian/Ubuntu)
@@ -147,17 +152,19 @@ int main(int argc, char *argv[]) {
     scmp_filter_ctx ctx;
     int rc;
 
-    if (argc < 2 || argc > 4) {
+    if (argc != 4) {
         fprintf(stderr,
-                "Usage: %s <output-file> [x86_64|aarch64] [unix|namespaces]\n",
+                "Usage: %s <output-file> <x86_64|aarch64> "
+                "<host|unix|namespaces>\n",
                 argv[0]);
         return 1;
     }
 
     const char *output_file = argv[1];
-    const char *arch_name = (argc >= 3) ? argv[2] : NULL;
-    const char *rule_set = (argc == 4) ? argv[3] : "unix";
-    if (strcmp(rule_set, "unix") != 0 && strcmp(rule_set, "namespaces") != 0) {
+    const char *arch_name = argv[2];
+    const char *rule_set = argv[3];
+    if (strcmp(rule_set, "host") != 0 && strcmp(rule_set, "unix") != 0 &&
+        strcmp(rule_set, "namespaces") != 0) {
         fprintf(stderr, "Error: Unknown rule set '%s'\n", rule_set);
         return 1;
     }
@@ -170,7 +177,7 @@ int main(int argc, char *argv[]) {
     }
 
     int native = 1;
-    if (arch_name != NULL) {
+    {
         uint32_t target;
         if (strcmp(arch_name, "x86_64") == 0) {
             target = SCMP_ARCH_X86_64;
@@ -194,35 +201,46 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(rule_set, "namespaces") == 0) {
-        if (add_namespace_rules(ctx, native,
-                                arch_name ? arch_name : "native") < 0) {
+        if (add_namespace_rules(ctx, native, arch_name) < 0) {
             seccomp_release(ctx);
             return 1;
         }
         return export_filter(ctx, output_file);
     }
 
-    /* Add rule to block socket(AF_UNIX, ...) */
-    /* socket() syscall signature: int socket(int domain, int type, int protocol) */
-    /* arg0 = domain (AF_UNIX = 1) */
-    /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
-     * int, so the kernel ignores the upper 32 bits of the register. A plain
-     * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
-     * are set. */
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
-    if (rc < 0) {
-        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
-        seccomp_release(ctx);
-        return 1;
+    /* Every rule below goes in with seccomp_rule_add_exact(), as the
+     * namespaces rules do: the plain seccomp_rule_add() takes a call the
+     * target architecture lacks, adds nothing, and returns success, which
+     * for these filters would be a silently weaker export. */
+
+    if (strcmp(rule_set, "unix") == 0) {
+        /* Add rule to block socket(AF_UNIX, ...) */
+        /* socket() syscall signature: int socket(int domain, int type, int protocol) */
+        /* arg0 = domain (AF_UNIX = 1) */
+        /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
+         * int, so the kernel ignores the upper 32 bits of the register. A plain
+         * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
+         * are set. */
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                                    SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return 1;
+        }
+        return export_filter(ctx, output_file);
     }
+
+    /* ---- The `host` rules. ---- */
 
     /* Add rule to block socket(AF_VSOCK, ...) */
     /* The network namespace does not fence VM sockets: on a machine with a
      * vsock transport one connects straight out of the sandbox, past the
-     * proxies. No socketpair() rule is needed: the family has none. */
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_VSOCK));
+     * proxies. No socketpair() rule is needed: the family has none. The
+     * domain argument is masked for the same reason as AF_UNIX's rule in the
+     * `unix` filter above. */
+    rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                                SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_VSOCK));
     if (rc < 0) {
         fprintf(stderr, "Error: Failed to add AF_VSOCK rule: %s\n", strerror(-rc));
         seccomp_release(ctx);
@@ -231,19 +249,29 @@ int main(int argc, char *argv[]) {
 
     /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
      * in kernel context without going through the socket() syscall, bypassing
-     * the rules above. seccomp cannot inspect io_uring SQEs (they live in a
+     * the socket rules. seccomp cannot inspect io_uring SQEs (they live in a
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
-     * inherited ring fd. */
-    int io_uring_calls[] = {
+     * inherited ring fd.
+     *
+     * Block the kernel-keyring calls too. A keyring is a kernel object shared
+     * by inheritance, not a file or a socket: the command holds its caller's
+     * session keyring across every namespace the sandbox makes, so these
+     * calls could read keys the caller's login left there (and add, change or
+     * unlink keys), which no mount or network rule covers. Docker's and
+     * containerd's default seccomp profiles refuse the same three calls. */
+    int host_calls[] = {
         SCMP_SYS(io_uring_setup),
         SCMP_SYS(io_uring_enter),
         SCMP_SYS(io_uring_register),
+        SCMP_SYS(add_key),
+        SCMP_SYS(request_key),
+        SCMP_SYS(keyctl),
     };
-    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
+    for (size_t i = 0; i < sizeof(host_calls) / sizeof(host_calls[0]); i++) {
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), host_calls[i], 0);
         if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            fprintf(stderr, "Error: Failed to add host rule: %s\n", strerror(-rc));
             seccomp_release(ctx);
             return 1;
         }

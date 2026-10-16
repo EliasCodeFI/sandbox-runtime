@@ -29,13 +29,13 @@ run([
   '-lseccomp',
 ])
 
-// The two filters apply-seccomp stacks (see seccomp-unix-block.c), as separate
-// arrays so that a command opted out of `namespaces` keeps `unix`. For the
-// builder's own architecture only: the generator can put a call its libseccomp
-// cannot name into a filter by number for that architecture alone.
+// The three filters apply-seccomp stacks (see seccomp-unix-block.c), as
+// separate arrays so that a command opted out of one keeps the others. For
+// the builder's own architecture only: the generator can put a call its
+// libseccomp cannot name into a filter by number for that architecture alone.
 const target = arch === 'x64' ? 'x86_64' : 'aarch64'
 const bpf: Record<string, Buffer> = {}
-for (const rules of ['unix', 'namespaces']) {
+for (const rules of ['host', 'unix', 'namespaces']) {
   const tmp = join(OUT, `${target}.${rules}.bpf`)
   run([gen, tmp, target, rules])
   bpf[rules] = readFileSync(tmp)
@@ -47,6 +47,9 @@ const header = join(OUT, 'unix-block-bpf.h')
 writeFileSync(
   header,
   `#if defined(__${target}__)\n` +
+    'static const unsigned char host_block_bpf[] = {\n' +
+    toCArray(bpf.host) +
+    '\n};\n' +
     'static const unsigned char unix_block_bpf[] = {\n' +
     toCArray(bpf.unix) +
     '\n};\n' +

@@ -710,12 +710,12 @@ or add an AppArmor profile that grants `userns` to the relevant binaries.
 
 Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is the helper's namespaces filter (next paragraph), not the command's capabilities: the nested namespace's copies of the mounts are locked, which refuses the unmount of any one deny but not the whole tree being moved aside with `pivot_root`. A non-root caller's command holds no capabilities at all.
 
-**The command stays in the namespaces made for it.** Every write deny on Linux is a read-only bind mount, and a bind protects a path only in the mount namespace it was made in. Creating a user namespace takes no capability and gives its creator a full capability set over a private copy of the mount tree, from which the binds can be removed; so a sandboxed command may not create one. The seccomp isolation layer enforces that with a second filter beside the Unix-socket one, which refuses `unshare` and `clone` with the user-namespace or the mount-namespace flag, `setns`, `mount`, `umount2`, `pivot_root` and the newer mount calls (`EPERM`), and `clone3` (`ENOSYS`, which sends libc and the language runtimes to `clone`), and with `user.max_user_namespaces` set to zero in the helper's own user namespace.
+**The command stays in the namespaces made for it.** Every write deny on Linux is a read-only bind mount, and a bind protects a path only in the mount namespace it was made in. Creating a user namespace takes no capability and gives its creator a full capability set over a private copy of the mount tree, from which the binds can be removed; so a sandboxed command may not create one. The seccomp isolation layer enforces that with a `namespaces` filter beside its socket rules, which refuses `unshare` and `clone` with the user-namespace or the mount-namespace flag, `setns`, `mount`, `umount2`, `pivot_root` and the newer mount calls (`EPERM`), and `clone3` (`ENOSYS`, which sends libc and the language runtimes to `clone`), and with `user.max_user_namespaces` set to zero in the helper's own user namespace.
 
 What stops working as a result is whatever sandboxes itself with user namespaces: Chromium's and Electron's namespace sandbox, rootless podman and buildah, a nested bubblewrap or `srt`, `unshare -r` in a build script. They fail with `EPERM` (`unshare: unshare failed: Operation not permitted`); a nested bubblewrap blames a kernel setting and suggests a `sysctl`, which does not apply here. A root caller's command also loses `mount`, `umount` and `setns` for purposes of its own (`unshare -m`, `nsenter`, `ip netns exec`), and a direct `clone3` call has no fallback. The cure is `allowNestedUserNamespaces: true`, at the price stated under that option. Known limits:
 
 - With no seccomp helper in the chain (`allowAllUnixSockets`, or no helper for the architecture) bubblewrap is given `--disable-userns` instead, which refuses a new user namespace (`ENOSPC`, `No space left on device`) and nothing else. That needs bubblewrap 0.8.0 or later, not installed setuid, and `enableWeakerNestedSandbox` off; where it cannot be done nothing limits namespaces, and a warning is logged once per process. **So `allowAllUnixSockets` and `enableWeakerNestedSandbox` together leave the limit off,** as `allowNestedUserNamespaces` does: an application that takes its options from several sources should trust whoever may set those two as far as whoever may set that one.
-- A helper built before this release (an embedder's own, through `seccomp.applyPath` or `seccomp.argv0`) imposes no limit, and nothing says so: rebuild it from this release's `vendor/seccomp-src`.
+- A helper built from an older release of `vendor/seccomp-src` (an embedder's own, through `seccomp.applyPath` or `seccomp.argv0`) imposes no limit and does not refuse the kernel-keyring calls, and nothing says so: rebuild it from this release's `vendor/seccomp-src`.
 
 **Optional Linux dependencies (for seccomp fallback):**
 
@@ -983,17 +983,23 @@ A wrap that carries no write restrictions at all — `filesystem.disabled` with 
 - Higher values provide more protection but slower performance
 - Files in CWD (depth 0) are always protected regardless of this setting
 
-### Unix Socket Restrictions (Linux)
+### Syscall Restrictions (Linux)
 
-On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Unix domain socket creation at the syscall level. This provides an additional layer of security to prevent processes from creating new Unix domain sockets for local IPC (unless explicitly allowed).
+On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to refuse, at the syscall level, calls that would reach past the sandbox's other restrictions. The `apply-seccomp` helper stacks up to three filters:
+
+- `host` — the calls that cross every namespace the sandbox makes, which every command gets: `socket(AF_VSOCK, ...)` (VM sockets bypass the network namespace), the three `io_uring` calls, and the kernel-keyring calls `add_key`, `request_key` and `keyctl` (a command inherits its caller's session keyring, which no mount or network rule covers — without these rules it could read keys the caller's login keeps there, Kerberos's `KEYRING:` credential caches being the common case, and add, change or unlink keys; Docker's and containerd's default profiles refuse the same three calls).
+- `unix` — `socket(AF_UNIX, ...)`: local IPC (unless explicitly allowed). `SRT_ALLOW_UNIX_SOCKETS=1` in the helper's own environment leaves this one filter out, for an embedder that runs the helper itself; the package's own wrap pins the variable to `0` and clears it from the inherited environment, so a caller's environment never decides.
+- `namespaces` — described under "The command stays in the namespaces made for it" above.
+
+What stops working under the keyring rules is whatever makes those calls itself: `keyctl(1)`, and Kerberos with a `KEYRING:` credential cache. `/proc/keys` still lists key descriptions (names, never payloads) to the command.
 
 **How it works:**
 
-1. **Baked-in BPF filter**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filter compiled in. The filter is architecture-specific but libc-independent, so the binary works with both glibc and musl.
+1. **Baked-in BPF filters**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filters compiled in. The filters are architecture-specific but libc-independent, so the binary works with both glibc and musl.
 
 2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
 
-3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
+3. **Syscall filtering**: The BPF filters answer the refused calls before the kernel acts on them — all with `EPERM`, except `clone3`'s `ENOSYS` (see "The command stays in the namespaces made for it").
 
 4. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
@@ -1001,11 +1007,11 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
    - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
    - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
-   - User command runs with all sandbox restrictions plus Unix socket creation blocking
+   - User command runs with all sandbox restrictions plus the seccomp filters
 
 **PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
 
-**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
+**Security limitations**: The `io_uring` calls are refused because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rules. The filters do not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
 
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 

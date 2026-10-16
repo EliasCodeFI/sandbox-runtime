@@ -9,8 +9,9 @@ import { isLinux } from '../helpers/platform.js'
  * vendor/seccomp/build.ts compiles the filter generator
  * (vendor/seccomp-src/seccomp-unix-block.c), runs it and deletes it, so it is
  * compiled here once more where there is a compiler and a libseccomp to link
- * against (elsewhere these tests skip). It must never write a `namespaces`
- * filter with one of its calls left out.
+ * against (elsewhere these tests skip). It must never write a `namespaces` or
+ * `host` filter with one of its calls left out, and never fall back to a rule
+ * set that was not asked for.
  */
 
 type Arch = 'x86_64' | 'aarch64'
@@ -47,6 +48,30 @@ const REFUSED: Record<Arch, Record<string, number>> = {
     umount2: 39,
     pivot_root: 41,
     ...SINCE_5_1,
+  },
+}
+
+// The seven calls of the `host` filter: socket (whose AF_VSOCK rule compares
+// the number before the argument), io_uring and the keyring calls.
+const IO_URING = {
+  io_uring_setup: 425,
+  io_uring_enter: 426,
+  io_uring_register: 427,
+}
+const HOST: Record<Arch, Record<string, number>> = {
+  x86_64: {
+    socket: 41,
+    add_key: 248,
+    request_key: 249,
+    keyctl: 250,
+    ...IO_URING,
+  },
+  aarch64: {
+    socket: 198,
+    add_key: 217,
+    request_key: 218,
+    keyctl: 219,
+    ...IO_URING,
   },
 }
 
@@ -118,19 +143,19 @@ function numbersComparedWith(filter: Buffer): Set<number> {
   return numbers
 }
 
-function generate(arch: Arch) {
-  const out = join(dirname(GENERATOR!), `${arch}.namespaces.bpf`)
+function generate(arch: Arch, rules: 'host' | 'unix' | 'namespaces') {
+  const out = join(dirname(GENERATOR!), `${arch}.${rules}.bpf`)
   rmSync(out, { force: true })
-  const run = spawnSync(GENERATOR!, [out, arch, 'namespaces'], {
+  const run = spawnSync(GENERATOR!, [out, arch, rules], {
     encoding: 'utf8',
     timeout: 30000,
   })
   return { status: run.status, stderr: run.stderr, out }
 }
 
-function expectEveryCall(arch: Arch, out: string): void {
+function expectEveryCall(calls: Record<string, number>, out: string): void {
   const compared = numbersComparedWith(readFileSync(out))
-  for (const [call, number] of Object.entries(REFUSED[arch])) {
+  for (const [call, number] of Object.entries(calls)) {
     // Named, so that a failure says which call is missing.
     expect([call, compared.has(number)]).toEqual([call, true])
   }
@@ -150,11 +175,11 @@ describe.if(isLinux)('the generator of the seccomp filters', () => {
   it.if(CAN_BUILD)(
     "the namespaces filter for the builder's own architecture has every one of its calls",
     () => {
-      const made = generate(NATIVE!)
+      const made = generate(NATIVE!, 'namespaces')
       expect(made.stderr).toBe('')
       expect(made.status).toBe(0)
       expect(Object.keys(REFUSED[NATIVE!])).toHaveLength(15)
-      expectEveryCall(NATIVE!, made.out)
+      expectEveryCall(REFUSED[NATIVE!], made.out)
     },
   )
 
@@ -163,9 +188,9 @@ describe.if(isLinux)('the generator of the seccomp filters', () => {
     () => {
       // Which of the two depends on the libseccomp it was linked with: one
       // that names every call can carry them all to another architecture.
-      const made = generate(OTHER)
+      const made = generate(OTHER, 'namespaces')
       if (made.status === 0) {
-        expectEveryCall(OTHER, made.out)
+        expectEveryCall(REFUSED[OTHER], made.out)
       } else {
         expect(made.stderr).toMatch(
           new RegExp(`cannot name (${Object.keys(REFUSED[OTHER]).join('|')})`),
@@ -174,4 +199,57 @@ describe.if(isLinux)('the generator of the seccomp filters', () => {
       }
     },
   )
+
+  it.if(CAN_BUILD)(
+    'the host filter names its seven calls, for both architectures',
+    () => {
+      // Its rules go in whole-or-none as the namespaces ones do, but every
+      // call in it is one that any libseccomp this repository builds with
+      // can name, so both architectures must simply succeed.
+      for (const arch of [NATIVE!, OTHER]) {
+        const made = generate(arch, 'host')
+        expect(made.stderr).toBe('')
+        expect(made.status).toBe(0)
+        expect(Object.keys(HOST[arch])).toHaveLength(7)
+        expectEveryCall(HOST[arch], made.out)
+      }
+    },
+  )
+
+  it.if(CAN_BUILD)(
+    'the unix filter names socket and none of the host calls',
+    () => {
+      for (const arch of [NATIVE!, OTHER]) {
+        const made = generate(arch, 'unix')
+        expect(made.stderr).toBe('')
+        expect(made.status).toBe(0)
+        const compared = numbersComparedWith(readFileSync(made.out))
+        expect(compared.has(HOST[arch].socket)).toBe(true)
+        for (const call of Object.keys(HOST[arch])) {
+          if (call === 'socket') continue
+          // Opting out of `unix` must give up local IPC alone: a host rule
+          // in here would be lost with it.
+          expect([arch, call, compared.has(HOST[arch][call])]).toEqual([
+            arch,
+            call,
+            false,
+          ])
+        }
+      }
+    },
+  )
+
+  it.if(CAN_BUILD)('an invocation without a rule set is refused', () => {
+    // The old two-argument form got the socket and io_uring rules by
+    // default; today it would have to pick one rule set, and any pick could
+    // be silently weaker than the caller meant. It must refuse instead.
+    const out = join(dirname(GENERATOR!), 'no-rule-set.bpf')
+    rmSync(out, { force: true })
+    const run = spawnSync(GENERATOR!, [out, NATIVE!], {
+      encoding: 'utf8',
+      timeout: 30000,
+    })
+    expect(run.status).not.toBe(0)
+    expect(existsSync(out)).toBe(false)
+  })
 })

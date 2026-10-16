@@ -392,11 +392,11 @@ describe.if(isLinux)(
         try {
           SandboxManager.updateConfig(configured(true))
           expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-            `SRT_ALLOW_NESTED_USERNS=1 ${APPLY_SECCOMP}`,
+            `SRT_ALLOW_NESTED_USERNS=1 SRT_ALLOW_UNIX_SOCKETS=0 ${APPLY_SECCOMP}`,
           )
           SandboxManager.updateConfig(configured())
           expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-            `SRT_ALLOW_NESTED_USERNS=0 ${APPLY_SECCOMP}`,
+            `SRT_ALLOW_NESTED_USERNS=0 SRT_ALLOW_UNIX_SOCKETS=0 ${APPLY_SECCOMP}`,
           )
         } finally {
           // The configuration outlives a reset, and the next file's tests.
@@ -435,7 +435,7 @@ describe.if(isLinux)(
               session,
               given,
               expect.stringContaining(
-                `SRT_ALLOW_NESTED_USERNS=${said} ${APPLY_SECCOMP}`,
+                `SRT_ALLOW_NESTED_USERNS=${said} SRT_ALLOW_UNIX_SOCKETS=0 ${APPLY_SECCOMP}`,
               ),
             ])
           }
@@ -443,7 +443,7 @@ describe.if(isLinux)(
           SandboxManager.updateConfig(configured(false))
           await wrapGiven(true)
           expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-            `SRT_ALLOW_NESTED_USERNS=0 ${APPLY_SECCOMP}`,
+            `SRT_ALLOW_NESTED_USERNS=0 SRT_ALLOW_UNIX_SOCKETS=0 ${APPLY_SECCOMP}`,
           )
         } finally {
           // The configuration outlives a reset, and the next file's tests.

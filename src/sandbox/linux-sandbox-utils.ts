@@ -1669,13 +1669,26 @@ export async function initializeLinuxNetworkBridge(
 const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
 
 /**
- * The assignment the helper's command line starts with, so that the variable
- * holds what the configuration says: the wrap reaches the helper through a
- * shell, whose start-up files (BASH_ENV) could set it after bubblewrap cleared
- * it, and an assignment before a command is made after those.
+ * Also read by the seccomp helper, never by this process. `1` leaves out the
+ * helper's Unix-socket filter alone, keeping its other rules; it is for an
+ * embedder that runs the helper itself. This wrap uses the helper only when
+ * Unix sockets are to be blocked (`allowAllUnixSockets` drops it instead), so
+ * it always pins the variable to `0`.
+ */
+const UNIX_SOCKETS_ENV = 'SRT_ALLOW_UNIX_SOCKETS'
+
+/**
+ * The assignments the helper's command line starts with, so that the
+ * variables hold what the configuration says: the wrap reaches the helper
+ * through a shell, whose start-up files (BASH_ENV) could set them after
+ * bubblewrap cleared them, and assignments before a command are made after
+ * those.
  */
 function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
-  return `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} `
+  return (
+    `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} ` +
+    `${UNIX_SOCKETS_ENV}=0 `
+  )
 }
 
 // Keyed by path, like the uid-0 probe. Only an answer is kept: a probe that
@@ -3605,9 +3618,11 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
-    // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
-    // apply-seccomp wraps the workload and applies the baked-in BPF filter
-    // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
+    // ========== SECCOMP FILTERS ==========
+    // apply-seccomp wraps the workload and applies the baked-in BPF filters:
+    // socket(AF_UNIX, ...), and the host rules every command gets
+    // (socket(AF_VSOCK, ...), io_uring, the kernel-keyring calls). Skipped
+    // when allowAllUnixSockets is true, which drops all of them.
     if (!allowAllUnixSockets) {
       applySeccompPrefix = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
@@ -3616,7 +3631,8 @@ export async function wrapCommandWithSandboxLinux(
 
       if (!applySeccompPrefix) {
         logForDebugging(
-          '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
+          '[Sandbox Linux] apply-seccomp binary not available - seccomp filtering disabled ' +
+            '(Unix and VM sockets, io_uring and the kernel-keyring calls stay open). ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
@@ -3624,13 +3640,11 @@ export async function wrapCommandWithSandboxLinux(
         applySeccompPrefix =
           helperEnvironmentPrefix(allowNestedUserNamespaces === true) +
           applySeccompPrefix
-        logForDebugging(
-          '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
-        )
+        logForDebugging('[Sandbox Linux] Applying the seccomp filters')
       }
     } else {
       logForDebugging(
-        '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
+        '[Sandbox Linux] Skipping the seccomp helper - allowAllUnixSockets is enabled',
       )
     }
 
@@ -3832,10 +3846,12 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--bind', '/proc', '/proc')
     }
 
-    // The caller's environment decides nothing about the command's namespaces:
-    // the variable is cleared after every other environment operation, which
-    // bubblewrap applies in argument order, and helperEnvironmentPrefix sets it.
+    // The caller's environment decides nothing about the command's namespaces
+    // or sockets: the variables are cleared after every other environment
+    // operation, which bubblewrap applies in argument order, and
+    // helperEnvironmentPrefix sets them.
     bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
+    bwrapArgs.push('--unsetenv', UNIX_SOCKETS_ENV)
 
     // With no helper to refuse user namespaces, bubblewrap is asked to. Never
     // beside the helper, which makes one of its own, and not under
@@ -3908,7 +3924,7 @@ export async function wrapCommandWithSandboxLinux(
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
     if (hasEnvRestrictions) restrictions.push('env')
-    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (applySeccompPrefix) restrictions.push('seccomp(host+unix-block)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,

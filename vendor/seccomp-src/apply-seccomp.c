@@ -3,10 +3,17 @@
  *
  * Usage: apply-seccomp <command> [args...]
  *
- * This program applies a baked-in seccomp BPF filter, isolates the
+ * This program applies the baked-in seccomp BPF filters, isolates the
  * target command in a nested user+PID+mount namespace so it cannot see or
- * ptrace any process that lacks the filter, applies the filter with
- * prctl(PR_SET_SECCOMP), and execs the command.
+ * ptrace any process that lacks the filters, applies them with
+ * prctl(PR_SET_SECCOMP), and execs the command. Up to three filters are
+ * stacked (seccomp-unix-block.c holds their rules): `host`, which every
+ * command gets; `unix`, left out only by SRT_ALLOW_UNIX_SOCKETS=1, for an
+ * embedder that runs this helper itself and whose workload needs local IPC;
+ * and `namespaces`, left out by SRT_ALLOW_NESTED_USERNS=1. The package's own
+ * wrap pins both variables on the helper's command line and clears them from
+ * the inherited environment (bwrap --unsetenv), so neither opt-out can be
+ * taken from the caller's environment.
  *
  * Process layout inside the outer bwrap sandbox:
  *
@@ -328,8 +335,9 @@ static int recv_fd(int sock) {
  * Audited syscalls between the seccomp() return and execve():
  *   sendmsg, close, close, prctl(PR_SET_SECCOMP) once per filter, execve
  * None are in the observe match set (write-intent fs), none are in the
- * namespaces set (user-namespace creation, setns, mount calls) and none are
- * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
+ * namespaces set (user-namespace creation, setns, mount calls), none are in
+ * the host set (socket(AF_VSOCK), io_uring, the keyring calls) and none are
+ * in the unix set (socket(AF_UNIX)), so the worker cannot
  * trap on itself, or be refused, before exec. perror()/snprintf() are
  * deliberately avoided post-filter to keep this set closed. */
 static void install_observe_filter(int sp_fd) {
@@ -678,16 +686,24 @@ int main(int argc, char *argv[]) {
 
     char **command_argv = &argv[1];
 
-    /* Read once, from the environment the caller built; the worker's copy is
-     * removed below. */
+    /* Read once, from the environment the caller built; the worker's copies
+     * are removed below. */
     const char *allow_env = getenv("SRT_ALLOW_NESTED_USERNS");
     int allow_nested_userns = allow_env && strcmp(allow_env, "1") == 0;
+    const char *allow_unix_env = getenv("SRT_ALLOW_UNIX_SOCKETS");
+    int allow_unix_sockets = allow_unix_env && strcmp(allow_unix_env, "1") == 0;
     /* Set when path (b) below runs, the only one the limit is written in. */
     int made_userns = 0;
 
+    _Static_assert(sizeof(host_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "BPF filter size must be a multiple of sock_filter");
+    struct sock_fprog host_prog = {
+        .len = (unsigned short)(sizeof(host_block_bpf) / sizeof(struct sock_filter)),
+        .filter = (struct sock_filter *)host_block_bpf,
+    };
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
-    struct sock_fprog prog = {
+    struct sock_fprog unix_prog = {
         .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_block_bpf,
     };
@@ -940,23 +956,28 @@ int main(int argc, char *argv[]) {
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
     unsetenv("SRT_ALLOW_NESTED_USERNS");
+    unsetenv("SRT_ALLOW_UNIX_SOCKETS");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
     /* Best-effort: install the USER_NOTIF observation filter and hand its
      * listener fd to the outer stub over the pre-fork socketpair. Runs after
-     * NO_NEW_PRIVS (required) and before the unix-block filter / exec so only
+     * NO_NEW_PRIVS (required) and before the blocking filters / exec so only
      * the workload is observed. */
     install_observe_filter(sp[1]);
-    /* Two filters, stacked: the kernel runs every installed filter and takes
-     * the most restrictive answer, so their order does not matter. Installing
-     * a filter is not among the calls this one refuses. */
+    /* Up to three filters, stacked: the kernel runs every installed filter
+     * and takes the most restrictive answer, so their order does not matter.
+     * Installing a filter is not among the calls any of them refuses. */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &host_prog) < 0) {
+        die("apply-seccomp: prctl(PR_SET_SECCOMP, host)");
+    }
     if (!allow_nested_userns
         && prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &namespace_prog) < 0) {
         die("apply-seccomp: prctl(PR_SET_SECCOMP, namespaces)");
     }
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
-        die("apply-seccomp: prctl(PR_SET_SECCOMP)");
+    if (!allow_unix_sockets
+        && prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &unix_prog) < 0) {
+        die("apply-seccomp: prctl(PR_SET_SECCOMP, unix)");
     }
 
     execvp(command_argv[0], command_argv);
