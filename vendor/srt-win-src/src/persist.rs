@@ -69,21 +69,38 @@
 //!
 //! ## A root whose volume is gone
 //!
-//! A root on a removable disk, a virtual disk or a volume that was
-//! reformatted cannot be reached to take its ACEs off, and waiting
-//! for it must not keep `acl forget` failing forever. Such a root —
-//! and each deny target kept with it — is moved from the records to a
-//! list of **pending strips** in the marker ([`PendingStrip`]: the
-//! object's file id, the group its ACEs name, its last path). `forget`
-//! then succeeds and reports it as pending. Every later session
-//! start, `forget` and uninstall looks at the list again
-//! ([`retry_pending`]): once the volume is back the ACEs are removed,
-//! and only then the entry.
+//! A root on a removable disk, a virtual disk, a locked encrypted
+//! volume or a share that does not answer cannot be reached to take
+//! its ACEs off, and waiting for it must not keep `acl forget` failing
+//! forever. Such a root — and each deny target kept with it — is moved
+//! from the records to a list of **pending strips** in the marker
+//! ([`PendingStrip`]: the object's file id, the group its ACEs name,
+//! its last path). `forget` then succeeds and reports it as pending.
 //!
-//! A pending strip does not refuse the ordinary token while its volume
-//! is absent — nothing can be written there. From the moment the
-//! volume is mounted again until the strip has succeeded it refuses
-//! exactly as a live kept grant does.
+//! Whether a volume is there is asked of the volumes of the machine,
+//! not of drive letters: a volume mounted only at a folder is present,
+//! and an object on a present volume is looked for by its file id
+//! wherever it has been renamed or moved to, and stripped there. Only
+//! when its volume reports that no such object exists is a record
+//! dropped. What becomes of a record is one table ([`disposition`]),
+//! fed by one classification of open errors
+//! (`path_id::classify_open_failure`).
+//!
+//! Every later session start, `forget` and uninstall looks at the
+//! list again ([`retry_pending`]): once the volume is back the ACEs
+//! are removed, and only then the entry. A pending strip does not
+//! refuse the ordinary token while its volume is absent — nothing can
+//! be written there. From the moment the volume is present again
+//! until the strip has succeeded it refuses exactly as a live kept
+//! grant does. Nothing drops an entry for a volume that never
+//! returns except `acl forget --drop-pending` ([`drop_pending`]), which
+//! says what it leaves behind.
+//!
+//! An entry on a network share cannot be looked for by file id, and
+//! looking contacts the server: it is tried at its recorded path, by
+//! an explicit `forget` or uninstall only, and does not refuse the
+//! ordinary token meanwhile (a local group's entries on a share's
+//! files match no token there).
 //!
 //! ## The profile read grant
 //!
@@ -151,13 +168,31 @@ const MARKER_ROOTS: &str = "Roots";
 const MARKER_EVER: &str = "EverEnabled";
 const MARKER_PENDING: &str = "Pending";
 const MARKER_GROUP: &str = "GroupSid";
+const MARKER_PREVIOUS_GROUPS: &str = "PreviousGroupSids";
 
 /// Remember the sandbox group's SID beside the grants that name it,
 /// so they can still be recognised — and removed — after the install
 /// record that held it is gone (an uninstall whose removal of the
 /// grants did not finish).
+///
+/// A group SID that was recorded before and differs — the sandbox was
+/// reinstalled while grants of the old install were still recorded —
+/// is kept in a list beside it: entries naming it are still ours to
+/// remove (`PersistentTrustees::previous_group_sids`).
 pub(crate) fn marker_set_group_sid(group_sid: &str) -> Result<()> {
-    reg::Key::create_hkcu(MARKER_KEY)?.set_sz(MARKER_GROUP, group_sid)
+    let key = reg::Key::create_hkcu(MARKER_KEY)?;
+    if let Some(old) = key.get_sz(MARKER_GROUP)?.filter(|s| !s.is_empty())
+        && old != group_sid
+    {
+        let mut previous = key
+            .get_multi_sz(MARKER_PREVIOUS_GROUPS)?
+            .unwrap_or_default();
+        if !previous.contains(&old) {
+            previous.push(old);
+            key.set_multi_sz(MARKER_PREVIOUS_GROUPS, &previous)?;
+        }
+    }
+    key.set_sz(MARKER_GROUP, group_sid)
 }
 
 /// Set the marker's `EverEnabled`: from now on "nothing is recorded"
@@ -177,6 +212,11 @@ pub(crate) fn marker_clear_ever_if_unused(conn: &Connection) -> Result<()> {
         && let Some(key) = reg::Key::open_hkcu(MARKER_KEY, true)?
     {
         reg::delete_value(&key, MARKER_EVER)?;
+        // With nothing recorded, no entry of an earlier group is left
+        // to recognise either.
+        if key.get_multi_sz(MARKER_PREVIOUS_GROUPS)?.is_some() {
+            reg::delete_value(&key, MARKER_PREVIOUS_GROUPS)?;
+        }
     }
     Ok(())
 }
@@ -266,6 +306,8 @@ pub struct Marker {
     pub pending: Vec<PendingStrip>,
     /// The sandbox group the recorded grants name.
     pub group_sid: Option<String>,
+    /// Groups of earlier installs that recorded grants may still name.
+    pub previous_group_sids: Vec<String>,
 }
 
 impl Marker {
@@ -299,6 +341,9 @@ pub fn read_marker() -> Result<Marker> {
         roots,
         pending,
         group_sid: key.get_sz(MARKER_GROUP)?.filter(|s| !s.is_empty()),
+        previous_group_sids: key
+            .get_multi_sz(MARKER_PREVIOUS_GROUPS)?
+            .unwrap_or_default(),
     })
 }
 
@@ -465,6 +510,10 @@ pub struct Ids {
     pub group_sid: Option<String>,
     pub sandbox_user_sid: Option<String>,
     pub real_user_sid: String,
+    /// Sandbox groups other than `group_sid` that grants recorded for
+    /// this user were made for: the marker's, when the install record
+    /// names another group now or none.
+    pub previous_group_sids: Vec<String>,
 }
 
 impl Ids {
@@ -473,14 +522,26 @@ impl Ids {
         // With the install record gone (an uninstall that removed the
         // account before the grants were all taken off), the group the
         // recorded grants name is still known from the marker.
-        let recorded_group = || read_marker().ok().and_then(|m| m.group_sid);
+        let marker = read_marker().unwrap_or_default();
+        let group_sid = setup
+            .as_ref()
+            .map(|s| s.sandbox_group_sid.clone())
+            .or_else(|| marker.group_sid.clone());
+        // Every other group the marker knows of: the one recorded
+        // with the grants, if the sandbox has been reinstalled since,
+        // and those before it.
+        let mut previous_group_sids: Vec<String> = marker
+            .group_sid
+            .into_iter()
+            .chain(marker.previous_group_sids)
+            .filter(|g| Some(g) != group_sid.as_ref())
+            .collect();
+        previous_group_sids.dedup();
         Ok(Self {
-            group_sid: setup
-                .as_ref()
-                .map(|s| s.sandbox_group_sid.clone())
-                .or_else(recorded_group),
+            group_sid,
             sandbox_user_sid: setup.map(|s| s.sandbox_user_sid),
             real_user_sid: crate::sid::current_user_sid()?,
+            previous_group_sids,
         })
     }
 
@@ -488,6 +549,7 @@ impl Ids {
         PersistentTrustees {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
+            previous_group_sids: &self.previous_group_sids,
         }
     }
 }
@@ -919,7 +981,7 @@ pub fn apply(
     }
     // A kept grant whose volume was absent when it was forgotten: if
     // the volume is back, its ACEs come off now.
-    retry_pending(conn, ids)?;
+    retry_pending(conn, ids, false)?;
     let mut touched: Vec<String> = Vec::new();
     let mut touch = |p: &str| {
         if !touched.iter().any(|t| t == p) {
@@ -1018,41 +1080,101 @@ impl Forgot {
     }
 }
 
-/// Where an object a record names is now, and so what removing its
-/// ACEs takes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Whereabouts {
-    /// At another path: remove them there.
-    Moved(String),
-    /// Nowhere: nothing to remove.
-    Gone,
-    /// On a volume that is not mounted: a pending strip.
-    VolumeAbsent,
-    /// Its volume is there and it could not be found or opened: an
-    /// error, the record stays.
-    Unknown,
+/// What opening a recorded path found, as far as it decides what
+/// becomes of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtPath {
+    /// The recorded object.
+    Recorded,
+    /// Something, but not the recorded object.
+    Another,
+    /// Nothing has that name ([`path_id::OpenFailure::NotFound`]).
+    Nothing,
+    /// The volume cannot be reached right now
+    /// ([`path_id::OpenFailure::VolumeUnavailable`]).
+    Unavailable,
 }
 
-fn whereabouts(located: Located) -> Whereabouts {
-    match located {
-        Located::At(p) => Whereabouts::Moved(p),
-        Located::Gone => Whereabouts::Gone,
-        Located::VolumeAbsent => Whereabouts::VolumeAbsent,
-        Located::Unknown => Whereabouts::Unknown,
+/// What removing a record's ACEs takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Disposition {
+    /// Remove them at the recorded path.
+    StripHere,
+    /// The object is at another path now — renamed, moved, or the
+    /// volume is mounted elsewhere: remove them there.
+    StripAt(String),
+    /// The object no longer exists: there is nothing to remove.
+    Drop,
+    /// The object is on a volume that cannot be reached now: a
+    /// pending strip.
+    Pending,
+    /// It could not be established where the object is while its
+    /// volume is there: an error; the record stays.
+    Fail,
+}
+
+/// The one table: where the recorded path leads now (`at_path`), where
+/// the object was found by its file id (`located`, asked only when the
+/// path does not lead to it), and whether the path is on a network
+/// share (`network`), where a volume cannot be looked for and an
+/// object not be found by its id.
+///
+/// | path \\ by file id | at P     | gone | volume absent        | unknown |
+/// |--------------------|----------|------|----------------------|---------|
+/// | the object         | here     | here | here                 | here    |
+/// | another / nothing  | strip P  | drop | pending (local only) | fail    |
+/// | volume unavailable | strip P  | drop | pending              | pending |
+///
+/// On a share, "another / nothing" with the object not found is a
+/// failure, as it always was: the share answered, and the object is
+/// not where it was recorded.
+fn disposition(at_path: AtPath, located: impl FnOnce() -> Located, network: bool) -> Disposition {
+    if at_path == AtPath::Recorded {
+        return Disposition::StripHere;
+    }
+    match (located(), at_path) {
+        (Located::At(p), _) => Disposition::StripAt(p),
+        (Located::Gone, _) => Disposition::Drop,
+        (Located::VolumeAbsent | Located::Unknown, AtPath::Unavailable) => Disposition::Pending,
+        (Located::VolumeAbsent, _) if !network => Disposition::Pending,
+        _ => Disposition::Fail,
+    }
+}
+
+/// Whether `canon` is somewhere volumes cannot be enumerated: a share,
+/// or a drive letter mapped to one.
+fn on_network(canon: &str) -> bool {
+    !path_id::is_drive_path(canon) || path_id::on_network_drive(canon)
+}
+
+/// What is at `path` now, against the recorded object `id`: the open
+/// error classified ([`path_id::open_failure`]). An error that is
+/// neither "nothing there" nor "volume unavailable" is returned.
+fn at_path(path: &str, id: &FileId) -> Result<AtPath> {
+    match path_id::capture_file_id(path) {
+        Ok(now) if now == *id => Ok(AtPath::Recorded),
+        Ok(_) => Ok(AtPath::Another),
+        Err(e) => match path_id::open_failure(&e) {
+            path_id::OpenFailure::NotFound => Ok(AtPath::Nothing),
+            path_id::OpenFailure::VolumeUnavailable => Ok(AtPath::Unavailable),
+            path_id::OpenFailure::Other => Err(e.context(format!("open '{path}'"))),
+        },
     }
 }
 
 /// Remove `canon`'s persistent grant: its ACEs from the object at the
-/// path and from the object it was granted on if that has moved, the
-/// deny ACEs kept with it, its capability SID, and its marker entry.
+/// path and from the object it was granted on wherever that is now,
+/// the deny ACEs kept with it, its capability SID, and its marker
+/// entry.
 ///
 /// Rows and ACEs go together: the row deletions commit only after
 /// every DACL write succeeded, and the marker entry is removed after
-/// that. An object on a mounted volume that can be neither found at
-/// its path nor located by file id fails the call, so the root stays
-/// listed — "could not look" is not "nothing there". An object whose
-/// VOLUME is not mounted is not an error: it becomes a pending strip
-/// (see the module doc), written to the marker before the rows go.
+/// that. What becomes of each recorded object — the root and every
+/// deny target — is decided by [`disposition`]: one that cannot be
+/// found while its volume is there fails the call, so the root stays
+/// listed ("could not look" is not "nothing there"); one whose VOLUME
+/// cannot be reached becomes a pending strip (see the module doc),
+/// written to the marker before the rows go.
 fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<Forgot> {
     forget_one_with(conn, ids, canon, path_id::locate_by_file_id)
 }
@@ -1063,11 +1185,6 @@ fn forget_one_with(
     canon: &str,
     locate: impl Fn(&FileId) -> Located,
 ) -> Result<Forgot> {
-    let here = match path_id::capture_file_id(canon) {
-        Ok(id) => Some(id),
-        Err(e) if path_id::is_not_found(&e) => None,
-        Err(e) => return Err(e.context(format!("open '{canon}'"))),
-    };
     // Every object the grant may have been written on.
     let mut granted: Vec<FileId> = Vec::new();
     granted.extend(root_row(conn, canon)?.map(|(id, _)| id));
@@ -1096,49 +1213,42 @@ fn forget_one_with(
     // what another root still records for it).
     let mut removed = false;
     let mut pending: Vec<PendingStrip> = Vec::new();
-    let mut wait_for = |file_id: FileId, path: &str| {
-        pending.push(PendingStrip {
-            file_id,
-            group_sid: ids.group_sid.clone().unwrap_or_default(),
-            path: path.to_owned(),
-        })
-    };
-    if here.is_some() {
-        removed |= converge(&tx, ids, canon)?;
-    }
-    for id in granted.iter().filter(|id| Some(**id) != here) {
-        match whereabouts(locate(id)) {
-            Whereabouts::Moved(moved) => removed |= converge(&tx, ids, &moved)?,
-            Whereabouts::Gone => {}
-            // Only a path on a drive letter can be waited for: that is
-            // where volumes are looked for. A share is never probed.
-            Whereabouts::VolumeAbsent
-                if path_id::is_drive_path(canon) && !path_id::on_network_drive(canon) =>
-            {
-                wait_for(*id, canon)
-            }
-            Whereabouts::VolumeAbsent | Whereabouts::Unknown => bail!(
-                "the object '{canon}' was granted on is no longer at that path and could \
-                 not be located by file id; its ACEs may still be on disk"
+    let mut recorded: Vec<(String, FileId)> =
+        granted.iter().map(|id| (canon.to_owned(), *id)).collect();
+    recorded.extend(
+        denies
+            .iter()
+            .filter_map(|(d, id)| Some((d.clone(), FileId::from_bytes(id).ok()?))),
+    );
+    // Whatever is at a recorded path now carries nothing of ours any
+    // more, whichever object it is.
+    let mut stripped_here: Vec<&str> = Vec::new();
+    for (path, id) in &recorded {
+        let at = at_path(path, id)?;
+        if matches!(at, AtPath::Recorded | AtPath::Another)
+            && !stripped_here.contains(&path.as_str())
+        {
+            removed |= converge(&tx, ids, path)?;
+            stripped_here.push(path);
+        }
+        match disposition(at, || locate(id), on_network(path)) {
+            Disposition::StripHere | Disposition::Drop => {}
+            Disposition::StripAt(now) => removed |= converge(&tx, ids, &now)?,
+            Disposition::Pending => pending.push(PendingStrip {
+                file_id: *id,
+                group_sid: ids.group_sid.clone().unwrap_or_default(),
+                path: path.clone(),
+            }),
+            Disposition::Fail => bail!(
+                "the object recorded for '{path}' is no longer at that path and could not \
+                 be located by file id; its ACEs may still be on disk"
             ),
         }
     }
-    for (d, id) in &denies {
-        match path_id::capture_file_id(d) {
-            Ok(_) => removed |= converge(&tx, ids, d)?,
-            Err(e) if path_id::is_not_found(&e) => {
-                // Gone, or moved, with the object it was on: only a
-                // target on an absent volume is waited for.
-                if let Ok(id) = FileId::from_bytes(id)
-                    && path_id::is_drive_path(d)
-                    && !path_id::on_network_drive(d)
-                    && whereabouts(locate(&id)) == Whereabouts::VolumeAbsent
-                {
-                    wait_for(id, d);
-                }
-            }
-            Err(e) => return Err(e.context(format!("open '{d}'"))),
-        }
+    // A root with no record of the object it was granted on (nothing
+    // in the database or the marker): the path is all there is.
+    if granted.is_empty() && path_id::capture_file_id(canon).is_ok() {
+        removed |= converge(&tx, ids, canon)?;
     }
     // Before the rows go: a crash in between leaves the object listed
     // twice, never not at all.
@@ -1154,17 +1264,40 @@ fn forget_one_with(
     })
 }
 
-/// Look at every pending strip again: if its volume is back, take the
-/// ACEs off the object, wherever it is now, and only then drop the
-/// entry; if the volume reports the object gone, drop the entry; if
-/// the volume is still absent, or the object cannot be reached, keep
-/// it. Returns what is still pending.
-pub(crate) fn retry_pending(conn: &Connection, ids: &Ids) -> Result<Vec<PendingStrip>> {
-    // Only volumes attached to this machine are looked at: this runs
-    // at every session start, and must not contact a file server.
+/// Look at every pending strip again.
+///
+/// One on a volume of this machine is looked for by its file id among
+/// the volumes that are present: found, the ACEs come off the object
+/// wherever it is now, and only then the entry goes; the volume
+/// reporting that no such object exists, the entry goes; the volume
+/// still away, or the object not reachable, it stays. Nothing else
+/// removes an entry — a volume that will never return is given up
+/// only by [`drop_pending`], on request.
+///
+/// One on a network share cannot be looked for by id. It is tried at
+/// its recorded path, and only when `probe_network` is set — an
+/// explicit `forget` or uninstall — because trying contacts the
+/// server: never at a session start.
+///
+/// Returns what is still pending.
+pub(crate) fn retry_pending(
+    conn: &Connection,
+    ids: &Ids,
+    probe_network: bool,
+) -> Result<Vec<PendingStrip>> {
     retry_pending_with(
         read_marker()?.pending,
-        path_id::locate_by_file_id_local,
+        |p| {
+            if !on_network(&p.path) {
+                path_id::locate_by_file_id_local(&p.file_id)
+            } else if probe_network
+                && path_id::capture_file_id(&p.path).is_ok_and(|now| now == p.file_id)
+            {
+                Located::At(p.path.clone())
+            } else {
+                Located::VolumeAbsent
+            }
+        },
         |p, at| {
             // The ACEs name the group that was installed when the grant
             // was made, which may not be the one installed now.
@@ -1187,14 +1320,14 @@ pub(crate) fn retry_pending(conn: &Connection, ids: &Ids) -> Result<Vec<PendingS
 /// what stays pending, and whether the list changed.
 fn retry_pending_with(
     pending: Vec<PendingStrip>,
-    locate: impl Fn(&FileId) -> Located,
+    locate: impl Fn(&PendingStrip) -> Located,
     strip: impl Fn(&PendingStrip, &str) -> Result<()>,
 ) -> Result<(Vec<PendingStrip>, bool)> {
     let before = pending.len();
     let mut left = Vec::new();
     for p in pending {
-        match whereabouts(locate(&p.file_id)) {
-            Whereabouts::Moved(at) => {
+        match locate(&p) {
+            Located::At(at) => {
                 if let Err(e) = strip(&p, &at) {
                     eprintln!(
                         "srt-win: WARNING: the kept grant on '{at}' (forgotten while its \
@@ -1203,12 +1336,48 @@ fn retry_pending_with(
                     left.push(p);
                 }
             }
-            Whereabouts::Gone => {}
-            Whereabouts::VolumeAbsent | Whereabouts::Unknown => left.push(p),
+            Located::Gone => {}
+            Located::VolumeAbsent | Located::Unknown => left.push(p),
         }
     }
     let changed = left.len() != before;
     Ok((left, changed))
+}
+
+/// Give up the pending strips recorded for `paths`: the deliberate way
+/// to stop waiting for a volume that will not return (reformatted,
+/// discarded). Nothing is written anywhere but the list. The entries
+/// dropped are returned, so the caller can say what is being
+/// abandoned; a path with no pending entry is an error and drops
+/// nothing.
+pub fn drop_pending(paths: &[String]) -> Result<Vec<PendingStrip>> {
+    let pending = read_marker()?.pending;
+    let named = |p: &PendingStrip| {
+        paths.iter().any(|want| {
+            let want = want.trim_end_matches('\\');
+            let have = p.path.trim_end_matches('\\');
+            have.eq_ignore_ascii_case(want)
+                || have
+                    .strip_prefix(r"\\?\")
+                    .is_some_and(|h| h.eq_ignore_ascii_case(want))
+        })
+    };
+    for want in paths {
+        if !pending.iter().any(|p| {
+            named(p) && {
+                let w = want.trim_end_matches('\\');
+                let h = p.path.trim_end_matches('\\');
+                h.eq_ignore_ascii_case(w)
+                    || h.strip_prefix(r"\\?\")
+                        .is_some_and(|h| h.eq_ignore_ascii_case(w))
+            }
+        }) {
+            bail!("no kept grant is waiting for a volume at '{want}'");
+        }
+    }
+    let (dropped, left): (Vec<_>, Vec<_>) = pending.into_iter().partition(named);
+    write_pending(&left)?;
+    Ok(dropped)
 }
 
 /// `acl forget`: remove the persistent grants of `roots` (canonical
@@ -1226,7 +1395,8 @@ pub fn forget(
 ) -> Result<Vec<(String, Forgot)>> {
     let conn = db.conn();
     // First the grants forgotten earlier whose volume was absent.
-    let still_pending = retry_pending(conn, ids)?;
+    // An explicit request: one on a share is tried at its path too.
+    let still_pending = retry_pending(conn, ids, true)?;
     let mut targets: Vec<String> = roots.to_vec();
     if all {
         targets.extend(read_marker()?.roots.into_iter().map(|r| r.path));
@@ -1265,29 +1435,48 @@ pub fn forget_everything() -> Result<Forgotten> {
 }
 
 /// What the half of `srt-win uninstall` that runs as the calling user
-/// does once the elevated half has returned `elevated_exit`.
+/// does once the elevated half has returned.
 ///
 /// The calling user's grants name the sandbox group, and their records
 /// are the calling user's own (their registry hive, their session
 /// database), which an elevated process running as another account
-/// cannot reach. So they are forgotten here, by the caller — but only
-/// AFTER the elevated removal has succeeded: a declined or failed
-/// elevation must leave the machine exactly as it was, grants and
-/// their records included. The group's SID is read before the hop, so
-/// its ACEs can still be recognised once the group is gone.
+/// cannot reach. So ONLY this half forgets them — the elevated step
+/// removes the machine-wide install and nothing else — and it does so
+/// by what is true afterwards, not by the elevated step's exit code
+/// alone:
+///
+/// - the install record is still there: the account and group were
+///   not removed (the prompt was declined, or the step failed before
+///   it got that far). The grants are still what a session runs on;
+///   nothing of the caller's is touched.
+/// - the install record is gone: the account and group are removed,
+///   whether or not the step then reported a failure of something
+///   else. The grants are forgotten, always — otherwise they would
+///   name a group that no longer exists, and after a reinstall would
+///   no longer be recognised by the new group's SID.
+///
+/// The group's SID is read before the hop, so its ACEs can still be
+/// recognised once the group is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterElevation {
-    /// The elevated removal succeeded: forget the caller's grants.
-    ForgetGrants,
-    /// It did not run or did not succeed: change nothing, exit with
-    /// this code.
+    /// The install is gone: forget the caller's grants. `step_failed`
+    /// is the elevated step's exit code if it was not 0 — it removed
+    /// the account and then failed at something else.
+    ForgetGrants { step_failed: Option<i32> },
+    /// The install is still there: change nothing of the caller's,
+    /// exit with this code.
     LeaveEverything(i32),
 }
 
-pub fn after_elevation(elevated_exit: i32) -> AfterElevation {
-    match elevated_exit {
-        0 => AfterElevation::ForgetGrants,
-        code => AfterElevation::LeaveEverything(code),
+pub fn after_elevation(elevated_exit: i32, install_record_present: bool) -> AfterElevation {
+    if install_record_present {
+        // Not removed. An exit of 0 with the record still there is not
+        // a clean removal either.
+        AfterElevation::LeaveEverything(if elevated_exit == 0 { 1 } else { elevated_exit })
+    } else {
+        AfterElevation::ForgetGrants {
+            step_failed: (elevated_exit != 0).then_some(elevated_exit),
+        }
     }
 }
 
@@ -1344,7 +1533,7 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Forgotten> {
 /// be read: "could not look" is not "no grant there".
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
     // A grant forgotten while its volume was absent, and back now.
-    retry_pending(db.conn(), &Ids::load()?)?;
+    retry_pending(db.conn(), &Ids::load()?, false)?;
     if let Some(why) = write_grant_block_reason() {
         bail!(
             "{why}; grants for the ordinary token are refused until `srt-win acl forget \
@@ -1474,12 +1663,32 @@ mod tests {
 
     #[test]
     fn uninstall_forgets_grants_only_after_the_elevated_removal_succeeded() {
-        assert_eq!(after_elevation(0), AfterElevation::ForgetGrants);
-        // A declined prompt (10), a failed removal, a crash: nothing
-        // of the caller's is touched, and the code is passed on.
-        for code in [10, 1, 2, -1, 259] {
-            assert_eq!(after_elevation(code), AfterElevation::LeaveEverything(code));
+        // The install is gone: the grants are forgotten, whatever the
+        // elevated step's exit code — it removed the account, and may
+        // have failed at something after that.
+        assert_eq!(
+            after_elevation(0, false),
+            AfterElevation::ForgetGrants { step_failed: None }
+        );
+        for code in [1, 2, 23, -1, 259] {
+            assert_eq!(
+                after_elevation(code, false),
+                AfterElevation::ForgetGrants {
+                    step_failed: Some(code)
+                }
+            );
         }
+        // The install is still there — a declined prompt (10), a step
+        // that failed before removing the account: nothing of the
+        // caller's is touched, and the code is passed on.
+        for code in [10, 1, 2, -1, 259] {
+            assert_eq!(
+                after_elevation(code, true),
+                AfterElevation::LeaveEverything(code)
+            );
+        }
+        // "Succeeded" with the account still there is not a removal.
+        assert_eq!(after_elevation(0, true), AfterElevation::LeaveEverything(1));
     }
 
     #[test]
@@ -1537,7 +1746,7 @@ mod tests {
         // 1: volume still absent. 2: back, at a new path. 3: the
         // volume is back and reports the object gone. 4: cannot be
         // established.
-        let locate = |f: &FileId| match f.as_bytes()[0] {
+        let locate = |p: &PendingStrip| match p.file_id.as_bytes()[0] {
             1 => Located::VolumeAbsent,
             2 => Located::At(r"\\?\F:\moved".to_owned()),
             3 => Located::Gone,
@@ -1564,17 +1773,67 @@ mod tests {
             retry_pending_with(vec![entry(1)], locate, |_, _| unreachable!()).unwrap();
         assert_eq!((left, changed), (vec![entry(1)], false));
 
-        // What removing a record's ACEs takes, by where the object is.
-        assert_eq!(whereabouts(Located::Gone), Whereabouts::Gone);
-        assert_eq!(
-            whereabouts(Located::VolumeAbsent),
-            Whereabouts::VolumeAbsent
-        );
-        assert_eq!(whereabouts(Located::Unknown), Whereabouts::Unknown);
-        assert_eq!(
-            whereabouts(Located::At("p".into())),
-            Whereabouts::Moved("p".into())
-        );
+        // The table: what removing a record's ACEs takes.
+        use AtPath::{Another, Nothing, Recorded, Unavailable};
+        let at = || Located::At("p".into());
+        let cases: [(AtPath, Located, bool, Disposition); 16] = [
+            // The path leads to the object: nothing else is asked.
+            (Recorded, Located::Unknown, false, Disposition::StripHere),
+            (
+                Recorded,
+                Located::VolumeAbsent,
+                true,
+                Disposition::StripHere,
+            ),
+            // Not at its path, on a volume that is there: by file id.
+            (Nothing, at(), false, Disposition::StripAt("p".into())),
+            (Another, at(), false, Disposition::StripAt("p".into())),
+            (Nothing, Located::Gone, false, Disposition::Drop),
+            (Another, Located::Gone, true, Disposition::Drop),
+            (Nothing, Located::Unknown, false, Disposition::Fail),
+            (Another, Located::Unknown, false, Disposition::Fail),
+            // Its volume is not among those present: the drive letter
+            // names nothing, or another volume.
+            (Nothing, Located::VolumeAbsent, false, Disposition::Pending),
+            (Another, Located::VolumeAbsent, false, Disposition::Pending),
+            // The volume is there by name and cannot be reached: no
+            // media, locked, not connected, the server away.
+            (
+                Unavailable,
+                Located::VolumeAbsent,
+                false,
+                Disposition::Pending,
+            ),
+            (Unavailable, Located::Unknown, false, Disposition::Pending),
+            (
+                Unavailable,
+                Located::VolumeAbsent,
+                true,
+                Disposition::Pending,
+            ),
+            (Unavailable, at(), false, Disposition::StripAt("p".into())),
+            // A share that answers, with the object not where it was:
+            // it cannot be looked for by id there.
+            (Nothing, Located::VolumeAbsent, true, Disposition::Fail),
+            (Another, Located::VolumeAbsent, true, Disposition::Fail),
+        ];
+        for (at_path, located, network, want) in cases {
+            let asked = std::cell::Cell::new(false);
+            let got = disposition(
+                at_path,
+                || {
+                    asked.set(true);
+                    located.clone()
+                },
+                network,
+            );
+            assert_eq!(got, want, "{at_path:?} / {located:?} / network={network}");
+            assert_eq!(
+                asked.get(),
+                at_path != Recorded,
+                "{at_path:?}: looked up by id"
+            );
+        }
     }
 
     #[test]

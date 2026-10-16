@@ -1206,6 +1206,12 @@ pub struct PersistentTrustees<'a> {
     pub group_sid: Option<&'a str>,
     /// The user the broker runs as.
     pub real_user_sid: &'a str,
+    /// Sandbox groups of earlier installs that kept grants were made
+    /// for and may still name (the marker's record of them): their
+    /// ACEs are ours to remove like the current group's. A reinstall
+    /// gives the group a new SID, and what an uninstall could not
+    /// take off would otherwise never be recognised again.
+    pub previous_group_sids: &'a [String],
 }
 
 /// What the profile read grant (`crate::profile`) allows on a path.
@@ -1228,6 +1234,7 @@ pub enum ProfileAce {
 /// for themselves (full control, say) is never taken for one of ours.
 pub fn is_persistent_ace(a: &AceView, t: &PersistentTrustees<'_>) -> bool {
     t.group_sid == Some(a.sid.as_str())
+        || t.previous_group_sids.contains(&a.sid)
         || crate::persist::is_capability_sid(&a.sid)
         || (!a.deny && a.sid == SID_OWNER_RIGHTS && a.mask == Mask::READ_CONTROL.bits())
         || (!a.deny && a.sid == t.real_user_sid && a.mask == Mask::OWNER_IMPLICIT.bits())
@@ -1602,6 +1609,7 @@ mod tests {
     const T: PersistentTrustees<'static> = PersistentTrustees {
         group_sid: Some(GROUP),
         real_user_sid: REAL,
+        previous_group_sids: &[],
     };
 
     fn root_want<'a>(cap: &'a str) -> PersistentWant<'a> {
@@ -1814,6 +1822,7 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
+            previous_group_sids: &[],
         };
         let dir = std::env::temp_dir().join(format!("srtwin-persist-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1949,6 +1958,7 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
+            previous_group_sids: &[],
         };
         let cap = crate::persist::new_capability_sid().unwrap();
         let base = std::env::temp_dir().join(format!("srtwin-canon-{}", std::process::id()));
@@ -2072,6 +2082,7 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
+            previous_group_sids: &[],
         };
         let cap = crate::persist::new_capability_sid().unwrap();
         let root = persistent_aces(&PersistentWant {
@@ -2217,6 +2228,36 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Entries naming the group of an earlier install are recognised
+    /// as ours when the marker still lists that group.
+    #[test]
+    fn entries_of_a_previous_group_are_ours_to_remove() {
+        let old = "S-1-5-21-1-2-3-1001".to_owned();
+        let ace = |sid: &str, deny: bool| AceView {
+            deny,
+            sid: sid.to_owned(),
+            mask: 0x1200a9,
+            flags: 3,
+            inherited: false,
+        };
+        let previous = [old.clone()];
+        let with = PersistentTrustees {
+            group_sid: Some("S-1-5-21-1-2-3-2002"),
+            real_user_sid: "S-1-5-21-9-9-9-500",
+            previous_group_sids: &previous,
+        };
+        let without = PersistentTrustees {
+            previous_group_sids: &[],
+            ..with
+        };
+        for deny in [false, true] {
+            assert!(is_persistent_ace(&ace(&old, deny), &with));
+            assert!(!is_persistent_ace(&ace(&old, deny), &without));
+            assert!(is_persistent_ace(&ace("S-1-5-21-1-2-3-2002", deny), &with));
+            assert!(!is_persistent_ace(&ace("S-1-5-32-545", deny), &with));
+        }
+    }
+
     /// A session's deny for the sandbox user stays in front of the
     /// group's allow, whichever of the two is written last, and
     /// removing the group's ACEs leaves it.
@@ -2230,6 +2271,7 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
+            previous_group_sids: &[],
         };
         let want = persistent_aces(&PersistentWant {
             group_sid: GROUP,

@@ -156,6 +156,12 @@ enum Cmd {
         /// unit).
         #[arg(long)]
         keep_user: bool,
+        /// Set by `uninstall` itself on the elevated process it
+        /// starts: do the machine-wide removal only. The grants kept
+        /// for the calling user are that user's to forget, in the
+        /// process that asked.
+        #[arg(long, hide = true)]
+        elevated_step: bool,
     },
     /// Print `{user: <user-status>, wfp: <wfp-status>}` as one line
     /// of JSON — the same objects `user status` and `wfp status`
@@ -599,6 +605,15 @@ enum AclCmd {
         /// one of this process id is running on a kept grant.
         #[arg(long, value_name = "PID")]
         unless_held_by_others: Option<u32>,
+        /// Stop waiting for the volume of a grant that `forget`
+        /// reported as pending, and drop its record: for a volume that
+        /// will not come back (reformatted, discarded). The entries on
+        /// that object are NOT removed — it cannot be reached — and
+        /// nothing will remove them later; the command says so, with
+        /// the group they name. Nothing else ever drops a pending
+        /// record. Repeatable; an unknown path is an error.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["all", "roots"])]
+        drop_pending: Vec<String>,
         /// The roots to forget.
         #[arg(value_name = "PATH")]
         roots: Vec<String>,
@@ -1298,30 +1313,50 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Uninstall {
             sublayer_guid,
             keep_user,
+            elevated_step,
         } => {
-            // The calling user's kept grants go with the account —
-            // AFTER the elevated removal has succeeded, never before
-            // (`persist::after_elevation`): a declined or failed
-            // elevation leaves everything as it was. What they need
-            // from the install record, the group's SID, is read now,
-            // while the record is still there.
-            let ids = if keep_user {
+            // Two halves (`persist::after_elevation`). The elevated
+            // one removes the machine-wide install and nothing else.
+            // The calling user's kept grants are forgotten by the
+            // calling user's own process — this one, unless it is the
+            // elevated step of another — and only once the install is
+            // really gone. What that needs from the install record,
+            // the group's SID, is read now, while the record is there.
+            let ids = if keep_user || elevated_step {
                 None
             } else {
                 srt_win::persist::Ids::load().ok()
             };
-            if let Some(code) = maybe_self_elevate(args)? {
+            let mut for_step: Vec<OsString> = args.to_vec();
+            for_step.push("--elevated-step".into());
+            if !elevated_step && let Some(code) = maybe_self_elevate(&for_step)? {
                 use srt_win::persist::{AfterElevation, after_elevation};
-                match after_elevation(code) {
+                if keep_user {
+                    // Nothing of the caller's goes with --keep-user.
+                    std::process::exit(code);
+                }
+                // By what is true now, not by the step's word alone.
+                let install_present = srt_win::install::read_setup()
+                    .map(|s| s.is_some())
+                    .unwrap_or(true);
+                match after_elevation(code, install_present) {
                     AfterElevation::LeaveEverything(code) => {
                         eprintln!(
-                            "srt-win: uninstall did not complete (exit {code}); nothing was \
-                             removed, and the grants kept for this user are unchanged"
+                            "srt-win: the elevated step did not remove the sandbox account \
+                             (exit {code}). The grants kept for this user are unchanged."
                         );
                         std::process::exit(code);
                     }
-                    AfterElevation::ForgetGrants => {
-                        std::process::exit(forget_grants_after_removal(ids.as_ref(), keep_user));
+                    AfterElevation::ForgetGrants { step_failed } => {
+                        if let Some(code) = step_failed {
+                            eprintln!(
+                                "srt-win: the elevated step removed the sandbox account and \
+                                 then reported a failure (exit {code}); the grants kept for \
+                                 this user are removed all the same."
+                            );
+                        }
+                        let forgot = forget_grants_after_removal(ids.as_ref(), keep_user);
+                        std::process::exit(step_failed.unwrap_or(forgot));
                     }
                 }
             }
@@ -1382,11 +1417,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotent on already-absent.
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
-            // Already elevated, so no hop: this process is also the
-            // calling user's half.
-            let code = forget_grants_after_removal(ids.as_ref(), keep_user);
-            if code != 0 {
-                std::process::exit(code);
+            // Started elevated by the user, so no hop: this process is
+            // also the calling user's half. As the elevated step of
+            // another process it is not: that process forgets.
+            if !elevated_step {
+                let code = forget_grants_after_removal(ids.as_ref(), keep_user);
+                if code != 0 {
+                    std::process::exit(code);
+                }
             }
         }
 
@@ -1815,10 +1853,44 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     all,
                     json,
                     unless_held_by_others,
+                    drop_pending,
                     roots,
                 },
         } => {
             use srt_win::{path_id, persist, state_db};
+            if !drop_pending.is_empty() {
+                let holder = state_db::HolderPid(std::process::id());
+                let (dropped, _) = state_db::with_init_lock(holder, false, |_| {
+                    persist::drop_pending(&drop_pending)
+                })?;
+                for p in &dropped {
+                    eprintln!(
+                        "srt-win: no longer waiting for the volume of '{}'. The entries the \
+                         kept grant wrote on that object (for the group {}) were NOT removed \
+                         and will not be: if the volume is ever attached again, they are \
+                         still on it.",
+                        p.path,
+                        if p.group_sid.is_empty() {
+                            "that was installed then"
+                        } else {
+                            p.group_sid.as_str()
+                        },
+                    );
+                }
+                if json {
+                    let entries: Vec<AceReleaseEntry> = dropped
+                        .iter()
+                        .map(|p| AceReleaseEntry {
+                            path: p.path.clone(),
+                            status: "abandoned",
+                        })
+                        .collect();
+                    serde_json::to_writer(std::io::stdout(), &entries)
+                        .context("write --json forget result")?;
+                    println!();
+                }
+                return Ok(());
+            }
             if !all && roots.is_empty() {
                 return Err(anyhow!(
                     "acl forget: name the roots to forget, or pass --all"
@@ -2693,7 +2765,7 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
     if ok.is_err() {
         let err = unsafe { GetLastError() };
         if err == ERROR_CANCELLED {
-            eprintln!("srt-win: UAC prompt cancelled by user");
+            eprintln!("srt-win: UAC prompt cancelled by user; nothing was changed");
             std::process::exit(10);
         }
         return Err(anyhow::anyhow!(
@@ -3000,6 +3072,39 @@ mod tests {
         }
         // Either every root or the named ones.
         assert!(forget(&["srt-win", "acl", "forget", "--all", r"C:\a"]).is_err());
+        // Giving up a pending grant is its own request, by path.
+        match forget(&["srt-win", "acl", "forget", "--drop-pending", r"E:\w"]) {
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    drop_pending, all, ..
+                },
+            }) => {
+                assert!(!all);
+                assert_eq!(drop_pending, [r"E:\w"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        for mixed in [
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                "--all",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                r"C:\a",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &["srt-win", "acl", "forget", "--drop-pending"][..],
+        ] {
+            assert!(forget(mixed).is_err(), "{mixed:?}");
+        }
 
         // The deny lists ride in the same stdin document.
         let input: AclGrantInput = serde_json::from_str(

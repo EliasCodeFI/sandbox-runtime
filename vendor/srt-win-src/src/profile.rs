@@ -1129,17 +1129,33 @@ fn stamp(store: &Store<'_>, ids: &Ids, path: &str, node: &Node, created: bool) -
 /// that can be neither found at its path nor located by id is an
 /// error and stays recorded.
 fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
+    // The open error decides, by the one table
+    // (`path_id::classify_open_failure`): nothing there, the volume
+    // away for now, or a failure.
+    let mut unavailable = false;
     let here = match open_for_stamp(&r.path) {
         Ok(o) => Some(o),
-        Err(e) if path_id::is_not_found(&e) => None,
-        Err(e) => return Err(e),
+        Err(e) => match path_id::open_failure(&e) {
+            path_id::OpenFailure::NotFound => None,
+            path_id::OpenFailure::VolumeUnavailable => {
+                unavailable = true;
+                None
+            }
+            path_id::OpenFailure::Other => return Err(e),
+        },
     };
+    let network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
     let mut targets: Vec<(String, Opened)> = Vec::new();
     match (here, r.file_id) {
         (Some(o), Some(id)) if o.id == id => targets.push((r.path.clone(), o)),
         // Never opened after it was recorded: the path is all that
         // identifies it.
         (Some(o), None) => targets.push((r.path.clone(), o)),
+        (None, None) if unavailable => bail!(
+            "'{}' is on a volume that cannot be reached now, and nothing records which \
+             object it was; its entry may still be on disk",
+            r.path
+        ),
         (None, None) => {}
         (_, Some(id)) => match path_id::locate_by_file_id(&id) {
             Located::At(p) => {
@@ -1153,9 +1169,14 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
             // now: its entry waits there, listed with the kept grants
             // whose volume is gone, and comes off when the volume is
             // back (`persist::retry_pending`).
-            Located::VolumeAbsent
-                if path_id::is_drive_path(&r.path) && !path_id::on_network_drive(&r.path) =>
-            {
+            Located::VolumeAbsent | Located::Unknown if unavailable => {
+                persist::marker_add_pending(&[persist::PendingStrip {
+                    file_id: id,
+                    group_sid: ids.group_sid.clone().unwrap_or_default(),
+                    path: r.path.clone(),
+                }])?;
+            }
+            Located::VolumeAbsent if !network => {
                 persist::marker_add_pending(&[persist::PendingStrip {
                     file_id: id,
                     group_sid: ids.group_sid.clone().unwrap_or_default(),
@@ -1799,6 +1820,7 @@ mod tests {
             group_sid: Some(GROUP.to_owned()),
             sandbox_user_sid: None,
             real_user_sid: crate::sid::current_user_sid().unwrap(),
+            previous_group_sids: Vec::new(),
         }
     }
 
