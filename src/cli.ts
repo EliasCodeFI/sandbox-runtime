@@ -225,6 +225,7 @@ async function main(): Promise<void> {
           installWindowsSandboxAsync,
           resolveSrtWin,
           VENDORED_SRT_WIN_EXE,
+          WINDOWS_INSTALL_NETWORK_EFFECT,
         } = await import('./sandbox/windows-sandbox-utils.js')
         const range =
           typeof o.proxyPortRange === 'string'
@@ -270,8 +271,7 @@ async function main(): Promise<void> {
                   `${r.profileGrant.result.skipped.length} skipped)`
                 : `NOT applied — ${r.profileGrant?.reason ?? 'unknown'}`) +
               `\n\n` +
-              `No logout needed — the WFP filter keys on the dedicated ` +
-              `\`srt-sandbox\` user's SID, so your network is unaffected.`,
+              `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}`,
           )
         } catch (e) {
           console.error(`Error: ${(e as Error).message}`)

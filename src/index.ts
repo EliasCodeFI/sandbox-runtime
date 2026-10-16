@@ -119,6 +119,8 @@ export type {
   WindowsProfileGrantItem,
   WindowsInstallProfileGrant,
   WindowsProfileExclusionConflict,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
