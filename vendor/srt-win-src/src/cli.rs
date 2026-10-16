@@ -276,10 +276,11 @@ enum Cmd {
         /// The process whose session this command belongs to and
         /// which is recorded as a holder of the kept grants the
         /// command runs on (`acl grant --persistent --holder-pid`).
-        /// Without it, under `--write-restricted-token`, this process
-        /// records itself as the holder — of the profile read grant
-        /// and of each `--write-root` — until the command has exited,
-        /// so that neither is removed from under it
+        /// Checked: if that process is not alive or holds nothing —
+        /// or without the flag — this process, under
+        /// `--write-restricted-token`, records itself as the holder of
+        /// the profile read grant and of each `--write-root`, so that
+        /// neither is removed from under the command
         /// (`--unless-held-by-others`).
         #[arg(long = "held-by", value_name = "PID")]
         held_by: Option<u32>,
@@ -689,10 +690,13 @@ enum AclCmd {
         /// non-zero.
         #[arg(long)]
         json: bool,
-        /// Remove nothing, print `{"held_by": [{pid, kind, path}]}`
-        /// on stdout and exit 22, if a live session other than the
-        /// one of this process id is running on a kept grant.
-        #[arg(long, value_name = "PID")]
+        /// With `--all` only: remove nothing, print `{"held_by":
+        /// [{pid, kind, path}]}` on stdout and exit 22, if a live
+        /// session other than the one of this process id is running on
+        /// any kept write root. (Not offered for named roots: a hold
+        /// is recorded by path, a root is forgotten by the object it
+        /// is, and the two would have to be matched.)
+        #[arg(long, value_name = "PID", requires = "all")]
         unless_held_by_others: Option<u32>,
         /// Stop waiting for the volume of a grant that `forget`
         /// reported as pending, and drop its record: for a volume that
@@ -2338,8 +2342,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             use srt_win::{path_id, persist, state_db};
             if !drop_pending.is_empty() {
                 let holder = state_db::HolderPid(std::process::id());
-                let (dropped, _) = state_db::with_init_lock(holder, false, |_| {
-                    persist::drop_pending(&drop_pending)
+                let ids = persist::Ids::load()?;
+                let (dropped, _) = state_db::with_init_lock(holder, false, |db| {
+                    persist::drop_pending(db.conn(), &ids, &drop_pending)
                 })?;
                 for p in &dropped {
                     eprintln!(
@@ -2391,8 +2396,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     })
                     .collect();
                 if unless_held_by_others.is_some() {
-                    // The roots to be forgotten: all, or these.
-                    exit_if_held_by_others(db, Held::Roots(&targets))?;
+                    exit_if_held_by_others(db, Held::Roots)?;
                 }
                 persist::forget(db, &ids, &targets, all)
             })?;
@@ -2617,27 +2621,68 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             let ids = persist::Ids::load()?;
             let layout = profile::Layout::resolve(test_profile.as_deref())?;
+            // One grant or forget at a time, for the whole run — on a
+            // lock of its own. The init lock, which sessions and
+            // commands need, is taken for crash recovery and the look
+            // at live sessions here, and then per object written: a
+            // profile takes from half a minute to many minutes, and
+            // commands keep running meanwhile. A command that starts
+            // while the grant is half applied is covered by the order
+            // of the writes — every exclusion is denied before the
+            // first allow, and every path of the run is in the record
+            // before either — and a SESSION that starts meanwhile is
+            // refused: the record says "incomplete" until the run is
+            // done.
+            let _one_at_a_time = state_db::acquire_profile_lock()?;
             let holder = state_db::HolderPid(std::process::id());
-            let (report, _) = state_db::with_init_lock(holder, false, |db| {
-                profile::grant(
-                    &profile::Store::of(db.conn()),
-                    &ids,
-                    &layout,
-                    &exclude,
-                    replace_excludes,
-                    !quiet,
-                )
-            })?;
+            let (live_read_denies, _) =
+                state_db::with_init_lock(holder, false, |db| state_db::live_read_denies(db))?;
+            let conn = state_db::open_db()?;
+            let report = profile::grant(
+                &profile::Store::of(&conn),
+                &ids,
+                &layout,
+                &exclude,
+                replace_excludes,
+                !quiet,
+                &live_read_denies,
+            )?;
+            if !report.blocked_by.is_empty() {
+                for b in &report.blocked_by {
+                    eprintln!("srt-win: profile grant: {} ('{}')", b.reason, b.path);
+                }
+                eprintln!(
+                    "srt-win: error: profile grant: nothing was written. Sessions that deny \
+                     reading of paths this run would make readable are running; run it again \
+                     when they have ended."
+                );
+                if json {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+                std::process::exit(EXIT_GRANT_BLOCKED_BY_SESSION);
+            }
             for s in &report.skipped {
                 eprintln!("srt-win: profile grant: skipped '{}': {}", s.path, s.reason);
             }
-            for f in &report.failed {
-                eprintln!("srt-win: profile grant: FAILED '{}': {}", f.path, f.reason);
+            for (what, items) in [
+                ("not granted", &report.not_granted),
+                (
+                    "excluded, closed by its own access list",
+                    &report.self_closed,
+                ),
+                ("excluded, could not be examined", &report.unverifiable),
+                ("EXCLUDED BUT READABLE", &report.unprotected),
+                ("FAILED", &report.failed),
+            ] {
+                for i in items {
+                    eprintln!("srt-win: profile grant: {what}: '{}': {}", i.path, i.reason);
+                }
             }
             eprintln!(
                 "srt-win: profile grant — '{}': {} container(s), {} directory(ies) and {} \
-                 file(s) granted, {} excluded ({} created), {} skipped, {} failed; {} DACL \
-                 write(s), {} unchanged, {} stale removed; {} ms",
+                 file(s) granted, {} excluded ({} created), {} skipped, {} not granted, {} \
+                 exclusion(s) without a deny ({} of them readable to the sandbox account); \
+                 {} DACL write(s), {} unchanged, {} stale removed; {} ms",
                 report.profile,
                 report.containers,
                 report.granted,
@@ -2645,7 +2690,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 report.denied,
                 report.placeholders,
                 report.skipped.len(),
-                report.failed.len(),
+                report.not_granted.len(),
+                report.self_closed.len() + report.unverifiable.len() + report.unprotected.len(),
+                report.unprotected.len(),
                 report.writes,
                 report.unchanged,
                 report.removed,
@@ -2656,8 +2703,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             if !report.complete {
                 return Err(anyhow!(
-                    "profile grant: an excluded directory could not be denied, or a stale \
-                     entry could not be removed; the grant is recorded as incomplete"
+                    "profile grant: an entry of an earlier run could not be removed; the \
+                     grant is recorded as incomplete"
                 ));
             }
         }
@@ -2672,12 +2719,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let ids = persist::Ids::load()?;
             let holder =
                 state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
-            let (out, _) = state_db::with_init_lock(holder, false, |db| {
+            // As for the grant: one at a time on its own lock, the
+            // init lock for the look at live holders and then per
+            // object.
+            let _one_at_a_time = state_db::acquire_profile_lock()?;
+            state_db::with_init_lock(holder, false, |db| {
                 if unless_held_by_others.is_some() {
                     exit_if_held_by_others(db, Held::Profile)?;
                 }
-                profile::forget(&profile::Store::of(db.conn()), &ids)
+                Ok(())
             })?;
+            let conn = state_db::open_db()?;
+            let out = profile::forget(&profile::Store::of(&conn), &ids)?;
             eprintln!(
                 "srt-win: profile forget — {} path(s) cleared, {} carried nothing, {} empty \
                  directory(ies) removed{}",
@@ -2933,16 +2986,38 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // error (glob, canon-fail, apply-fail) FAILS the exec
             // rather than running the child with an incomplete deny
             // set.
-            // A command with no session holding the kept grants for it
-            // holds them itself while it runs. Not taking the hold is
-            // not running the command: without it the grant could be
-            // removed in the middle of it.
-            let kept_hold = if write_restricted_token && held_by.is_none() {
-                Some(KeptHold::take(&write_root).context("hold the kept grants for this command")?)
-            } else {
-                None
+            // The kept grants this command runs on must be held by a
+            // live process for as long as it runs, or another session
+            // could have them removed in the middle of it. The caller
+            // names the session that holds for it (`--held-by`); that
+            // is checked, not believed — a session whose holds were
+            // released while it goes on running is no holder. If
+            // nobody holds, this process does, for its own lifetime:
+            // the hold is not given back at exit but reaped, like any
+            // dead holder's, the next time the records are looked at,
+            // so it costs one acquisition of the init lock and none
+            // when a session holds.
+            let self_hold: Option<Vec<String>> = (write_restricted_token
+                && !held_by.is_some_and(srt_win::state_db::holds_profile))
+            .then(|| {
+                write_root
+                    .iter()
+                    .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+                    .map(|(canon, _)| canon)
+                    .collect()
+            });
+            let hold_for_self = |db: &srt_win::state_db::Locked| -> anyhow::Result<()> {
+                match &self_hold {
+                    Some(roots) => db.hold_kept(roots, Some(srt_win::state_db::KEPT_PROFILE_PATH)),
+                    None => Ok(()),
+                }
             };
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
+                if self_hold.is_some() {
+                    let own = srt_win::state_db::HolderPid(std::process::id());
+                    srt_win::state_db::with_init_lock(own, false, |db| hold_for_self(db))
+                        .context("hold the kept grants for this command")?;
+                }
                 None
             } else {
                 use srt_win::{acl, state_db};
@@ -2953,6 +3028,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .map(|(canon, _)| canon)
                     .collect();
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
+                    // The same acquisition takes the hold.
+                    hold_for_self(db)?;
                     let at = canonicalize_ace_targets(
                         db,
                         "deny",
@@ -3053,7 +3130,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                     );
                     drop(per_exec_guard);
-                    drop(kept_hold);
                     std::process::exit(16);
                 }
             };
@@ -3062,7 +3138,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // per-exec restore guard's Drop must be explicit
             // BEFORE it.
             drop(per_exec_guard);
-            drop(kept_hold);
             std::process::exit(code as i32);
         }
     }
@@ -3192,6 +3267,10 @@ fn require_elevated() -> anyhow::Result<()> {
     }
 }
 
+/// Exit code of `profile grant` when live sessions deny reading of
+/// paths it would newly allow: nothing was written.
+const EXIT_GRANT_BLOCKED_BY_SESSION: i32 = 24;
+
 /// Exit code of `acl forget` / `profile forget` with
 /// `--unless-held-by-others` when another live session runs on a kept
 /// grant: nothing was removed.
@@ -3199,45 +3278,11 @@ const EXIT_HELD_BY_OTHERS: i32 = 22;
 
 /// Which kept grant a removal is about.
 #[derive(Clone, Copy)]
-enum Held<'a> {
+enum Held {
     /// The profile read grant.
     Profile,
-    /// These kept write roots (canonical); every one if empty.
-    Roots(&'a [String]),
-}
-
-/// A sandboxed command's own hold on the kept grants it runs on, for
-/// one `exec` with no session holding for it: taken before the child
-/// starts, given back when it has exited. Crash recovery gives it back
-/// if this process dies first.
-struct KeptHold(srt_win::state_db::HolderPid);
-
-impl KeptHold {
-    fn take(write_roots: &[String]) -> anyhow::Result<Self> {
-        use srt_win::state_db;
-        let own = state_db::HolderPid(std::process::id());
-        let roots: Vec<String> = write_roots
-            .iter()
-            .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
-            .map(|(canon, _)| canon)
-            .collect();
-        state_db::with_init_lock(own, false, |db| {
-            db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))
-        })?;
-        Ok(Self(own))
-    }
-}
-
-impl Drop for KeptHold {
-    fn drop(&mut self) {
-        if let Err(e) = srt_win::state_db::with_init_lock(self.0, false, |db| db.release_kept()) {
-            eprintln!(
-                "srt-win: WARNING: this command's hold on the kept grants was not released \
-                 ({e:#}); it is dropped once pid {} is gone",
-                self.0.0
-            );
-        }
-    }
+    /// The kept write roots, all of them.
+    Roots,
 }
 
 /// Under the init lock, after crash recovery has dropped the holds of
@@ -3247,7 +3292,7 @@ impl Drop for KeptHold {
 /// before anything is removed. Removing the grant would take the
 /// working directory, or the profile, away from under that session's
 /// commands.
-fn exit_if_held_by_others(db: &srt_win::state_db::Locked, what: Held<'_>) -> anyhow::Result<()> {
+fn exit_if_held_by_others(db: &srt_win::state_db::Locked, what: Held) -> anyhow::Result<()> {
     use srt_win::state_db::{KIND_KEPT_PROFILE, KIND_KEPT_ROOT};
     // Only the holds on what is about to be removed count: a session
     // that reads the profile through the grant does not keep another
@@ -3257,10 +3302,7 @@ fn exit_if_held_by_others(db: &srt_win::state_db::Locked, what: Held<'_>) -> any
         .into_iter()
         .filter(|h| match what {
             Held::Profile => h.kind == KIND_KEPT_PROFILE,
-            Held::Roots(roots) => {
-                h.kind == KIND_KEPT_ROOT
-                    && (roots.is_empty() || roots.iter().any(|r| r.eq_ignore_ascii_case(&h.path)))
-            }
+            Held::Roots => h.kind == KIND_KEPT_ROOT,
         })
         .collect();
     if held.is_empty() {

@@ -224,6 +224,13 @@ impl Drop for InitMutex {
 
 impl InitMutex {
     fn acquire() -> Result<Self> {
+        Self::acquire_file(".acl-init.lock")
+    }
+
+    /// The same kind of lock on another file of the session
+    /// directory: for a long operation that must not run twice at
+    /// once and must not keep the init lock while it runs.
+    fn acquire_file(name: &str) -> Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::{
             LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
@@ -232,7 +239,7 @@ impl InitMutex {
         let dir = session_store_dir()?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create_dir_all {}", dir.display()))?;
-        let path = dir.join(".acl-init.lock");
+        let path = dir.join(name);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -282,6 +289,59 @@ impl InitMutex {
 /// acquire the session init lock without opening the session DB.
 pub fn acquire_session_lock() -> Result<impl Drop> {
     InitMutex::acquire()
+}
+
+/// The lock a `profile grant` or `profile forget` holds for its whole
+/// run, so that two of them do not interleave. It is NOT the init
+/// lock: that one they take per object written, so that sessions and
+/// commands that need it wait for one DACL write at most, not for the
+/// walk of a profile.
+pub fn acquire_profile_lock() -> Result<impl Drop> {
+    InitMutex::acquire_file(".profile-grant.lock")
+}
+
+/// Whether the live process `pid` is recorded as a holder of the
+/// profile read grant — a session that registered at its start
+/// (`acl grant --persistent`) and has not released since. Read from
+/// the database without the init lock: it decides only whether a
+/// command takes a hold of its own, and a wrong "no" costs one hold
+/// too many.
+pub fn holds_profile(pid: u32) -> bool {
+    let Ok(Some(conn)) = open_db_ro() else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT b.process_create_time FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         WHERE h.pid = ?1 AND h.kind = ?2",
+        params![pid as i64, KIND_KEPT_PROFILE],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some_and(|created| (DISK.alive)(pid, created))
+}
+
+/// The read denies live sessions hold, as `(holder process, path)`:
+/// what a profile grant must not write a new allow beneath. Call under
+/// the init lock, after crash recovery has dropped the rows of holders
+/// that are gone.
+pub fn live_read_denies(db: &Locked) -> Result<Vec<(u32, String)>> {
+    let read_deny = SbAce::Deny(acl::DenyMask::ReadDeny);
+    let rows: Vec<(i64, i64, String)> = query_vec(
+        db.conn(),
+        "SELECT h.pid, b.process_create_time, h.canonical_path \
+         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         WHERE h.kind = ?1 AND h.want_mask = ?2 \
+         ORDER BY h.pid, h.canonical_path",
+        params![read_deny.kind(), read_deny.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|&(pid, ct, _)| (DISK.alive)(pid as u32, ct))
+        .map(|(pid, _, path)| (pid as u32, path))
+        .collect())
 }
 
 /// Open (creating if needed) the per-user SESSION DB. Stamps the
@@ -878,6 +938,21 @@ impl Locked {
                         witnesses.push(w);
                         true
                     }
+                    // A read deny that cannot be written on an object
+                    // whose own access list already gives the sandbox
+                    // account no read is what the deny asks for. One
+                    // that cannot be written where the account CAN
+                    // read fails the batch, as before.
+                    Err(_)
+                        if ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
+                            && crate::profile::closed_to_sandbox(canon) =>
+                    {
+                        eprintln!(
+                            "srt-win: '{canon}' cannot be given a read deny and is closed to \
+                             the sandbox account by its own access list"
+                        );
+                        false
+                    }
                     Err(e) => {
                         eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
                         failed += 1;
@@ -904,6 +979,9 @@ impl Locked {
                 match db.ensure_ace(canon, read_deny, sandbox_sid) {
                     Ok(w) => witnesses.push(w),
                     Err(e) if path_id::is_not_found(&e) => {}
+                    // Cannot be written, and its own access list
+                    // already gives the sandbox account no read.
+                    Err(_) if crate::profile::closed_to_sandbox(canon) => {}
                     Err(e) => {
                         eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
                         failed += 1;
@@ -1158,7 +1236,13 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
+    // The sandbox group, for the one place where a session's allow
+    // goes ahead of another entry of ours (`apply_sandbox_aces_over`).
+    let group = crate::install::read_setup()
+        .ok()
+        .flatten()
+        .map(|s| s.sandbox_group_sid);
+    acl::apply_sandbox_aces_over(canon, sandbox_sid, set, group.as_deref())
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 

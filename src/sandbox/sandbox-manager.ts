@@ -303,6 +303,23 @@ function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
 // ordinary token — the sandbox works, the profile is not readable.
 // `undefined` outside a Windows session.
 let windowsProfileRead: 'granted' | 'absent' | undefined
+// Windows: what the session has to tell its user about the profile
+// read grant it runs on (getWindowsProfileReadWarnings).
+let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+
+/** Something about the profile read grant that the user should be shown. */
+export interface WindowsProfileReadWarning {
+  /**
+   * `profile_exclusion_unprotected`: paths on the exclusion list that
+   * sandboxed commands can read all the same — by the paths' own
+   * access lists, which the user who made the grant may not change.
+   * The grant did not open them and cannot close them; their owner or
+   * an administrator can.
+   */
+  code: 'profile_exclusion_unprotected'
+  message: string
+  paths: { path: string; reason: string }[]
+}
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1225,6 +1242,7 @@ async function initializeSteps(
     // Under the ordinary token there is no grant: one that is found is
     // removed before anything else is granted.
     windowsProfileRead = 'absent'
+    windowsProfileReadWarnings = []
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
     >[1] = { exclusions: [], ungrantedOnly: [] }
@@ -1302,6 +1320,23 @@ async function initializeSteps(
         if (grant.state === 'current') {
           profileExclusions = grant
           windowsProfileRead = 'granted'
+          if (grant.unprotected.length > 0) {
+            const warning: WindowsProfileReadWarning = {
+              code: 'profile_exclusion_unprotected',
+              message:
+                `${grant.unprotected.length} path(s) on the exclusion list of ` +
+                `the profile read grant are readable to sandboxed commands ` +
+                `by their own access lists, which you may not change: ` +
+                grant.unprotected.map(u => u.path).join(', ') +
+                `. Their owner or an administrator can close them ` +
+                `(\`srt-win profile status\` lists them with the reason).`,
+              paths: grant.unprotected,
+            }
+            windowsProfileReadWarnings = [warning]
+            logForDebugging(`[Sandbox Windows] ${warning.message}`, {
+              level: 'warn',
+            })
+          }
         }
       }
       if (windowsProfileRead === 'absent') {
@@ -3071,13 +3106,6 @@ async function wrapWithSandboxArgv(
       // so: the session's own was required to at initialize(), and
       // one passed for this command, or used with no session, is
       // asked now.
-      if (perExecDenyRead.length > 0 && windowsWriteRestrictedToken) {
-        assertWindowsSrtWinCapable(
-          customConfig?.windows?.srtWin
-            ? resolveSrtWin(customConfig.windows.srtWin)
-            : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
-        )
-      }
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
@@ -3107,6 +3135,21 @@ async function wrapWithSandboxArgv(
         `Per-command windows.writeRestrictedToken is not supported — ` +
           `the egress fence is verified for the session's token shape ` +
           `at initialize(). Set it at the session level.`,
+      )
+    }
+    // Under the write-restricted token every command relies on its
+    // srt-win for more than running it: the read denies above, and
+    // being held (`--held-by`, or srt-win holding for the command
+    // itself). The session's own srt-win was required to do all of it
+    // at initialize(); one passed for this command, or used with no
+    // session behind it, is asked now — once per srt-win, so an older
+    // one is refused as outdated instead of failing on a flag it does
+    // not know.
+    if (writeRestrictedToken) {
+      assertWindowsSrtWinCapable(
+        customConfig?.windows?.srtWin
+          ? resolveSrtWin(customConfig.windows.srtWin)
+          : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
       )
     }
     registerCommandText(command, options)
@@ -3155,9 +3198,11 @@ async function wrapWithSandboxArgv(
       caCertPath: mitmCA?.trustBundlePath,
       writeRestrictedToken,
       // The session that holds the kept grants for this command:
-      // this process, once initialize() has registered it. A command
-      // with no session behind it names none, and srt-win holds for
-      // the length of the command itself.
+      // this process, once initialize() has registered it. srt-win
+      // checks that it really holds — an embedder that revoked the
+      // session's grants in the middle of it no longer does — and
+      // otherwise, as for a command with no session behind it, holds
+      // for the command itself.
       heldBy:
         writeRestrictedToken && windowsFsSbUserSid !== undefined
           ? process.pid
@@ -3427,6 +3472,7 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
   windowsProfileRead = undefined
+  windowsProfileReadWarnings = []
   windowsCapableSrtWin.clear()
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
@@ -3746,6 +3792,13 @@ export interface ISandboxManager {
    * profile is not readable. `undefined` outside a Windows session.
    */
   getWindowsProfileRead(): 'granted' | 'absent' | undefined
+  /**
+   * Windows: what the current session has to tell its user about the
+   * profile read grant — at present, excluded paths that sandboxed
+   * commands can read all the same. Empty when there is nothing, and
+   * outside a session. An embedding program shows these.
+   */
+  getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -3791,6 +3844,7 @@ export const SandboxManager: ISandboxManager = {
   reset,
   getMitmCA: () => mitmCA,
   getWindowsProfileRead: () => windowsProfileRead,
+  getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,

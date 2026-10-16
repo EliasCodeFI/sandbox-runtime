@@ -550,6 +550,7 @@ impl Ids {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
             previous_group_sids: &self.previous_group_sids,
+            sandbox_user_sid: self.sandbox_user_sid.as_deref(),
         }
     }
 }
@@ -1348,31 +1349,47 @@ fn retry_pending_with(
 /// to stop waiting for a volume that will not return (reformatted,
 /// discarded). Nothing is written anywhere but the list. The entries
 /// dropped are returned, so the caller can say what is being
-/// abandoned; a path with no pending entry is an error and drops
-/// nothing.
-pub fn drop_pending(paths: &[String]) -> Result<Vec<PendingStrip>> {
-    let pending = read_marker()?.pending;
-    let named = |p: &PendingStrip| {
-        paths.iter().any(|want| {
-            let want = want.trim_end_matches('\\');
-            let have = p.path.trim_end_matches('\\');
-            have.eq_ignore_ascii_case(want)
-                || have
-                    .strip_prefix(r"\\?\")
-                    .is_some_and(|h| h.eq_ignore_ascii_case(want))
-        })
+/// abandoned.
+///
+/// Only an entry whose volume really is absent can be given up. First
+/// everything that can be removed is ([`retry_pending`]); an entry
+/// that is then still pending while its volume is present — by the
+/// same enumeration of volumes everything else uses, or, on a share,
+/// by its path answering — is live on a reachable object: it is not
+/// dropped, and the call fails saying so. A path with no pending
+/// entry is an error too. Either way nothing is dropped.
+pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Vec<PendingStrip>> {
+    let pending = retry_pending(conn, ids, true)?;
+    let names = |p: &PendingStrip, want: &str| {
+        let want = want.trim_end_matches('\\');
+        let have = p.path.trim_end_matches('\\');
+        have.eq_ignore_ascii_case(want)
+            || have
+                .strip_prefix(r"\\?\")
+                .is_some_and(|h| h.eq_ignore_ascii_case(want))
     };
+    let named = |p: &PendingStrip| paths.iter().any(|want| names(p, want));
     for want in paths {
-        if !pending.iter().any(|p| {
-            named(p) && {
-                let w = want.trim_end_matches('\\');
-                let h = p.path.trim_end_matches('\\');
-                h.eq_ignore_ascii_case(w)
-                    || h.strip_prefix(r"\\?\")
-                        .is_some_and(|h| h.eq_ignore_ascii_case(w))
-            }
-        }) {
-            bail!("no kept grant is waiting for a volume at '{want}'");
+        if !pending.iter().any(|p| names(p, want)) {
+            bail!(
+                "no kept grant is waiting for a volume at '{want}' (what could be removed \
+                 has been)"
+            );
+        }
+    }
+    for p in pending.iter().filter(|p| named(p)) {
+        let reachable = if on_network(&p.path) {
+            path_id::capture_file_id(&p.path).is_ok()
+        } else {
+            path_id::volume_mounted(p.file_id.volume_serial)
+        };
+        if reachable {
+            bail!(
+                "the volume of '{}' is present, and its entries could not be removed just \
+                 now; they are live and are not given up. Run `srt-win acl forget --all` \
+                 for the reason",
+                p.path
+            );
         }
     }
     let (dropped, left): (Vec<_>, Vec<_>) = pending.into_iter().partition(named);

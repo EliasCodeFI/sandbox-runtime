@@ -1,5 +1,6 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
+export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
 export type {
   WrapWithSandboxOptions,
   SandboxInitializeOptions,

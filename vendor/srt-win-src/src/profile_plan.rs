@@ -835,14 +835,11 @@ pub enum LinkTarget {
     /// Inside the profile: the target's components beneath it (empty
     /// for the profile directory itself).
     Inside(Vec<String>),
-    /// Outside the profile, or not a redirection at all, with a word
-    /// about it. Nothing there is granted, so nothing follows.
+    /// Outside the profile, not a redirection at all, or a link whose
+    /// own data cannot be decoded, with a word about it. The link is
+    /// skipped — nothing is granted on or through it, and its parent
+    /// is a container — and no rule follows it.
     Elsewhere(String),
-    /// Where it leads could not be established: the link's data could
-    /// not be read or makes no sense, or the way there could not be
-    /// looked at. The rule it stands under may apply anywhere, so the
-    /// plan stops ([`plan_resolved`]) rather than grant around it.
-    Unreadable(String),
 }
 
 /// Why a link has no destination to follow ([`link_destination`]).
@@ -1104,9 +1101,9 @@ pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
 ///
 /// A link that leads to the profile directory itself from a place a
 /// rule covers would exclude the whole profile; that is an error, as
-/// is a chain of links longer than [`MAX_LINK_ROUNDS`], and a link
-/// whose destination cannot be established at all
-/// ([`LinkTarget::Unreadable`]).
+/// is a chain of links longer than [`MAX_LINK_ROUNDS`]. Nothing else
+/// about a link stops the plan: one that leads out of the profile, or
+/// whose data cannot be decoded, is skipped.
 pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, Rules), String> {
     let mut rules = rules.clone();
     for _ in 0..=MAX_LINK_ROUNDS {
@@ -1127,17 +1124,8 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
         let Found { nodes: out, hits } = found;
         let mut grew = false;
         for hit in hits {
-            let target = match tree.resolve_link(&hit.rel) {
-                LinkTarget::Inside(target) => target,
-                LinkTarget::Elsewhere(_) => continue,
-                LinkTarget::Unreadable(why) => {
-                    return Err(format!(
-                        "'{}' is a link that stands where an exclusion applies, and where it \
-                         leads could not be established ({why}); the profile cannot be \
-                         granted around it",
-                        hit.rel.join("\\")
-                    ));
-                }
+            let LinkTarget::Inside(target) = tree.resolve_link(&hit.rel) else {
+                continue;
             };
             if target.is_empty() {
                 return Err(format!(
@@ -1390,6 +1378,15 @@ impl RecordedAllows {
         self.paths.is_empty()
     }
 
+    /// The recorded path that `path` itself is, if it is one.
+    pub fn at(&self, path: &str) -> Option<&str> {
+        let path = norm_path(path);
+        self.paths
+            .iter()
+            .find(|(_, p)| *p == path)
+            .map(|(recorded, _)| recorded.as_str())
+    }
+
     /// The recorded paths a read deny on `deny` has to be written on
     /// as well, for it to hold against the grant.
     ///
@@ -1439,7 +1436,8 @@ impl RecordedAllows {
 }
 
 /// [`RecordedAllows::covered`] for one deny and no session allows.
-pub fn covered_by_read_deny<'a>(
+#[cfg(test)]
+fn covered_by_read_deny<'a>(
     deny: &str,
     recorded: impl IntoIterator<Item = (&'a str, Kind)>,
 ) -> Vec<&'a str> {
@@ -1454,6 +1452,111 @@ pub fn covered_by_read_deny<'a>(
         .map(|(p, _)| p)
         .filter(|p| covered.iter().any(|c| c == p))
         .collect()
+}
+
+// ─── An exclusion whose deny cannot be written ─────────────────────────
+
+/// One entry of an object's access list, as far as it decides reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AceFact<'a> {
+    pub deny: bool,
+    pub sid: &'a str,
+    pub mask: u32,
+    /// The entry is a template for objects beneath and does not apply
+    /// to this object.
+    pub inherit_only: bool,
+}
+
+/// Groups every token of the sandbox account carries, besides its own
+/// SID and the sandbox group's: `Everyone`, `Authenticated Users`,
+/// `BUILTIN\Users` (the account is made a member).
+pub const SANDBOX_ALWAYS: [&str; 3] = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
+
+/// Groups its token carries depending on how it was logged on:
+/// `INTERACTIVE`, `BATCH`, `SERVICE`, `NETWORK`, `LOCAL`, `CONSOLE
+/// LOGON`, `This Organization`, `Local account`, `NTLM
+/// Authentication`.
+pub const SANDBOX_MAYBE: [&str; 9] = [
+    "S-1-5-4",
+    "S-1-5-3",
+    "S-1-5-6",
+    "S-1-5-2",
+    "S-1-2-0",
+    "S-1-2-1",
+    "S-1-5-15",
+    "S-1-5-113",
+    "S-1-5-64-10",
+];
+
+/// Read data / list directory, and the generic rights that include it.
+const READS: u32 = 0x1 | 0x8000_0000 | 0x1000_0000;
+
+/// Whether an object's own access list may let the sandbox account
+/// read it (a file's data, a directory's listing). `dacl` is the list
+/// in its order, explicit and inherited entries alike; `None` is an
+/// object with no access list at all, which everyone may read.
+/// `certain` are the SIDs the account's token always carries, `maybe`
+/// those it may carry.
+///
+/// The answer errs towards "may": an ALLOW counts for a SID the token
+/// may carry, a DENY only for one it certainly carries. Entries of
+/// kinds this does not model (object, callback, conditional) are not
+/// passed in at all; an access list that relies on them is read as
+/// what its plain entries say.
+pub fn may_read(dacl: Option<&[AceFact<'_>]>, certain: &[&str], maybe: &[&str]) -> bool {
+    let Some(dacl) = dacl else {
+        return true;
+    };
+    for ace in dacl
+        .iter()
+        .filter(|a| !a.inherit_only && a.mask & READS != 0)
+    {
+        let is_certain = certain.contains(&ace.sid);
+        if ace.deny && is_certain {
+            return false;
+        }
+        if !ace.deny && (is_certain || maybe.contains(&ace.sid)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// What an excluded path is, when the deny that marks it could not be
+/// written (the caller neither owns the object nor may change its
+/// access list).
+///
+/// The deny is the second layer. The first holds regardless: nothing
+/// above an exclusion carries an inheriting allow from the grant. So
+/// what remains to ask is whether the object lets the sandbox account
+/// in BY ITS OWN access list — which it then did before the grant too,
+/// and would without it: the grant's deny would have closed that, and
+/// cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unstamped {
+    /// Its own access list gives the sandbox account no read: closed
+    /// without the deny.
+    SelfClosed,
+    /// Its own access list lets the sandbox account read it, and that
+    /// cannot be changed from here. Reported, loudly; the grant is not
+    /// what opened it and cannot close it.
+    Unprotected,
+    /// The access list cannot even be read by the calling user, who
+    /// can therefore not use the object either. Unknown, and said so.
+    Unverifiable,
+}
+
+/// `dacl`: `Err` if the access list could not be read.
+pub fn unstamped_exclusion(
+    dacl: Result<Option<&[AceFact<'_>]>, ()>,
+    certain: &[&str],
+    maybe: &[&str],
+) -> Unstamped {
+    match dacl {
+        Err(()) => Unstamped::Unverifiable,
+        Ok(dacl) if may_read(dacl, certain, maybe) => Unstamped::Unprotected,
+        Ok(_) => Unstamped::SelfClosed,
+    }
 }
 
 // ─── Configuration pointers ─────────────────────────────────────────
@@ -1535,7 +1638,7 @@ mod tests {
         /// Link path → where it points: a path beneath the profile
         /// (`""` for the profile itself), or `None` for outside it.
         links: BTreeMap<String, Option<String>>,
-        /// Links whose destination cannot be established.
+        /// Links whose own data cannot be decoded.
         broken: Vec<String>,
     }
 
@@ -1620,7 +1723,7 @@ mod tests {
     impl Tree for Mem {
         fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
             if self.broken.contains(&rel.join("\\")) {
-                return LinkTarget::Unreadable("access denied".to_owned());
+                return LinkTarget::Elsewhere("its data cannot be decoded".to_owned());
             }
             match self.real(&rel.join("\\")) {
                 Some(real) => LinkTarget::Inside(split_path(&real)),
@@ -1985,7 +2088,7 @@ mod tests {
     /// A link whose target is not there yet, and one that cannot be
     /// read.
     #[test]
-    fn a_missing_link_target_is_still_protected_and_an_unreadable_link_stops_the_plan() {
+    fn a_missing_link_target_is_still_protected_and_an_undecodable_link_is_skipped() {
         // `.ssh` → `dotfiles\.ssh`, which does not exist; `dotfiles`
         // does. The rule lands there with the placeholder a missing
         // `.ssh` would get, and `dotfiles` is a container, not granted
@@ -2016,23 +2119,18 @@ mod tests {
         assert!(!kinds(&nodes).contains_key(r"dotfiles\.config\hub"));
         assert!(rules.excludes(&names(&split_path(r"dotfiles\.config\hub"))));
 
-        // A link where a rule points whose destination cannot be
-        // established: no plan, rather than one that grants around it.
+        // A link where a rule points whose own data cannot be decoded:
+        // skipped like any other link, in a parent that is a
+        // container. The rest of the profile is still granted — one
+        // unreadable link does not cost the user the whole grant.
         let mut t = Mem::default();
         t.add(r"dotfiles\.ssh\id").add(r"Documents\a.txt");
         t.link(".ssh", Some(r"dotfiles\.ssh"));
         t.broken.push(".ssh".to_owned());
-        let err = plan(&mut t, &super::tests::rules()).unwrap_err();
-        assert!(
-            err.contains(".ssh") && err.contains("could not be established"),
-            "{err}"
-        );
-        // The same link where no rule points is only skipped.
-        let mut t = Mem::default();
-        t.add(r"work\x");
-        t.link("shortcut", Some("work"));
-        t.broken.push("shortcut".to_owned());
-        assert!(plan(&mut t, &super::tests::rules()).is_ok());
+        let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
+        assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get("").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get("Documents").map(|v| v.0), Some(Kind::Granted));
     }
 
     /// A rule carried over to a link's target keeps the source rule's
@@ -3176,6 +3274,118 @@ mod tests {
             };
             assert_eq!(sorted(got), sorted(expect.clone()), "case: {name}");
         }
+    }
+
+    /// What an object's own access list lets the sandbox account do,
+    /// and so what an exclusion is whose deny could not be written.
+    #[test]
+    fn an_unwritable_exclusion_is_judged_by_its_own_access_list() {
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+        const GROUP: &str = "S-1-5-21-1-2-3-1002";
+        const OWNER: &str = "S-1-5-21-1-2-3-500";
+        const SYSTEM: &str = "S-1-5-18";
+        const ADMINS: &str = "S-1-5-32-544";
+        const RX: u32 = 0x1200a9;
+        const FULL: u32 = 0x1f01ff;
+        let certain: Vec<&str> = [USER, GROUP].into_iter().chain(SANDBOX_ALWAYS).collect();
+        let allow = |sid, mask| AceFact {
+            deny: false,
+            sid,
+            mask,
+            inherit_only: false,
+        };
+        let deny = |sid, mask| AceFact {
+            deny: true,
+            sid,
+            mask,
+            inherit_only: false,
+        };
+        let class =
+            |dacl: &[AceFact<'_>]| unstamped_exclusion(Ok(Some(dacl)), &certain, &SANDBOX_MAYBE);
+
+        // The usual profile object: the owner, SYSTEM, Administrators.
+        assert_eq!(
+            class(&[allow(OWNER, FULL), allow(SYSTEM, FULL), allow(ADMINS, FULL)]),
+            Unstamped::SelfClosed
+        );
+        // The directory of the first real failure: explicit denies of
+        // read for Everyone, Authenticated Users and Users, ahead of
+        // the owner's allow. Closed, also where Users is allowed
+        // further down.
+        assert_eq!(
+            class(&[
+                deny("S-1-1-0", RX),
+                deny("S-1-5-11", RX),
+                deny("S-1-5-32-545", RX),
+                allow(OWNER, FULL),
+                allow("S-1-5-32-545", RX),
+            ]),
+            Unstamped::SelfClosed
+        );
+        // The directory of the second: Everyone read, SYSTEM and
+        // Administrators full. Were it excluded, it would be open.
+        assert_eq!(
+            class(&[
+                allow("S-1-1-0", RX),
+                allow(SYSTEM, FULL),
+                allow(ADMINS, FULL)
+            ]),
+            Unstamped::Unprotected
+        );
+        // Every group the account is always in opens it; so does one
+        // it may be in; so does its own SID or the sandbox group's.
+        for sid in certain.iter().chain(&SANDBOX_MAYBE) {
+            assert_eq!(class(&[allow(sid, RX)]), Unstamped::Unprotected, "{sid}");
+        }
+        // The first entry that speaks of reading decides: an allow
+        // ahead of the deny opens, a deny ahead of the allow closes.
+        assert_eq!(
+            class(&[allow("S-1-5-32-545", RX), deny("S-1-1-0", RX)]),
+            Unstamped::Unprotected
+        );
+        assert_eq!(
+            class(&[deny(GROUP, 0x1), allow("S-1-1-0", FULL)]),
+            Unstamped::SelfClosed
+        );
+        // A deny for a group the account only MAY be in is not relied
+        // on; an allow for one is counted.
+        assert_eq!(
+            class(&[deny("S-1-5-4", RX), allow("S-1-1-0", RX)]),
+            Unstamped::Unprotected
+        );
+        // Entries that say nothing of reading, or apply only beneath,
+        // decide nothing.
+        assert_eq!(
+            class(&[
+                deny("S-1-1-0", 0x10000),
+                allow("S-1-1-0", 0x100080),
+                AceFact {
+                    inherit_only: true,
+                    ..allow("S-1-1-0", FULL)
+                },
+            ]),
+            Unstamped::SelfClosed
+        );
+        // Generic rights count as what they include.
+        assert_eq!(
+            class(&[allow("S-1-1-0", 0x8000_0000)]),
+            Unstamped::Unprotected
+        );
+        assert_eq!(
+            class(&[allow("S-1-5-11", 0x1000_0000)]),
+            Unstamped::Unprotected
+        );
+        // An empty access list admits nobody; none at all, everybody.
+        assert_eq!(class(&[]), Unstamped::SelfClosed);
+        assert_eq!(
+            unstamped_exclusion(Ok(None), &certain, &SANDBOX_MAYBE),
+            Unstamped::Unprotected
+        );
+        // An access list the caller cannot read is not judged.
+        assert_eq!(
+            unstamped_exclusion(Err(()), &certain, &SANDBOX_MAYBE),
+            Unstamped::Unverifiable
+        );
     }
 
     #[test]
