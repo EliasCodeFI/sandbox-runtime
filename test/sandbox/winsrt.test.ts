@@ -9,6 +9,7 @@ import {
   spyOn,
 } from 'bun:test'
 import * as child_process from 'node:child_process'
+import * as fs from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
@@ -259,8 +260,15 @@ function onOrdinaryToken(cfg: SandboxRuntimeConfig): SandboxRuntimeConfig {
 // What `srt-win profile status` prints for a current profile read
 // grant that touches none of the paths the rows use, for a mocked
 // `srt-win` that is asked.
+/** What an `srt-win` of this tree says it does. */
+const SRT_WIN_CAPABILITIES = [
+  'profile-deny-expansion',
+  'profile-session-grant-check',
+  'kept-grant-holders',
+]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
+  capabilities: SRT_WIN_CAPABILITIES,
   state: 'current',
   extra_exclusions: [],
   exclusions: ['Z:\\no-such-profile\\.ssh'],
@@ -505,6 +513,60 @@ async function bindOutOfRange(): Promise<BoundListener> {
 // Pure-JS object test — runs on all platforms. `srtWin.path` is
 // pointed at the test runner's own executable so binary resolution
 // passes its existence check on non-Windows hosts.
+/**
+ * Whether `argv` is one of the `srt-win` calls that can walk a tree,
+ * which the library makes without blocking: `acl grant --persistent`,
+ * `acl forget`, `profile forget`.
+ */
+function walksATree(argv: readonly string[]): boolean {
+  const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
+  return (
+    (own[0] === 'acl' &&
+      (own[1] === 'forget' ||
+        (own[1] === 'grant' && own.includes('--persistent')))) ||
+    (own[0] === 'profile' && own[1] === 'forget')
+  )
+}
+
+/**
+ * A fake child for an asynchronous `srt-win` call, answered by the
+ * test's `spawnSync` mock once its stdin has been written: the call
+ * is recorded and answered by the same code as a synchronous one, in
+ * the order the calls are made.
+ */
+function asyncChildAnsweredBySync(exe: string, argv: readonly string[]) {
+  const mkStream = () => {
+    const s = new EventEmitter() as EventEmitter & {
+      setEncoding(e: string): typeof s
+      end(d?: string): void
+    }
+    s.setEncoding = () => s
+    s.end = () => {}
+    return s
+  }
+  const child = Object.assign(new EventEmitter(), {
+    stdout: mkStream(),
+    stderr: mkStream(),
+    stdin: mkStream(),
+    kill: () => true,
+  })
+  child.stdin.end = (input?: string) => {
+    setImmediate(() => {
+      const r = child_process.spawnSync(exe, [...argv], {
+        input,
+      }) as unknown as {
+        status: number | null
+        stdout?: string
+        stderr?: string
+      }
+      if (r.stdout) child.stdout.emit('data', r.stdout)
+      if (r.stderr) child.stderr.emit('data', r.stderr)
+      child.emit('close', r.status, null)
+    })
+  }
+  return child
+}
+
 describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
   it('argv shape: srtWin.path → [path, --srt-win, exec, …]; --env overlay before --', () => {
     // Mirrors real usage: SandboxManager.initialize() resolves once
@@ -1632,6 +1694,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         realUserSid: 'S-1-5-21-3',
         caCertThumb: certThumbprint(readFileSync(CA_CERT, 'utf8')),
         caCertPem: readFileSync(CA_CERT, 'utf8'),
+        capabilities: SRT_WIN_CAPABILITIES,
       }),
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         target: '',
@@ -1651,6 +1714,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
       }),
       spyOn(winUtils, 'getWindowsProfileReadStatus').mockReturnValue({
         state: 'current',
+        capabilities: SRT_WIN_CAPABILITIES,
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
@@ -1669,15 +1733,17 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
       // The default: one call with all four lists. Recorded as the
       // grant and the stamp it stands for, each only when it has
       // something in it, as the two separate calls are made.
-      spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(o => {
-        expect(writeRestrictedToken).toBeUndefined()
-        if (o.read.length > 0 || o.write.length > 0) {
-          granted = { read: o.read, write: o.write }
-        }
-        if (o.denyRead.length > 0 || o.denyWrite.length > 0) {
-          stamped = { denyRead: o.denyRead, denyWrite: o.denyWrite }
-        }
-      }),
+      spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(
+        async o => {
+          expect(writeRestrictedToken).toBeUndefined()
+          if (o.read.length > 0 || o.write.length > 0) {
+            granted = { read: o.read, write: o.write }
+          }
+          if (o.denyRead.length > 0 || o.denyWrite.length > 0) {
+            stamped = { denyRead: o.denyRead, denyWrite: o.denyWrite }
+          }
+        },
+      ),
       spyOn(winUtils, 'revokeWindowsAclChecked').mockReturnValue({
         complete: true,
         outcomes: [],
@@ -2146,7 +2212,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ])
   })
 
-  it('grantWindowsAclPersistent: one acl grant --persistent with grants and denies on stdin; any non-zero exit throws', () => {
+  // These two walk a tree, so they are asynchronous; the fake child
+  // is answered by the same stub as a synchronous call.
+  const answerAsyncBySync = () =>
+    spawnSpy.mockImplementation(((exe: string, argv: readonly string[]) =>
+      asyncChildAnsweredBySync(exe, argv)) as never)
+
+  it('grantWindowsAclPersistent: one acl grant --persistent with grants and denies on stdin; any non-zero exit throws', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const opts = {
       sandboxUserSid: 'S-1-5-21-1',
@@ -2158,7 +2230,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       srtWin,
     }
     stubSpawn(() => ({ status: 0, stdout: '' }))
-    winUtils.grantWindowsAclPersistent(opts)
+    answerAsyncBySync()
+    const pending = winUtils.grantWindowsAclPersistent(opts)
+    // Not a blocking call: nothing has been spawned synchronously by
+    // the time it returns its promise.
+    expect(pending).toBeInstanceOf(Promise)
+    expect(spawnSyncSpy.mock.calls).toHaveLength(0)
+    await pending
     expect(spawnSyncSpy.mock.calls).toHaveLength(1)
     const [, argv, spawnOpts] = spawnSyncSpy.mock.calls[0] as [
       string,
@@ -2187,9 +2265,10 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       spawnSyncSpy.mockRestore()
       spawnSpy.mockRestore()
       stubSpawn(() => ({ status, stdout: '' }))
+      answerAsyncBySync()
       let thrown: unknown
       try {
-        winUtils.grantWindowsAclPersistent(opts)
+        await winUtils.grantWindowsAclPersistent(opts)
       } catch (e) {
         thrown = e
       }
@@ -2198,24 +2277,60 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('forgetWindowsPersistentGrants: acl forget --all; a non-zero exit throws acl_forget_failed', () => {
+  it('forgetWindowsPersistentGrants: acl forget --all, asynchronously; a non-zero exit throws acl_forget_failed, a held grant kept_grants_in_use', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     stubSpawn(() => ({ status: 0, stdout: '' }))
-    winUtils.forgetWindowsPersistentGrants({ srtWin })
+    answerAsyncBySync()
+    await winUtils.forgetWindowsPersistentGrants({ srtWin })
+    await winUtils.forgetWindowsPersistentGrants({
+      srtWin,
+      unlessHeldByOthers: 4242,
+    })
     expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [SRT_WIN_DISPATCH_ARG1, 'acl', 'forget', '--all'],
+      [
+        SRT_WIN_DISPATCH_ARG1,
+        'acl',
+        'forget',
+        '--all',
+        '--unless-held-by-others',
+        '4242',
+      ],
     ])
-    spawnSyncSpy.mockRestore()
-    spawnSpy.mockRestore()
-    stubSpawn(() => ({ status: 1, stdout: '' }))
-    let thrown: unknown
-    try {
-      winUtils.forgetWindowsPersistentGrants({ srtWin })
-    } catch (e) {
-      thrown = e
+    const failing = async (status: number, stdout: string) => {
+      spawnSyncSpy.mockRestore()
+      spawnSpy.mockRestore()
+      stubSpawn(() => ({ status, stdout }))
+      answerAsyncBySync()
+      try {
+        await winUtils.forgetWindowsPersistentGrants({
+          srtWin,
+          unlessHeldByOthers: 4242,
+        })
+      } catch (e) {
+        return e as WindowsSandboxError
+      }
+      throw new Error('expected a throw')
     }
-    expect(thrown).toBeInstanceOf(WindowsSandboxError)
-    expect((thrown as WindowsSandboxError).code).toBe('acl_forget_failed')
+    const failed = await failing(1, '')
+    expect(failed).toBeInstanceOf(WindowsSandboxError)
+    expect(failed.code).toBe('acl_forget_failed')
+    // Exit 22: another live session runs on a kept grant. Named in
+    // the message; a list that cannot be read changes nothing about
+    // the refusal.
+    const held = await failing(
+      22,
+      JSON.stringify({
+        held_by: [
+          { pid: 77, kind: 'kept_root', path: 'C:\\work\\repo' },
+          { pid: 78, kind: 'profile', path: 'C:\\Users\\me' },
+        ],
+      }),
+    )
+    expect(held.code).toBe('kept_grants_in_use')
+    expect(held.message).toContain('process 77 writes C:\\work\\repo')
+    expect(held.message).toContain('process 78 reads the profile')
+    expect((await failing(22, 'not json')).code).toBe('kept_grants_in_use')
   })
 
   it('user status: persistent_grants is surfaced unless it says "none"; an unknown state is not "none"', () => {
@@ -3457,6 +3572,8 @@ describe('Windows write-restricted token, the default: write roots are granted o
 
   /** What `user status` adds about kept grants; `undefined` = no field. */
   let persistentGrants: unknown
+  /** What `user status` says srt-win does; `undefined` = no field. */
+  let capabilities: string[] | undefined = SRT_WIN_CAPABILITIES
   /** `marker_version` / `setup_version` overrides for `user status`. */
   let setupVersions: { marker_version?: number; setup_version?: number }
   const stdoutFor = (argv: readonly string[]): string => {
@@ -3466,6 +3583,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
       ...(persistentGrants !== undefined && {
         persistent_grants: persistentGrants,
       }),
+      ...(capabilities !== undefined && { capabilities }),
     }
     return argv.includes('profile')
       ? CURRENT_PROFILE_GRANT
@@ -3491,6 +3609,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
 
   beforeEach(() => {
     persistentGrants = undefined
+    capabilities = SRT_WIN_CAPABILITIES
     setupVersions = {}
     acl = []
     aclResult = {}
@@ -3515,11 +3634,13 @@ describe('Windows write-restricted token, the default: write roots are granted o
         return verifyResult()
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Async spawns: `user status` / `status` at initialize().
+      // Async spawns: `user status` / `status` at initialize(), and
+      // the calls that can walk a tree, answered as the sync ones.
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
       ) => {
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -3811,7 +3932,30 @@ describe('Windows write-restricted token, the default: write roots are granted o
       persistentGrants = reported
       await SandboxManager.initialize(config(false))
       expect(subs()).toEqual(['forget', 'grant', 'stamp'])
-      expect(acl[0].argv).toEqual(['--all'])
+      // Not from under another live session: srt-win is told whose
+      // session asks, and checks its holder records itself.
+      expect(acl[0].argv).toEqual([
+        '--all',
+        '--unless-held-by-others',
+        `${process.pid}`,
+      ])
+    })
+
+    it(`option false, kept grants ${reported.state}: another live session runs on one → kept_grants_in_use, nothing removed or granted`, async () => {
+      persistentGrants = reported
+      aclResult.forget = exit(
+        22,
+        JSON.stringify({
+          held_by: [{ pid: 4711, kind: 'kept_root', path: 'C:\\work' }],
+        }),
+      )
+      const e = await rejection(config(false))
+      expect(e.code).toBe('kept_grants_in_use')
+      expect(e.message).toContain('process 4711 writes C:\\work')
+      // The refused forget is the only thing that ran.
+      expect(subs()).toEqual(['forget'])
+      expect(verifyCalls).toHaveLength(0)
+      expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
     it(`option false, kept grants ${reported.state}: forget fails → initialize() rejects with nothing granted, and does not fall back to the write-restricted token`, async () => {
@@ -4019,11 +4163,13 @@ function restoreGatedOnACompletedRevoke(
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize().
+      // Async spawns: `user status` / `status` at initialize(), and
+      // the calls that can walk a tree, answered as the sync ones.
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
       ) => {
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -7241,10 +7387,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           lists(),
           { write: true },
         ),
-        denyTargets: winUtils.windowsProfileGrantDenyTargets(
-          paths,
-          recorded() as winUtils.WindowsProfileGrantPath[],
-        ),
         calls: calls.map(c => `${c.cmd} ${c.sub}`),
       },
       null,
@@ -7274,7 +7416,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     kind,
   })
   /** The grant as recorded for `home`. */
+  /** More recorded paths, for one test. */
+  let extraRecorded: ReturnType<typeof rec>[] = []
   const recorded = () => [
+    ...extraRecorded,
     rec('container'),
     rec('granted', 'Documents'),
     rec('file', '.npmrc'),
@@ -7289,7 +7434,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
    * What the grant protects: built-in entries, one added one, and an
    * added one inside the temporary directory.
    */
+  /** More recorded exclusions, for one test. */
+  let extraExclusions: string[] = []
   const exclusions = () => [
+    ...extraExclusions,
     join(home, '.ssh'),
     join(home, '.cargo', 'credentials.toml'),
     join(home, 'NTUSER.DAT*'),
@@ -7303,8 +7451,16 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     exclusions: exclusions(),
     ungrantedOnly: ungrantedOnly(),
   })
+  /**
+   * What `srt-win` says it does, in `user status` and in `profile
+   * status`; `undefined` = an srt-win that does not say.
+   */
+  let brokerCapabilities: string[] | undefined = SRT_WIN_CAPABILITIES
   const current = (extra: string[] = ['.myapp']) => ({
     record_version: 1,
+    ...(brokerCapabilities !== undefined && {
+      capabilities: brokerCapabilities,
+    }),
     state: 'current',
     profile: home,
     list_version: 1,
@@ -7361,6 +7517,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     mkdirSync(join(temp(), 'keys', 'sub'), { recursive: true })
     writeFileSync(join(home, '.npmrc'), '//feed/:_authToken=t\n')
     writeFileSync(join(home, '.cargo', 'config.toml'), '')
+    brokerCapabilities = SRT_WIN_CAPABILITIES
     profileStatus = current()
     grantRun = { stderr: [], stdout: grantJson(), code: 0 }
     const stdoutFor = (argv: readonly string[]): string => {
@@ -7381,6 +7538,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         ca_cert_thumb: null,
         ca_cert_pem: null,
         ...(briefGrant !== undefined && { profile_grant: briefGrant }),
+        ...(brokerCapabilities !== undefined && {
+          capabilities: brokerCapabilities,
+        }),
       }
       const wfp = {
         state: 'installed',
@@ -7413,6 +7573,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         _exe: string,
         argv: readonly string[],
       ) => {
+        // The calls that can walk a tree are asynchronous too; they
+        // are recorded and answered with the synchronous ones.
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         asyncCalls.push([...own])
         const mkStream = () => {
@@ -7532,10 +7695,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   }
 
   describe('a default session: initialize() checks the record and never writes the grant', () => {
-    it('a current grant: one `profile status --paths`, then the session as usual', async () => {
+    it('a current grant: one `profile status`, without the path list, then the session as usual', async () => {
       await SandboxManager.initialize(config())
       expect(names()).toEqual(['profile status', 'acl grant'])
-      expect(calls[0].argv).toEqual(['--paths'])
+      expect(calls[0].argv).toEqual([])
       expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(names()).not.toContain('profile grant')
       expect(names()).not.toContain('profile forget')
@@ -7675,38 +7838,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   })
 
   describe('a session read deny against the grant', () => {
+    // A read deny on or above a path the grant made readable has to
+    // be on that path too. srt-win works that out from its record
+    // (covered there by its own tests and the smoke script); what is
+    // checked here is that the library hands it the deny once, as
+    // given, and never a list that grows with the record.
     const denyRead = async (
       ...paths: string[]
     ): Promise<string[] | undefined> => {
       await SandboxManager.initialize(config({}, { denyRead: paths }))
       return stdinOf('acl grant')?.denyRead
     }
-    const readable = [
-      () => home,
-      () => join(home, 'Documents'),
-      () => join(home, '.npmrc'),
-      () => join(home, '.cargo'),
-      () => join(home, '.cargo', 'config.toml'),
-    ]
 
-    it('on the profile directory: stamped on every path the grant made readable, and on none it excluded', async () => {
-      const stamped = await denyRead(home)
-      await explained([home], () => {
-        expect(new Set(stamped)).toEqual(new Set(readable.map(p => p())))
-        // Each once: the profile directory is itself a recorded path.
-        expect(stamped).toHaveLength(5)
-      })
+    it('on the profile directory, a container, a granted directory or a path beneath one: the deny itself, once', async () => {
+      for (const p of [
+        home,
+        join(home, '.cargo'),
+        join(home, 'Documents'),
+        join(home, 'Documents', 'sub'),
+      ]) {
+        calls = []
+        expect(await denyRead(p)).toEqual([p])
+        await SandboxManager.reset()
+      }
     })
 
-    it('on the profile directory as the session spells it (a short name, a link, another case): the same stamps', async () => {
-      // However the deny itself ends up spelled, it and its stamps
-      // are, as objects, exactly the readable paths.
-      const stamped = await denyRead(homeAsSpelled)
-      await explained([homeAsSpelled], () => {
-        expect(new Set((stamped ?? []).map(canonical))).toEqual(
-          new Set(readable.map(p => p())),
-        )
-      })
+    it('the record is not asked for path by path: status is read without the path list', async () => {
+      await denyRead(home)
+      const status = calls.find(c => c.cmd === 'profile' && c.sub === 'status')
+      expect(status?.argv).toEqual([])
     })
 
     it('denyRead of the profile directory holds for that session only: the next one stamps nothing', async () => {
@@ -7727,24 +7887,57 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(stdinOf('acl grant')?.denyRead).toEqual([])
     })
 
-    it('on a granted directory: that directory, once', async () => {
-      expect(await denyRead(join(home, 'Documents'))).toEqual([
-        join(home, 'Documents'),
-      ])
-    })
-
-    it('on a container: the container and the files granted in it', async () => {
-      const stamped = await denyRead(join(home, '.cargo'))
-      await explained([join(home, '.cargo')], () => {
-        expect(new Set(stamped)).toEqual(
-          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
-        )
+    it("a write root with a read-denied file inside it: the session starts, and the deny is the session's, not a recorded exclusion", async () => {
+      const proj = join(home, 'proj')
+      mkdirSync(proj)
+      writeFileSync(join(proj, '.env'), 'TOKEN=x')
+      const cfg = config(
+        {},
+        { allowWrite: [proj], denyRead: [join(proj, '.env')] },
+      )
+      await SandboxManager.initialize(cfg)
+      // The root is granted for writing and the file denied for
+      // reading, in the one call a session makes.
+      expect(stdinOf('acl grant')).toMatchObject({
+        write: [proj],
+        denyRead: [join(proj, '.env')],
       })
+      // Nothing about the session is written into the grant's record:
+      // the grant is neither made nor refreshed by initialize().
+      expect(names()).toEqual(['profile status', 'acl grant'])
+      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(argv.filter((_, i) => argv[i - 1] === '--write-root')).toEqual([
+        proj,
+      ])
+      await SandboxManager.reset()
+      // And again: nothing a first session did stands in the way of
+      // the second.
+      calls = []
+      await SandboxManager.initialize(cfg)
+      expect(stdinOf('acl grant')).toMatchObject({ write: [proj] })
+      // No helper offers a session's denies as exclusions to record.
+      expect(
+        (winUtils as Record<string, unknown>).windowsProfileReadExclusions,
+      ).toBeUndefined()
     })
 
-    it('beneath a granted directory: only its own path — a deny there already comes first', async () => {
-      const sub = join(home, 'Documents', 'sub')
-      expect(await denyRead(sub)).toEqual([sub])
+    it('a grant recorded with such a file as an added exclusion refuses the root until the added list is replaced', async () => {
+      // What an earlier arrangement produced: the session's deny,
+      // recorded with the grant. The root above it cannot be granted
+      // for writing; `grantWindowsProfileRead({ exclude: [],
+      // replaceExclusions: true })` drops it.
+      const proj = join(home, 'proj')
+      mkdirSync(proj)
+      extraExclusions = [join(proj, '.env')]
+      profileStatus = current()
+      try {
+        const e = await rejection(
+          config({}, { allowWrite: [proj], denyRead: [join(proj, '.env')] }),
+        )
+        expect(e.code).toBe('profile_exclusion_read_grant')
+      } finally {
+        extraExclusions = []
+      }
     })
 
     it('outside the profile: only its own path', async () => {
@@ -7772,23 +7965,46 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
-    it('a per-command read deny is stamped on the covered paths for that command', async () => {
-      await SandboxManager.initialize(config())
-      const cfg = config(
-        {},
-        { denyRead: [join(home, '.cargo')], allowWrite: [] },
+    it('a per-command read deny above thousands of recorded paths is one argument, not one per path', async () => {
+      // A record of a few thousand paths under AppData — more than a
+      // command line could carry if each were named on it.
+      const big = Array.from({ length: 4000 }, (_, i) =>
+        rec(
+          i % 2 ? 'granted' : 'file',
+          'AppData',
+          'Local',
+          `application-${i % 50}`,
+          `entry-with-a-long-name-${i}`,
+        ),
       )
-      const { argv } = await SandboxManager.wrapWithSandboxArgv(
-        'echo x',
-        undefined,
-        cfg,
+      expect(big.map(r => r.path).join(' --deny-read ').length).toBeGreaterThan(
+        32_767,
       )
-      const denied = argv.filter((_, i) => argv[i - 1] === '--deny-read')
-      await explained([join(home, '.cargo')], () => {
-        expect(new Set(denied)).toEqual(
-          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
+      extraRecorded = big
+      profileStatus = current()
+      try {
+        await SandboxManager.initialize(config())
+        mkdirSync(join(home, 'AppData'), { recursive: true })
+        const cfg = config(
+          {},
+          {
+            denyRead: [join(home, 'AppData'), join(home, '.cargo')],
+            allowWrite: [],
+          },
         )
-      })
+        const { argv } = await SandboxManager.wrapWithSandboxArgv(
+          'echo x',
+          undefined,
+          cfg,
+        )
+        const denied = argv.filter((_, i) => argv[i - 1] === '--deny-read')
+        expect(denied).toEqual([join(home, 'AppData'), join(home, '.cargo')])
+        // Nothing of the record is on the command line.
+        expect(argv.some(a => a.includes('entry-with-a-long-name'))).toBe(false)
+        expect(argv.join(' ').length).toBeLessThan(8000)
+      } finally {
+        extraRecorded = []
+      }
     })
 
     it('under the ordinary token there is no grant, and nothing is added to a deny', async () => {
@@ -7854,6 +8070,211 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       calls = []
       await SandboxManager.initialize(allowRead(join(app, 'data')))
       expect(stdinOf('acl grant')?.read).toEqual([join(app, 'data')])
+    })
+
+    describe('the look beneath a path above a wildcard entry', () => {
+      // Lists of their own, so that a directory two levels above the
+      // wildcard's last component is not also above a literal entry.
+      const own = () => ({
+        exclusions: [join(home, 'apps', '*', '*', 'store')],
+        ungrantedOnly: [],
+      })
+      const apps = () => join(home, 'apps')
+      const check = (p: string, write = false) =>
+        winUtils.windowsProfileExclusionConflicts([p], own(), { write })
+
+      it('admits a path that was looked at and holds no match, or is not there', () => {
+        mkdirSync(join(apps(), 'a', 'b', 'other'), { recursive: true })
+        writeFileSync(join(apps(), 'file'), '')
+        expect(check(apps())).toEqual([])
+        expect(check(join(apps(), 'a'))).toEqual([])
+        // Not there (yet): nothing can lie beneath it.
+        expect(check(join(apps(), 'not-yet'))).toEqual([])
+        expect(check(join(apps(), 'file', 'x'))).toEqual([])
+        // And refuses once something matches.
+        mkdirSync(join(apps(), 'a', 'b', 'store'))
+        expect(check(apps())).toMatchObject([{ relation: 'above' }])
+        expect(check(apps())[0]!.unexamined).toBeUndefined()
+        expect(check(join(apps(), 'a'), true)).toMatchObject([
+          { relation: 'above', access: 'write' },
+        ])
+      })
+
+      // Every way of not being able to look refuses: "could not look"
+      // is not "nothing there".
+      const failing = (
+        code: string,
+        on: 'realpath' | 'lstat' | 'readdir',
+        match: (p: string) => boolean,
+      ) => {
+        const err = () =>
+          Object.assign(new Error(`${code}: simulated`), { code })
+        if (on === 'realpath') {
+          const real = fs.realpathSync.native
+          return spyOn(fs.realpathSync, 'native').mockImplementation(((
+            p: string,
+          ) => {
+            if (match(String(p))) throw err()
+            return real(p)
+          }) as typeof fs.realpathSync.native)
+        }
+        const real = fs[`${on}Sync`] as (...a: unknown[]) => unknown
+        return spyOn(fs, `${on}Sync`).mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          if (match(String(p))) throw err()
+          return real(p, ...rest)
+        }) as never)
+      }
+
+      for (const [code, on, where] of [
+        ['EACCES', 'readdir', 'the path itself'],
+        ['EIO', 'readdir', 'the path itself'],
+        ['EPERM', 'lstat', 'the path itself'],
+        ['EACCES', 'realpath', 'the path itself'],
+        ['EIO', 'realpath', 'the path itself'],
+        ['ELOOP', 'realpath', 'the path itself'],
+        ['EACCES', 'readdir', 'a level beneath it'],
+        ['EBUSY', 'lstat', 'a level beneath it'],
+      ] as const) {
+        it(`refuses when ${on} fails with ${code} on ${where}`, () => {
+          mkdirSync(join(apps(), 'a', 'b'), { recursive: true })
+          const target =
+            where === 'the path itself' ? apps() : join(apps(), 'a')
+          const spy = failing(code, on, p => p === target)
+          try {
+            for (const write of [false, true]) {
+              const got = check(apps(), write)
+              expect(got).toMatchObject([{ relation: 'above' }])
+              expect(got[0]!.unexamined).toContain(code)
+            }
+          } finally {
+            spy.mockRestore()
+          }
+          // The same tree, readable: admitted.
+          expect(check(apps())).toEqual([])
+        })
+      }
+
+      it('a level that is not there, or not a directory, is no match and no failure', () => {
+        mkdirSync(join(apps(), 'a'), { recursive: true })
+        for (const code of ['ENOENT', 'ENOTDIR']) {
+          const spy = failing(code, 'readdir', p => p === join(apps(), 'a'))
+          try {
+            expect(check(apps())).toEqual([])
+          } finally {
+            spy.mockRestore()
+          }
+        }
+      })
+
+      it('refuses a path that turns out to be a link when it is listed', () => {
+        mkdirSync(apps(), { recursive: true })
+        const real = fs.lstatSync
+        const spy = spyOn(fs, 'lstatSync').mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          const st = (real as (...a: unknown[]) => fs.Stats)(p, ...rest)
+          if (String(p) === apps()) st.isSymbolicLink = () => true
+          return st
+        }) as never)
+        try {
+          expect(check(apps())[0]?.unexamined).toContain('is a link')
+        } finally {
+          spy.mockRestore()
+        }
+      })
+
+      it('never opens, lists or resolves a path on a share or in the device namespace', () => {
+        const spies = [
+          spyOn(fs.realpathSync, 'native'),
+          spyOn(fs, 'realpathSync'),
+          spyOn(fs, 'lstatSync'),
+          spyOn(fs, 'statSync'),
+          spyOn(fs, 'readdirSync'),
+          spyOn(fs, 'existsSync'),
+        ]
+        try {
+          for (const p of [
+            '\\\\server\\share\\x',
+            '\\\\?\\UNC\\server\\share\\x',
+            '\\\\.\\UNC\\server\\share\\x',
+            '//server/share/x',
+            '\\\\?\\GLOBALROOT\\Device\\Mup\\server\\share',
+            '\\\\.\\pipe\\x',
+          ]) {
+            for (const write of [false, true]) {
+              // A profile on a local drive has no exclusion a share
+              // could be related to: nothing to refuse, nothing read.
+              expect(
+                winUtils.windowsProfileExclusionConflicts([p], lists(), {
+                  write,
+                }),
+              ).toEqual([])
+            }
+          }
+          // A profile that is itself on a share: the wildcard entry
+          // could lie beneath the path, which is not looked at, so it
+          // is refused unseen.
+          const shared = {
+            exclusions: [
+              '\\\\?\\UNC\\server\\profiles\\me\\AppData\\Local\\*\\EBWebView',
+            ],
+            ungrantedOnly: [],
+          }
+          for (const p of [
+            '\\\\server\\profiles\\me\\AppData\\Local\\tool',
+            '\\\\?\\UNC\\server\\profiles\\me\\AppData\\Local\\tool',
+          ]) {
+            const got = winUtils.windowsProfileExclusionConflicts([p], shared)
+            expect(got).toMatchObject([{ relation: 'above' }])
+            expect(got[0]!.unexamined).toContain('not on a local drive')
+          }
+          for (const s of spies) expect(s).not.toHaveBeenCalled()
+        } finally {
+          for (const s of spies) s.mockRestore()
+        }
+      })
+    })
+
+    it('a wildcard entry refuses a directory above it only while something beneath it matches', async () => {
+      // A tool's own directory under Local, with no EBWebView in it:
+      // grantable for reading and as a write root.
+      const tool = join(home, 'AppData', 'Local', 'npm-cache')
+      mkdirSync(join(tool, 'bin'), { recursive: true })
+      await SandboxManager.initialize(
+        config({}, { allowRead: [tool], allowWrite: [join(tool, 'bin')] }),
+      )
+      expect(stdinOf('acl grant')).toMatchObject({
+        read: [tool],
+        write: [join(tool, 'bin')],
+      })
+      await SandboxManager.reset()
+      // The same directory once such a child exists in it: refused.
+      mkdirSync(join(tool, 'EBWebView'))
+      calls = []
+      await refused(allowRead(tool))
+      await SandboxManager.reset()
+      calls = []
+      await refused(config({}, { allowWrite: [tool] }))
+      // The lookup is as deep as the rule and no deeper, and does not
+      // go through a link.
+      const deep = join(home, 'AppData', 'Local', 'deep')
+      mkdirSync(join(deep, 'x', 'EBWebView'), { recursive: true })
+      const linked = join(home, 'AppData', 'Local', 'linked')
+      mkdirSync(linked)
+      symlinkSync(
+        join(tool, 'EBWebView'),
+        join(linked, 'elsewhere'),
+        'junction',
+      )
+      await explained([deep, linked], () => {
+        expect(
+          winUtils.windowsProfileExclusionConflicts([deep, linked], lists()),
+        ).toEqual([])
+      })
     })
 
     it('a link that resolves into an excluded store → refused (a junction, and a name spelled like an 8.3 short name: both are resolved by the final-path lookup)', async () => {
@@ -8098,10 +8519,170 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         briefGrant = brief
         await SandboxManager.initialize(config(ORDINARY))
         expect(names()).toEqual(['profile forget', 'acl grant'])
-        expect(calls[0].argv).toEqual(['--json'])
+        expect(calls[0].argv).toEqual([
+          '--json',
+          '--unless-held-by-others',
+          `${process.pid}`,
+        ])
         expect(calls[1].argv).not.toContain('--persistent')
       })
     }
+
+    it('another live session reads the profile through the grant → kept_grants_in_use; the grant stays, no session', async () => {
+      briefGrant = { state: 'present' }
+      syncResult['profile forget'] = exit(
+        22,
+        JSON.stringify({
+          held_by: [{ pid: 4711, kind: 'profile', path: home }],
+        }),
+      )
+      const e = await rejection(config(ORDINARY))
+      expect(e.code).toBe('kept_grants_in_use')
+      expect(e.message).toContain('process 4711 reads the profile')
+      expect(names()).toEqual(['profile forget'])
+      expect(SandboxManager.getConfig()).toBeUndefined()
+    })
+
+    describe('an srt-win that is not the build this library was made with', () => {
+      // The library names a read deny once and leaves it to srt-win
+      // to write it on the recorded paths beneath; it removes kept
+      // grants only through srt-win's holder check. Both are asked
+      // for by name.
+      const old = (caps: string[] | undefined) => {
+        brokerCapabilities = caps
+        profileStatus = current()
+      }
+
+      for (const [what, caps] of [
+        ['says nothing about what it does', undefined],
+        [
+          'lists other capabilities only',
+          ['kept-grant-holders', 'something-else'],
+        ],
+      ] as const) {
+        it(`a grant is recorded and srt-win ${what}: srt_win_outdated, nothing granted`, async () => {
+          old(caps as string[] | undefined)
+          for (const cfg of [
+            config(),
+            config({}, { denyRead: [home] }),
+            config({}, { allowWrite: [] }),
+          ]) {
+            calls = []
+            const e = await rejection(cfg)
+            expect(e).toBeInstanceOf(WindowsSandboxError)
+            expect(e.code).toBe('srt_win_outdated')
+            expect(e.message).toContain('profile-deny-expansion')
+            // The status was read; nothing was granted or stamped.
+            expect(names()).toEqual(['profile status'])
+            expect(SandboxManager.getConfig()).toBeUndefined()
+          }
+        })
+      }
+
+      it('a grant is recorded and srt-win lists the capability: the session starts', async () => {
+        old(['profile-deny-expansion'])
+        await SandboxManager.initialize(config({}, { denyRead: [home] }))
+        expect(names()).toEqual(['profile status', 'acl grant'])
+        expect(stdinOf('acl grant')?.denyRead).toEqual([home])
+        expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+      })
+
+      it('no grant is recorded: nothing is required of an older srt-win, read denies included', async () => {
+        old(undefined)
+        profileStatus = { state: 'none' }
+        briefGrant = { state: 'none' }
+        await SandboxManager.initialize(config({}, { denyRead: [home] }))
+        expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
+        expect(stdinOf('acl grant')?.denyRead).toEqual([home])
+        await SandboxManager.reset()
+        // An srt-win from before the grant existed says nothing of it
+        // at all.
+        calls = []
+        briefGrant = undefined
+        await SandboxManager.initialize(config({}, { denyRead: [home] }))
+        expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
+        expect(names()).toEqual(['acl grant'])
+      })
+
+      it('a command wrapped with no session behind it looks for itself, once, before it relies on a read deny', async () => {
+        const cfg = config(
+          {},
+          { denyRead: [join(home, '.cargo')], allowWrite: [] },
+        )
+        const wrap = () =>
+          SandboxManager.wrapWithSandboxArgv('echo x', undefined, cfg)
+        old(undefined)
+        let thrown: unknown
+        try {
+          await wrap()
+        } catch (e) {
+          thrown = e
+        }
+        expect((thrown as WindowsSandboxError).code).toBe('srt_win_outdated')
+        expect(names()).toEqual(['profile status'])
+        // An srt-win that does it: wrapped, and not asked again for
+        // the next command.
+        old(SRT_WIN_CAPABILITIES)
+        calls = []
+        const { argv } = await wrap()
+        expect(argv.filter((_, i) => argv[i - 1] === '--deny-read')).toEqual([
+          join(home, '.cargo'),
+        ])
+        await wrap()
+        expect(names()).toEqual(['profile status'])
+        // No read deny, nothing to rely on: no look at all.
+        await SandboxManager.reset()
+        calls = []
+        old(undefined)
+        await SandboxManager.wrapWithSandboxArgv(
+          'echo x',
+          undefined,
+          config({}, { allowWrite: [] }),
+        )
+        expect(names()).toEqual([])
+      })
+
+      it('the token opt-out with a grant to remove needs the holder check: without it, srt_win_outdated and nothing removed', async () => {
+        old(['profile-deny-expansion'])
+        briefGrant = { state: 'present' }
+        const e = await rejection(config(ORDINARY))
+        expect(e.code).toBe('srt_win_outdated')
+        expect(e.message).toContain('kept-grant-holders')
+        expect(names()).toEqual([])
+        // With no kept grant of either kind there is nothing to
+        // remove, and nothing is asked of it.
+        briefGrant = { state: 'none' }
+        profileStatus = { state: 'none' }
+        await SandboxManager.initialize(config(ORDINARY))
+        expect(names()).not.toContain('profile forget')
+      })
+    })
+
+    it('a default session registers as a holder of the grant even with nothing to grant, and releases it at reset', async () => {
+      const cfg = config({}, { allowWrite: [] })
+      await SandboxManager.initialize(cfg)
+      expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+      // The one `acl grant --persistent`, with empty lists: what
+      // records this process as running on the profile read grant.
+      expect(names()).toEqual(['profile status', 'acl grant'])
+      expect(calls[1].argv).toContain('--persistent')
+      expect(calls[1].argv).toContain(`${process.pid}`)
+      expect(stdinOf('acl grant')).toEqual({
+        read: [],
+        write: [],
+        denyRead: [],
+        denyWrite: [],
+      })
+      await SandboxManager.reset()
+      expect(names().slice(2)).toEqual(['acl revoke', 'acl restore'])
+      // Without a grant to hold, a session with nothing to grant
+      // makes no call at all.
+      calls = []
+      profileStatus = { state: 'none' }
+      briefGrant = { state: 'none' }
+      await SandboxManager.initialize(cfg)
+      expect(names()).toEqual([])
+    })
 
     it('profile forget fails → profile_forget_failed; nothing granted, no session', async () => {
       briefGrant = { state: 'present' }
@@ -8581,6 +9162,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         state: winUtils.WindowsProfileGrantState,
       ): winUtils.WindowsProfileGrantStatus => ({
         state,
+        capabilities: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
@@ -8637,24 +9219,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       ]) {
         expect(envNames).not.toContain(v)
       }
-    })
-
-    it('windowsProfileReadExclusions: the credential files and read denies inside the profile', () => {
-      mkdirSync(join(home, '.secrets'))
-      mkdirSync(join(work, 'private'))
-      const cfg = config(
-        {},
-        { denyRead: [join(home, '.secrets'), join(work, 'private'), home] },
-      )
-      cfg.credentials = {
-        files: [
-          { path: join(home, '.npmrc'), mode: 'mask' },
-          { path: join(work, 'token'), mode: 'deny' },
-        ],
-      }
-      expect(new Set(winUtils.windowsProfileReadExclusions(cfg, home))).toEqual(
-        new Set([join(home, '.secrets'), join(home, '.npmrc')]),
-      )
     })
 
     it('user status: the grant is reported unless srt-win says there is none', () => {

@@ -67,7 +67,7 @@ use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
 use crate::path_id::{self, FileId, Located};
 use crate::persist::{self, Ids, OpenObject};
-use crate::profile_plan::{self as plan, Entry, Kind, Name, Node, Rules, Tree};
+use crate::profile_plan::{self as plan, Entry, Kind, LinkTarget, Name, Node, Rules, Tree};
 use crate::reg;
 use crate::util::{OwnedHandle, pcwstr, wstr};
 
@@ -322,6 +322,7 @@ fn list_dir(h: HANDLE) -> Result<Vec<Entry>> {
                         short: String::from_utf16(short).ok().filter(|s| !s.is_empty()),
                     },
                     is_dir,
+                    link: info.FileAttributes & ATTR_REPARSE_POINT != 0,
                 });
             }
             if info.NextEntryOffset == 0 {
@@ -340,7 +341,98 @@ struct DiskTree<'a> {
     profile: &'a str,
 }
 
+/// The object `path` names, with every link on the way resolved —
+/// one link at a time, each from the link's own data, and only for as
+/// long as the way stays on drive letters of this machine.
+///
+/// An ordinary open of `path` would do the same in one step, but it
+/// follows a link wherever it leads: a symbolic link to
+/// `\\\\server\\share` makes the opener contact that server with the
+/// user's credentials. A link in the profile can be made by whatever
+/// may write there, so a link is never followed by opening it. Each
+/// component is opened as itself (a link is opened, not followed);
+/// the first link met is read (`FSCTL_GET_REPARSE_POINT`), its
+/// destination worked out from that ([`plan::link_destination`]) and
+/// refused unless it is on a local drive; and the walk starts over on
+/// the destination, a bounded number of times. The spelling of the
+/// result comes from a handle on the object opened the same way.
+fn resolve_on_local_drives(path: &str) -> std::result::Result<String, String> {
+    const MAX_LINKS: usize = 32;
+    let mut cur = path.to_owned();
+    for _ in 0..MAX_LINKS {
+        if !path_id::is_drive_path(&cur) || path_id::on_network_drive(&cur) {
+            return Err(format!(
+                "leads to '{cur}', which is not on a local drive; not followed"
+            ));
+        }
+        let (root, tail) = cur.split_at(7);
+        let comps: Vec<&str> = tail.split('\\').filter(|c| !c.is_empty()).collect();
+        let mut link = None;
+        for i in 0..comps.len() {
+            let prefix = format!("{root}{}", comps[..=i].join("\\"));
+            let o = open_no_follow(&prefix, FILE_READ_ATTRIBUTES)
+                .map_err(|e| format!("cannot be resolved: {e:#}"))?;
+            if o.attrs & ATTR_REPARSE_POINT != 0 {
+                let rest: Vec<String> = comps[i + 1..].iter().map(|c| (*c).to_owned()).collect();
+                link = Some((prefix, o, rest));
+                break;
+            }
+            if i + 1 == comps.len() {
+                return path_id::final_path_of(o.h.raw())
+                    .map_err(|e| format!("cannot be resolved: {e:#}"));
+            }
+        }
+        let Some((at, o, rest)) = link else {
+            // The root of a drive.
+            return Ok(cur);
+        };
+        let data = read_reparse(o.h.raw()).map_err(|e| format!("'{at}': {e:#}"))?;
+        cur = plan::link_destination(&at, &data, &rest)?;
+    }
+    Err(format!(
+        "'{path}' leads through more than {MAX_LINKS} links"
+    ))
+}
+
+/// The reparse data of the link open on `h`.
+fn read_reparse(h: HANDLE) -> Result<plan::LinkData> {
+    use windows::Win32::System::IO::DeviceIoControl;
+    const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+    // MAXIMUM_REPARSE_DATA_BUFFER_SIZE.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut returned = 0u32;
+    // SAFETY: `buf` is writable for the length passed and outlives
+    // the call; `returned` receives how much of it was filled.
+    unsafe {
+        DeviceIoControl(
+            h,
+            FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            Some(buf.as_mut_ptr().cast()),
+            buf.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .context("read the link")?;
+    buf.truncate(returned as usize);
+    plan::parse_reparse(&buf).map_err(|e| anyhow!(e))
+}
+
 impl Tree for DiskTree<'_> {
+    /// Where the link at `rel` leads, placed against the profile. Only
+    /// read; nothing is written at either end here.
+    fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
+        match resolve_on_local_drives(&join(self.profile, rel)) {
+            Ok(real) => match plan::rel_components(self.profile, &real) {
+                Ok(inside) => LinkTarget::Inside(inside),
+                Err(_) => LinkTarget::Elsewhere(format!("leads to '{real}'")),
+            },
+            Err(why) => LinkTarget::Elsewhere(why),
+        }
+    }
+
     fn list(&mut self, rel: &[String]) -> std::result::Result<Vec<Entry>, String> {
         let path = join(self.profile, rel);
         (|| -> Result<Vec<Entry>> {
@@ -747,13 +839,112 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
                 .unwrap_or_else(|_| a.clone())
         })
         .collect();
-    check_grants_against(read_marker_at(persist::MARKER_KEY), grants, &admitted)
+    check_grants_against(
+        read_marker_at(persist::MARKER_KEY),
+        grants,
+        &admitted,
+        &entry_names,
+    )
+}
+
+/// What this build does that a caller built separately may rely on,
+/// reported as `capabilities` by `user status` and `profile status`.
+/// The library and this program are not always the same build: the
+/// library asks for a behaviour by name instead of assuming it, and
+/// refuses to start a session that depends on one that is missing.
+/// A token is added when a behaviour moves here and is never reused
+/// for another.
+///
+/// - `profile-deny-expansion`: a read deny (`acl grant`, `acl stamp`,
+///   `exec --deny-read`) is also written on every recorded path of the
+///   profile read grant beneath it that carries an allow of its own
+///   ([`read_deny_also`]). A caller that names a deny once depends on
+///   this: without it a deny on the profile directory would not reach
+///   a granted directory in it.
+/// - `profile-session-grant-check`: `acl grant` refuses a path that
+///   reaches a recorded exclusion ([`check_session_grants`]).
+/// - `kept-grant-holders`: sessions are recorded as holders of the
+///   kept grants they run on, and `acl forget` / `profile forget`
+///   take `--unless-held-by-others`.
+pub const CAPABILITIES: &[&str] = &[
+    "profile-deny-expansion",
+    "profile-session-grant-check",
+    "kept-grant-holders",
+];
+
+/// The profile a read grant is recorded for, if one is: what a
+/// default session runs on, and so holds for as long as it lives
+/// (`state_db::Locked::hold_kept`). A record that cannot be read
+/// counts as a grant — the session may well be reading through it.
+pub fn held_profile() -> Option<String> {
+    match read_marker_at(persist::MARKER_KEY) {
+        Ok(m) if m.is_empty() => None,
+        Ok(m) => Some(
+            m.header
+                .map(|h| h.profile)
+                .unwrap_or_else(|| "(profile)".to_owned()),
+        ),
+        Err(_) => Some("(profile)".to_owned()),
+    }
+}
+
+/// The recorded paths a session's read deny on `deny` (canonical) is
+/// written on as well ([`plan::covered_by_read_deny`]), among those
+/// that still exist. Nothing when no grant is recorded. A record that
+/// cannot be read is an error: a deny that silently covered less than
+/// it says is worse than a command that does not start.
+pub fn read_deny_also(deny: &str) -> Result<Vec<String>> {
+    let m = read_marker_at(persist::MARKER_KEY).context("read the profile read grant record")?;
+    Ok(
+        plan::covered_by_read_deny(deny, m.paths.iter().map(|r| (r.path.as_str(), r.kind)))
+            .into_iter()
+            .filter(|p| match open_no_follow(p, FILE_READ_ATTRIBUTES) {
+                Ok(_) => true,
+                // Gone since it was recorded: nothing to deny.
+                Err(e) => !path_id::is_not_found(&e),
+            })
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The entries of the directory `dir`, read through a handle opened
+/// without following a link.
+///
+/// Only a path on a drive letter of this machine is opened. A share
+/// (`\\\\?\\UNC\\…`, or a drive letter mapped to one) and anything else
+/// in the device namespace is reported as not listable without being
+/// touched: opening it would send the user's credentials to whatever
+/// server the path names. (A profile on a local drive has no exclusion
+/// such a path could lie above, so this is reached only for a profile
+/// that is itself on a share.)
+fn entry_names(dir: &str) -> plan::Listing {
+    use plan::Listing;
+    if !path_id::is_drive_path(dir) || path_id::on_network_drive(dir) {
+        return Listing::Failed("not on a local drive, and not examined".to_owned());
+    }
+    let o = match open_no_follow(dir, ACCESS_LIST) {
+        Ok(o) => o,
+        Err(e) if path_id::is_not_found(&e) => return Listing::Nothing,
+        Err(e) => return Listing::Failed(format!("{e:#}")),
+    };
+    if skip_reason(o.attrs, o.is_dir).is_some() {
+        return Listing::Link;
+    }
+    if !o.is_dir {
+        return Listing::Nothing;
+    }
+    match list_dir(o.h.raw()) {
+        Ok(entries) => Listing::Entries(entries.into_iter().map(|e| e.name.long).collect()),
+        Err(e) => Listing::Failed(format!("{e:#}")),
+    }
 }
 
 fn check_grants_against(
     marker: Result<Marker>,
     grants: &[(String, bool)],
     admitted: &[String],
+    list: &dyn Fn(&str) -> plan::Listing,
 ) -> Result<()> {
     let m = marker.map_err(|e| {
         anyhow!(
@@ -772,9 +963,14 @@ fn check_grants_against(
         );
     }
     for (path, write) in grants {
-        if let Some(why) =
-            plan::session_grant_refusal(path, *write, &m.exclusions, &m.ungranted_only, admitted)
-        {
+        if let Some(why) = plan::session_grant_refusal(
+            path,
+            *write,
+            &m.exclusions,
+            &m.ungranted_only,
+            admitted,
+            list,
+        ) {
             bail!("refused, and nothing was granted: {why}");
         }
     }
@@ -914,7 +1110,20 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
                 }
             }
             Located::Gone => {}
-            Located::Unknown => bail!(
+            // On a volume attached to this machine that is not mounted
+            // now: its entry waits there, listed with the kept grants
+            // whose volume is gone, and comes off when the volume is
+            // back (`persist::retry_pending`).
+            Located::VolumeAbsent
+                if path_id::is_drive_path(&r.path) && !path_id::on_network_drive(&r.path) =>
+            {
+                persist::marker_add_pending(&[persist::PendingStrip {
+                    file_id: id,
+                    group_sid: ids.group_sid.clone().unwrap_or_default(),
+                    path: r.path.clone(),
+                }])?;
+            }
+            Located::VolumeAbsent | Located::Unknown => bail!(
                 "the object recorded for '{}' is no longer at that path and could not be \
                  located by file id; its entry may still be on disk",
                 r.path
@@ -1040,8 +1249,10 @@ pub fn grant(
         layout.rel(&layout.local).as_deref(),
         &extra,
     );
-    let nodes = plan::plan(&mut DiskTree { profile }, &rules)
-        .map_err(|e| anyhow!("list the profile directory '{profile}': {e}"))?;
+    // The rules the plan ends with include those carried over to the
+    // targets of links; they are what is recorded.
+    let (nodes, rules) = plan::plan_resolved(&mut DiskTree { profile }, &rules)
+        .map_err(|e| anyhow!("plan the grant on '{profile}': {e}"))?;
 
     let mut report = Report {
         profile: profile.to_owned(),
@@ -1071,6 +1282,9 @@ pub fn grant(
     let before = all_recorded(store, &old)?;
     if store.key == persist::MARKER_KEY {
         persist::marker_set_ever()?;
+        if let Some(g) = &ids.group_sid {
+            persist::marker_set_group_sid(g)?;
+        }
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
     let absolute = |rel: Vec<String>| -> Vec<String> {
@@ -1380,6 +1594,13 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
 /// `srt-win uninstall`: forget the calling user's profile grant.
 /// Does nothing, and creates no state, when none is recorded.
 pub fn forget_everything() -> Result<Option<Forgotten>> {
+    forget_everything_as(None)
+}
+
+/// [`forget_everything`] with the identities read earlier: after the
+/// install record is gone, `ids` taken before it went still name the
+/// group the grant was written for.
+pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
     let marker_empty = read_marker_at(persist::MARKER_KEY).is_ok_and(|m| m.is_empty());
     let db_empty = match crate::state_db::open_db_ro() {
         Ok(Some(conn)) => db_has_rows(&conn).is_ok_and(|rows| !rows),
@@ -1389,10 +1610,17 @@ pub fn forget_everything() -> Result<Option<Forgotten>> {
     if marker_empty && db_empty {
         return Ok(None);
     }
-    let ids = Ids::load()?;
+    let loaded;
+    let ids = match ids {
+        Some(ids) => ids,
+        None => {
+            loaded = Ids::load()?;
+            &loaded
+        }
+    };
     let holder = crate::state_db::HolderPid(std::process::id());
     let (out, _) =
-        crate::state_db::with_init_lock(holder, false, |db| forget(&Store::of(db.conn()), &ids))?;
+        crate::state_db::with_init_lock(holder, false, |db| forget(&Store::of(db.conn()), ids))?;
     Ok(Some(out))
 }
 
@@ -1676,7 +1904,7 @@ mod tests {
             paths: Vec::new(),
         };
         let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
-            check_grants_against(m, g, admitted)
+            check_grants_against(m, g, admitted, &|_| plan::Listing::Nothing)
         };
         // No grant recorded: nothing in the profile is readable by
         // default, and there is no list to check against.
@@ -1858,6 +2086,99 @@ mod tests {
         unchanged("after the removal");
         drop(o);
         std::fs::remove_dir(granted.join("j")).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An excluded name that is a link into the profile: the link is
+    /// left alone, and its target carries what the name would have.
+    #[test]
+    fn an_excluded_name_that_is_a_link_protects_its_target() {
+        let base = scratch("links");
+        let prof = base.join("profile");
+        for f in [
+            r"dotfiles\.ssh\id_ed25519",
+            r"dotfiles\.config\gh\hosts.yml",
+            r"dotfiles\.config\nvim\init.lua",
+            r"dotfiles\README",
+            r"Documents\a.txt",
+        ] {
+            write(&prof, f);
+        }
+        junction(&prof.join(".ssh"), &prof.join(r"dotfiles\.ssh"));
+        junction(&prof.join(".config"), &prof.join(r"dotfiles\.config"));
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let key = format!("{TEST_KEY}Links");
+        let store = Store {
+            conn: &conn,
+            key: &key,
+        };
+        clear_marker(&key).unwrap();
+        let ids = ids();
+        let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        let deny_dir = vec![(true, true, 0x3u8, ALL)];
+        // The keys and the sign-in are denied where they really are …
+        assert_eq!(group_aces(&prof.join(r"dotfiles\.ssh")), deny_dir);
+        assert_eq!(group_aces(&prof.join(r"dotfiles\.config\gh")), deny_dir);
+        assert!(
+            !group_aces(&prof.join(r"dotfiles\.ssh\id_ed25519"))
+                .iter()
+                .any(|a| !a.1)
+        );
+        // … the directories above them are containers, not granted
+        // whole, and what else is in them is readable.
+        assert_eq!(group_aces(&prof.join("dotfiles")), [(true, false, 0, LIST)]);
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\.config")),
+            [(true, false, 0, LIST)]
+        );
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\README")),
+            [(true, false, 0, RX)]
+        );
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\.config\nvim")),
+            [(true, false, 0x3, RX)]
+        );
+        // Both links are reported as skipped.
+        for link in [r"\.ssh", r"\.config"] {
+            assert!(
+                report.skipped.iter().any(|s| s.path.ends_with(link)),
+                "{link}: {:?}",
+                report.skipped
+            );
+        }
+        // The record lists the exclusions where they really are, which
+        // is where a session's path resolves to.
+        let st = status_json(&key, Ok(layout.clone()), false);
+        let listed: Vec<String> = st["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+        for want in [r"\dotfiles\.ssh", r"\dotfiles\.config\gh"] {
+            let full = format!("{}{want}", layout.profile.to_lowercase());
+            assert!(listed.contains(&full), "{full} not in {listed:?}");
+        }
+        let through_link =
+            path_id::canonicalize_path(prof.join(r".ssh\id_ed25519").to_str().unwrap())
+                .unwrap()
+                .0;
+        let refused =
+            check_grants_against(read_marker_at(&key), &[(through_link, false)], &[], &|_| {
+                plan::Listing::Nothing
+            });
+        assert!(
+            refused.is_err(),
+            "a session read grant on the keys through the link"
+        );
+        let f = forget(&store, &ids).unwrap();
+        assert!(f.failed.is_empty(), "{f:?}");
+        assert!(group_aces(&prof.join(r"dotfiles\.ssh")).is_empty());
+        std::fs::remove_dir(prof.join(".ssh")).ok();
+        std::fs::remove_dir(prof.join(".config")).ok();
         std::fs::remove_dir_all(&base).ok();
     }
 

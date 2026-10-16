@@ -509,10 +509,75 @@ pub enum Located {
     /// Positively gone: its volume was found and the volume reported
     /// that no file has this id.
     Gone,
-    /// Could not be established either way — the volume is not
-    /// mounted, or the open-by-id or path query failed for a reason
-    /// other than "no such file". The object may still exist.
+    /// No mounted volume has the recorded serial number: a removable
+    /// or virtual disk that is not attached, or a volume that was
+    /// reformatted. The object may still exist on it; nothing can be
+    /// read or written there until the volume is back.
+    VolumeAbsent,
+    /// Could not be established either way — the volume is there and
+    /// the open-by-id or path query failed for a reason other than
+    /// "no such file". The object may still exist.
     Unknown,
+}
+
+/// Whether `canon` (canonical form) is a path on a drive letter:
+/// `\\?\X:\…`, as opposed to a share (`\\?\UNC\…`) or anything else in
+/// the device namespace.
+pub fn is_drive_path(canon: &str) -> bool {
+    let b = canon.as_bytes();
+    canon.starts_with(r"\\?\")
+        && b.len() >= 7
+        && b[4].is_ascii_alphabetic()
+        && b[5] == b':'
+        && b[6] == b'\\'
+}
+
+/// Whether `root` (`X:\`) is a volume attached to this machine — a
+/// fixed, removable, optical or RAM disk — as opposed to a network
+/// drive or a letter with nothing behind it. Asked of the drive table;
+/// the drive is not opened.
+fn is_local_drive_root(root: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_CDROM, DRIVE_RAMDISK.
+    let wide = wstr(root);
+    matches!(
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that
+        // outlives the call.
+        unsafe { GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) },
+        2 | 3 | 5 | 6
+    )
+}
+
+/// Whether the drive letter `canon` (a drive path) is on names a
+/// network share right now.
+pub fn on_network_drive(canon: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOTE: u32 = 4;
+    if !is_drive_path(canon) {
+        return false;
+    }
+    let wide = wstr(&canon[4..7]);
+    // SAFETY: as in `is_local_drive_root`.
+    unsafe { GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) == DRIVE_REMOTE }
+}
+
+/// Whether a volume with this serial number is mounted on a drive
+/// letter now.
+///
+/// Only drives on this machine are looked at. A drive letter mapped to
+/// a network share is skipped without being opened: opening it would
+/// contact the server.
+pub fn volume_mounted(volume_serial: u64) -> bool {
+    (b'A'..=b'Z').any(|drive| {
+        let root = format!(r"{}:\", drive as char);
+        if !is_local_drive_root(&root) {
+            return false;
+        }
+        open_for_metadata(&format!(r"\\?\{root}"))
+            .ok()
+            .and_then(|vh| file_id_from_handle(vh.raw()).ok())
+            .is_some_and(|id| id.volume_serial == volume_serial)
+    })
 }
 
 /// Locate the CURRENT path of a file by its captured
@@ -527,6 +592,18 @@ pub enum Located {
 /// that is about to forget an ACE must not read "could not look" as
 /// "nothing there".
 pub fn locate_by_file_id(file_id: &FileId) -> Located {
+    locate_on(file_id, false)
+}
+
+/// [`locate_by_file_id`] looking only at volumes attached to this
+/// machine: a drive letter mapped to a network share is not opened.
+/// For lookups nobody asked for by name — the periodic re-check of a
+/// grant that waits for its volume.
+pub fn locate_by_file_id_local(file_id: &FileId) -> Located {
+    locate_on(file_id, true)
+}
+
+fn locate_on(file_id: &FileId, local_only: bool) -> Located {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
@@ -539,6 +616,9 @@ pub fn locate_by_file_id(file_id: &FileId) -> Located {
     // its canonical_path was recorded under).
     for drive in b'A'..=b'Z' {
         let root = format!(r"\\?\{}:\", drive as char);
+        if local_only && !is_local_drive_root(&root[4..]) {
+            continue;
+        }
         let vh = match open_for_metadata(&root) {
             Ok(h) => h,
             Err(_) => continue,
@@ -590,7 +670,7 @@ pub fn locate_by_file_id(file_id: &FileId) -> Located {
         };
     }
     // No mounted volume carries this serial.
-    Located::Unknown
+    Located::VolumeAbsent
 }
 
 #[cfg(test)]

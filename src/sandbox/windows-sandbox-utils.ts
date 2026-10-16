@@ -32,11 +32,7 @@ export {
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
 import { literalReadings } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type {
-  FilesystemPathEntry,
-  SandboxRuntimeConfig,
-  SrtWinConfig,
-} from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 import {
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   windowsLoopbackPortRangeIssue,
@@ -154,6 +150,8 @@ export type WindowsSandboxErrorCode =
   | 'profile_grant_failed'
   /** `srt-win profile forget` could not remove the whole grant. */
   | 'profile_forget_failed'
+  | 'kept_grants_in_use'
+  | 'srt_win_outdated'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -446,6 +444,12 @@ export interface WindowsSandboxUserStatus {
     state: 'present' | 'unknown'
     reason?: string
   }
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
   /**
    * SID of the user who owns the interactive session this process
    * runs in, when `srt-win` can tell. It differs from
@@ -1141,6 +1145,55 @@ type RawUserStatus = {
   session_user_sid?: string | null
   /** Absent from an `srt-win` that predates the field. */
   seclogon?: string
+  /** Absent from an `srt-win` that does not name what it does. */
+  capabilities?: unknown
+}
+
+/**
+ * Behaviours of `srt-win` this library relies on and asks for by
+ * name. `srt-win` lists what it does as `capabilities` in `user
+ * status` and `profile status`. The two are not always the same
+ * build — an embedder can ship `srt-win` inside its own runtime and
+ * take this library from the package registry — so a behaviour that
+ * lives in `srt-win` is verified, not assumed: a session that depends
+ * on one that is not listed is refused (`srt_win_outdated`).
+ */
+export const WINDOWS_SRT_WIN_CAPABILITIES = {
+  /**
+   * A read deny handed to `srt-win` is also written on every recorded
+   * path of the profile read grant beneath it that carries an allow
+   * of its own. This library names a deny once and leaves that to
+   * `srt-win`; with one that does not do it, a `denyRead` on the
+   * profile directory would not reach a granted directory in it.
+   */
+  profileDenyExpansion: 'profile-deny-expansion',
+  /**
+   * Sessions are recorded as holders of the kept grants they run on,
+   * and `acl forget` / `profile forget` take
+   * `--unless-held-by-others`.
+   */
+  keptGrantHolders: 'kept-grant-holders',
+} as const
+
+function capabilityList(v: unknown): string[] {
+  return Array.isArray(v)
+    ? v.filter((x): x is string => typeof x === 'string')
+    : []
+}
+
+/** The typed error for an `srt-win` that lacks a behaviour by name. */
+export function windowsSrtWinOutdatedError(
+  capability: string,
+  why: string,
+): WindowsSandboxError {
+  return new WindowsSandboxError(
+    'srt_win_outdated',
+    `The srt-win in use is older than this library: it does not report ` +
+      `the capability '${capability}', which ${why}. Update srt-win (the ` +
+      `one shipped with the program embedding this library, or the ` +
+      `package's own) to a build that matches the library. Nothing was ` +
+      `granted.`,
+  )
 }
 
 const SECLOGON_STATES: readonly string[] = [
@@ -1186,6 +1239,7 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
       raw.session_user_sid !== '' && {
         sessionUserSid: raw.session_user_sid,
       }),
+    capabilities: capabilityList(raw.capabilities),
     // As above: only an explicit "none" is no grant.
     ...(raw.profile_grant &&
       raw.profile_grant.state !== 'none' && {
@@ -2706,28 +2760,76 @@ export function expandWindowsFsPaths(
 }
 
 /**
+ * A path that names a network share (`\\\\server\\share\\…`, `\\\\?\\UNC\\…`) or
+ * anything in the device namespace other than a drive (`\\\\.\\pipe\\…`,
+ * `\\\\?\\GLOBALROOT\\…`). Such a path is never opened, listed or
+ * resolved by the checks here: for a share that would send the real
+ * user's credentials to whatever server a session's configuration
+ * names (see {@link isUncPath}).
+ */
+function isUnprobedWindowsPath(p: string): boolean {
+  return isUncPath(p) || /^[\\/]{2}[?.][\\/](?![a-z]:)/i.test(p)
+}
+
+/** What the one look at a path on disk found. */
+type ResolvedWindowsPath =
+  /** The object it names, with links, 8.3 names and case resolved. */
+  | { state: 'resolved'; path: string }
+  /** Nothing is there (or a parent is not a directory). */
+  | { state: 'absent' }
+  /** Not looked at: see {@link isUnprobedWindowsPath}. */
+  | { state: 'unprobed' }
+  /** Looking failed for another reason: access denied, an I/O error. */
+  | { state: 'error'; code: string }
+
+/** "Does not exist" as opposed to "could not look". */
+function isAbsentError(e: unknown): boolean {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+/**
+ * The single place a path of a session's configuration is resolved on
+ * disk for comparison: the same final-path lookup `srt-win` makes.
+ */
+function resolveWindowsPath(p: string): ResolvedWindowsPath {
+  if (isUnprobedWindowsPath(p)) return { state: 'unprobed' }
+  try {
+    // The final-path lookup itself, which also resolves 8.3 names and the
+    // case on disk.
+    // eslint-disable-next-line no-restricted-properties
+    return { state: 'resolved', path: fs.realpathSync.native(p) }
+  } catch (e) {
+    return isAbsentError(e)
+      ? { state: 'absent' }
+      : {
+          state: 'error',
+          code: (e as NodeJS.ErrnoException | undefined)?.code ?? 'unknown',
+        }
+  }
+}
+
+/**
  * `p` for comparison with another path, as the object `srt-win` opens for it:
  * links, junctions, 8.3 names and the case on disk are resolved by the same
  * final-path lookup the helper makes. On top of that, lower case, `/`
  * separators and none at the end. A path that cannot be opened is compared as
- * spelled, and so is a UNC path, which is never probed (see
- * {@link isUncPath}).
+ * spelled, and so is one that is never probed (see
+ * {@link isUnprobedWindowsPath}).
  */
 function windowsPathKey(p: string): string {
-  let resolved = p
-  if (!isUncPath(p)) {
-    try {
-      // The final-path lookup itself, which also resolves 8.3 names and the
-      // case on disk.
-      // eslint-disable-next-line no-restricted-properties
-      resolved = fs.realpathSync.native(p)
-    } catch {
-      // Not there, so nothing lies beneath it either.
-    }
-  }
+  return windowsPathKeyOf(p, resolveWindowsPath(p))
+}
+
+/** {@link windowsPathKey} from a look at the path already taken. */
+function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
   return normalizeCaseForComparison(
     path.win32
-      .normalize(stripExtendedPathPrefix(resolved))
+      .normalize(
+        stripExtendedPathPrefix(
+          resolved.state === 'resolved' ? resolved.path : p,
+        ),
+      )
       .replace(/\\/g, '/')
       .replace(/\/+$/, ''),
   )
@@ -3223,15 +3325,18 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
  * Pass `write` to {@link wrapCommandWithSandboxWindows} as
  * `writeRoots`.
  *
+ * Asynchronous: a root's first grant walks its whole tree, and the
+ * event loop of the embedding program stays live meanwhile.
+ *
  * @throws on exit ≠ 0, including exit 2 (an input was skipped).
  *   Nothing falls back to a per-session grant.
  */
-export function grantWindowsAclPersistent(
+export async function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
     denyRead: readonly string[]
     denyWrite: readonly string[]
   },
-): void {
+): Promise<void> {
   const holder = opts.holderPid ?? process.pid
   const stdin = JSON.stringify({
     read: opts.read,
@@ -3239,7 +3344,7 @@ export function grantWindowsAclPersistent(
     denyRead: opts.denyRead,
     denyWrite: opts.denyWrite,
   })
-  const r = runSrtWin(
+  const r = await runSrtWinAsync(
     [
       'acl',
       'grant',
@@ -3277,19 +3382,26 @@ export function grantWindowsAclPersistent(
  * grant lets the sandbox account write its tree under the ordinary
  * token.
  *
- * @throws if any grant could not be removed.
+ * Asynchronous: it walks each root's tree.
+ *
+ * `unlessHeldByOthers` (the calling session's process id) makes it
+ * remove nothing if another live session is running on a kept grant.
+ *
+ * @throws `kept_grants_in_use` in that case, naming the sessions;
+ *   `acl_forget_failed` if any grant could not be removed.
  */
-export function forgetWindowsPersistentGrants(
-  opts: { srtWin?: SrtWinSpawn } = {},
-): void {
-  const r = runSrtWin(['acl', 'forget', '--all'], {
-    timeoutMs: 600_000,
-    srtWin: opts.srtWin,
-  })
+export async function forgetWindowsPersistentGrants(
+  opts: { unlessHeldByOthers?: number; srtWin?: SrtWinSpawn } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(
+    ['acl', 'forget', '--all', ...unlessHeldArgs(opts.unlessHeldByOthers)],
+    { timeoutMs: 600_000, srtWin: opts.srtWin },
+  )
   logForDebugging(
     `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
   )
+  throwIfKeptGrantsInUse(r, 'acl')
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'acl_forget_failed',
@@ -3298,6 +3410,48 @@ export function forgetWindowsPersistentGrants(
         `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
     )
   }
+}
+
+/** `srt-win`'s exit code for "another live session runs on a kept grant". */
+const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
+
+function unlessHeldArgs(holderPid: number | undefined): string[] {
+  return holderPid === undefined
+    ? []
+    : ['--unless-held-by-others', `${holderPid}`]
+}
+
+/**
+ * Turn `srt-win`'s refusal to remove a kept grant from under another
+ * live session into the typed error, naming those sessions.
+ */
+function throwIfKeptGrantsInUse(r: RunResult, command: string): void {
+  if (r.status !== SRT_WIN_EXIT_HELD_BY_OTHERS) return
+  let held: { pid?: unknown; kind?: unknown; path?: unknown }[] = []
+  try {
+    const parsed = JSON.parse(r.stdout) as { held_by?: unknown }
+    if (Array.isArray(parsed.held_by)) held = parsed.held_by as typeof held
+  } catch {
+    // The exit code says it; the list is for the message only.
+  }
+  const what = held
+    .map(
+      h =>
+        `process ${String(h.pid)} ` +
+        (h.kind === 'profile'
+          ? `reads the profile through the profile read grant`
+          : `writes ${String(h.path)} through a kept grant`),
+    )
+    .join('; ')
+  throw new WindowsSandboxError(
+    'kept_grants_in_use',
+    `Another sandbox session is running on grants this one would have to ` +
+      `remove to use windows.writeRestrictedToken: false` +
+      (what ? ` (${what})` : '') +
+      `. Nothing was removed and nothing was granted. End that session ` +
+      `first, or start this one with the write-restricted token.`,
+    command,
+  )
 }
 
 /**
@@ -3452,6 +3606,12 @@ export interface WindowsProfileGrantStatus {
   reason?: string
   /** The profile directory the grant was made for. */
   profile?: string
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
@@ -3483,6 +3643,7 @@ export interface WindowsProfileGrantStatus {
 
 type RawProfileStatus = {
   record_version?: unknown
+  capabilities?: unknown
   state?: string
   reason?: string
   profile?: string | null
@@ -3586,6 +3747,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     state,
     ...(reason && { reason }),
     ...(raw.profile && { profile: raw.profile }),
+    capabilities: capabilityList(raw.capabilities),
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],
@@ -3630,10 +3792,16 @@ export interface WindowsProfileGrantOptions {
   /**
    * Paths inside the profile to keep unreadable in addition to the
    * built-in list (absolute, or relative to the profile): for example
-   * the embedding program's own configuration directory, or
-   * {@link windowsProfileReadExclusions} of a session configuration.
-   * They are recorded with the grant and stay in force on later runs
-   * that do not name them. Nothing removes a built-in exclusion.
+   * the embedding program's own configuration directory. They are
+   * recorded with the grant and stay in force — for every session,
+   * read and write — on later runs that do not name them. Nothing
+   * removes a built-in exclusion.
+   *
+   * These are deliberate, lasting choices. A session's own
+   * `filesystem.denyRead` and `credentials.files` do NOT belong here:
+   * a session denies those itself, for as long as it runs, and a path
+   * recorded here can no longer lie inside any session's
+   * `allowWrite` root.
    */
   exclude?: readonly string[]
   /**
@@ -3837,6 +4005,12 @@ function grantWindowsProfileReadSync(
  * grant and `windows.writeRestrictedToken` is `false`; uninstall
  * removes the grant too.
  *
+ * This is the synchronous form, for callers that are synchronous by
+ * contract (a command-line tool, an exit path). It blocks for as long
+ * as the removal takes, which on a large profile is minutes:
+ * anything with an event loop to keep alive uses
+ * {@link forgetWindowsProfileReadAsync}, as `initialize()` does.
+ *
  * @throws `profile_forget_failed` if any path could not be completed;
  *   the grant then still counts as existing.
  */
@@ -3847,6 +4021,37 @@ export function forgetWindowsProfileRead(
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
+  profileForgetResult(r)
+}
+
+/**
+ * {@link forgetWindowsProfileRead} without blocking the event loop.
+ *
+ * `unlessHeldByOthers` (the calling session's process id) makes it
+ * remove nothing if another live session is running on a kept grant.
+ *
+ * @throws `kept_grants_in_use` in that case; `profile_forget_failed`
+ *   if any path could not be completed.
+ */
+export async function forgetWindowsProfileReadAsync(
+  opts: {
+    timeoutMs?: number
+    unlessHeldByOthers?: number
+    srtWin?: SrtWinSpawn
+  } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(
+    ['profile', 'forget', '--json', ...unlessHeldArgs(opts.unlessHeldByOthers)],
+    {
+      timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+      srtWin: opts.srtWin,
+    },
+  )
+  throwIfKeptGrantsInUse(r, 'profile')
+  profileForgetResult(r)
+}
+
+function profileForgetResult(r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] profile forget exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
@@ -3869,40 +4074,6 @@ function profilePathKey(p: string): string {
     .toLowerCase()
 }
 
-/** `p` relative to `profile` (`/`-separated, lower case), or `undefined` if it is not beneath it. */
-function relativeToProfile(profile: string, p: string): string | undefined {
-  const root = profilePathKey(profile)
-  const key = profilePathKey(p)
-  return key.startsWith(root + '/') ? key.slice(root.length + 1) : undefined
-}
-
-/**
- * The paths a session configuration keeps unreadable that lie inside
- * the profile — every `credentials.files` path and
- * `filesystem.denyRead` path — to pass to
- * {@link grantWindowsProfileRead} (or the install) as `exclude`. A
- * session denies those itself (see
- * {@link windowsProfileGrantDenyTargets}); excluding them when the
- * grant is made keeps them unreadable for every other session too.
- *
- * `profileDir` is the profile of the user running this; globs are
- * expanded as of now.
- */
-export function windowsProfileReadExclusions(
-  config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>,
-  profileDir: string,
-): string[] {
-  const out = new Set<string>()
-  const named: FilesystemPathEntry[] = [
-    ...(config.filesystem?.disabled ? [] : (config.filesystem?.denyRead ?? [])),
-    ...(config.credentials?.files ?? []).map(f => f.path),
-  ]
-  for (const p of expandWindowsFsPaths(named, { mode: 'deny' })) {
-    if (relativeToProfile(profileDir, p) !== undefined) out.add(p)
-  }
-  return [...out]
-}
-
 /** How a path a session wants to grant stands to a profile exclusion. */
 export interface WindowsProfileExclusionConflict {
   /** The path as the session configuration resolved it. */
@@ -3919,6 +4090,13 @@ export interface WindowsProfileExclusionConflict {
    * lies beneath it.
    */
   relation: 'equal' | 'inside' | 'above'
+  /**
+   * Set on an `above` conflict with a wildcard exclusion when the path
+   * could not be examined for what the exclusion covers beneath it —
+   * access denied, an I/O error, a path on a share — with the reason.
+   * "Could not look" is treated as "something may match".
+   */
+  unexamined?: string
 }
 
 /** One component of a recorded exclusion against one of a path; both lower case. */
@@ -3926,6 +4104,60 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
   if (pattern === '*') return true
   if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1))
   return pattern === name
+}
+
+/**
+ * Whether something that exists beneath the directory `dir` matches
+ * `rest`, the components of an exclusion that `dir` lies above. No
+ * link is followed out of `dir`, and the lookup goes exactly as deep
+ * as the exclusion has components left.
+ *
+ * - `none`: every level that could lead to a match was listed, and
+ *   nothing matches — including when `dir` is not a directory.
+ * - `match`: something does.
+ * - an object with `unexamined`: a level could not be listed for a
+ *   reason other than not being there (access denied, an I/O error),
+ *   or `dir` itself turned out to be a link. The caller treats that as
+ *   a possible match: a path is admitted only when it was looked at
+ *   and found empty of matches, never because looking failed.
+ */
+function exclusionMatchedBeneath(
+  dir: string,
+  rest: readonly string[],
+  top = true,
+): 'none' | 'match' | { unexamined: string } {
+  if (rest.length === 0) return 'match'
+  let entries: fs.Dirent[]
+  try {
+    const st = fs.lstatSync(dir)
+    if (st.isSymbolicLink()) {
+      // Beneath `dir`, a link is simply not followed. `dir` itself was
+      // resolved a moment ago and should not be one.
+      return top ? { unexamined: `'${dir}' is a link` } : 'none'
+    }
+    if (!st.isDirectory()) return 'none'
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch (e) {
+    if (isAbsentError(e)) return 'none'
+    const code = (e as NodeJS.ErrnoException | undefined)?.code ?? 'error'
+    return { unexamined: `'${dir}' could not be listed (${code})` }
+  }
+  let unexamined: { unexamined: string } | undefined
+  for (const e of entries) {
+    if (
+      !exclusionComponentMatches(rest[0]!, normalizeCaseForComparison(e.name))
+    ) {
+      continue
+    }
+    const found = exclusionMatchedBeneath(
+      path.join(dir, e.name),
+      rest.slice(1),
+      false,
+    )
+    if (found === 'match') return 'match'
+    if (found !== 'none') unexamined ??= found
+  }
+  return unexamined ?? 'none'
 }
 
 /**
@@ -3942,7 +4174,26 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
  *   path, lies inside it, or lies above it. Above counts because a
  *   session grant inherits: an excluded store that is deleted and
  *   created again beneath it would be readable, which is what the
- *   grant's own layout never allows.
+ *   grant's own layout never allows. An exclusion with a wildcard
+ *   (`…\Local\*\EBWebView`) names no path until something matches
+ *   it, and would otherwise make every directory under `Local`
+ *   ungrantable: a path counts as above one only while something that
+ *   exists beneath the path matches it. `srt-win` applies the same
+ *   rule. The look is taken when a session starts — for every read
+ *   and write path of its configuration, so also for a write root kept
+ *   from an earlier session — and not continuously: a store that
+ *   appears beneath a root later is found at the next start, which is
+ *   then refused. It fails closed: a path that exists and cannot be
+ *   listed (access denied, an I/O error) is refused like one with a
+ *   match, and a path on a share or in the device namespace is never
+ *   opened at all and refused if a wildcard exclusion could lie
+ *   beneath it (it cannot, for a profile on a local drive). A path
+ *   that does not exist has nothing beneath it and is admitted.
+ *
+ *   A store the sandboxed command itself creates beneath its own
+ *   write root is that command's own data: nothing here tries to keep
+ *   a command from reading what it wrote, and the next start's
+ *   refusal is about the root, not about that command.
  * - Against an UNGRANTED-ONLY directory (the temporary directory) it
  *   collides when it is that directory or lies above it: the grant
  *   would cover everything in it. A path INSIDE one does not collide:
@@ -3998,7 +4249,10 @@ export function windowsProfileExclusionConflicts(
   )
   const out: WindowsProfileExclusionConflict[] = []
   for (const p of paths) {
-    const key = windowsPathKey(p)
+    // One guarded look at the path: the comparison key and the
+    // lookups beneath it use the same result.
+    const onDisk = resolveWindowsPath(p)
+    const key = windowsPathKeyOf(p, onDisk)
     const parts = key.split('/')
     for (const r of rules) {
       const shared = Math.min(parts.length, r.parts.length)
@@ -4014,6 +4268,25 @@ export function windowsProfileExclusionConflicts(
             ? 'inside'
             : 'above'
       if (r.onlyEqual && relation !== 'equal') continue
+      let unexamined: string | undefined
+      if (relation === 'above' && r.exclusion.includes('*')) {
+        if (onDisk.state === 'absent') continue
+        if (onDisk.state === 'resolved') {
+          const found = exclusionMatchedBeneath(
+            onDisk.path,
+            r.parts.slice(parts.length),
+          )
+          if (found === 'none') continue
+          if (found !== 'match') unexamined = found.unexamined
+        } else {
+          // Never opened (a share, the device namespace) or not
+          // openable: nothing was looked at, so nothing is admitted.
+          unexamined =
+            onDisk.state === 'unprobed'
+              ? `'${p}' is not on a local drive and is not examined`
+              : `'${p}' could not be resolved (${onDisk.code})`
+        }
+      }
       if (r.kind === 'ungranted-only') {
         if (relation === 'inside') continue
       } else if (relation !== 'above' && admitted.has(key)) {
@@ -4027,41 +4300,10 @@ export function windowsProfileExclusionConflicts(
         kind: r.kind,
         access,
         relation,
+        ...(unexamined === undefined ? {} : { unexamined }),
       })
       break
     }
-  }
-  return out
-}
-
-/**
- * What a session's read denies have to be stamped on, beyond their
- * own paths, while a profile read grant exists.
- *
- * A granted directory, a container and a granted file each carry an
- * ALLOW of their own for the sandbox group. A deny on the same path,
- * or on anything beneath a granted directory, comes first and wins. A
- * deny on a directory ABOVE one of them reaches it only by
- * inheritance, behind its own ALLOW, and loses. So for every deny
- * that is such a path or lies above it, the path itself gets the deny
- * for the session.
- *
- * Returns the recorded paths to add to `denyRead` (none that is
- * already in it).
- */
-export function windowsProfileGrantDenyTargets(
-  denyRead: readonly string[],
-  paths: readonly WindowsProfileGrantPath[],
-): string[] {
-  if (denyRead.length === 0 || paths.length === 0) return []
-  const denyKeys = denyRead.map(windowsPathKey)
-  const already = new Set(denyKeys)
-  const out: string[] = []
-  for (const p of paths) {
-    if (p.kind === 'denied') continue
-    const key = normalizeCaseForComparison(profilePathKey(p.path))
-    if (already.has(key)) continue
-    if (denyKeys.some(d => isAtOrUnder(key, d))) out.push(p.path)
   }
   return out
 }

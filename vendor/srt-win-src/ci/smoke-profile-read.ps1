@@ -136,12 +136,15 @@ function Invoke-Srt { param([string] $bin, [string[]] $argv)
 
 # Sandboxed exec under the write-restricted token (or the ordinary one
 # with -Ordinary), with `$extraPath` appended to the child's PATH.
-function Sb { param([string[]] $tail, [string] $extraPath = '', [switch] $Ordinary, [int] $TimeoutSec = 180)
+# With -ExecFlagsFirst, `$tail` starts with flags of `exec` itself and
+# carries its own `--`.
+function Sb { param([string[]] $tail, [string] $extraPath = '', [switch] $Ordinary, [int] $TimeoutSec = 180, [string[]] $WriteRoots = @(), [switch] $ExecFlagsFirst)
   $path = $env:PATH
   if ($extraPath) { $path = "$path;$extraPath" }
   $argv = @('exec', '--env', "PATH=$path", '--env', "PATHEXT=$($env:PATHEXT)")
   if (-not $Ordinary) { $argv += '--write-restricted-token' }
-  $argv += @('--') + $tail
+  foreach ($w in $WriteRoots) { $argv += @('--write-root', $w) }
+  if ($ExecFlagsFirst) { $argv += $tail } else { $argv += @('--') + $tail }
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.FileName               = $ExeAbs
   $psi.UseShellExecute        = $false
@@ -232,17 +235,20 @@ function End-Session {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
 }
-# The recorded paths a deny on `$d` has to be stamped on: `$d` itself
-# and every path the grant made readable at or beneath it.
-function Deny-Targets { param([string] $d)
-  $key = $d.TrimEnd('\').ToLowerInvariant()
-  $out = @($d)
-  foreach ($p in (Status).paths) {
-    if ($p.kind -eq 'denied') { continue }
-    $at = ($p.path -replace '^\\\\\?\\', '').TrimEnd('\').ToLowerInvariant()
-    if ($at -ne $key -and $at.StartsWith($key + '\')) { $out += $p.path }
+# The explicit ACEs of a path's DACL, in order, and whether they are
+# in canonical order: every deny before the first allow.
+function Explicit-Aces { param([string] $p)
+  $dacl = ((Sddl $p) -replace '^.*?D:', '') -replace 'S:.*$', ''
+  @([regex]::Matches($dacl, '\(([^;)]*);([^;)]*);[^)]*\)') | Where-Object { $_.Groups[2].Value -notmatch 'ID' } |
+    ForEach-Object Value)
+}
+function Denies-First { param([string] $p)
+  $seenAllow = $false
+  foreach ($a in (Explicit-Aces $p)) {
+    if ($a.StartsWith('(A')) { $seenAllow = $true }
+    elseif ($a.StartsWith('(D') -and $seenAllow) { return $false }
   }
-  return $out
+  return $true
 }
 
 try { Start-Service seclogon -ea Stop } catch {
@@ -262,6 +268,7 @@ $outside = Join-Path $root 'outside'
 
 $sbSid = $null
 $script:grpSid = $null
+$lSsh = $null; $lCfg = $null; $ownerDenied = $null; $wrDeny = $null
 try {
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange)
   $us = J @('user', 'status')
@@ -550,6 +557,50 @@ try {
   End-Session
   & $Exe acl forget $sessDir 2>&1 | Out-Null
   Remove-Item -Recurse -Force -LiteralPath $sshSub
+  # A wildcard exclusion (an embedded browser profile in any directory
+  # of the local application data) closes a directory above it only
+  # while something in that directory matches.
+  $noWeb   = Join-Path $prof 'AppData\Local\NoWeb'
+  $withWeb = Join-Path $prof 'AppData\Local\WithWeb'
+  New-Item -ItemType Directory -Path (Join-Path $noWeb 'cache'), (Join-Path $withWeb 'EBWebView') -Force | Out-Null
+  $code = Session-Grant -write @($noWeb)
+  if ($code -eq 0) { Ok 'A: a directory of the local application data with no embedded browser profile in it is granted as a write root' }
+  else { Fail "A: write root AppData\Local\NoWeb: exit=$code output: $($script:lastGrant)" }
+  End-Session
+  & $Exe acl forget $noWeb 2>&1 | Out-Null
+  $code = Session-Grant -read @($noWeb)
+  if ($code -eq 0) { Ok 'A: … and for reading' } else { Fail "A: read grant AppData\Local\NoWeb: exit=$code output: $($script:lastGrant)" }
+  End-Session
+  Refused 'a write root with an embedded browser profile beneath it' $withWeb -write @($withWeb)
+  Refused 'a read grant on such a directory'                         $withWeb -read @($withWeb)
+  # The look is taken at every session start: the same root, once such
+  # a store has appeared in it, is refused the next time.
+  New-Item -ItemType Directory -Path (Join-Path $noWeb 'EBWebView') -Force | Out-Null
+  Refused 'a root that was granted before, once a store has appeared beneath it' $noWeb -write @($noWeb)
+  Remove-Item -Recurse -Force -LiteralPath (Join-Path $noWeb 'EBWebView')
+
+  # ── P: a write root with a read-denied file inside it ────────────
+  # The session's own deny, not a recorded exclusion: the root is
+  # granted, the file is unreadable, the rest of the root is writable.
+  $proj    = Join-Path $prof 'Documents\proj'
+  $envFile = Seed 'Documents\proj\.env'    'ENV-CONTENT'
+  $srcFile = Seed 'Documents\proj\src.txt' 'SRC-CONTENT'
+  $json = @{ read = @(); write = @($proj); denyRead = @($envFile); denyWrite = @() } | ConvertTo-Json -Compress
+  $raw = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { Fail "P: a write root with a read-denied file inside is refused: $raw" }
+  else {
+    $r = Sb @($cmd, '/d', '/s', '/c', "type `"$srcFile`" & echo NEW> `"$proj\p-new.txt`" & type `"$envFile`"") -WriteRoots @($proj)
+    $made = Test-Path -LiteralPath (Join-Path $proj 'p-new.txt')
+    if ($r.out -match 'SRC-CONTENT' -and $made -and $r.out -notmatch 'ENV-CONTENT') {
+      Ok 'P: the root is readable and writable, the denied file inside it is not readable'
+    } else { Fail "P: read=$($r.out -match 'SRC-CONTENT') created=$made env-read=$($r.out -match 'ENV-CONTENT') raw: $($r.raw)" }
+    $before = (Status).exclusions
+    if (@($before | Where-Object { $_ -match 'proj' }).Count -eq 0) { Ok "P: the session's deny is not among the recorded exclusions" }
+    else { Fail "P: recorded exclusions name the session's deny: $($before -join ', ')" }
+  }
+  End-Session
+  & $Exe acl forget $proj 2>&1 | Out-Null
+  Remove-Item -Recurse -Force -LiteralPath $proj
 
   # ── W: nothing is writable ───────────────────────────────────────
   foreach ($case in @(
@@ -582,14 +633,22 @@ try {
   else { Fail "J: .ssh carries an allow for the group: $(Sddl $sshDir) / $(Sddl $sshKey)" }
 
   # ── D: session read denies ───────────────────────────────────────
-  # On the profile directory, stamped as the library stamps it.
-  $targets = Deny-Targets $prof
-  Write-Host "D: a deny on the profile directory is stamped on $($targets.Count) path(s)"
-  if ((Session-Deny $targets) -ne 0) { Fail 'D: the session stamps for a deny on the profile directory could not be written' }
+  # The deny is handed over as a session names it: one path. srt-win
+  # puts it on every recorded path beneath it that carries an allow of
+  # its own, from its record.
+  # That it does so is what the library asks for by name.
+  $capsUser = @((J @('user', 'status')).capabilities)
+  $capsProf = @((Status).capabilities)
+  if ($capsUser -contains 'profile-deny-expansion' -and $capsProf -contains 'profile-deny-expansion' -and
+      $capsUser -contains 'kept-grant-holders') { Ok 'D: user status and profile status name the capabilities the library relies on' }
+  else { Fail "D: capabilities: user status [$($capsUser -join ', ')] profile status [$($capsProf -join ', ')]" }
+  if ((Session-Deny @($prof)) -ne 0) { Fail 'D: the session stamps for a deny on the profile directory could not be written' }
   else {
     Expect-NoRead 'D (deny on the profile: granted child)' $note 'NOTE-CONTENT'
+    Expect-NoRead 'D (deny on the profile: file under a granted child)' $subFile 'DEEP-CONTENT'
     Expect-NoRead 'D (deny on the profile: root file)' $npmrc 'NPMRC-CONTENT'
     Expect-NoRead 'D (deny on the profile: file of a container)' $cargoCfg 'CARGO-CONFIG-CONTENT'
+    Expect-NoRead 'D (deny on the profile: file under a nested container)' $npmTool 'NPM-TOOL'
     $r = Sb @($cmd, '/d', '/s', '/c', "dir /b /a `"$prof`"")
     if ($r.exit -ne 0) { Ok 'D: the denied profile directory cannot be listed' }
     else { Fail "D: dir of the denied profile directory: exit=$($r.exit) raw: $($r.raw)" }
@@ -597,9 +656,23 @@ try {
   End-Session
   Expect-Read 'D (after the session)' $note 'NOTE-CONTENT'
   Expect-Read 'D (after the session)' $npmrc 'NPMRC-CONTENT'
+  Expect-Read 'D (after the session)' $cargoCfg 'CARGO-CONFIG-CONTENT'
+  # On a container: what is recorded beneath it, and nothing else.
+  if ((Session-Deny @((Join-Path $prof 'AppData'))) -ne 0) { Fail 'D: the session stamps for a deny on a container could not be written' }
+  else {
+    Expect-NoRead 'D (deny on a container: a granted directory two levels down)' $npmTool 'NPM-TOOL'
+    Expect-Read 'D (deny on a container leaves the rest)' $note 'NOTE-CONTENT'
+  }
+  End-Session
+  # The same deny for one command only (`exec --deny-read`): one
+  # argument, whatever it covers.
+  $r = Sb @('--deny-read', (Join-Path $prof 'AppData'), '--', $cmd, '/d', '/s', '/c', "type `"$npmTool`"") -ExecFlagsFirst
+  if ($r.out -notmatch 'NPM-TOOL' -and $r.exit -ne 0) { Ok 'D: a per-command deny on a container reaches the granted directory beneath it' }
+  else { Fail "D: per-command deny on AppData: exit=$($r.exit) raw: $($r.raw)" }
+  Expect-Read 'D (after that command)' $npmTool 'NPM-TOOL'
   # On a granted child.
   $docs = Join-Path $prof 'Documents'
-  if ((Session-Deny (Deny-Targets $docs)) -ne 0) { Fail 'D: the session stamp for a deny on a granted child could not be written' }
+  if ((Session-Deny @($docs)) -ne 0) { Fail 'D: the session stamp for a deny on a granted child could not be written' }
   else {
     Expect-NoRead 'D (deny on a granted child)' $note 'NOTE-CONTENT'
     Expect-NoRead 'D (deny on a granted child, deeper)' $subFile 'DEEP-CONTENT'
@@ -616,14 +689,6 @@ try {
   }
   End-Session
   Expect-Read 'D (after the session)' $subFile 'DEEP-CONTENT'
-  # OBSERVATION: the deny on the profile directory alone. A granted
-  # child's own allow is met before a deny it only inherits, which is
-  # why the stamps above go on every granted path.
-  if ((Session-Deny @($prof)) -eq 0) {
-    $x = Sb-Reads $note 'NOTE-CONTENT'
-    Write-Host "D: OBSERVATION: with the deny stamped on the profile directory ONLY, a file under a granted child is $(if ($x.read) { 'still READABLE (so the per-path stamps are needed)' } else { 'not readable' })"
-  }
-  End-Session
 
   # ── O: the ordinary token ────────────────────────────────────────
   $r = Sb @($cmd, '/d', '/s', '/c', 'echo ORDINARY-RAN') -Ordinary
@@ -645,11 +710,124 @@ try {
   if ($r.exit -eq 0 -and $r.out -match 'ORDINARY-RAN') { Ok 'F: the ordinary token runs again' }
   else { Fail "F: ordinary-token exec after forget: exit=$($r.exit) raw: $($r.raw)" }
 
+  # ── L: excluded names that are links ─────────────────────────────
+  # A second made-up profile whose `.ssh` and `.config` are junctions
+  # into a `dotfiles` directory. The links are left alone; what the
+  # rules say for the names holds where the objects really are.
+  $prof2 = Join-Path $root 'profile2'
+  $dot   = Join-Path $prof2 'dotfiles'
+  New-Item -ItemType Directory -Path (Join-Path $dot '.ssh'), (Join-Path $dot '.config\gh'), (Join-Path $dot '.config\nvim') -Force | Out-Null
+  $lKey    = Join-Path $dot '.ssh\id_test';          'LKEY-CONTENT'   | Set-Content -Encoding ASCII -LiteralPath $lKey
+  $lHosts  = Join-Path $dot '.config\gh\hosts.yml';  'LHOSTS-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $lHosts
+  $lNvim   = Join-Path $dot '.config\nvim\init.lua'; 'LNVIM-CONTENT'  | Set-Content -Encoding ASCII -LiteralPath $lNvim
+  $lReadme = Join-Path $dot 'README';                 'LREADME-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $lReadme
+  $lSsh = Join-Path $prof2 '.ssh'
+  $lCfg = Join-Path $prof2 '.config'
+  New-Item -ItemType Junction -Path $lSsh -Target (Join-Path $dot '.ssh')    | Out-Null
+  New-Item -ItemType Junction -Path $lCfg -Target (Join-Path $dot '.config') | Out-Null
+  $gl = Invoke-Srt $HooksAbs @('profile', 'grant', '--test-profile', $prof2, '--json')
+  if ($gl.exit -ne 0) { Fail "L: profile grant on the profile with links: exit=$($gl.exit) raw: $($gl.raw)" }
+  else {
+    Expect-Read   'L (beside the linked stores)'                 $lReadme 'LREADME-CONTENT'
+    Expect-Read   'L (configuration no rule names, behind the link)' $lNvim 'LNVIM-CONTENT'
+    Expect-NoRead 'L (the keys, where they really are)'          $lKey   'LKEY-CONTENT'
+    Expect-NoRead 'L (the keys, through the link)'               (Join-Path $lSsh 'id_test') 'LKEY-CONTENT'
+    Expect-NoRead 'L (the sign-in, where it really is)'          $lHosts 'LHOSTS-CONTENT'
+    Expect-NoRead 'L (the sign-in, through the link)'            (Join-Path $lCfg 'gh\hosts.yml') 'LHOSTS-CONTENT'
+    if (-not (Has-GroupAllow (Join-Path $dot '.ssh')) -and -not (Has-GroupAllow (Join-Path $dot '.config\gh'))) {
+      Ok 'L: the link targets carry no allow for the group'
+    } else { Fail "L: a link target carries an allow: $(Sddl (Join-Path $dot '.ssh')) / $(Sddl (Join-Path $dot '.config\gh'))" }
+    $st2 = (Invoke-Srt $HooksAbs @('profile', 'status', '--test-profile', $prof2)).json
+    $want = @((Join-Path $dot '.ssh'), (Join-Path $dot '.config\gh')) | ForEach-Object { $_.ToLowerInvariant() }
+    $have = @($st2.exclusions | ForEach-Object { ($_ -replace '^\\\\\?\\', '').ToLowerInvariant() })
+    $missing = @($want | Where-Object { $have -notcontains $_ })
+    if ($missing.Count -eq 0) { Ok 'L: the exclusions are recorded where the objects really are' }
+    else { Fail "L: not among the recorded exclusions: $($missing -join ', ') (recorded: $($have -join ', '))" }
+    # A session cannot be granted the real location either.
+    $code = Session-Grant -read @((Join-Path $dot '.ssh'))
+    End-Session
+    if ($code -ne 0) { Ok 'L: a session read grant on the real location of the keys is refused' }
+    else { Fail "L: a session read grant on dotfiles\.ssh was accepted: $($script:lastGrant)" }
+  }
+  $fl = Invoke-Srt $ExeAbs @('profile', 'forget', '--json')
+  if ($fl.exit -ne 0) { Fail "L: profile forget exit=$($fl.exit) raw: $($fl.raw)" }
+
+  # ── C: a deny the owner put there stays in front ──────────────────
+  # On a directory of the profile, before the grant: the group's allow
+  # is written behind it, and the sandboxed command stays denied.
+  $ownerDenied = Join-Path $prof 'OwnerDenied'
+  $odFile = Seed 'OwnerDenied\f.txt' 'OWNER-DENIED-CONTENT'
+  & icacls $ownerDenied /deny '*S-1-5-32-545:(OI)(CI)(RD)' | Out-Null
+  $g = Grant
+  if ($g.exit -ne 0) { Fail "C: profile grant exit=$($g.exit) raw: $($g.raw)" }
+  else {
+    if (Has-GroupAllow $ownerDenied) { Ok 'C: the directory is granted like any other child' }
+    else { Fail "C: OwnerDenied carries no allow for the group: $(Sddl $ownerDenied)" }
+    Expect-NoRead "C (a profile directory with the owner's deny for Users)" $odFile 'OWNER-DENIED-CONTENT'
+    if (Denies-First $ownerDenied) { Ok 'C: every explicit deny precedes the first allow on it' }
+    else { Fail "C: the DACL of OwnerDenied is not in canonical order: $((Explicit-Aces $ownerDenied) -join '')" }
+    Expect-Read 'C (the rest of the profile reads as before)' $note 'NOTE-CONTENT'
+  }
+  # On a kept write root: the owner's deny of delete still applies to
+  # the sandboxed command, which may otherwise write there.
+  $wrDeny = Join-Path $root 'wr-deny'
+  New-Item -ItemType Directory -Path $wrDeny -Force | Out-Null
+  'KEEP' | Set-Content -Encoding ASCII -LiteralPath (Join-Path $wrDeny 'keep.txt')
+  & icacls $wrDeny /deny '*S-1-5-32-545:(OI)(CI)(DE,DC)' | Out-Null
+  $code = Session-Grant -write @($wrDeny)
+  if ($code -ne 0) { Fail "C: write root with the owner's deny: exit=$code output: $($script:lastGrant)" }
+  else {
+    $r = Sb @($cmd, '/d', '/s', '/c', "echo NEW> `"$wrDeny\c-new.txt`" & del /q `"$wrDeny\keep.txt`" & exit /b 0") -WriteRoots @($wrDeny)
+    $kept = Test-Path -LiteralPath (Join-Path $wrDeny 'keep.txt')
+    $made = Test-Path -LiteralPath (Join-Path $wrDeny 'c-new.txt')
+    if ($kept -and $made) { Ok "C: in a kept write root the command writes, and the owner's deny of delete still holds" }
+    else { Fail "C: kept write root: keep.txt present=$kept new file created=$made raw: $($r.raw)" }
+    if (Denies-First $wrDeny) { Ok 'C: every explicit deny precedes the first allow on the root' }
+    else { Fail "C: the DACL of the write root is not in canonical order: $((Explicit-Aces $wrDeny) -join '')" }
+  }
+  End-Session
+  & $Exe acl forget $wrDeny 2>&1 | Out-Null
+  & icacls $wrDeny /remove:d '*S-1-5-32-545' | Out-Null
+
+  # ── H: a kept grant is not removed from under a live session ─────
+  # This script's process holds a session on the profile grant and on
+  # a kept root. Asked on behalf of another process (4 is always
+  # alive), neither forget removes anything.
+  $code = Session-Grant -write @($workDir)
+  if ($code -ne 0) { Fail "H: setup — the session's grant: $($script:lastGrant)" }
+  else {
+    $h = Invoke-Srt $ExeAbs @('profile', 'forget', '--json', '--unless-held-by-others', '4')
+    $holders = @($h.json.held_by | Where-Object { $_.pid -eq $PID })
+    if ($h.exit -eq 22 -and $holders.Count -ge 1 -and (Has-Group $prof)) { Ok 'H: profile forget is refused (exit 22) while another live session reads through the grant, which stays' }
+    else { Fail "H: profile forget with a live holder: exit=$($h.exit) grant present=$(Has-Group $prof) raw: $($h.raw)" }
+    $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--all', '--unless-held-by-others', '4')
+    if ($h.exit -eq 22 -and (Has-Group $workDir)) { Ok 'H: acl forget --all is refused (exit 22) while another live session writes through a kept root, which stays' }
+    else { Fail "H: acl forget --all with a live holder: exit=$($h.exit) root still granted=$(Has-Group $workDir) raw: $($h.raw)" }
+    Expect-Read 'H (the held grant still reads)' $note 'NOTE-CONTENT'
+    # The session's own process is not "another".
+    $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--unless-held-by-others', "$PID", (Join-Path $root 'never-granted'))
+    if ($h.exit -eq 0) { Ok 'H: the holder itself is not refused' }
+    else { Fail "H: forget asked by the holder: exit=$($h.exit) raw: $($h.raw)" }
+  }
+  End-Session
+  # The session over, the same request goes through.
+  $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--all', '--unless-held-by-others', '4')
+  if ($h.exit -eq 0 -and -not (Has-Group $workDir)) { Ok 'H: with the session ended, the kept root is forgotten' }
+  else { Fail "H: acl forget --all after the session: exit=$($h.exit) root still granted=$(Has-Group $workDir) raw: $($h.raw)" }
+
   # ── U: uninstall ─────────────────────────────────────────────────
+  # (Already elevated, so there is no prompt to decline; this is the
+  # path where the account is removed first and the grants are then
+  # forgotten with the group's SID read beforehand.)
+  & icacls $ownerDenied /remove:d '*S-1-5-32-545' | Out-Null
   $g = Grant
   if ($g.exit -ne 0 -or -not (Has-Group $prof)) { Fail "U: setup — the grant is not there: $($g.raw)" }
   else {
-    & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
+    $un = Invoke-Srt $ExeAbs @('uninstall', '--sublayer-guid', $Sublayer)
+    if ($un.exit -eq 0) { Ok 'U: uninstall reports a clean removal' }
+    else { Fail "U: uninstall exit=$($un.exit) raw: $($un.raw)" }
+    if (-not (Has-Group $ownerDenied) -and -not (Has-Group $withWeb)) { Ok 'U: nothing added after the first grant still names the group' }
+    else { Fail "U: still naming the group: OwnerDenied=$(Sddl $ownerDenied) WithWeb=$(Sddl $withWeb)" }
     Restored 'U'
     Outside-Unchanged 'after uninstall'
   }
@@ -662,7 +840,10 @@ finally {
     & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   }
   # Junctions first, as links: never through them.
-  foreach ($j in @($jTop, $jOutside, $jSsh, $symFile)) {
+  foreach ($d in @($ownerDenied, $wrDeny)) {
+    if ($d -and (Test-Path -LiteralPath $d)) { & icacls $d /remove:d '*S-1-5-32-545' 2>&1 | Out-Null }
+  }
+  foreach ($j in @($jTop, $jOutside, $jSsh, $symFile, $lSsh, $lCfg)) {
     if ($j -and (Test-Path -LiteralPath $j)) { [System.IO.Directory]::Exists($j) ? [System.IO.Directory]::Delete($j) : [System.IO.File]::Delete($j) }
   }
   Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
@@ -674,4 +855,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, A, W, J, D, O, F, U)'
+Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, U)'

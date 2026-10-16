@@ -473,6 +473,11 @@ enum ProfileCmd {
         /// stdout, also when exiting non-zero.
         #[arg(long)]
         json: bool,
+        /// Remove nothing, print `{"held_by": [{pid, kind, path}]}`
+        /// on stdout and exit 22, if a live session other than the
+        /// one of this process id is running on a kept grant.
+        #[arg(long, value_name = "PID")]
+        unless_held_by_others: Option<u32>,
     },
     /// Print the recorded grant as JSON: `{state, reason?, profile,
     /// list_version, recorded_list_version, extra_exclusions,
@@ -659,6 +664,11 @@ enum AclCmd {
         /// non-zero.
         #[arg(long)]
         json: bool,
+        /// Remove nothing, print `{"held_by": [{pid, kind, path}]}`
+        /// on stdout and exit 22, if a live session other than the
+        /// one of this process id is running on a kept grant.
+        #[arg(long, value_name = "PID")]
+        unless_held_by_others: Option<u32>,
         /// The roots to forget.
         #[arg(value_name = "PATH")]
         roots: Vec<String>,
@@ -843,6 +853,15 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
+        // A read deny holds against the profile read grant only if it
+        // is also on each recorded path beneath it that carries an
+        // allow of its own. Worked out here, from the record, so the
+        // caller names the deny once whatever it covers.
+        if matches!(ace, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)) {
+            for also in srt_win::profile::read_deny_also(&canon)? {
+                targets.push((also, ace));
+            }
+        }
         // Full-chain hold (see doc). Duplicates are merged below.
         if matches!(ace, SbAce::Deny(_)) {
             for anc in db.placeholder_ancestors_of(&canon)? {
@@ -923,6 +942,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // Whether a profile read grant is recorded (`none`, `present`
         // or `unknown`); `profile status` says whether it is current.
         "profile_grant": srt_win::profile::brief_status_json(),
+        "capabilities": srt_win::profile::CAPABILITIES,
         // The user of the interactive session this process is in, when
         // that can be told (`null` otherwise): an install applies the
         // profile read grant only when it runs as that user.
@@ -1517,43 +1537,31 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Persistent write grants go with the account. Done here,
-            // before the elevation hop: the records are the CALLING
-            // user's (their registry hive, their session database),
-            // and the elevated process may be another user. They name
-            // the sandbox group, so this must also precede its
-            // removal. A root that cannot be completed stays recorded
-            // (`acl forget --all` retries) and does not stop the
-            // uninstall: once the group is gone its ACEs match no
-            // token.
-            if !keep_user {
-                match srt_win::profile::forget_everything() {
-                    Ok(None) => {}
-                    Ok(Some(f)) if f.failed.is_empty() => eprintln!(
-                        "srt-win: profile read grant removed ({} path(s))",
-                        f.removed + f.absent
-                    ),
-                    Ok(Some(f)) => eprintln!(
-                        "srt-win: warning: the profile read grant could not be removed from \
-                         {} path(s), which stay recorded",
-                        f.failed.len()
-                    ),
-                    Err(e) => eprintln!("srt-win: warning: profile read grant cleanup: {e:#}"),
-                }
-                match srt_win::persist::forget_everything() {
-                    Ok((0, _)) => {}
-                    Ok((n, 0)) => {
-                        eprintln!("srt-win: persistent write grants removed from {n} root(s)")
-                    }
-                    Ok((n, failed)) => eprintln!(
-                        "srt-win: warning: {failed} of {n} persistent write grant(s) could \
-                         not be removed and stay recorded"
-                    ),
-                    Err(e) => eprintln!("srt-win: warning: persistent write grant cleanup: {e:#}"),
-                }
-            }
+            // The calling user's kept grants go with the account —
+            // AFTER the elevated removal has succeeded, never before
+            // (`persist::after_elevation`): a declined or failed
+            // elevation leaves everything as it was. What they need
+            // from the install record, the group's SID, is read now,
+            // while the record is still there.
+            let ids = if keep_user {
+                None
+            } else {
+                srt_win::persist::Ids::load().ok()
+            };
             if let Some(code) = maybe_self_elevate(args)? {
-                std::process::exit(code);
+                use srt_win::persist::{AfterElevation, after_elevation};
+                match after_elevation(code) {
+                    AfterElevation::LeaveEverything(code) => {
+                        eprintln!(
+                            "srt-win: uninstall did not complete (exit {code}); nothing was \
+                             removed, and the grants kept for this user are unchanged"
+                        );
+                        std::process::exit(code);
+                    }
+                    AfterElevation::ForgetGrants => {
+                        std::process::exit(forget_grants_after_removal(ids.as_ref(), keep_user));
+                    }
+                }
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             // Record first, filters second — see
@@ -1615,6 +1623,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotent on already-absent.
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
+            // Already elevated, so no hop: this process is also the
+            // calling user's half.
+            let code = forget_grants_after_removal(ids.as_ref(), keep_user);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
 
         // ─── status (combined) ─────────────────────────────────────
@@ -2078,7 +2092,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     )?;
                     // Before anything is granted, in either mode: no
                     // grant may reach what a recorded profile read
-                    // grant excludes.
+                    // grant excludes. This is every session start, and
+                    // every path of the session — a write root kept
+                    // from an earlier session included, before its
+                    // DACL is read and found to need no write: what
+                    // lies beneath it is looked at again each time.
                     let grants: Vec<(String, bool)> = at
                         .targets
                         .iter()
@@ -2130,6 +2148,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .collect();
                     let (kept, per_session_denies) =
                         persist::apply(db, &ids, &roots, &denies.targets)?;
+                    // From here the holder's session runs on these
+                    // kept roots, and on the profile read grant if one
+                    // is recorded: said in the holder table, so that
+                    // nothing removes either from under it
+                    // (`--unless-held-by-others`).
+                    db.hold_kept(&roots, srt_win::profile::held_profile().as_deref())?;
                     // Per session, for the sandbox user SID as without
                     // the flag: the read grants, and the denies under
                     // no persistent root.
@@ -2195,7 +2219,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Forget { all, json, roots },
+            sub:
+                AclCmd::Forget {
+                    all,
+                    json,
+                    unless_held_by_others,
+                    roots,
+                },
         } => {
             use srt_win::{path_id, persist, state_db};
             if !all && roots.is_empty() {
@@ -2204,9 +2234,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 ));
             }
             let ids = persist::Ids::load()?;
-            // No holder of its own: the PID is this process's.
-            let holder = state_db::HolderPid(std::process::id());
+            // No holder of its own: the PID is this process's, unless
+            // the caller says whose session is asking.
+            let holder =
+                state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _report) = state_db::with_init_lock(holder, false, |db| {
+                if unless_held_by_others.is_some() {
+                    exit_if_held_by_others(db)?;
+                }
                 // A root that no longer resolves is looked up as
                 // given: it may be recorded under that spelling.
                 let targets: Vec<String> = roots
@@ -2223,11 +2258,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 .iter()
                 .filter(|(_, r)| matches!(r, persist::Forgot::Failed(_)))
                 .count();
+            let pending = out
+                .iter()
+                .filter(|(_, r)| *r == persist::Forgot::Pending)
+                .count();
             eprintln!(
-                "srt-win: acl forget — {} root(s){}",
+                "srt-win: acl forget — {} root(s){}{}",
                 out.len(),
                 if failed > 0 {
                     format!(", {failed} FAILED (still recorded)")
+                } else {
+                    String::new()
+                },
+                if pending > 0 {
+                    format!(", {pending} on a volume that is not mounted (removed when it is back)")
                 } else {
                     String::new()
                 },
@@ -2261,6 +2305,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             use srt_win::state_db;
             let holder = state_db::HolderPid(holder_pid);
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
+                // The session is ending: it no longer runs on the
+                // kept grants either.
+                db.release_kept()?;
                 db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
             })?;
             // Grants whose ACE may still be on disk (rows kept).
@@ -2473,12 +2520,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
         Cmd::Profile {
-            sub: ProfileCmd::Forget { json },
+            sub:
+                ProfileCmd::Forget {
+                    json,
+                    unless_held_by_others,
+                },
         } => {
             use srt_win::{persist, profile, state_db};
             let ids = persist::Ids::load()?;
-            let holder = state_db::HolderPid(std::process::id());
+            let holder =
+                state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _) = state_db::with_init_lock(holder, false, |db| {
+                if unless_held_by_others.is_some() {
+                    exit_if_held_by_others(db)?;
+                }
                 profile::forget(&profile::Store::of(db.conn()), &ids)
             })?;
             eprintln!(
@@ -2516,14 +2571,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let test_profile: Option<String> = None;
             #[cfg(feature = "test-hooks")]
             let test_profile = test_profile.or_else(test_profile_from_env);
-            println!(
-                "{}",
-                profile::status_json(
-                    persist::MARKER_KEY,
-                    profile::Layout::resolve(test_profile.as_deref()),
-                    paths,
-                )
+            let mut status = profile::status_json(
+                persist::MARKER_KEY,
+                profile::Layout::resolve(test_profile.as_deref()),
+                paths,
             );
+            // Whatever the state: what this build does, by name.
+            if let Some(o) = status.as_object_mut() {
+                o.insert("capabilities".to_owned(), json!(profile::CAPABILITIES));
+            }
+            println!("{status}");
         }
 
         // ─── runner ────────────────────────────────────────────────
@@ -2971,6 +3028,123 @@ fn require_elevated() -> anyhow::Result<()> {
             "this command requires elevation — run from an \
              administrator prompt"
         ))
+    }
+}
+
+/// Exit code of `acl forget` / `profile forget` with
+/// `--unless-held-by-others` when another live session runs on a kept
+/// grant: nothing was removed.
+const EXIT_HELD_BY_OTHERS: i32 = 22;
+
+/// Under the init lock, after crash recovery has dropped the holds of
+/// sessions that died: if a live session other than the lock's holder
+/// runs on a kept write root or on the profile read grant, say which
+/// (`{"held_by": […]}` on stdout) and exit [`EXIT_HELD_BY_OTHERS`]
+/// before anything is removed. Removing the grant would take the
+/// working directory, or the profile, away from under that session's
+/// commands.
+fn exit_if_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Result<()> {
+    let held = db.other_kept_holders()?;
+    if held.is_empty() {
+        return Ok(());
+    }
+    for h in &held {
+        eprintln!(
+            "srt-win: a live session (pid {}) is running on the kept {} '{}'",
+            h.pid,
+            if h.kind == srt_win::state_db::KIND_KEPT_PROFILE {
+                "profile read grant for"
+            } else {
+                "write grant on"
+            },
+            h.path
+        );
+    }
+    eprintln!("srt-win: nothing was removed");
+    println!("{}", serde_json::json!({ "held_by": held }));
+    std::process::exit(EXIT_HELD_BY_OTHERS);
+}
+
+/// Exit code of `uninstall` when the machine-wide removal succeeded
+/// and the calling user's grants could not all be forgotten: they stay
+/// recorded, and `acl forget --all` / `profile forget` finish the job.
+const EXIT_GRANTS_NOT_FORGOTTEN: i32 = 23;
+
+/// The calling user's half of `uninstall`, run once the machine-wide
+/// removal has succeeded: forget their profile read grant and their
+/// kept write grants. `ids` were read before the removal and still
+/// name the sandbox group, whose ACEs are what is taken off.
+///
+/// Returns the exit code: 0, or [`EXIT_GRANTS_NOT_FORGOTTEN`] when
+/// something could not be removed. Such a grant stays recorded (with
+/// the group's SID, in the marker) so a later `forget` can finish. A
+/// grant on a volume that is not mounted is not a failure, but it is
+/// said: the removal is not clean until that volume has been back.
+fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: bool) -> i32 {
+    if keep_user {
+        return 0;
+    }
+    let mut incomplete = false;
+    match srt_win::profile::forget_everything_as(ids) {
+        Ok(None) => {}
+        Ok(Some(f)) if f.failed.is_empty() => eprintln!(
+            "srt-win: profile read grant removed ({} path(s))",
+            f.removed + f.absent
+        ),
+        Ok(Some(f)) => {
+            incomplete = true;
+            eprintln!(
+                "srt-win: WARNING: the profile read grant could not be removed from {} \
+                 path(s), which stay recorded; run `srt-win profile forget`",
+                f.failed.len()
+            );
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: profile read grant not removed: {e:#}");
+        }
+    }
+    match srt_win::persist::forget_everything_as(ids) {
+        Ok(f) => {
+            if f.roots > 0 && f.failed == 0 {
+                eprintln!(
+                    "srt-win: persistent write grants removed from {} root(s)",
+                    f.roots - f.pending.len()
+                );
+            }
+            if f.failed > 0 {
+                incomplete = true;
+                eprintln!(
+                    "srt-win: WARNING: {} of {} persistent write grant(s) could not be \
+                     removed and stay recorded; run `srt-win acl forget --all`",
+                    f.failed, f.roots
+                );
+            }
+            if !f.pending.is_empty() {
+                eprintln!(
+                    "srt-win: NOTE: {} grant(s) are on volumes that are not mounted and are \
+                     still on disk there. They stay recorded and are removed by `srt-win acl \
+                     forget --all` once the volume is back:",
+                    f.pending.len()
+                );
+                for p in &f.pending {
+                    eprintln!("srt-win:   {p}");
+                }
+            }
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: persistent write grants not removed: {e:#}");
+        }
+    }
+    if incomplete {
+        eprintln!(
+            "srt-win: the sandbox account and filters are removed, but not every grant kept \
+             for this user was (see above)"
+        );
+        EXIT_GRANTS_NOT_FORGOTTEN
+    } else {
+        0
     }
 }
 
@@ -3563,7 +3737,44 @@ mod tests {
         assert!(matches!(
             parse(&["srt-win", "profile", "forget", "--json"]),
             Ok(Cmd::Profile {
-                sub: ProfileCmd::Forget { json: true }
+                sub: ProfileCmd::Forget {
+                    json: true,
+                    unless_held_by_others: None,
+                }
+            })
+        ));
+        // Either kind of kept grant can be left alone while another
+        // live session runs on one.
+        assert!(matches!(
+            parse(&[
+                "srt-win",
+                "profile",
+                "forget",
+                "--unless-held-by-others",
+                "41"
+            ]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Forget {
+                    unless_held_by_others: Some(41),
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&[
+                "srt-win",
+                "acl",
+                "forget",
+                "--all",
+                "--unless-held-by-others",
+                "41"
+            ]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    all: true,
+                    unless_held_by_others: Some(41),
+                    ..
+                }
             })
         ));
         assert!(matches!(

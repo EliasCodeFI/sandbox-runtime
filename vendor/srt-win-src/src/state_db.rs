@@ -363,6 +363,53 @@ pub fn open_db() -> Result<Connection> {
 pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
+/// Holder rows that record no ACE of the holder's own: that a session
+/// is RUNNING ON a grant kept between sessions — a kept write root
+/// (`kept_root`, by root path) or the profile read grant (`profile`,
+/// by profile directory). Nothing is written for them and they have
+/// no `working_aces` row. They exist so that removing a kept grant
+/// can first ask whether a live session depends on it
+/// ([`Locked::other_kept_holders`]); they go when the session
+/// releases its grants, or with its broker row when crash recovery
+/// finds the holder dead.
+pub const KIND_KEPT_ROOT: &str = "kept_root";
+pub const KIND_KEPT_PROFILE: &str = "profile";
+
+/// A live session, other than the caller's, running on a kept grant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KeptHolder {
+    pub pid: u32,
+    /// [`KIND_KEPT_ROOT`] or [`KIND_KEPT_PROFILE`].
+    pub kind: String,
+    pub path: String,
+}
+
+/// The kept-grant holds of every holder but `except` whose process is
+/// alive ([`Disk::alive`]: same PID, same creation time).
+fn kept_holders_with(
+    conn: &Connection,
+    except: i64,
+    alive: fn(u32, i64) -> bool,
+) -> Result<Vec<KeptHolder>> {
+    let rows: Vec<(i64, i64, String, String)> = query_vec(
+        conn,
+        "SELECT h.pid, b.process_create_time, h.kind, h.canonical_path \
+         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         WHERE h.kind IN ('kept_root', 'profile') AND h.pid != ?1 \
+         ORDER BY h.pid, h.kind, h.canonical_path",
+        params![except],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|&(pid, ct, _, _)| alive(pid as u32, ct))
+        .map(|(pid, _, kind, path)| KeptHolder {
+            pid: pid as u32,
+            kind,
+            path,
+        })
+        .collect())
+}
 
 /// `prepare → query_map → collect` with one error context. Shared
 /// by every "list of T from one query" site so error plumbing is
@@ -685,6 +732,52 @@ impl Locked {
             )
             .context("INSERT brokers")?;
         Ok(())
+    }
+
+    /// Record that the holder's session runs on these kept grants:
+    /// each kept write root, and the profile read grant if `profile`
+    /// names the profile it is recorded for. Idempotent.
+    pub fn hold_kept(&self, roots: &[String], profile: Option<&str>) -> Result<()> {
+        if roots.is_empty() && profile.is_none() {
+            return Ok(());
+        }
+        self.register_broker()?;
+        let pid = self.holder_pid.0 as i64;
+        let mut insert = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO ace_holders (canonical_path, kind, pid, want_mask) \
+             VALUES (?1, ?2, ?3, '')",
+        )?;
+        for root in roots {
+            insert
+                .execute(params![root, KIND_KEPT_ROOT, pid])
+                .context("INSERT kept-root hold")?;
+        }
+        if let Some(profile) = profile {
+            insert
+                .execute(params![profile, KIND_KEPT_PROFILE, pid])
+                .context("INSERT profile hold")?;
+        }
+        Ok(())
+    }
+
+    /// Drop the holder's kept-grant holds (its session is ending).
+    /// The broker row goes with the last hold of any kind
+    /// ([`Self::release_aces`], which the caller runs next).
+    pub fn release_kept(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM ace_holders WHERE pid = ?1 AND kind IN ('kept_root', 'profile')",
+                params![self.holder_pid.0 as i64],
+            )
+            .context("DELETE kept holds")?;
+        Ok(())
+    }
+
+    /// The live sessions, other than the holder's own, that run on a
+    /// kept grant. Crash recovery has already run under this lock, so
+    /// a holder that died is not among them.
+    pub fn other_kept_holders(&self) -> Result<Vec<KeptHolder>> {
+        kept_holders_with(&self.conn, self.holder_pid.0 as i64, DISK.alive)
     }
 
     /// Remove the holder's `brokers` row. CASCADE drops its
@@ -1213,7 +1306,7 @@ fn release_hold(
         IdGate::Mismatch if kind == "grant" => match (disk.locate)(&want_id) {
             path_id::Located::At(at) => Site::Moved(at),
             path_id::Located::Gone => Site::Gone,
-            path_id::Located::Unknown => {
+            path_id::Located::Unknown | path_id::Located::VolumeAbsent => {
                 eprintln!(
                     "srt-win: grant '{canon}': not at its path and \
                      could not be located by file_id; ACE may \
@@ -1714,6 +1807,103 @@ mod tests {
                 .unwrap()
         };
         (n("brokers"), n("ace_holders"), n("working_aces"))
+    }
+
+    /// Who runs on a kept grant: live holders other than the caller,
+    /// and never one whose process is gone.
+    #[test]
+    fn kept_grant_holders_are_the_live_other_sessions() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            let (other, dead) = (me + 1, me + 2);
+            let root = r"\\?\C:\work".to_owned();
+            // This session: a root and the profile grant.
+            db.hold_kept(std::slice::from_ref(&root), Some(r"\\?\C:\Users\me"))
+                .unwrap();
+            // Twice is once.
+            db.hold_kept(std::slice::from_ref(&root), Some(r"\\?\C:\Users\me"))
+                .unwrap();
+            assert_eq!(counts(&db.conn), (1, 2, 0));
+            // Nothing held: no broker row is made for it.
+            let alone = Locked {
+                conn: open_memory_db_for_tests(),
+                holder_pid: HolderPid(db.holder_pid.0),
+            };
+            alone.hold_kept(&[], None).unwrap();
+            assert_eq!(counts(&alone.conn), (0, 0, 0));
+            // Another session, and one whose process has died, each
+            // with holds of their own; the other also has an ordinary
+            // session grant, which is not a kept-grant hold.
+            // A holder's liveness is its process's; here a creation
+            // time of 2 stands for a process that is gone.
+            fn alive(_pid: u32, create_time: i64) -> bool {
+                create_time != 2
+            }
+            for (pid, create_time) in [(other, 1), (dead, 2)] {
+                db.conn
+                    .execute(
+                        "INSERT INTO brokers (pid, process_create_time, started_at) \
+                         VALUES (?1, ?2, 0)",
+                        params![pid, create_time],
+                    )
+                    .unwrap();
+                for (kind, path) in [("kept_root", root.as_str()), ("profile", "p")] {
+                    db.conn
+                        .execute(
+                            "INSERT INTO ace_holders (canonical_path, kind, pid, want_mask) \
+                             VALUES (?1, ?2, ?3, '')",
+                            params![path, kind, pid],
+                        )
+                        .unwrap();
+                }
+            }
+            seed(&db.conn, other, TREE, "grant", "modify");
+            let held = kept_holders_with(&db.conn, me, alive).unwrap();
+            assert_eq!(
+                held,
+                [
+                    KeptHolder {
+                        pid: other as u32,
+                        kind: "kept_root".into(),
+                        path: root.clone()
+                    },
+                    KeptHolder {
+                        pid: other as u32,
+                        kind: "profile".into(),
+                        path: "p".into()
+                    },
+                ]
+            );
+            // Asked by the other session, it is this one that holds.
+            let held = kept_holders_with(&db.conn, other, alive).unwrap();
+            assert!(held.iter().all(|h| i64::from(h.pid) == me) && held.len() == 2);
+
+            // Crash recovery reaps the dead holder's holds and its
+            // broker row; the live ones stay.
+            let disk = Disk { alive, ..OK_DISK };
+            let report = recover_with(&db.conn, Some(SID), &disk).unwrap();
+            assert_eq!(report.dead_brokers, 1);
+            let left: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM ace_holders WHERE pid = ?1",
+                    params![dead],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0);
+            assert_eq!(kept_holders_with(&db.conn, me, alive).unwrap().len(), 2);
+
+            // A session that ends drops its own holds and nobody
+            // else's.
+            db.release_kept().unwrap();
+            assert!(
+                kept_holders_with(&db.conn, other, alive)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(kept_holders_with(&db.conn, me, alive).unwrap().len(), 2);
+        });
     }
 
     #[test]

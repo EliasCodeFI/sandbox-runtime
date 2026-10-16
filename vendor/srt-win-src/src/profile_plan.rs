@@ -47,6 +47,22 @@
 //! grant of the directory itself, or of one above it, would cover
 //! everything in it and is refused like one above a protected path.
 //!
+//! ## Links
+//!
+//! A junction, a symbolic link or a cloud placeholder is never written
+//! on or through. But a link can stand where a rule points: with
+//! `.ssh` a link to `dotfiles\.ssh`, skipping the link alone would
+//! leave the keys in a `dotfiles` directory that no rule names and
+//! that would be granted whole. So a link at or above a path some rule
+//! covers is resolved, and if its target lies inside the profile the
+//! rules that would have applied beneath the link are applied beneath
+//! the target as well ([`plan_resolved`]): the target is denied, or
+//! becomes a container with the right children denied. The added
+//! rules are recorded with the grant like any other exclusion, in
+//! their resolved form — which is the form a session's path is
+//! compared in. A target outside the profile gets nothing: nothing
+//! there is granted either.
+//!
 //! A file directly inside a container is readable only if it is
 //! granted itself. In the profile root that is the short list in
 //! [`READABLE_ROOT_FILES`]: the root is where the registry hives and
@@ -60,7 +76,7 @@
 
 /// Version of the exclusion list and of the walk rule. A recorded
 /// grant made with another version is reported as outdated.
-pub const LIST_VERSION: u32 = 2;
+pub const LIST_VERSION: u32 = 3;
 
 /// What a built-in exclusion's path is relative to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +105,12 @@ pub struct Excl {
     /// Ungranted-only (see the module doc): kept out of the grant,
     /// not denied. Every other entry is protected.
     pub ungranted_only: bool,
+    /// Create the directory, empty, when it is missing, so the deny
+    /// has an object to sit on. Not set for the stores of tools most
+    /// profiles do not have: a missing one is covered without it —
+    /// nothing above it carries an inheriting allow, and a session
+    /// may not grant a path above it.
+    pub create: bool,
 }
 
 /// A protected directory.
@@ -99,6 +121,19 @@ const fn dir(base: Base, path: &'static str) -> Excl {
         dir: true,
         stamp: true,
         ungranted_only: false,
+        create: true,
+    }
+}
+
+/// A protected directory that is not created when missing.
+const fn store(base: Base, path: &'static str) -> Excl {
+    Excl {
+        base,
+        path,
+        dir: true,
+        stamp: true,
+        ungranted_only: false,
+        create: false,
     }
 }
 
@@ -110,6 +145,7 @@ const fn file(base: Base, path: &'static str) -> Excl {
         dir: false,
         stamp: true,
         ungranted_only: false,
+        create: false,
     }
 }
 
@@ -121,6 +157,7 @@ const fn ungranted(base: Base, path: &'static str) -> Excl {
         dir: true,
         stamp: false,
         ungranted_only: true,
+        create: false,
     }
 }
 
@@ -159,6 +196,33 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Roaming, "terraform.d"),
     file(Roaming, "terraform.rc"),
     dir(Local, "heroku"),
+    // Plaintext token files and directories of further command-line
+    // tools, at the locations each uses on Windows and, where the tool
+    // also follows the XDG convention, under `.config`.
+    store(Local, "github-copilot"),
+    store(Profile, r".config\github-copilot"),
+    store(Profile, r".config\doctl"),
+    store(Roaming, "doctl"),
+    store(Profile, r".config\op"),
+    file(Profile, r".config\hub"),
+    file(Profile, r".gem\credentials"),
+    file(Profile, r".pulumi\credentials.json"),
+    file(Roaming, r"postgresql\pgpass.conf"),
+    file(Profile, ".pgpass"),
+    file(Roaming, r"Composer\auth.json"),
+    file(Profile, r".composer\auth.json"),
+    file(Profile, r".fly\config.yml"),
+    file(Profile, ".databrickscfg"),
+    file(Profile, ".boto"),
+    file(Profile, ".s3cfg"),
+    file(Roaming, "s3cmd.ini"),
+    store(Profile, ".kaggle"),
+    store(Profile, ".snowsql"),
+    store(Profile, ".oci"),
+    store(Profile, ".bluemix"),
+    store(Profile, ".ibmcloud"),
+    store(Profile, ".railway"),
+    store(Profile, ".supabase"),
     // Package-feed sign-in caches: the token stores of the credential
     // providers, as opposed to the configuration files that name a
     // feed (those are readable — see `READABLE_CONFIG`).
@@ -186,6 +250,25 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Local, r"BraveSoftware\Brave-Browser\User Data"),
     dir(Roaming, r"Mozilla\Firefox"),
     dir(Local, r"Mozilla\Firefox"),
+    // The other channels of those browsers, the other browsers built
+    // on the same engines, and the mail client that shares Firefox's
+    // profile layout.
+    store(Local, r"Google\Chrome Beta\User Data"),
+    store(Local, r"Google\Chrome Dev\User Data"),
+    store(Local, r"Google\Chrome SxS\User Data"),
+    store(Local, r"Chromium\User Data"),
+    store(Local, r"Microsoft\Edge Beta\User Data"),
+    store(Local, r"Microsoft\Edge Dev\User Data"),
+    store(Local, r"Microsoft\Edge SxS\User Data"),
+    store(Local, r"BraveSoftware\Brave-Browser-Beta\User Data"),
+    store(Local, r"BraveSoftware\Brave-Browser-Nightly\User Data"),
+    store(Local, r"Vivaldi\User Data"),
+    store(Local, r"Yandex\YandexBrowser\User Data"),
+    store(Roaming, "Opera Software"),
+    store(Local, "Opera Software"),
+    store(Roaming, r"Mozilla\SeaMonkey"),
+    store(Roaming, "Thunderbird"),
+    store(Local, "Thunderbird"),
     // Embedded browser profiles of desktop applications.
     dir(Local, r"*\EBWebView"),
     dir(Local, r"Microsoft\*\EBWebView"),
@@ -235,6 +318,7 @@ pub const BUILT_IN: &[Excl] = &[
         dir: true,
         stamp: false,
         ungranted_only: false,
+        create: false,
     },
     // UNGRANTED-ONLY. The user's temporary directory: every program
     // of the user drops files there, so none of it is readable by
@@ -454,7 +538,7 @@ impl Rules {
                     spelled,
                     stamp: e.stamp,
                     ungranted: e.ungranted_only,
-                    placeholder: e.dir && e.stamp && !wild && !e.ungranted_only,
+                    placeholder: e.dir && e.stamp && e.create && !wild && !e.ungranted_only,
                 });
             }
         }
@@ -560,6 +644,72 @@ pub fn relation(path: &str, rule: &str) -> Option<Relation> {
     })
 }
 
+/// What listing a directory gave ([`session_grant_refusal`]'s `list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// Its entry names.
+    Entries(Vec<String>),
+    /// Nothing to list: the path is not there, or is a file.
+    Nothing,
+    /// A link: not followed.
+    Link,
+    /// It is there and could not be listed — access denied, an I/O
+    /// error, a path that is not looked at at all — with the reason.
+    Failed(String),
+}
+
+/// What lies beneath a path that is above a wildcard rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Beneath {
+    /// Every level that could lead to a match was listed; none does.
+    NoMatch,
+    /// Something that exists matches the rule.
+    Match,
+    /// A level could not be listed. Treated as a possible match: a
+    /// path is admitted because it was looked at and found empty of
+    /// matches, never because looking failed.
+    Unexamined(String),
+}
+
+/// Whether something that exists beneath the directory `path` matches
+/// the rest of `rule`, which `path` lies above. The lookup never
+/// leaves `path` through a link — a link beneath it is not followed —
+/// and goes exactly as deep as the rule has components left. `path`
+/// itself being a link is a failure to look: it was resolved before
+/// it got here and should not be one.
+fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Listing) -> Beneath {
+    fn go(dir: &str, rest: &[Pat], top: bool, list: &dyn Fn(&str) -> Listing) -> Beneath {
+        let Some((first, rest)) = rest.split_first() else {
+            return Beneath::Match;
+        };
+        let names = match list(dir) {
+            Listing::Entries(names) => names,
+            Listing::Nothing => return Beneath::NoMatch,
+            Listing::Link if top => return Beneath::Unexamined(format!("'{dir}' is a link")),
+            Listing::Link => return Beneath::NoMatch,
+            Listing::Failed(why) => {
+                return Beneath::Unexamined(format!("'{dir}' could not be listed: {why}"));
+            }
+        };
+        let mut unexamined = None;
+        for name in names.iter().filter(|n| first.matches(&norm_component(n))) {
+            let child = format!("{}\\{name}", dir.trim_end_matches('\\'));
+            match go(&child, rest, false, list) {
+                Beneath::Match => return Beneath::Match,
+                Beneath::NoMatch => {}
+                u @ Beneath::Unexamined(_) => unexamined = unexamined.or(Some(u)),
+            }
+        }
+        unexamined.unwrap_or(Beneath::NoMatch)
+    }
+    let depth = split_path(path).len();
+    let pats: Vec<Pat> = split_path(rule).iter().map(|c| Pat::parse(c)).collect();
+    if pats.len() <= depth {
+        return Beneath::NoMatch;
+    }
+    go(path, &pats[depth..], true, list)
+}
+
 /// Why a session must not be granted `path` (canonical) while a
 /// profile read grant with these recorded exclusions exists; `None`
 /// when it may.
@@ -572,7 +722,26 @@ pub fn relation(path: &str, rule: &str) -> Option<Relation> {
 ///
 /// A grant above an exclusion inherits: a store that is deleted and
 /// created again beneath it would carry the grant, which the profile
-/// grant's own layout never allows. `admitted` are the paths the
+/// grant's own layout never allows. That holds for a rule that names
+/// its path outright. A rule with a wildcard (`Local\*\EBWebView`)
+/// names no path until something matches it, and read the same way it
+/// would make every directory beneath `Local` ungrantable; so `path`
+/// counts as above such a rule only while something that exists
+/// beneath it matches ([`matched_beneath`], through `list`). That
+/// includes a path that is not there yet: nothing lies beneath it. It
+/// fails closed — a level that exists and cannot be listed refuses the
+/// path like a match does. The grant's own walk does not make the
+/// concession at all: it treats every such level as a container.
+///
+/// The look is taken when a grant is asked for, which is at every
+/// session start and for every path of the session, a write root kept
+/// from an earlier session included — before its DACL is read and
+/// found to need no write. It is not continuous: a store that appears
+/// beneath a kept root later is found at the next start, which is
+/// then refused until the root is narrowed or forgotten. A store the
+/// sandboxed command ITSELF creates beneath its own write root is that
+/// command's own data; nothing here is meant to keep a command from
+/// reading what it wrote. `admitted` are the paths the
 /// caller explicitly asked to open (`acl grant
 /// --allow-profile-exclusion`); they count for a READ grant that is a
 /// protected path or lies inside one, and for nothing else — a write
@@ -583,6 +752,7 @@ pub fn session_grant_refusal(
     protected: &[String],
     ungranted: &[String],
     admitted: &[String],
+    list: &dyn Fn(&str) -> Listing,
 ) -> Option<String> {
     let what = if write { "write" } else { "read" };
     for u in ungranted {
@@ -600,6 +770,22 @@ pub fn session_grant_refusal(
     for r in protected {
         match relation(path, r) {
             None => {}
+            Some(Relation::Above) if r.contains('*') => match matched_beneath(path, r, list) {
+                Beneath::NoMatch => {}
+                Beneath::Match => {
+                    return Some(format!(
+                        "a {what} grant on '{path}' would be inherited by what the excluded \
+                         '{r}' covers beneath it; choose a narrower directory"
+                    ));
+                }
+                Beneath::Unexamined(why) => {
+                    return Some(format!(
+                        "'{path}' may lie above something '{r}' excludes from the profile \
+                         read grant, and could not be examined ({why}); a {what} grant is \
+                         made only on a path that was looked at"
+                    ));
+                }
+            },
             Some(Relation::Above) => {
                 return Some(format!(
                     "a {what} grant on '{path}' would be inherited by the excluded '{r}' \
@@ -638,13 +824,168 @@ pub struct Entry {
     /// Set for an entry nothing may be written on or through: a
     /// reparse point or a cloud placeholder.
     pub skip: Option<String>,
+    /// The entry is a reparse point: something that may redirect to
+    /// another place ([`Tree::resolve_link`]).
+    pub link: bool,
+}
+
+/// Where a link leads, with every link on the way resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// Inside the profile: the target's components beneath it (empty
+    /// for the profile directory itself).
+    Inside(Vec<String>),
+    /// Outside the profile, or nowhere that can be resolved (a
+    /// dangling link, a cycle), with a word about it.
+    Elsewhere(String),
+}
+
+/// What a reparse point says about where it leads, as read from the
+/// link itself ([`parse_reparse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkData {
+    /// A junction, with its target in the object namespace
+    /// (`\??\C:\dir`).
+    Junction(String),
+    /// A symbolic link, with its target as stored and whether that is
+    /// relative to the link's directory.
+    Symlink { target: String, relative: bool },
+    /// Some other kind of reparse point (a cloud placeholder, an
+    /// application link), by tag. Not a redirection to follow.
+    Other(u32),
+}
+
+/// Read a reparse data buffer (`FSCTL_GET_REPARSE_POINT`).
+pub fn parse_reparse(buf: &[u8]) -> Result<LinkData, String> {
+    const TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const TAG_SYMLINK: u32 = 0xA000_000C;
+    let u16_at = |at: usize| -> Result<usize, String> {
+        buf.get(at..at + 2)
+            .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+            .ok_or_else(|| "truncated reparse data".to_owned())
+    };
+    let tag = buf
+        .get(0..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or("truncated reparse data")?;
+    // Header: tag, data length, reserved. Then, for both kinds, the
+    // offset and length of the substitute name and of the print name;
+    // a symbolic link has a flags word before the names.
+    let names_at = match tag {
+        TAG_MOUNT_POINT => 16,
+        TAG_SYMLINK => 20,
+        other => return Ok(LinkData::Other(other)),
+    };
+    let (off, len) = (u16_at(8)?, u16_at(10)?);
+    let bytes = buf
+        .get(names_at + off..names_at + off + len)
+        .ok_or("truncated reparse data")?;
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let target = String::from_utf16(&wide).map_err(|_| "a link target that is not valid UTF-16")?;
+    Ok(if tag == TAG_MOUNT_POINT {
+        LinkData::Junction(target)
+    } else {
+        let flags = buf
+            .get(16..20)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or("truncated reparse data")?;
+        LinkData::Symlink {
+            target,
+            relative: flags & 1 != 0,
+        }
+    })
+}
+
+/// Where the link at `link` (`\\?\X:\…`) leads, with `rest` — the
+/// components that followed it — appended: a path on a drive letter,
+/// in the same form. Worked out from the link's own data, without
+/// opening anything.
+///
+/// Only a target on a drive letter is a destination. A share
+/// (`\??\UNC\…`, `\\server\share`), a volume without a letter and
+/// anything else in the object namespace are refused, so that the
+/// caller never opens them: resolving a link must not be a way to
+/// make the grant contact a server.
+pub fn link_destination(link: &str, data: &LinkData, rest: &[String]) -> Result<String, String> {
+    let drive_of = |p: &str| -> Option<(char, String)> {
+        let b = p.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+            .then(|| (b[0] as char, p[3..].to_owned()))
+    };
+    let link_plain = link
+        .strip_prefix(r"\\?\")
+        .ok_or_else(|| format!("'{link}' is not a drive path"))?;
+    let (link_drive, link_tail) =
+        drive_of(link_plain).ok_or_else(|| format!("'{link}' is not a drive path"))?;
+    let absolute = |target: &str| -> Result<(char, String), String> {
+        let plain = target
+            .strip_prefix(r"\??\")
+            .or_else(|| target.strip_prefix(r"\\?\"))
+            .unwrap_or(target);
+        drive_of(plain).ok_or_else(|| {
+            format!("leads to '{target}', which is not on a drive of this machine; not followed")
+        })
+    };
+    let (drive, tail) = match data {
+        LinkData::Other(tag) => {
+            return Err(format!(
+                "a reparse point of another kind ({tag:#x}); not followed"
+            ));
+        }
+        LinkData::Junction(target) => absolute(target)?,
+        LinkData::Symlink {
+            target,
+            relative: false,
+        } => absolute(target)?,
+        LinkData::Symlink {
+            target,
+            relative: true,
+        } => {
+            if let Some(rooted) = target.strip_prefix('\\') {
+                // Relative to the root of the link's drive.
+                if rooted.starts_with('\\') {
+                    return Err(format!("leads to '{target}'; not followed"));
+                }
+                (link_drive, rooted.to_owned())
+            } else {
+                let parent = link_tail.rsplit_once('\\').map_or("", |(p, _)| p);
+                (link_drive, format!("{parent}\\{target}"))
+            }
+        }
+    };
+    // Lexical `.` and `..`, as the system resolves a link's target.
+    let mut comps: Vec<&str> = Vec::new();
+    for c in tail
+        .split(['\\', '/'])
+        .chain(rest.iter().map(String::as_str))
+    {
+        match c {
+            "" | "." => {}
+            ".." => {
+                comps
+                    .pop()
+                    .ok_or_else(|| format!("'{link}' leads above the root of its drive"))?;
+            }
+            c => comps.push(c),
+        }
+    }
+    Ok(format!(
+        r"\\?\{}:\{}",
+        drive.to_ascii_uppercase(),
+        comps.join("\\")
+    ))
 }
 
 /// What the walk reads the tree through. `list` is called for the
 /// root and for every directory about to be treated as a container;
 /// an `Err` makes that directory skipped, with the error as reason.
+/// `resolve_link` is called for a link that sits where a rule points.
 pub trait Tree {
     fn list(&mut self, rel: &[String]) -> Result<Vec<Entry>, String>;
+    fn resolve_link(&mut self, rel: &[String]) -> LinkTarget;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,20 +1046,97 @@ pub struct Node {
     pub note: Option<String>,
 }
 
+/// A link the walk met where a rule points: its path, and the rules
+/// that matched down to and including its name.
+struct LinkHit {
+    rel: Vec<String>,
+    rules: Vec<usize>,
+}
+
+/// What a walk produces.
+struct Found {
+    nodes: Vec<Node>,
+    hits: Vec<LinkHit>,
+}
+
+/// How many times the rules may grow by resolving links before the
+/// plan gives up: each round resolves the links the previous round's
+/// added rules led to, so this bounds the length of a chain of links
+/// that each sit beneath the previous one's target.
+const MAX_LINK_ROUNDS: usize = 8;
+
 /// The plan for a profile: every node the grant touches or reports,
 /// parents before children, in the order the tree listed them.
 pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
-    let entries = tree.list(&[])?;
-    let mut out = vec![Node {
-        rel: Vec::new(),
-        is_dir: true,
-        kind: Kind::Container,
-        missing: false,
-        stamp: true,
-        note: None,
-    }];
-    walk(tree, rules, &[], entries, &rules.all(), false, &mut out);
-    Ok(out)
+    plan_resolved(tree, rules).map(|(nodes, _)| nodes)
+}
+
+/// [`plan`], with the rules it ended up with: `rules` plus, for every
+/// link that sits at or above a path a rule covers and leads into the
+/// profile, that rule carried over to the link's target (see the
+/// module doc). The returned rules are what the grant records.
+///
+/// A link that leads to the profile directory itself from a place a
+/// rule covers would exclude the whole profile; that is an error, as
+/// is a chain of links longer than [`MAX_LINK_ROUNDS`].
+pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, Rules), String> {
+    let mut rules = rules.clone();
+    for _ in 0..=MAX_LINK_ROUNDS {
+        let entries = tree.list(&[])?;
+        let mut found = Found {
+            nodes: vec![Node {
+                rel: Vec::new(),
+                is_dir: true,
+                kind: Kind::Container,
+                missing: false,
+                stamp: true,
+                note: None,
+            }],
+            hits: Vec::new(),
+        };
+        let all = rules.all();
+        walk(tree, &rules, &[], entries, &all, false, &mut found);
+        let Found { nodes: out, hits } = found;
+        let mut grew = false;
+        for hit in hits {
+            let LinkTarget::Inside(target) = tree.resolve_link(&hit.rel) else {
+                continue;
+            };
+            if target.is_empty() {
+                return Err(format!(
+                    "'{}' is a link to the profile directory itself and stands where an \
+                     exclusion applies; the profile cannot be granted around it",
+                    hit.rel.join("\\")
+                ));
+            }
+            let depth = hit.rel.len();
+            for i in hit.rules {
+                let from = rules.rules[i].clone();
+                let mut pats: Vec<Pat> =
+                    target.iter().map(|c| Pat::Lit(norm_component(c))).collect();
+                pats.extend(from.pats[depth..].iter().cloned());
+                let mut spelled = target.clone();
+                spelled.extend(from.spelled[depth..].iter().cloned());
+                let same = |r: &Rule| r.pats == pats && r.ungranted == from.ungranted;
+                if !rules.rules.iter().any(same) {
+                    rules.rules.push(Rule {
+                        pats,
+                        spelled,
+                        stamp: true,
+                        ungranted: from.ungranted,
+                        placeholder: false,
+                    });
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return Ok((out, rules));
+        }
+    }
+    Err(format!(
+        "links beneath the profile lead on to further links more than {MAX_LINK_ROUNDS} times"
+    ))
 }
 
 /// Walk one container. `alive` are the rules whose first `rel.len()`
@@ -732,7 +1150,7 @@ fn walk(
     entries: Vec<Entry>,
     alive: &[usize],
     bare: bool,
-    out: &mut Vec<Node>,
+    found: &mut Found,
 ) {
     let depth = rel.len();
     let node = |name: &str, is_dir: bool, kind: Kind| Node {
@@ -745,18 +1163,26 @@ fn walk(
     };
     for e in &entries {
         let name = e.name.long.as_str();
-        if let Some(why) = &e.skip {
-            out.push(Node {
-                note: Some(why.clone()),
-                ..node(name, e.is_dir, Kind::Skipped)
-            });
-            continue;
-        }
         let next: Vec<usize> = alive
             .iter()
             .copied()
             .filter(|&i| e.name.matched_by(&rules.rules[i].pats[depth]))
             .collect();
+        if let Some(why) = &e.skip {
+            found.nodes.push(Node {
+                note: Some(why.clone()),
+                ..node(name, e.is_dir, Kind::Skipped)
+            });
+            // Nothing is written on it. If rules point at or through
+            // it and it leads somewhere, they follow it there.
+            if e.link && !next.is_empty() {
+                found.hits.push(LinkHit {
+                    rel: rel.iter().cloned().chain([name.to_owned()]).collect(),
+                    rules: next,
+                });
+            }
+            continue;
+        }
         let ending: Vec<&Rule> = next
             .iter()
             .map(|&i| &rules.rules[i])
@@ -765,7 +1191,7 @@ fn walk(
         // A protected rule ending here wins over an ungranted-only one.
         let protected: Vec<&&Rule> = ending.iter().filter(|r| !r.ungranted).collect();
         if !protected.is_empty() {
-            out.push(Node {
+            found.nodes.push(Node {
                 stamp: protected.iter().all(|r| r.stamp),
                 ..node(name, e.is_dir, Kind::Denied)
             });
@@ -787,16 +1213,16 @@ fn walk(
                 let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
                 match tree.list(&child) {
                     Ok(children) => {
-                        out.push(node(name, true, Kind::Ungranted));
-                        walk(tree, rules, &child, children, &deeper, true, out);
+                        found.nodes.push(node(name, true, Kind::Ungranted));
+                        walk(tree, rules, &child, children, &deeper, true, found);
                     }
-                    Err(why) => out.push(Node {
+                    Err(why) => found.nodes.push(Node {
                         note: Some(why),
                         ..node(name, true, Kind::Skipped)
                     }),
                 }
             } else if !ending.is_empty() {
-                out.push(node(name, true, Kind::Ungranted));
+                found.nodes.push(node(name, true, Kind::Ungranted));
             }
             continue;
         }
@@ -808,21 +1234,21 @@ fn walk(
                 true
             };
             if readable {
-                out.push(node(name, false, Kind::File));
+                found.nodes.push(node(name, false, Kind::File));
             }
             continue;
         }
         if next.is_empty() {
-            out.push(node(name, true, Kind::Granted));
+            found.nodes.push(node(name, true, Kind::Granted));
             continue;
         }
         let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
         match tree.list(&child) {
             Ok(children) => {
-                out.push(node(name, true, Kind::Container));
-                walk(tree, rules, &child, children, &next, false, out);
+                found.nodes.push(node(name, true, Kind::Container));
+                walk(tree, rules, &child, children, &next, false, found);
             }
-            Err(why) => out.push(Node {
+            Err(why) => found.nodes.push(Node {
                 note: Some(why),
                 ..node(name, true, Kind::Skipped)
             }),
@@ -869,7 +1295,7 @@ fn walk(
                 break;
             }
             let excluded_here = rules.excludes(&names);
-            out.push(Node {
+            found.nodes.push(Node {
                 rel: chain,
                 is_dir: true,
                 kind: if last || excluded_here {
@@ -886,6 +1312,42 @@ fn walk(
             }
         }
     }
+}
+
+// ─── A session's read deny on top of the grant ─────────────────────────
+
+/// The recorded paths a read deny on `deny` has to be written on as
+/// well, for it to hold against the grant.
+///
+/// A container, a granted directory and a granted file each carry an
+/// ALLOW of their own for the sandbox group. A deny on the same path
+/// comes first and wins, and a deny on a granted directory reaches
+/// everything beneath it, where nothing carries an entry of its own.
+/// A deny on a directory ABOVE a recorded path reaches that path only
+/// by inheritance, behind its own allow, and loses. So each recorded
+/// path that carries an allow and lies beneath `deny` gets the deny
+/// itself. That is the smallest set: one entry per recorded allow,
+/// none for what lies beneath a granted directory.
+///
+/// This is worked out by `srt-win`, which holds the record, from the
+/// deny alone — so the caller passes one path however many recorded
+/// paths it covers, and no list has to travel on a command line.
+pub fn covered_by_read_deny<'a>(
+    deny: &str,
+    recorded: impl IntoIterator<Item = (&'a str, Kind)>,
+) -> Vec<&'a str> {
+    let norm =
+        |p: &str| -> Vec<String> { split_path(p).iter().map(|c| norm_component(c)).collect() };
+    let deny = norm(deny);
+    recorded
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Container | Kind::Granted | Kind::File))
+        .filter(|(path, _)| {
+            let path = norm(path);
+            path.len() > deny.len() && path[..deny.len()] == deny[..]
+        })
+        .map(|(path, _)| path)
+        .collect()
 }
 
 // ─── Configuration pointers ─────────────────────────────────────────
@@ -964,6 +1426,9 @@ mod tests {
     struct Mem {
         dirs: BTreeMap<String, Vec<Entry>>,
         unreadable: Vec<String>,
+        /// Link path → where it points: a path beneath the profile
+        /// (`""` for the profile itself), or `None` for outside it.
+        links: BTreeMap<String, Option<String>>,
     }
 
     fn entry(name: &str, is_dir: bool) -> Entry {
@@ -971,6 +1436,7 @@ mod tests {
             name: Name::long(name),
             is_dir,
             skip: None,
+            link: false,
         }
     }
 
@@ -1006,7 +1472,51 @@ mod tests {
         }
     }
 
+    impl Mem {
+        /// Make the directory `path` a link to `target`.
+        fn link(&mut self, path: &str, target: Option<&str>) -> &mut Self {
+            if !self.dirs.contains_key(path) {
+                self.add(&format!("{path}\\"));
+            }
+            let e = self.entry_mut(path);
+            e.skip = Some("reparse point".into());
+            e.link = true;
+            self.links
+                .insert(path.to_owned(), target.map(str::to_owned));
+            self
+        }
+
+        /// `path` with every link on the way resolved, as the final
+        /// path of a real open is; `None` for outside the profile or
+        /// a cycle.
+        fn real(&self, path: &str) -> Option<String> {
+            let mut cur = path.to_owned();
+            for _ in 0..32 {
+                let comps = split_path(&cur);
+                let hit = (1..=comps.len())
+                    .map(|n| comps[..n].join("\\"))
+                    .find(|prefix| self.links.contains_key(prefix));
+                let Some(prefix) = hit else {
+                    return Some(cur);
+                };
+                let target = self.links[&prefix].clone()?;
+                let rest = &cur[prefix.len()..];
+                cur = format!("{target}{rest}")
+                    .trim_start_matches('\\')
+                    .to_owned();
+            }
+            None
+        }
+    }
+
     impl Tree for Mem {
+        fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
+            match self.real(&rel.join("\\")) {
+                Some(real) => LinkTarget::Inside(split_path(&real)),
+                None => LinkTarget::Elsewhere("outside the profile".to_owned()),
+            }
+        }
+
         fn list(&mut self, rel: &[String]) -> Result<Vec<Entry>, String> {
             let key = rel.join("\\");
             if self.unreadable.contains(&key) {
@@ -1125,6 +1635,10 @@ mod tests {
             k.get(r"AppData\Local\Google\Chrome\User Data"),
             Some(&(Kind::Denied, true))
         );
+        // Nor is a store most profiles do not have created.
+        absent(".kaggle");
+        absent(r"AppData\Local\Vivaldi");
+        absent(r"AppData\Roaming\Thunderbird");
         // A missing excluded FILE gets no placeholder, nor does a
         // wildcard entry.
         absent(".git-credentials");
@@ -1192,6 +1706,246 @@ mod tests {
         t.add(r"AppData\Local\x");
         let k = kinds(&plan(&mut t, &rules).unwrap());
         assert!(!k.keys().any(|p| p.starts_with(r"AppData\Local\Temp")));
+    }
+
+    /// A link where a rule points: the rule follows it to its target.
+    #[test]
+    fn a_rule_follows_a_link_to_its_target_inside_the_profile() {
+        let mut t = Mem::default();
+        t.add(r"dotfiles\.ssh\id_ed25519")
+            .add(r"dotfiles\.config\gh\hosts.yml")
+            .add(r"dotfiles\.config\git\config")
+            .add(r"dotfiles\.config\git\credentials")
+            .add(r"dotfiles\.config\nvim\init.lua")
+            .add(r"dotfiles\README")
+            .add(r"Documents\a.txt");
+        t.link(".ssh", Some(r"dotfiles\.ssh"))
+            .link(".config", Some(r"dotfiles\.config"));
+        let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        let is = |p: &str, kind: Kind| assert_eq!(k.get(p).map(|v| v.0), Some(kind), "{p}");
+        // The links themselves: nothing written, nothing beneath.
+        is(".ssh", Kind::Skipped);
+        is(".config", Kind::Skipped);
+        // Their targets: what the rules say for the names they have
+        // through the links.
+        is("dotfiles", Kind::Container);
+        is(r"dotfiles\.ssh", Kind::Denied);
+        is(r"dotfiles\.config", Kind::Container);
+        is(r"dotfiles\.config\gh", Kind::Denied);
+        is(r"dotfiles\.config\git", Kind::Container);
+        is(r"dotfiles\.config\git\credentials", Kind::Denied);
+        is(r"dotfiles\.config\git\config", Kind::File);
+        is(r"dotfiles\.config\nvim", Kind::Granted);
+        is(r"dotfiles\README", Kind::File);
+        is("Documents", Kind::Granted);
+        assert!(!k.contains_key(r"dotfiles\.ssh\id_ed25519"));
+        // The carried-over rules are part of what is recorded, in
+        // their resolved form, and cover paths not there yet.
+        let spelled = rules.spelled();
+        for want in [
+            r"dotfiles\.ssh",
+            r"dotfiles\.config\gh",
+            r"dotfiles\.config\gcloud",
+        ] {
+            assert!(
+                spelled.iter().any(|s| s == want),
+                "{want} not in {spelled:?}"
+            );
+        }
+        assert!(rules.excludes(&names(&split_path(r"dotfiles\.ssh\new-key"))));
+        assert!(rules.could_exclude_beneath(&names(&split_path("dotfiles"))));
+        // Without the links none of that holds: `dotfiles` is an
+        // ordinary directory, granted whole.
+        let mut plain = Mem::default();
+        plain
+            .add(r"dotfiles\.ssh\id_ed25519")
+            .add(r"dotfiles\README");
+        let k = kinds(&plan(&mut plain, &super::tests::rules()).unwrap());
+        assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Granted));
+    }
+
+    /// A link's destination is worked out from the link's own data,
+    /// and is a destination only on a drive letter.
+    #[test]
+    fn a_link_is_followed_only_to_a_drive_of_this_machine() {
+        let link = r"\\?\C:\Users\me\.ssh";
+        let rest = ["keys".to_owned(), "id".to_owned()];
+        let j = |t: &str| LinkData::Junction(t.to_owned());
+        let sym = |t: &str, relative: bool| LinkData::Symlink {
+            target: t.to_owned(),
+            relative,
+        };
+        let to = |d: &LinkData| link_destination(link, d, &rest);
+        assert_eq!(
+            to(&j(r"\??\C:\Users\me\dotfiles\.ssh")).unwrap(),
+            r"\\?\C:\Users\me\dotfiles\.ssh\keys\id"
+        );
+        assert_eq!(
+            to(&j(r"\??\d:\elsewhere\")).unwrap(),
+            r"\\?\D:\elsewhere\keys\id"
+        );
+        assert_eq!(to(&sym(r"\??\C:\x", false)).unwrap(), r"\\?\C:\x\keys\id");
+        // Relative to the link's directory, with `..`.
+        assert_eq!(
+            to(&sym(r"dotfiles\.ssh", true)).unwrap(),
+            r"\\?\C:\Users\me\dotfiles\.ssh\keys\id"
+        );
+        assert_eq!(
+            to(&sym(r"..\shared\.\ssh", true)).unwrap(),
+            r"\\?\C:\Users\shared\ssh\keys\id"
+        );
+        // Relative to the root of the link's drive.
+        assert_eq!(
+            to(&sym(r"\data\ssh", true)).unwrap(),
+            r"\\?\C:\data\ssh\keys\id"
+        );
+        assert_eq!(
+            link_destination(link, &sym("..", true), &[]).unwrap(),
+            r"\\?\C:\Users"
+        );
+        // Never a share, a volume without a letter, another namespace,
+        // above the drive's root, or another kind of reparse point.
+        for d in [
+            j(r"\??\UNC\server\share\x"),
+            sym(r"\??\UNC\server\share\x", false),
+            sym(r"\\server\share\x", false),
+            sym(r"\\server\share\x", true),
+            sym(r"\\?\UNC\server\share", false),
+            j(r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\x"),
+            sym(r"\Device\Mup\server\share", false),
+            sym(r"..\..\..\..\x", true),
+            LinkData::Other(0x9000_001A),
+        ] {
+            assert!(to(&d).is_err(), "{d:?} was followed to {:?}", to(&d));
+        }
+        // A link that is not itself on a drive path is not followed.
+        assert!(link_destination(r"\\?\UNC\s\h\l", &sym("x", true), &[]).is_err());
+
+        // The data as the system returns it.
+        let wide = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let buffer = |tag: u32, flags: Option<u32>, subst: &str, print: &str| {
+            let (s, p) = (wide(subst), wide(print));
+            let mut b = Vec::new();
+            b.extend(tag.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend(0u16.to_le_bytes());
+            b.extend((s.len() as u16).to_le_bytes());
+            b.extend((s.len() as u16).to_le_bytes());
+            b.extend((p.len() as u16).to_le_bytes());
+            if let Some(f) = flags {
+                b.extend(f.to_le_bytes());
+            }
+            b.extend(&s);
+            b.extend(&p);
+            b
+        };
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_0003, None, r"\??\C:\t", r"C:\t")),
+            Ok(j(r"\??\C:\t"))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_000C, Some(1), r"..\t", r"..\t")),
+            Ok(sym(r"..\t", true))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0xA000_000C, Some(0), r"\??\UNC\s\h", "")),
+            Ok(sym(r"\??\UNC\s\h", false))
+        );
+        assert_eq!(
+            parse_reparse(&buffer(0x9000_001A, None, "", "")),
+            Ok(LinkData::Other(0x9000_001A))
+        );
+        assert!(parse_reparse(&[0x03, 0, 0, 0xA0, 0, 0]).is_err());
+        let mut cut = buffer(0xA000_0003, None, r"\??\C:\t", "");
+        cut.truncate(cut.len() - 4);
+        assert!(parse_reparse(&cut).is_err());
+    }
+
+    #[test]
+    fn links_in_chains_upwards_outwards_and_in_circles() {
+        // A chain: `.config` → `a\cfg`, and in there `gh` → `b\gh`.
+        let mut t = Mem::default();
+        t.add(r"a\cfg\other\x")
+            .add(r"b\gh\hosts.yml")
+            .add(r"b\keep.txt");
+        t.link(".config", Some(r"a\cfg"))
+            .link(r"a\cfg\gh", Some(r"b\gh"));
+        let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get(r"b\gh").map(|v| v.0), Some(Kind::Denied));
+        assert_eq!(k.get("b").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"b\keep.txt").map(|v| v.0), Some(Kind::File));
+        assert_eq!(k.get(r"a\cfg").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"a\cfg\gh").map(|v| v.0), Some(Kind::Skipped));
+        assert!(rules.spelled().iter().any(|s| s == r"b\gh"));
+
+        // A link whose target is above it: `.config\gh` → `.config`.
+        // The rule for `.config\gh` lands on `.config`, all of it.
+        let mut t = Mem::default();
+        t.add(r".config\git\config");
+        t.link(r".config\gh", Some(".config"));
+        let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
+        assert_eq!(k.get(".config").map(|v| v.0), Some(Kind::Denied));
+        assert!(!k.contains_key(r".config\git"));
+
+        // A link out of the profile: skipped, and nothing follows it.
+        let mut t = Mem::default();
+        t.add(r"Documents\a.txt");
+        t.link(".ssh", None);
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get("Documents").map(|v| v.0), Some(Kind::Granted));
+        assert_eq!(rules.spelled(), super::tests::rules().spelled());
+
+        // A circle of links resolves nowhere: both skipped.
+        let mut t = Mem::default();
+        t.link(".ssh", Some(".aws")).link(".aws", Some(".ssh"));
+        let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
+        assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get(".aws").map(|v| v.0), Some(Kind::Skipped));
+
+        // A link no rule points at or through is only skipped.
+        let mut t = Mem::default();
+        t.add(r"work\x");
+        t.link("shortcut", Some("work"));
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        assert_eq!(kinds(&nodes).get("work").map(|v| v.0), Some(Kind::Granted));
+        assert_eq!(rules.spelled(), super::tests::rules().spelled());
+
+        // An excluded name that leads to the profile directory itself
+        // cannot be granted around.
+        let mut t = Mem::default();
+        t.link(".ssh", Some(""));
+        assert!(plan(&mut t, &super::tests::rules()).is_err());
+
+        // A chain longer than the bound is an error, not a partial
+        // plan. Each link carries the rest of a long added rule one
+        // directory on: `x1` → `h1`, `h1\x2` → `h2`, …
+        let hops = MAX_LINK_ROUNDS + 3;
+        let long: Vec<String> = (1..=hops + 1).map(|i| format!("x{i}")).collect();
+        let chain = |links: usize| {
+            let mut t = Mem::default();
+            for i in 1..=links {
+                let at = if i == 1 {
+                    "x1".to_owned()
+                } else {
+                    format!(r"h{}\x{i}", i - 1)
+                };
+                t.add(&format!(r"h{i}\keep.txt"));
+                t.link(&at, Some(&format!("h{i}")));
+            }
+            t
+        };
+        let with_long = Rules::new(None, None, std::slice::from_ref(&long));
+        assert!(plan(&mut chain(hops), &with_long).is_err());
+        // Within the bound the last target gets the rest of the rule.
+        let (nodes, rules) = plan_resolved(&mut chain(3), &with_long).unwrap();
+        assert_eq!(kinds(&nodes).get("h3").map(|v| v.0), Some(Kind::Container));
+        let rest = long[3..].join("\\");
+        assert!(rules.spelled().contains(&format!(r"h3\{rest}")));
     }
 
     #[test]
@@ -1393,6 +2147,30 @@ mod tests {
             (Local, r"Microsoft\Windows\UsrClass.dat"),
             (Profile, r".config\gcloud"),
             (Profile, r".config\gh"),
+            (Local, r"github-copilot\hosts.json"),
+            (Profile, r".config\github-copilot\apps.json"),
+            (Profile, r".gem\credentials"),
+            (Profile, r".pulumi\credentials.json"),
+            (Roaming, r"postgresql\pgpass.conf"),
+            (Profile, ".pgpass"),
+            (Roaming, r"Composer\auth.json"),
+            (Profile, r".composer\auth.json"),
+            (Profile, r".config\doctl\config.yaml"),
+            (Profile, r".config\hub"),
+            (Profile, r".config\op\config"),
+            (Profile, r".kaggle\kaggle.json"),
+            (Profile, ".databrickscfg"),
+            (Profile, r".snowsql\config"),
+            (Profile, ".boto"),
+            (Profile, ".s3cfg"),
+            (Profile, r".oci\config"),
+            (Profile, r".fly\config.yml"),
+            (Local, r"Google\Chrome Beta\User Data\Default\Cookies"),
+            (Local, r"Chromium\User Data"),
+            (Local, r"Vivaldi\User Data"),
+            (Local, r"Yandex\YandexBrowser\User Data"),
+            (Roaming, r"Opera Software\Opera GX Stable"),
+            (Roaming, r"Thunderbird\Profiles"),
         ] {
             let prefix = match base {
                 Roaming => r"AppData\Roaming\",
@@ -1406,6 +2184,16 @@ mod tests {
             && !e.path.starts_with('\\')
             && !e.path.contains('/')
             && !e.path.contains(':')));
+        // The tools those stores belong to stay runnable: only the
+        // token file is excluded where the tool installs itself
+        // beside it.
+        for tool in [
+            r".pulumi\bin\pulumi.exe",
+            r".fly\bin\flyctl.exe",
+            r".gem\specs",
+        ] {
+            assert!(!r.excludes(&names(&split_path(tool))), "{tool}");
+        }
         // The readable configuration files are not excluded.
         for (base, path, _) in READABLE_CONFIG {
             let prefix = match base {
@@ -1506,10 +2294,18 @@ mod tests {
         }
         // Some entries are links or cannot be listed.
         let keys: Vec<String> = t.dirs.keys().filter(|k| !k.is_empty()).cloned().collect();
-        for k in keys {
-            match rng.below(12) {
-                0 => t.entry_mut(&k).skip = Some("reparse point".into()),
-                1 => t.unreadable.push(k),
+        for k in &keys {
+            match rng.below(10) {
+                // A link: to another directory of the tree, or out of
+                // the profile.
+                0 => {
+                    let target = match rng.below(4) {
+                        0 => None,
+                        _ => Some(keys[rng.below(keys.len())].clone()),
+                    };
+                    t.link(k, target.as_deref());
+                }
+                1 => t.unreadable.push(k.clone()),
                 _ => {}
             }
         }
@@ -1529,9 +2325,12 @@ mod tests {
         ];
         let rules = Rules::new(None, None, &extra);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for round in 0..400 {
+        let original = rules;
+        for round in 0..600 {
             let mut t = random_tree(&mut rng);
-            let nodes = plan(&mut t, &rules).unwrap();
+            // The rules as the plan ends up with them: the original
+            // ones, and those carried over to the targets of links.
+            let (nodes, rules) = plan_resolved(&mut t, &original).unwrap();
             let by_rel: BTreeMap<String, &Node> =
                 nodes.iter().map(|n| (n.rel.join("\\"), n)).collect();
             assert_eq!(by_rel.len(), nodes.len(), "round {round}: a path twice");
@@ -1582,6 +2381,59 @@ mod tests {
                 }
                 if !n.rel.is_empty() {
                     assert_eq!(by_rel[""].kind, Kind::Container);
+                }
+            }
+            // Links. For every link the walk met, whatever is planned
+            // at or beneath its target is looked at under the name it
+            // has THROUGH the link, against the rules as written: what
+            // is excluded under that name is not granted under its
+            // real one, and nothing that could become excluded under
+            // that name lies beneath an inheriting allow.
+            // (A link INSIDE an ungranted-only directory that no rule
+            // points at leads to an ordinary place, like a link inside
+            // any directory the grant does not enter: its target is
+            // judged by where it really is.)
+            for (link, _) in t.links.iter().filter(|(l, _)| {
+                let parent = split_path(l);
+                by_rel
+                    .get(l.as_str())
+                    .is_some_and(|n| n.kind == Kind::Skipped)
+                    && !original.ungranted(&names(&parent[..parent.len() - 1]))
+            }) {
+                let Some(target) = t.real(link) else { continue };
+                for n in &nodes {
+                    let real = n.rel.join("\\");
+                    let rest = if real == target {
+                        ""
+                    } else if let Some(r) = real.strip_prefix(&format!("{target}\\")) {
+                        r
+                    } else if target.is_empty() {
+                        real.as_str()
+                    } else {
+                        continue;
+                    };
+                    let alias = names(&split_path(&format!("{link}\\{rest}")));
+                    if original.excludes(&alias) {
+                        assert!(
+                            matches!(n.kind, Kind::Denied | Kind::Skipped),
+                            "round {round}: {real} is {:?} though excluded as {link}\\{rest}",
+                            n.kind
+                        );
+                    }
+                    if n.kind == Kind::Granted {
+                        assert!(
+                            !original.could_exclude_beneath(&alias),
+                            "round {round}: granted {real} is {link}\\{rest}, beneath which \
+                             an exclusion can lie"
+                        );
+                    }
+                    if original.ungranted(&alias) {
+                        assert!(
+                            matches!(n.kind, Kind::Ungranted | Kind::Denied | Kind::Skipped),
+                            "round {round}: {real} is {:?} though ungranted as {link}\\{rest}",
+                            n.kind
+                        );
+                    }
                 }
             }
             // Every excluded object on disk whose ancestors were all
@@ -1727,8 +2579,27 @@ mod tests {
             p(r"AppData\Local\Temp\keys"),
         ];
         let ungranted = vec![p(r"AppData\Local\Temp")];
+        // What is on disk, for the wildcard rules: `App` has an
+        // EBWebView directory, `Tool` and `npm-cache` do not.
+        let on_disk = |dir: &str| -> Listing {
+            let d = dir.to_lowercase();
+            let names: &[&str] = if d.ends_with(r"\appdata\local") {
+                &["App", "Tool", "npm-cache", "Temp"]
+            } else if d.ends_with(r"\appdata\local\app") {
+                &["EBWebView", "data"]
+            } else if d.ends_with(r"\appdata\local\tool") {
+                &["bin"]
+            } else if d.ends_with(r"\appdata") {
+                &["Local", "Roaming"]
+            } else if d.ends_with(r"\users\me") {
+                &["AppData", "Documents"]
+            } else {
+                return Listing::Nothing;
+            };
+            Listing::Entries(names.iter().map(|n| (*n).to_owned()).collect())
+        };
         let check = |rel: &str, write: bool, admitted: &[String]| {
-            session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted)
+            session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted, &on_disk)
         };
         let refused = |rel: &str, write: bool| check(rel, write, &[]).is_some();
         for write in [false, true] {
@@ -1739,6 +2610,12 @@ mod tests {
             assert!(refused("ntuser.dat.LOG1", write));
             assert!(refused(r"AppData\Local\App", write));
             assert!(refused("AppData", write));
+            // A wildcard rule refuses a directory above it only while
+            // something beneath that directory matches: a tool's own
+            // directory under Local with no such child is grantable.
+            assert!(!refused(r"AppData\Local\Tool", write));
+            assert!(!refused(r"AppData\Local\npm-cache", write));
+            assert!(!refused(r"AppData\Local\Tool\bin", write));
             // Ungranted-only: the directory and above it, not inside.
             assert!(refused(r"AppData\Local\Temp", write));
             assert!(refused(r"AppData\Local", write));
@@ -1756,7 +2633,8 @@ mod tests {
         for root in [r"\\?\C:\Users\me", r"\\?\C:\Users", r"\\?\C:\"] {
             for write in [false, true] {
                 assert!(
-                    session_grant_refusal(root, write, &protected, &ungranted, &[]).is_some(),
+                    session_grant_refusal(root, write, &protected, &ungranted, &[], &on_disk)
+                        .is_some(),
                     "{root}"
                 );
             }
@@ -1764,7 +2642,7 @@ mod tests {
         // Another drive, another user.
         for other in [r"\\?\D:\work", r"\\?\C:\Users\other\.ssh"] {
             assert_eq!(
-                session_grant_refusal(other, true, &protected, &ungranted, &[]),
+                session_grant_refusal(other, true, &protected, &ungranted, &[], &on_disk),
                 None
             );
         }
@@ -1779,6 +2657,114 @@ mod tests {
         assert!(check("AppData", false, &[p("AppData")]).is_some());
         let temp = [p(r"AppData\Local\Temp")];
         assert!(check(r"AppData\Local\Temp", false, &temp).is_some());
+        // With nothing on disk only the rules that name their path
+        // refuse a directory above them; the wildcard ones do not.
+        let empty = |_: &str| Listing::Nothing;
+        let bare = |rel: &str| {
+            session_grant_refusal(&p(rel), true, &protected, &ungranted, &[], &empty).is_some()
+        };
+        assert!(!bare(r"AppData\Local\App"));
+        assert!(bare(r"AppData\Local\App\EBWebView"));
+        assert!(bare(r"AppData\Local"));
+        assert!(bare(""));
+        // The lookup goes no deeper than the rule: `x\y\EBWebView`
+        // beneath Local does not make Local's child `x` refused.
+        let deep = |dir: &str| -> Listing {
+            let d = dir.to_lowercase();
+            if d.ends_with(r"\local\x") {
+                Listing::Entries(vec!["y".to_owned()])
+            } else if d.ends_with(r"\local\x\y") {
+                Listing::Entries(vec!["EBWebView".to_owned()])
+            } else {
+                Listing::Nothing
+            }
+        };
+        assert_eq!(
+            session_grant_refusal(
+                &p(r"AppData\Local\x"),
+                true,
+                &protected,
+                &ungranted,
+                &[],
+                &deep
+            ),
+            None
+        );
+        // Failing closed. A rule two levels deep, so that a level
+        // BENEATH the path can fail too: `apps\*\*\store`.
+        let two = vec![p(r"apps\*\*\store")];
+        let with = |at_apps: Listing, at_a: Listing| {
+            move |dir: &str| -> Listing {
+                let d = dir.to_lowercase();
+                if d.ends_with(r"\apps") {
+                    at_apps.clone()
+                } else if d.ends_with(r"\apps\a") {
+                    at_a.clone()
+                } else {
+                    Listing::Nothing
+                }
+            }
+        };
+        let names = |n: &[&str]| Listing::Entries(n.iter().map(|s| (*s).to_owned()).collect());
+        let verdict = |list: &dyn Fn(&str) -> Listing| {
+            session_grant_refusal(&p("apps"), true, &two, &[], &[], list)
+        };
+        // Looked at, nothing matches: admitted. Not there: admitted.
+        assert_eq!(verdict(&with(names(&["a"]), names(&["b"]))), None);
+        assert_eq!(verdict(&with(names(&["a"]), Listing::Nothing)), None);
+        assert_eq!(verdict(&with(Listing::Nothing, Listing::Nothing)), None);
+        // A link beneath the path is not followed, and is no failure.
+        assert_eq!(verdict(&with(names(&["a"]), Listing::Link)), None);
+        // Could not look — at the path itself, or at a level beneath
+        // it that could lead to a match: refused, and the message says
+        // it was not examined rather than that something was found.
+        for (at_apps, at_a) in [
+            (Listing::Failed("access denied".into()), Listing::Nothing),
+            (Listing::Failed("i/o error".into()), Listing::Nothing),
+            (names(&["a"]), Listing::Failed("access denied".into())),
+            (
+                names(&["a", "z"]),
+                Listing::Failed("sharing violation".into()),
+            ),
+            // The path itself turning out to be a link.
+            (Listing::Link, Listing::Nothing),
+        ] {
+            let why = verdict(&with(at_apps.clone(), at_a.clone()))
+                .unwrap_or_else(|| panic!("{at_apps:?}/{at_a:?} was admitted"));
+            assert!(why.contains("could not be examined"), "{why}");
+        }
+        // A failure where the rule cannot match anyway does not count:
+        // `a` is never listed for a rule whose next component is not
+        // matched by it.
+        let narrow = vec![p(r"apps\b\*\store")];
+        assert_eq!(
+            session_grant_refusal(
+                &p("apps"),
+                true,
+                &narrow,
+                &[],
+                &[],
+                &with(names(&["a"]), Listing::Failed("access denied".into()))
+            ),
+            None
+        );
+        // And a match found elsewhere wins over a failure.
+        let found = |dir: &str| -> Listing {
+            let d = dir.to_lowercase();
+            if d.ends_with(r"\apps") {
+                names(&["a", "c"])
+            } else if d.ends_with(r"\apps\a") {
+                Listing::Failed("access denied".into())
+            } else if d.ends_with(r"\apps\c") {
+                names(&["d"])
+            } else if d.ends_with(r"\apps\c\d") {
+                names(&["store"])
+            } else {
+                Listing::Nothing
+            }
+        };
+        let why = verdict(&found).unwrap();
+        assert!(why.contains("narrower"), "{why}");
         // The message for a write root above an exclusion says what
         // to do about it.
         let why = check("AppData", true, &[]).unwrap();
@@ -1787,6 +2773,87 @@ mod tests {
         assert_eq!(relation(&p(r".ssh\a"), &p(".ssh")), Some(Relation::Inside));
         assert_eq!(relation(&p(""), &p(".ssh")), Some(Relation::Above));
         assert_eq!(relation(&p("x"), &p(".ssh")), None);
+    }
+
+    #[test]
+    fn a_read_deny_is_also_written_on_each_recorded_allow_beneath_it() {
+        let root = r"\\?\C:\Users\me";
+        let rec: Vec<(String, Kind)> = [
+            ("", Kind::Container),
+            (r"\Documents", Kind::Granted),
+            (r"\.gitconfig", Kind::File),
+            (r"\.ssh", Kind::Denied),
+            (r"\AppData", Kind::Container),
+            (r"\AppData\Local", Kind::Container),
+            (r"\AppData\Local\Temp", Kind::Ungranted),
+            (r"\AppData\Local\Programs", Kind::Granted),
+            (r"\AppData\Local\IconCache.db", Kind::File),
+            (r"\AppData\Roaming", Kind::Container),
+            (r"\OneDrive", Kind::Skipped),
+        ]
+        .iter()
+        .map(|(p, k)| (format!("{root}{p}"), *k))
+        .collect();
+        let also = |deny: &str| -> Vec<String> {
+            covered_by_read_deny(
+                &format!("{root}{deny}"),
+                rec.iter().map(|(p, k)| (p.as_str(), *k)),
+            )
+            .into_iter()
+            .map(|p| p[root.len()..].to_owned())
+            .collect()
+        };
+        // On a container: every recorded allow beneath it, and neither
+        // the denied, the ungranted, the skipped nor the path itself.
+        assert_eq!(
+            also(r"\AppData"),
+            [
+                r"\AppData\Local",
+                r"\AppData\Local\Programs",
+                r"\AppData\Local\IconCache.db",
+                r"\AppData\Roaming"
+            ]
+        );
+        // However the deny is spelled.
+        assert_eq!(also(r"\APPDATA\local.").len(), 2);
+        // On a granted directory, a file, or something inside a
+        // granted directory: nothing more — the deny on the path
+        // itself reaches all there is.
+        assert!(also(r"\Documents").is_empty());
+        assert!(also(r"\.gitconfig").is_empty());
+        assert!(also(r"\Documents\work\secret").is_empty());
+        // A name that only begins like a recorded one is not above it.
+        assert!(also(r"\App").is_empty());
+        // On the profile itself: all of them but itself.
+        assert_eq!(also("").len(), 7);
+
+        // A record of a few thousand paths: one deny in, the paths
+        // out, with nothing to pass along a command line.
+        let many: Vec<(String, Kind)> = (0..6000)
+            .map(|i| {
+                let kind = match i % 3 {
+                    0 => Kind::Container,
+                    1 => Kind::Granted,
+                    _ => Kind::File,
+                };
+                (
+                    format!(r"{root}\AppData\Local\dir{}\entry-{i}", i % 40),
+                    kind,
+                )
+            })
+            .chain((0..500).map(|i| (format!(r"{root}\Documents\d{i}"), Kind::Granted)))
+            .collect();
+        let got = covered_by_read_deny(
+            &format!(r"{root}\AppData"),
+            many.iter().map(|(p, k)| (p.as_str(), *k)),
+        );
+        assert_eq!(got.len(), 6000);
+        assert!(got.iter().map(|p| p.len() + 14).sum::<usize>() > 32_767);
+        let one = covered_by_read_deny(
+            &format!(r"{root}\AppData\Local\dir7"),
+            many.iter().map(|(p, k)| (p.as_str(), *k)),
+        );
+        assert_eq!(one.len(), 150);
     }
 
     #[test]
