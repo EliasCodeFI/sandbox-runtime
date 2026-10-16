@@ -911,27 +911,20 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
 /// - `kept-grant-holders`: sessions are recorded as holders of the
 ///   kept grants they run on, and `acl forget` / `profile forget`
 ///   take `--unless-held-by-others`.
+/// - `read-deny-except`: that expansion leaves out what the session
+///   allows more specifically — the grants of the same `acl grant`
+///   call, and `exec --deny-read-except`.
+/// - `exec-holder`: every session under the write-restricted token is
+///   recorded as a holder of the profile read grant from its start,
+///   and `exec` either is told the session that holds for it
+///   (`--held-by`) or holds for the duration of the command itself.
 pub const CAPABILITIES: &[&str] = &[
     "profile-deny-expansion",
     "profile-session-grant-check",
     "kept-grant-holders",
+    "read-deny-except",
+    "exec-holder",
 ];
-
-/// The profile a read grant is recorded for, if one is: what a
-/// default session runs on, and so holds for as long as it lives
-/// (`state_db::Locked::hold_kept`). A record that cannot be read
-/// counts as a grant — the session may well be reading through it.
-pub fn held_profile() -> Option<String> {
-    match read_marker_at(persist::MARKER_KEY) {
-        Ok(m) if m.is_empty() => None,
-        Ok(m) => Some(
-            m.header
-                .map(|h| h.profile)
-                .unwrap_or_else(|| "(profile)".to_owned()),
-        ),
-        Err(_) => Some("(profile)".to_owned()),
-    }
-}
 
 /// The recorded paths that carry an allow of their own, for working
 /// out what a session's read denies are also written on

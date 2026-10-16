@@ -495,6 +495,16 @@ export interface WindowsSandboxParams {
    * further up.
    */
   denyReadExcept?: readonly string[]
+  /**
+   * Under the write-restricted token: the process whose session this
+   * command belongs to and which `srt-win` has recorded as a holder of
+   * the kept grants ({@link grantWindowsAclPersistent} with that
+   * `holderPid`). Leave it out for a command with no such session:
+   * `srt-win exec` then records itself as the holder until the
+   * command has exited, so that neither the profile read grant nor a
+   * write root is removed from under it.
+   */
+  heldBy?: number
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
@@ -984,6 +994,19 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
    * holds when that status does not show a grant that is on disk.
    */
   profileSessionGrantCheck: 'profile-session-grant-check',
+  /**
+   * That expansion leaves out the recorded paths the session allows
+   * more specifically: the grants of the same `acl grant` call, and
+   * the ones a command names with `--deny-read-except`. Without it a
+   * deny on the profile would take a session's own write root away.
+   */
+  readDenyExcept: 'read-deny-except',
+  /**
+   * A session under the write-restricted token is recorded as a
+   * holder of the profile read grant from its start, and `exec` is
+   * told which session holds for it (`--held-by`) or holds for itself.
+   */
+  execHolder: 'exec-holder',
 } as const
 
 /**
@@ -3872,6 +3895,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (writeRestricted) {
     argv.push('--write-restricted-token')
     for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
+    if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
   }
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)

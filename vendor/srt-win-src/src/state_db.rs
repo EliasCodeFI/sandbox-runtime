@@ -374,6 +374,11 @@ pub const KIND_GRANT: &[&str] = &["grant"];
 /// finds the holder dead.
 pub const KIND_KEPT_ROOT: &str = "kept_root";
 pub const KIND_KEPT_PROFILE: &str = "profile";
+/// What a `profile` hold names. It is one resource — the calling
+/// user's profile read grant, whether or not one is recorded at the
+/// moment — and not a path: a session holds it from its start, so a
+/// grant made while the session runs is covered too.
+pub const KEPT_PROFILE_PATH: &str = "(profile)";
 
 /// A live session, other than the caller's, running on a kept grant.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -760,9 +765,9 @@ impl Locked {
         Ok(())
     }
 
-    /// Drop the holder's kept-grant holds (its session is ending).
-    /// The broker row goes with the last hold of any kind
-    /// ([`Self::release_aces`], which the caller runs next).
+    /// Drop the holder's kept-grant holds (its session, or its one
+    /// command, is ending). The broker row goes with the last hold of
+    /// any kind.
     pub fn release_kept(&self) -> Result<()> {
         self.conn
             .execute(
@@ -770,6 +775,9 @@ impl Locked {
                 params![self.holder_pid.0 as i64],
             )
             .context("DELETE kept holds")?;
+        if self.my_ace_holds(None)?.is_empty() {
+            self.unregister_broker()?;
+        }
         Ok(())
     }
 
@@ -1846,10 +1854,10 @@ mod tests {
             let (other, dead) = (me + 1, me + 2);
             let root = r"\\?\C:\work".to_owned();
             // This session: a root and the profile grant.
-            db.hold_kept(std::slice::from_ref(&root), Some(r"\\?\C:\Users\me"))
+            db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
                 .unwrap();
             // Twice is once.
-            db.hold_kept(std::slice::from_ref(&root), Some(r"\\?\C:\Users\me"))
+            db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
                 .unwrap();
             assert_eq!(counts(&db.conn), (1, 2, 0));
             // Nothing held: no broker row is made for it.
@@ -1925,6 +1933,16 @@ mod tests {
             // A session that ends drops its own holds and nobody
             // else's.
             db.release_kept().unwrap();
+            // With its last hold its broker row went too.
+            let mine: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM brokers WHERE pid = ?1",
+                    params![me],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(mine, 0);
             assert!(
                 kept_holders_with(&db.conn, other, alive)
                     .unwrap()

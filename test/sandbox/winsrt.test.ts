@@ -244,6 +244,8 @@ const SRT_WIN_CAPABILITIES = [
   'profile-deny-expansion',
   'profile-session-grant-check',
   'kept-grant-holders',
+  'read-deny-except',
+  'exec-holder',
 ]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
@@ -2547,12 +2549,26 @@ describe('Windows write-restricted token, the default: write roots are granted o
         denyWrite: [],
       }
       await SandboxManager.initialize(cfg)
-      expect(subs()).toEqual([])
+      // The one call is still made, with empty lists: it is what
+      // records this process as a holder of the profile read grant,
+      // whether or not one exists yet.
+      expect(subs()).toEqual(['grant'])
+      expect(acl[0].stdin).toEqual({
+        read: [],
+        write: [],
+        denyRead: [],
+        denyWrite: [],
+      })
       expect(verifyCalls).toHaveLength(1)
       expect(verifyCalls[0]?.writeRoots).toEqual([])
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
       expect(argv).toContain('--write-restricted-token')
       expect(argv).not.toContain('--write-root')
+      // The command names the session that holds for it.
+      expect(argv[argv.indexOf('--held-by') + 1]).toBe(`${process.pid}`)
+      // … and the hold is released with the session.
+      await SandboxManager.reset()
+      expect(subs()).toEqual(['grant', 'revoke', 'restore'])
     })
 
     for (const status of [1, 2]) {
@@ -7214,13 +7230,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       })
       await SandboxManager.reset()
       expect(names().slice(2)).toEqual(['acl revoke', 'acl restore'])
-      // Without a grant to hold, a session with nothing to grant
-      // makes no call at all.
+      // With no grant recorded the session registers all the same:
+      // one made while it runs is read through from then on, and
+      // must not be removable from under it.
       calls = []
       profileStatus = { state: 'none' }
       briefGrant = { state: 'none' }
       await SandboxManager.initialize(cfg)
-      expect(names()).toEqual([])
+      expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
+      expect(names()).toEqual(['acl grant'])
+      expect(calls[0].argv).toContain('--persistent')
+      const inSession = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(inSession.argv[inSession.argv.indexOf('--held-by') + 1]).toBe(
+        `${process.pid}`,
+      )
+      await SandboxManager.reset()
+      expect(names()).toEqual(['acl grant', 'acl revoke', 'acl restore'])
+      // A command with no session behind it names no holder: srt-win
+      // holds for the length of the command itself.
+      const alone = await SandboxManager.wrapWithSandboxArgv(
+        'echo x',
+        undefined,
+        config({}, { allowWrite: [] }),
+      )
+      expect(alone.argv).toContain('--write-restricted-token')
+      expect(alone.argv).not.toContain('--held-by')
+      // Under the ordinary token there is nothing to hold.
+      await SandboxManager.initialize(config(ORDINARY))
+      const ordinary = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(ordinary.argv).not.toContain('--held-by')
     })
 
     it('profile forget fails → profile_forget_failed; nothing granted, no session', async () => {

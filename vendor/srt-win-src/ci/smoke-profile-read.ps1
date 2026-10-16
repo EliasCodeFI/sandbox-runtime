@@ -639,8 +639,8 @@ try {
   # That it does so is what the library asks for by name.
   $capsUser = @((J @('user', 'status')).capabilities)
   $capsProf = @((Status).capabilities)
-  if ($capsUser -contains 'profile-deny-expansion' -and $capsProf -contains 'profile-deny-expansion' -and
-      $capsUser -contains 'kept-grant-holders') { Ok 'D: user status and profile status name the capabilities the library relies on' }
+  $need = @('profile-deny-expansion', 'profile-session-grant-check', 'kept-grant-holders', 'read-deny-except', 'exec-holder')
+  if (@($need | Where-Object { $capsUser -notcontains $_ -or $capsProf -notcontains $_ }).Count -eq 0) { Ok 'D: user status and profile status name the capabilities the library relies on' }
   else { Fail "D: capabilities: user status [$($capsUser -join ', ')] profile status [$($capsProf -join ', ')]" }
   if ((Session-Deny @($prof)) -ne 0) { Fail 'D: the session stamps for a deny on the profile directory could not be written' }
   else {

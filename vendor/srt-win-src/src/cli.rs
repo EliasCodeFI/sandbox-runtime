@@ -239,6 +239,16 @@ enum Cmd {
         /// cannot be resolved spares nothing.
         #[arg(long = "deny-read-except", value_name = "PATH")]
         deny_read_except: Vec<String>,
+        /// The process whose session this command belongs to and
+        /// which is recorded as a holder of the kept grants the
+        /// command runs on (`acl grant --persistent --holder-pid`).
+        /// Without it, under `--write-restricted-token`, this process
+        /// records itself as the holder — of the profile read grant
+        /// and of each `--write-root` — until the command has exited,
+        /// so that neither is removed from under it
+        /// (`--unless-held-by-others`).
+        #[arg(long = "held-by", value_name = "PID")]
+        held_by: Option<u32>,
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
@@ -1771,11 +1781,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     let (kept, per_session_denies) =
                         persist::apply(db, &ids, &roots, &denies.targets)?;
                     // From here the holder's session runs on these
-                    // kept roots, and on the profile read grant if one
-                    // is recorded: said in the holder table, so that
-                    // nothing removes either from under it
-                    // (`--unless-held-by-others`).
-                    db.hold_kept(&roots, srt_win::profile::held_profile().as_deref())?;
+                    // kept roots and on the profile read grant: said
+                    // in the holder table, so that nothing removes
+                    // either from under it
+                    // (`--unless-held-by-others`). The profile grant
+                    // is held whether or not one is recorded now — one
+                    // made while the session runs is read through by
+                    // its commands from then on.
+                    db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))?;
                     // Per session, for the sandbox user SID as without
                     // the flag: the read grants, and the denies under
                     // no persistent root.
@@ -1902,9 +1915,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let holder =
                 state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _report) = state_db::with_init_lock(holder, false, |db| {
-                if unless_held_by_others.is_some() {
-                    exit_if_held_by_others(db)?;
-                }
                 // A root that no longer resolves is looked up as
                 // given: it may be recorded under that spelling.
                 let targets: Vec<String> = roots
@@ -1915,6 +1925,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             .unwrap_or_else(|_| r.clone())
                     })
                     .collect();
+                if unless_held_by_others.is_some() {
+                    // The roots to be forgotten: all, or these.
+                    exit_if_held_by_others(db, Held::Roots(&targets))?;
+                }
                 persist::forget(db, &ids, &targets, all)
             })?;
             let failed = out
@@ -2195,7 +2209,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _) = state_db::with_init_lock(holder, false, |db| {
                 if unless_held_by_others.is_some() {
-                    exit_if_held_by_others(db)?;
+                    exit_if_held_by_others(db, Held::Profile)?;
                 }
                 profile::forget(&profile::Store::of(db.conn()), &ids)
             })?;
@@ -2278,6 +2292,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Exec {
             deny_read,
             deny_read_except,
+            held_by,
             deny_write,
             env,
             quiet,
@@ -2369,6 +2384,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // error (glob, canon-fail, apply-fail) FAILS the exec
             // rather than running the child with an incomplete deny
             // set.
+            // A command with no session holding the kept grants for it
+            // holds them itself while it runs. Not taking the hold is
+            // not running the command: without it the grant could be
+            // removed in the middle of it.
+            let kept_hold = if write_restricted_token && held_by.is_none() {
+                Some(KeptHold::take(&write_root).context("hold the kept grants for this command")?)
+            } else {
+                None
+            };
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
                 None
             } else {
@@ -2488,6 +2512,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                     );
                     drop(per_exec_guard);
+                    drop(kept_hold);
                     std::process::exit(16);
                 }
             };
@@ -2496,6 +2521,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // per-exec restore guard's Drop must be explicit
             // BEFORE it.
             drop(per_exec_guard);
+            drop(kept_hold);
             std::process::exit(code as i32);
         }
     }
@@ -2576,6 +2602,49 @@ fn require_elevated() -> anyhow::Result<()> {
 /// grant: nothing was removed.
 const EXIT_HELD_BY_OTHERS: i32 = 22;
 
+/// Which kept grant a removal is about.
+#[derive(Clone, Copy)]
+enum Held<'a> {
+    /// The profile read grant.
+    Profile,
+    /// These kept write roots (canonical); every one if empty.
+    Roots(&'a [String]),
+}
+
+/// A sandboxed command's own hold on the kept grants it runs on, for
+/// one `exec` with no session holding for it: taken before the child
+/// starts, given back when it has exited. Crash recovery gives it back
+/// if this process dies first.
+struct KeptHold(srt_win::state_db::HolderPid);
+
+impl KeptHold {
+    fn take(write_roots: &[String]) -> anyhow::Result<Self> {
+        use srt_win::state_db;
+        let own = state_db::HolderPid(std::process::id());
+        let roots: Vec<String> = write_roots
+            .iter()
+            .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+            .map(|(canon, _)| canon)
+            .collect();
+        state_db::with_init_lock(own, false, |db| {
+            db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))
+        })?;
+        Ok(Self(own))
+    }
+}
+
+impl Drop for KeptHold {
+    fn drop(&mut self) {
+        if let Err(e) = srt_win::state_db::with_init_lock(self.0, false, |db| db.release_kept()) {
+            eprintln!(
+                "srt-win: WARNING: this command's hold on the kept grants was not released \
+                 ({e:#}); it is dropped once pid {} is gone",
+                self.0.0
+            );
+        }
+    }
+}
+
 /// Under the init lock, after crash recovery has dropped the holds of
 /// sessions that died: if a live session other than the lock's holder
 /// runs on a kept write root or on the profile read grant, say which
@@ -2583,8 +2652,22 @@ const EXIT_HELD_BY_OTHERS: i32 = 22;
 /// before anything is removed. Removing the grant would take the
 /// working directory, or the profile, away from under that session's
 /// commands.
-fn exit_if_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Result<()> {
-    let held = db.other_kept_holders()?;
+fn exit_if_held_by_others(db: &srt_win::state_db::Locked, what: Held<'_>) -> anyhow::Result<()> {
+    use srt_win::state_db::{KIND_KEPT_PROFILE, KIND_KEPT_ROOT};
+    // Only the holds on what is about to be removed count: a session
+    // that reads the profile through the grant does not keep another
+    // user of the machine from forgetting a write root it never used.
+    let held: Vec<_> = db
+        .other_kept_holders()?
+        .into_iter()
+        .filter(|h| match what {
+            Held::Profile => h.kind == KIND_KEPT_PROFILE,
+            Held::Roots(roots) => {
+                h.kind == KIND_KEPT_ROOT
+                    && (roots.is_empty() || roots.iter().any(|r| r.eq_ignore_ascii_case(&h.path)))
+            }
+        })
+        .collect();
     if held.is_empty() {
         return Ok(());
     }
