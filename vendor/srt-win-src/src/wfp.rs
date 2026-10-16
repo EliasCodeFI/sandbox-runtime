@@ -653,9 +653,9 @@ pub fn install_filters(
 
         // Idempotency + migration: drop EVERY stale srt-win filter
         // (this version's user-keyed shape, the anonymous BLOCK of
-        // a revision-2 install, and any legacy group-keyed filters
-        // from a prior install) before re-adding. Inside the transaction so a crash leaves the
-        // previous state intact.
+        // an earlier revision, and any legacy group-keyed filters
+        // from a prior install) before re-adding. Inside the
+        // transaction so a crash leaves the previous state intact.
         delete_tagged_filters(engine, sublayer)?;
 
         let mut sd_user_blob = sd_byte_blob(&sd_user);
