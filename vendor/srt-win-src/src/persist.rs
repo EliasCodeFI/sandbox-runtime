@@ -676,7 +676,7 @@ pub(crate) fn converge_on(
     // object sits behind one of our allows (a DACL an earlier build
     // wrote with its allows at the head is rewritten).
     let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir)
-        && acl::persistent_layout_canonical(&aces, &t);
+        && acl::persistent_layout_ok(&aces, &t);
     // Settled: no write is outstanding for this path. With ACEs
     // wanted, that takes a completed write of exactly this list on
     // this object; with none wanted, only that no write was left
@@ -743,7 +743,7 @@ pub(crate) fn settled_on_object(
     let aces = acl::read_aces_at(DaclTarget::Handle(on.handle, canon))?;
     if acl::persistent_on_disk(&aces, &ids.trustees(), on.is_dir)
         != acl::comparable(&want, on.is_dir)
-        || !acl::persistent_layout_canonical(&aces, &ids.trustees())
+        || !acl::persistent_layout_ok(&aces, &ids.trustees())
     {
         return Ok(false);
     }
