@@ -357,7 +357,6 @@ impl Ids {
         PersistentTrustees {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
-            sandbox_user_sid: self.sandbox_user_sid.as_deref(),
         }
     }
 }
@@ -542,7 +541,11 @@ pub(crate) fn converge_on(
         )
         .optional()
         .context("SELECT persistent_writes")?;
-    let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir);
+    // The same entries, and laid out so that no explicit deny on the
+    // object sits behind one of our allows (a DACL an earlier build
+    // wrote with its allows at the head is rewritten).
+    let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir)
+        && acl::persistent_layout_canonical(&aces, &t);
     // Settled: no write is outstanding for this path. With ACEs
     // wanted, that takes a completed write of exactly this list on
     // this object; with none wanted, only that no write was left
@@ -609,6 +612,7 @@ pub(crate) fn settled_on_object(
     let aces = acl::read_aces_at(DaclTarget::Handle(on.handle, canon))?;
     if acl::persistent_on_disk(&aces, &ids.trustees(), on.is_dir)
         != acl::comparable(&want, on.is_dir)
+        || !acl::persistent_layout_canonical(&aces, &ids.trustees())
     {
         return Ok(false);
     }

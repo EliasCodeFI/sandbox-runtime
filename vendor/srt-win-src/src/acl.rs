@@ -1117,11 +1117,6 @@ pub struct PersistentTrustees<'a> {
     pub group_sid: Option<&'a str>,
     /// The user the broker runs as.
     pub real_user_sid: &'a str,
-    /// The sandbox user. Its ACEs are not persistent ones (a session
-    /// writes and removes them); it is here because its DENY ACEs
-    /// have to stay ahead of the allows written for the group — see
-    /// [`write_persistent_aces_at`].
-    pub sandbox_user_sid: Option<&'a str>,
 }
 
 /// What the profile read grant (`crate::profile`) allows on a path.
@@ -1320,17 +1315,25 @@ pub fn write_persistent_aces(
     write_persistent_aces_at(DaclTarget::Path(canonical_path), t, want)
 }
 
+/// The ACE types that deny: plain, object, callback, callback-object.
+fn is_deny_type(hdr: &ACE_HEADER) -> bool {
+    matches!(u32::from(hdr.AceType), 1 | 6 | 10 | 12)
+}
+
 /// [`write_persistent_aces`] on a path or on an open handle.
 ///
-/// Order of the explicit ACEs written: the wanted DENY ACEs, then the
-/// DENY ACEs the object already has for the sandbox user, then the
-/// wanted ALLOW ACEs, then every other explicit ACE that was there,
-/// in its old order. The second run is what a session's read or write
-/// deny on this object is (`apply_sandbox_aces` puts it at the head):
-/// an ALLOW for the sandbox group written in front of it would be
-/// reached first and decide the access check, so a session's deny on
-/// a path the group may read would stop denying whenever this
-/// function ran during the session.
+/// The explicit ACEs are written in canonical order: the wanted DENY
+/// ACEs, then EVERY explicit DENY the object already has, whoever it
+/// names, then the wanted ALLOW ACEs, then the explicit ALLOW ACEs
+/// that were there — each run in its old order. An ALLOW for the
+/// sandbox group written in front of an existing DENY would be reached
+/// first and decide the access check: a deny for `Everyone` or
+/// `Users` the owner had put on the object, or a session's deny for
+/// the sandbox user, would stop applying to the sandbox account.
+/// Inherited ACEs are not written here; the system derives them.
+///
+/// Removing (an empty `want`) takes the persistent ACEs out and leaves
+/// every other explicit ACE where it was.
 pub fn write_persistent_aces_at(
     target: DaclTarget<'_>,
     t: &PersistentTrustees<'_>,
@@ -1341,21 +1344,10 @@ pub fn write_persistent_aces_at(
         .read()
         .with_context(|| format!("persistent ACEs '{label}'"))?;
     let protected = sd_dacl_protected(&sd)?;
-    let sb = t
-        .sandbox_user_sid
-        .map(crate::sid::sid_bytes)
-        .transpose()
-        .context("parse the sandbox user SID")?;
-    let is_sb_deny = |hdr: &ACE_HEADER, body: &[u8]| {
-        u32::from(hdr.AceType) == ACCESS_DENIED_ACE_TYPE
-            && sb.as_deref().is_some_and(|sb| ace_sid_is(body, sb))
-    };
     let stays = |hdr: &ACE_HEADER, body: &[u8]| {
         hdr.AceFlags & INHERITED_ACE == 0
             && !ace_view(hdr, body).is_some_and(|a| is_persistent_ace(&a, t))
     };
-    let kept_denies = filter_aces(old, |h, b| stays(h, b) && is_sb_deny(h, b))?;
-    let kept_rest = filter_aces(old, |h, b| stays(h, b) && !is_sb_deny(h, b))?;
     let sids: Vec<LocalPsid> = want
         .iter()
         .map(|a| LocalPsid::from_string(&a.sid))
@@ -1368,18 +1360,25 @@ pub fn write_persistent_aces_at(
             NewAce::Allow(s.as_psid(), a.mask, fl)
         }
     };
-    let pairs = || want.iter().zip(&sids);
-    let denies: Vec<NewAce> = pairs().filter(|(a, _)| a.deny).map(new_ace).collect();
-    let allows: Vec<NewAce> = pairs().filter(|(a, _)| !a.deny).map(new_ace).collect();
-    let new = rebuild_acl_seq(
-        kept_rest.2,
-        &[
-            AclPart::New(&denies),
-            AclPart::Kept(&kept_denies),
-            AclPart::New(&allows),
-            AclPart::Kept(&kept_rest),
-        ],
-    )?;
+    let new = if want.is_empty() {
+        let kept = filter_aces(old, stays)?;
+        rebuild_acl_seq(kept.2, &[AclPart::Kept(&kept)])?
+    } else {
+        let kept_denies = filter_aces(old, |h, b| stays(h, b) && is_deny_type(h))?;
+        let kept_rest = filter_aces(old, |h, b| stays(h, b) && !is_deny_type(h))?;
+        let pairs = || want.iter().zip(&sids);
+        let denies: Vec<NewAce> = pairs().filter(|(a, _)| a.deny).map(new_ace).collect();
+        let allows: Vec<NewAce> = pairs().filter(|(a, _)| !a.deny).map(new_ace).collect();
+        rebuild_acl_seq(
+            kept_rest.2,
+            &[
+                AclPart::New(&denies),
+                AclPart::Kept(&kept_denies),
+                AclPart::New(&allows),
+                AclPart::Kept(&kept_rest),
+            ],
+        )?
+    };
     let prot = if protected {
         Protection::Protected
     } else {
@@ -1388,6 +1387,22 @@ pub fn write_persistent_aces_at(
     target
         .write(new.as_ptr(), prot)
         .with_context(|| format!("persistent ACEs '{label}'"))
+}
+
+/// Whether the explicit ACEs among `aces` (DACL order) are laid out
+/// as [`write_persistent_aces_at`] lays them out: no explicit DENY, of
+/// any trustee, after one of the persistent ALLOW ACEs. A DACL written
+/// by a build that put its allows at the very head fails this where a
+/// deny was already on the object, and is rewritten.
+pub fn persistent_layout_canonical(aces: &[AceView], t: &PersistentTrustees<'_>) -> bool {
+    let mut seen_our_allow = false;
+    for a in aces.iter().filter(|a| !a.inherited) {
+        if a.deny && seen_our_allow {
+            return false;
+        }
+        seen_our_allow |= !a.deny && is_persistent_ace(a, t);
+    }
+    true
 }
 
 const INHERITED_ACE: u8 = 0x10;
@@ -1508,7 +1523,6 @@ mod tests {
     const T: PersistentTrustees<'static> = PersistentTrustees {
         group_sid: Some(GROUP),
         real_user_sid: REAL,
-        sandbox_user_sid: None,
     };
 
     fn root_want<'a>(cap: &'a str) -> PersistentWant<'a> {
@@ -1721,7 +1735,6 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
-            sandbox_user_sid: None,
         };
         let dir = std::env::temp_dir().join(format!("srtwin-persist-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1845,6 +1858,128 @@ mod tests {
         assert_eq!(Mask::DIR_LIST.bits(), 0x1 | 0x20 | 0x80 | 0x10_0000);
     }
 
+    /// An explicit DENY the object already carries — the owner's, for
+    /// any trustee — stays in front of the allows written here, and a
+    /// DACL laid out the old way (allows at the head) is recognised as
+    /// needing a rewrite.
+    #[test]
+    fn existing_denies_stay_ahead_of_the_allows_written_here() {
+        const GROUP: &str = "S-1-5-32-546";
+        const EVERYONE: &str = "S-1-1-0";
+        let real = crate::sid::current_user_sid().unwrap();
+        let t = PersistentTrustees {
+            group_sid: Some(GROUP),
+            real_user_sid: &real,
+        };
+        let cap = crate::persist::new_capability_sid().unwrap();
+        let base = std::env::temp_dir().join(format!("srtwin-canon-{}", std::process::id()));
+        let explicit = |p: &str| -> Vec<AceView> {
+            read_aces(p)
+                .unwrap()
+                .into_iter()
+                .filter(|a| !a.inherited)
+                .collect()
+        };
+        let canonical = |aces: &[AceView]| {
+            let first_allow = aces.iter().position(|a| !a.deny).unwrap_or(aces.len());
+            aces[first_allow..].iter().all(|a| !a.deny)
+        };
+        // The owner's own DACL: a deny of delete for Everyone, read
+        // denied to Users, full control for the user and SYSTEM.
+        let owner_sddl = format!(
+            "D:P(D;OICI;0x10040;;;{EVERYONE})(D;OICI;0x1;;;{SID_BUILTIN_USERS})\
+             (A;OICI;FA;;;{real})(A;OICI;FA;;;{SID_SYSTEM})"
+        );
+        for (name, want) in [
+            (
+                "root",
+                persistent_aces(&PersistentWant {
+                    group_sid: GROUP,
+                    real_user_sid: &real,
+                    capability_sid: Some(&cap),
+                    deny: None,
+                    deny_fdc: true,
+                    deny_delete: false,
+                    profile: None,
+                }),
+            ),
+            (
+                "profile",
+                persistent_aces(&PersistentWant {
+                    group_sid: GROUP,
+                    real_user_sid: &real,
+                    capability_sid: None,
+                    deny: None,
+                    deny_fdc: false,
+                    deny_delete: false,
+                    profile: Some(ProfileAce::Granted),
+                }),
+            ),
+        ] {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.to_str().unwrap();
+            set_path_dacl_from_sddl(path, &owner_sddl, "test").unwrap();
+            let before = explicit(path);
+            write_persistent_aces(path, &t, &want).unwrap();
+            let aces = explicit(path);
+            assert!(canonical(&aces), "{name}: {aces:?}");
+            assert!(persistent_layout_canonical(&aces, &t), "{name}");
+            assert_eq!(
+                persistent_on_disk(&aces, &t, true),
+                comparable(&want, true),
+                "{name}"
+            );
+            // Both of the owner's denies precede every allow of ours.
+            let our_allow = aces
+                .iter()
+                .position(|a| !a.deny && is_persistent_ace(a, &t))
+                .unwrap();
+            for foreign in [EVERYONE, SID_BUILTIN_USERS] {
+                let at = aces
+                    .iter()
+                    .position(|a| a.deny && a.sid == foreign)
+                    .unwrap();
+                assert!(
+                    at < our_allow,
+                    "{name}: deny for {foreign} behind our allow"
+                );
+            }
+            // A second write of the same list changes nothing.
+            write_persistent_aces(path, &t, &want).unwrap();
+            assert_eq!(explicit(path), aces, "{name}");
+            // Removing ours leaves the owner's entries, in their order.
+            write_persistent_aces(path, &t, &[]).unwrap();
+            assert_eq!(explicit(path), before, "{name}");
+
+            // The layout an earlier build wrote: ours at the very head,
+            // in front of the owner's denies. Told apart, and repaired
+            // by the next write.
+            let head: String = want.iter().map(AceView::sddl).collect();
+            let old_sddl = format!("D:P{head}{}", &owner_sddl[3..]);
+            set_path_dacl_from_sddl(path, &old_sddl, "test").unwrap();
+            let old = explicit(path);
+            assert_eq!(
+                persistent_on_disk(&old, &t, true),
+                comparable(&want, true),
+                "{name}: the old layout holds the same entries"
+            );
+            let has_our_allow_first = want.iter().any(|a| !a.deny);
+            assert_eq!(
+                persistent_layout_canonical(&old, &t),
+                !has_our_allow_first,
+                "{name}: the old layout is not canonical"
+            );
+            write_persistent_aces(path, &t, &want).unwrap();
+            let repaired = explicit(path);
+            assert!(canonical(&repaired), "{name}: {repaired:?}");
+            assert!(persistent_layout_canonical(&repaired, &t), "{name}");
+            // So the test's own cleanup is not denied.
+            set_path_dacl_from_sddl(path, &format!("D:P(A;OICI;FA;;;{real})"), "test").unwrap();
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// A session's deny for the sandbox user stays in front of the
     /// group's allow, whichever of the two is written last, and
     /// removing the group's ACEs leaves it.
@@ -1858,7 +1993,6 @@ mod tests {
         let t = PersistentTrustees {
             group_sid: Some(GROUP),
             real_user_sid: &real,
-            sandbox_user_sid: Some(SB),
         };
         let want = persistent_aces(&PersistentWant {
             group_sid: GROUP,
