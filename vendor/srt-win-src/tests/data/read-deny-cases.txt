@@ -51,6 +51,14 @@ handed-read: P\AppData
 handed-deny: P | P\AppData\Local
 expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData\Local | P\AppData\Local\Programs
 
+case: a grant beneath a second, deeper deny that an upper grant lies above
+read: P\AppData | P\AppData\Local\Programs
+deny: P | P\AppData\Local
+handed-read: P\AppData | P\AppData\Local\Programs
+handed-deny: P | P\AppData\Local
+except: P\AppData | P\AppData\Local\Programs
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData\Local
+
 case: an allow on the denied path itself does not win
 read: P\Documents
 deny: P\Documents

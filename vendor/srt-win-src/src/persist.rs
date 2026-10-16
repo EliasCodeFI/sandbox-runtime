@@ -1290,13 +1290,37 @@ pub(crate) fn retry_pending(
         read_marker()?.pending,
         |p| {
             if !on_network(&p.path) {
-                path_id::locate_by_file_id_local(&p.file_id)
-            } else if probe_network
-                && path_id::capture_file_id(&p.path).is_ok_and(|now| now == p.file_id)
-            {
-                Located::At(p.path.clone())
-            } else {
-                Located::VolumeAbsent
+                return path_id::locate_by_file_id_local(&p.file_id);
+            }
+            if !probe_network {
+                return Located::VolumeAbsent;
+            }
+            // On a share an object cannot be looked for by its id;
+            // its recorded path is all there is. If the path answers
+            // with the recorded object, it is stripped there. If it
+            // answers with ANOTHER object — the directory was removed
+            // and made again — the recorded one is gone, and so is
+            // the entry: there is nothing left that could be stripped
+            // or waited for. If it does not answer, the entry waits.
+            match path_id::capture_file_id(&p.path) {
+                Ok(now) if now == p.file_id => Located::At(p.path.clone()),
+                Ok(_) => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on is no longer \
+                         there (another one is at that path); its record is dropped",
+                        p.path
+                    );
+                    Located::Gone
+                }
+                Err(e) if path_id::is_not_found(&e) => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on is no longer \
+                         there; its record is dropped",
+                        p.path
+                    );
+                    Located::Gone
+                }
+                Err(_) => Located::VolumeAbsent,
             }
         },
         |p, at| {
@@ -1378,11 +1402,9 @@ pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Ve
         }
     }
     for p in pending.iter().filter(|p| named(p)) {
-        let reachable = if on_network(&p.path) {
-            path_id::capture_file_id(&p.path).is_ok()
-        } else {
-            path_id::volume_mounted(p.file_id.volume_serial)
-        };
+        // What is left on a share after the retry above is a path
+        // that does not answer: nothing reachable is given up there.
+        let reachable = !on_network(&p.path) && path_id::volume_mounted(p.file_id.volume_serial);
         if reachable {
             bail!(
                 "the volume of '{}' is present, and its entries could not be removed just \

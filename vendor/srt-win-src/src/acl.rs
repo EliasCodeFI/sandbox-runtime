@@ -926,12 +926,7 @@ fn is_deny_type(hdr: &ACE_HEADER) -> bool {
 /// Where the entries written here go among the explicit entries that
 /// are kept ([`place_around`]).
 #[derive(Clone, Copy, Default)]
-struct Placement<'a> {
-    /// Kept entries at the very head that our denies go BEHIND: the
-    /// session's own entries for this trustee SID (as bytes), when the
-    /// kept grant is written under a running session. `None`: our
-    /// denies go at the head.
-    behind_leading: Option<&'a [u8]>,
+struct Placement {
     /// Our allows go at the head (behind our denies) instead of
     /// behind the last kept deny.
     allows_first: bool,
@@ -962,32 +957,25 @@ struct Placement<'a> {
 fn place_around(
     acl: *const ACL,
     stays: impl Fn(&ACE_HEADER, &[u8]) -> bool,
-    placement: Placement<'_>,
+    placement: Placement,
     denies: &[NewAce],
     allows: &[NewAce],
 ) -> Result<BuiltAcl> {
-    // One pass for the two cut points among the kept entries.
-    let (mut seen, mut after_last_deny, mut leading, mut in_lead) = (0usize, 0usize, 0usize, true);
+    // One pass for the cut point among the kept entries.
+    let (mut seen, mut after_last_deny) = (0usize, 0usize);
     filter_aces(acl, |h, b| {
         if stays(h, b) {
             seen += 1;
             if is_deny_type(h) {
                 after_last_deny = seen;
             }
-            in_lead = in_lead
-                && placement
-                    .behind_leading
-                    .is_some_and(|sid| ace_sid_is(b, sid));
-            if in_lead {
-                leading = seen;
-            }
         }
         false
     })?;
     let allows_at = if placement.allows_first {
-        leading
+        0
     } else {
-        after_last_deny.max(leading)
+        after_last_deny
     };
     let part = |from: usize, to: usize| {
         let mut at = 0usize;
@@ -998,17 +986,12 @@ fn place_around(
             }
         })
     };
-    let (lead, mid, rest) = (
-        part(0, leading)?,
-        part(leading, allows_at)?,
-        part(allows_at, seen)?,
-    );
+    let (head, rest) = (part(0, allows_at)?, part(allows_at, seen)?);
     rebuild_acl_seq(
         rest.2,
         &[
-            AclPart::Kept(&lead),
             AclPart::New(denies),
-            AclPart::Kept(&mid),
+            AclPart::Kept(&head),
             AclPart::New(allows),
             AclPart::Kept(&rest),
         ],
@@ -1107,7 +1090,6 @@ pub fn apply_sandbox_aces_over(
         old,
         stays,
         Placement {
-            behind_leading: None,
             allows_first: group_denies_here,
         },
         &denies,
@@ -1537,16 +1519,16 @@ pub fn write_persistent_aces_at(
     let pairs = || want.iter().zip(&sids);
     let denies: Vec<NewAce> = pairs().filter(|(a, _)| a.deny).map(new_ace).collect();
     let allows: Vec<NewAce> = pairs().filter(|(a, _)| !a.deny).map(new_ace).collect();
-    // Under a running session the session's own entries for the
-    // sandbox user sit at the head — its denies, and an allow it was
-    // admitted to on an excluded path. Ours go behind them, so a
-    // rewrite here does not undo what the session's writer placed.
-    let session = t.sandbox_user_sid.map(LocalPsid::from_string).transpose()?;
+    // Our denies always go first — ahead of everything, a session's
+    // entries included. The one order in which an allow of ours
+    // precedes a deny of ours is made by the session writer, on an
+    // excluded path the override admitted, AFTER this deny is in
+    // place; a rewrite here undoes it, and the session's next write
+    // puts it back.
     let new = place_around(
         old,
         stays,
         Placement {
-            behind_leading: session.as_ref().map(|s| s.as_bytes()),
             allows_first: false,
         },
         &denies,
@@ -2395,14 +2377,26 @@ mod tests {
             at(&aces, SB, false) < at(&aces, GROUP, true),
             "the allow is behind the exclusion deny: {aces:?}"
         );
-        // The kept grant sees nothing to rewrite, and a rewrite keeps
-        // the session's allow where it is.
+        // The kept grant sees nothing to rewrite: this order is one
+        // the session's writer makes, and only it.
         assert!(persistent_layout_ok(&aces, &t));
         assert_eq!(
             persistent_on_disk(&aces, &t, true),
             comparable(&exclusion, true)
         );
+        // The kept writer itself ALWAYS puts its deny first — ahead of
+        // a session's allow too. An ordinary session allow that was
+        // at the head when an exclusion is first recorded on the
+        // object therefore ends up behind the deny.
         write_persistent_aces(path, &t, &exclusion).unwrap();
+        let rewritten = explicit(path);
+        assert!(
+            at(&rewritten, GROUP, true) < at(&rewritten, SB, false),
+            "{rewritten:?}"
+        );
+        assert_eq!(at(&rewritten, GROUP, true), Some(0));
+        // … and the session's next write puts its admitted allow back.
+        apply_sandbox_aces_over(path, SB, read, Some(GROUP)).unwrap();
         assert_eq!(explicit(path), aces);
         // Revoke restores the list exactly.
         apply_sandbox_aces_over(path, SB, SbAceSet::default(), Some(GROUP)).unwrap();

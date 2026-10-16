@@ -13,6 +13,22 @@
 //! [`crate::profile_plan`] decides what each directory gets; this
 //! module reads the tree, writes the entries, and keeps the record.
 //!
+//! ## When it is written
+//!
+//! The profile's entries change only while no sandboxed process
+//! exists. `profile grant` (first run and refresh), `profile forget`
+//! and the forget of an uninstall hold the one lock that every session
+//! start and every command that stamps anything takes
+//! (`state_db::with_profile_lock`) for their whole run, and refuse to
+//! start while any live session or command holds anything
+//! (`state_db::live_holders`). So nothing reads the record, stamps a
+//! deny or starts a session beside them, and **a session's view of
+//! the profile grant is fixed from its start to its end**: what it
+//! found granted, excluded and recorded then is what holds until it
+//! releases. A refresh therefore needs running sessions closed. A
+//! session start that finds the lock held for this is told so at
+//! once (`state_db::ProfileBusy`) and does not wait the run out.
+//!
 //! ## What is written
 //!
 //! One ACE per path, for the sandbox group, through the same
@@ -682,14 +698,18 @@ pub enum NoteClass {
     /// An exclusion whose deny could not be written and whose own
     /// access list lets the sandbox account read it.
     Unprotected,
+    /// Carries the allow of an earlier run though it is no longer to
+    /// be readable, and the allow could not be removed.
+    StaleAllow,
 }
 
 impl NoteClass {
-    pub const ALL: [NoteClass; 4] = [
+    pub const ALL: [NoteClass; 5] = [
         NoteClass::NotGranted,
         NoteClass::SelfClosed,
         NoteClass::Unverifiable,
         NoteClass::Unprotected,
+        NoteClass::StaleAllow,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -698,6 +718,7 @@ impl NoteClass {
             NoteClass::SelfClosed => "self_closed",
             NoteClass::Unverifiable => "unverifiable",
             NoteClass::Unprotected => "unprotected",
+            NoteClass::StaleAllow => "stale_allow",
         }
     }
 }
@@ -1283,10 +1304,67 @@ pub fn session_user_sid() -> Option<String> {
 // ─── Grant ──────────────────────────────────────────────────────────
 
 /// A path with why it was skipped or what failed on it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Item {
     pub path: String,
     pub reason: String,
+    /// For an exclusion that could not be examined: whether the
+    /// CALLING user can open it for reading — `true`, `false`, or
+    /// `"unknown"` where that was not tried. An object the caller can
+    /// read without being able to see its access list is one the
+    /// sandbox account may read too: what admits the caller there is
+    /// as a rule a group both are in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_reads: Option<serde_json::Value>,
+    /// For the same: why it could not be examined — `acl_unreadable`
+    /// (the caller may not read the access list), `account_unknown`
+    /// (the sandbox account's identity is not known), `not_local` (not
+    /// on a local drive, so not looked at), `probe_failed` (the look
+    /// failed otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<&'static str>,
+}
+
+/// What an exclusion without a deny of ours is, with what was found
+/// out about it.
+struct Probe {
+    class: NoteClass,
+    reason: String,
+    /// `Some` for [`NoteClass::Unverifiable`] only.
+    caller_reads: Option<Option<bool>>,
+    cause: Option<&'static str>,
+}
+
+impl Probe {
+    fn settled(class: NoteClass, reason: String) -> Self {
+        Probe {
+            class,
+            reason,
+            caller_reads: None,
+            cause: None,
+        }
+    }
+
+    fn unverifiable(cause: &'static str, caller_reads: Option<bool>, reason: String) -> Self {
+        Probe {
+            class: NoteClass::Unverifiable,
+            reason,
+            caller_reads: Some(caller_reads),
+            cause: Some(cause),
+        }
+    }
+
+    fn item(&self, path: &str) -> Item {
+        Item {
+            path: path.to_owned(),
+            reason: self.reason.clone(),
+            caller_reads: self.caller_reads.map(|known| match known {
+                Some(reads) => serde_json::Value::Bool(reads),
+                None => serde_json::Value::String("unknown".to_owned()),
+            }),
+            cause: self.cause,
+        }
+    }
 }
 
 /// Outcome of [`grant`], and the `--json` output of `profile grant`.
@@ -1321,28 +1399,37 @@ pub struct Report {
     pub self_closed: Vec<Item>,
     pub unverifiable: Vec<Item>,
     pub unprotected: Vec<Item>,
-    /// Entries of an earlier run that are no longer wanted and could
-    /// not be removed: the one thing that leaves a finished run
-    /// incomplete.
+    /// Paths that are no longer to be readable — excluded now, or no
+    /// longer part of the grant — and still carry the allow of an
+    /// earlier run, which could not be removed. They are readable
+    /// through the grant and it could not take that back: the one
+    /// outcome here that leaves something open by our own entry.
+    pub stale_allow: Vec<Item>,
+    /// Always empty: no outcome of a run that ends is a failure of
+    /// the run. Kept for readers of the output.
     pub failed: Vec<Item>,
-    /// Set, with nothing written, when live sessions deny reading of
-    /// paths this run would newly allow: run it again when they have
-    /// ended.
-    pub blocked_by: Vec<Item>,
     pub elapsed_ms: u64,
 }
 
 impl Report {
     fn note(&mut self, class: NoteClass, path: &str, reason: String) {
-        let item = Item {
-            path: path.to_owned(),
-            reason,
-        };
+        self.note_item(
+            class,
+            Item {
+                path: path.to_owned(),
+                reason,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn note_item(&mut self, class: NoteClass, item: Item) {
         match class {
             NoteClass::NotGranted => self.not_granted.push(item),
             NoteClass::SelfClosed => self.self_closed.push(item),
             NoteClass::Unverifiable => self.unverifiable.push(item),
             NoteClass::Unprotected => self.unprotected.push(item),
+            NoteClass::StaleAllow => self.stale_allow.push(item),
         }
     }
 
@@ -1362,22 +1449,10 @@ impl Report {
             of(NoteClass::SelfClosed, &self.self_closed),
             of(NoteClass::Unverifiable, &self.unverifiable),
             of(NoteClass::Unprotected, &self.unprotected),
+            of(NoteClass::StaleAllow, &self.stale_allow),
         ]
         .concat()
     }
-}
-
-/// Run one step that writes a DACL or the record under the session
-/// init lock, and no longer than that step. A grant on a real profile
-/// takes from half a minute to many minutes; holding the lock across
-/// all of it would stall every sandboxed command that needs it. What
-/// the lock protects is each read-modify-write of an access list and
-/// each update of the record against a session doing the same.
-///
-/// The caller must not hold the lock itself.
-fn locked<T>(step: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _held = crate::state_db::acquire_session_lock()?;
-    step()
 }
 
 /// The SIDs of the sandbox account's token: those it always carries.
@@ -1394,14 +1469,25 @@ fn sandbox_sids(ids: &Ids) -> Vec<&str> {
 /// reading it, read with the least access that can ([`open_bare`],
 /// `READ_CONTROL`): `Err` if it cannot be read, `Ok(None)` if nothing
 /// is there.
-fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, String> {
+///
+/// The error says which it was: `acl_unreadable` when the system
+/// refused the caller the access list, `probe_failed` otherwise.
+fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, (&'static str, String)> {
+    let failed = |e: &anyhow::Error| {
+        let cause = if is_access_denied(e) {
+            "acl_unreadable"
+        } else {
+            "probe_failed"
+        };
+        (cause, format!("{e:#}"))
+    };
     let h = match open_bare(path, READ_CONTROL) {
         Ok(h) => h,
         Err(e) if path_id::is_not_found(&e) => return Ok(None),
-        Err(e) => return Err(format!("{e:#}")),
+        Err(e) => return Err(failed(&e)),
     };
-    let dacl = acl::read_dacl_views(acl::DaclTarget::Handle(h.raw(), path))
-        .map_err(|e| format!("{e:#}"))?;
+    let dacl =
+        acl::read_dacl_views(acl::DaclTarget::Handle(h.raw(), path)).map_err(|e| failed(&e))?;
     let facts: Option<Vec<plan::AceFact<'_>>> = dacl.as_ref().map(|aces| {
         aces.iter()
             .map(|a| plan::AceFact {
@@ -1409,6 +1495,8 @@ fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, String
                 sid: &a.sid,
                 mask: a.mask,
                 inherit_only: a.flags & 0x8 != 0,
+                // Object-inherit or container-inherit.
+                inherited_beneath: a.flags & 0x3 != 0,
             })
             .collect()
     });
@@ -1422,34 +1510,83 @@ fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, String
 /// An excluded path whose deny could not be written (`why`): which of
 /// the three it is ([`plan::Unstamped`]), with the line for the
 /// report.
-fn exclusion_without_deny(path: &str, ids: &Ids, why: &anyhow::Error) -> (NoteClass, String) {
+fn exclusion_without_deny(path: &str, ids: &Ids, why: &anyhow::Error) -> Probe {
+    exclusion_as_it_is(path, ids, &format!("could not be written ({why:#})"))
+}
+
+/// [`exclusion_without_deny`] at any later time: what an exclusion
+/// that carries no deny of ours is NOW. Its class is a fact about
+/// access lists, and those change; the record of what it was when the
+/// grant ran is not replayed (see [`status_json`]). `why` completes
+/// "its deny …".
+///
+/// Only a path on a local drive is looked at; anything else is
+/// unverifiable without being touched, as is one the look fails on.
+fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
+    if !path_id::is_drive_path(path) || path_id::on_network_drive(path) {
+        return Probe::unverifiable(
+            "not_local",
+            None,
+            format!("its deny {why}, and it is not on a local drive, so it is not examined"),
+        );
+    }
     match own_access(path, ids) {
-        Ok(None) => (
+        Ok(None) => Probe::settled(
             NoteClass::SelfClosed,
-            format!("nothing is there to deny ({why:#})"),
+            format!("nothing is there to deny (its deny {why})"),
         ),
-        Ok(Some(false)) => (
+        // Said of the object and of what it hands down to objects
+        // beneath — not of every object already inside it, which is
+        // not looked at: an excluded store is not walked.
+        Ok(Some(false)) => Probe::settled(
             NoteClass::SelfClosed,
             format!(
-                "its deny could not be written ({why:#}); its own access list gives the \
-                 sandbox account no read"
+                "its deny {why}; its own access list gives the sandbox account no read, \
+                 on it or handed down beneath it"
             ),
         ),
-        Ok(Some(true)) => (
+        Ok(Some(true)) => Probe::settled(
             NoteClass::Unprotected,
             format!(
-                "its deny could not be written ({why:#}), and its own access list lets the \
-                 sandbox account read it — as it did before the grant. Only its owner or an \
-                 administrator can close it"
+                "its deny {why}, and its own access list lets the sandbox account read it \
+                 or what is put into it — the grant did not open it and cannot close it. \
+                 Only its owner or an administrator can"
             ),
         ),
-        Err(e) => (
-            NoteClass::Unverifiable,
-            format!(
-                "its deny could not be written ({why:#}) and its access list could not be \
-                 read ({e}); the calling user cannot use it either"
-            ),
-        ),
+        // Unverifiable. What is true of such an object: the calling
+        // user is not its owner (an owner always reads the access
+        // list) and nothing on it gives the calling user that right.
+        // The groups the sandbox account's token carries — Everyone,
+        // Authenticated Users, Users — are groups the calling user is
+        // in as well, so an entry that admits the sandbox account
+        // through one of them admits the caller too.
+        //
+        // That cuts both ways, and is why the caller's own access is
+        // TRIED and reported as a fact rather than argued from: if the
+        // caller can open the object for reading without being able
+        // to see why, the likeliest reason is such a shared group, and
+        // the object is to be treated as readable to sandboxed
+        // commands. If the caller cannot, that is the fact reported —
+        // not a probability: an access list can still deny the caller
+        // by name and admit Users. Either way it is a warning — an
+        // object whose access list the user may not even read must
+        // not be what stops the sandbox.
+        Err((cause, e)) => {
+            const FILE_READ_DATA: u32 = 0x1;
+            let caller_reads = open_bare(path, FILE_READ_DATA).is_ok();
+            Probe::unverifiable(
+                cause,
+                Some(caller_reads),
+                format!(
+                    "its deny {why} and its access list could not be read ({e}); {}",
+                    if caller_reads {
+                        "you can read its content all the same"
+                    } else {
+                        "you cannot read its content either"
+                    }
+                ),
+            )
+        }
     }
 }
 
@@ -1676,7 +1813,6 @@ pub fn grant(
     extra_raw: &[String],
     replace_extra: bool,
     progress: bool,
-    live_read_denies: &[(u32, String)],
 ) -> Result<Report> {
     let started = std::time::Instant::now();
     if ids.group_sid.is_none() {
@@ -1737,6 +1873,7 @@ pub fn grant(
             Kind::Skipped => report.skipped.push(Item {
                 path,
                 reason: n.note.clone().unwrap_or_default(),
+                ..Default::default()
             }),
             // Its owner writes its deny; here it is only left out.
             Kind::Denied if !n.stamp => {}
@@ -1750,54 +1887,15 @@ pub fn grant(
     // What an earlier run recorded.
     let before = all_recorded(store, &old)?;
     let is_allow = |k: Kind| matches!(k, Kind::Container | Kind::Granted | Kind::File);
-
-    // A live session's read deny holds against the grant because it
-    // was also written on every recorded path it covers — when that
-    // session started. An allow this run would newly write on a path
-    // such a deny covers would be read through by that session's
-    // commands from now on. Rather than write other sessions' denies
-    // for them, the run does not start: nothing is written, and it is
-    // to be run again when those sessions have ended. (A session that
-    // starts after this point finds every path of this run in the
-    // record already, before any allow is written, and denies them
-    // itself.)
-    if !live_read_denies.is_empty() {
-        let already: HashSet<String> = before
-            .iter()
-            .filter(|r| is_allow(r.kind))
-            .map(|r| r.path.to_lowercase())
-            .collect();
-        let index = plan::RecordedAllows::new(
-            planned
-                .iter()
-                .filter(|(p, n)| is_allow(n.kind) && !already.contains(&p.to_lowercase()))
-                .map(|(p, n)| (p.as_str(), n.kind)),
-        );
-        for (pid, deny) in live_read_denies {
-            let mut covered: Vec<&str> = index.covered(deny, &[]);
-            covered.extend(index.at(deny));
-            if let Some(first) = covered.first() {
-                report.blocked_by.push(Item {
-                    path: (*first).to_owned(),
-                    reason: format!(
-                        "a running session (process {pid}) denies reading of '{deny}', which \
-                         covers {} path(s) this run would make readable",
-                        covered.len()
-                    ),
-                });
-            }
-        }
-        if !report.blocked_by.is_empty() {
-            report.complete = old.header.as_ref().is_some_and(|h| h.complete);
-            report.elapsed_ms = started.elapsed().as_millis() as u64;
-            return Ok(report);
-        }
-    }
+    let earlier = |path: &str| before.iter().find(|r| r.path.eq_ignore_ascii_case(path));
 
     // The record, before anything is written: every path this run may
-    // write, and every path an earlier run recorded. `complete` is
-    // false from here to the end of the run and for nothing else: an
-    // incomplete grant is one that was cut short.
+    // write, and every path an earlier run recorded — so that a run
+    // that is KILLED leaves nothing on disk that `profile forget` does
+    // not know of. `complete` is false from here to the end of the run
+    // and for nothing else: an incomplete grant is one that was cut
+    // short. Nobody reads the record in between — the run holds the
+    // one lock, and runs only while no session exists.
     if store.key == persist::MARKER_KEY {
         persist::marker_set_ever()?;
         if let Some(g) = &ids.group_sid {
@@ -1830,19 +1928,17 @@ pub fn grant(
             });
         }
     }
-    locked(|| {
-        write_marker(
-            store.key,
-            &Marker {
-                header: Some(header.clone()),
-                extra: extra_strings.clone(),
-                exclusions: exclusions.clone(),
-                ungranted_only: ungranted_only.clone(),
-                paths: pre,
-                notes: old.notes.clone(),
-            },
-        )
-    })?;
+    write_marker(
+        store.key,
+        &Marker {
+            header: Some(header.clone()),
+            extra: extra_strings.clone(),
+            exclusions: exclusions.clone(),
+            ungranted_only: ungranted_only.clone(),
+            paths: pre,
+            notes: old.notes.clone(),
+        },
+    )?;
 
     // Excluded directories that are not there yet. Recorded as
     // created before they are, so a run cut short here leaves no
@@ -1886,33 +1982,72 @@ pub fn grant(
             Kind::Skipped | Kind::Ungranted => {}
         }
     };
-    // A path whose stamp did not go through: take back whatever of
-    // the record, or of the entry, got as far as existing. If an
-    // entry of an earlier run is still on the object and cannot be
-    // removed, that — and only that — is a failure of the run.
-    let take_back = |report: &mut Report, path: &str, n: &Node| -> Result<()> {
-        let row = db_rows(store.conn)?.into_iter().find(|r| r.path == path);
-        let earlier = before.iter().find(|r| r.path == path);
-        let Some(gone) = row.or_else(|| earlier.cloned()) else {
-            return Ok(());
+    let unrecord = |path: &str| -> Result<()> {
+        store.conn.execute(
+            "DELETE FROM profile_paths WHERE canonical_path = ?1",
+            params![path],
+        )?;
+        Ok(())
+    };
+    // A path that an earlier run wrote on and that cannot be written
+    // now (`why`): a file being deleted, a directory whose access
+    // list was taken out of the user's hands since. NOTHING is taken
+    // off it — an entry that cannot be written cannot be removed
+    // either, and a deny that is still wanted is never touched. It
+    // keeps what the earlier run put there and stays recorded as
+    // that. What that means depends on what is wanted now:
+    //
+    // - the same as before (an allow, or the deny): nothing is lost;
+    //   it is reported as not looked at again;
+    // - a deny where an allow is on it — it has become an exclusion:
+    //   the one case that must be visible. It is readable through our
+    //   entry and we could not take that back ([`NoteClass::StaleAllow`]);
+    // - an allow where the deny is on it: it stays unreadable.
+    //
+    // None of this makes the grant incomplete. Returns `false` if no
+    // earlier run recorded the path (then the caller decides).
+    let keeps_earlier = |report: &mut Report,
+                         path: &str,
+                         wanted: Option<&Node>,
+                         why: &anyhow::Error|
+     -> Result<bool> {
+        let Some(r) = earlier(path) else {
+            return Ok(false);
         };
-        if let Err(e) = locked(|| strip(store, ids, &gone)) {
-            if earlier.is_some() {
-                report.complete = false;
-                report.failed.push(Item {
+        // The stamp may have got as far as recording the new kind.
+        upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created)?;
+        match (is_allow(r.kind), wanted.map(|n| is_allow(n.kind))) {
+            (true, Some(false)) | (true, None) => report.note(
+                NoteClass::StaleAllow,
+                path,
+                format!(
+                    "it is no longer to be readable, and the entry of an earlier run that \
+                         makes it readable could not be removed ({why:#})"
+                ),
+            ),
+            (false, Some(true)) => report.note(
+                NoteClass::NotGranted,
+                path,
+                format!(
+                    "the deny of an earlier run is on it and could not be replaced \
+                         ({why:#}); it stays unreadable to sandboxed commands"
+                ),
+            ),
+            _ => {
+                report.skipped.push(Item {
                     path: path.to_owned(),
-                    reason: format!("remove the entry of an earlier run: {e:#}"),
+                    reason: format!(
+                        "carries its entry from an earlier run and could not be looked at \
+                             again ({why:#})"
+                    ),
+                    ..Default::default()
                 });
-            } else {
-                // Recorded by this run only, and never written.
-                store.conn.execute(
-                    "DELETE FROM profile_paths WHERE canonical_path = ?1",
-                    params![path],
-                )?;
+                if let Some(n) = wanted {
+                    count(report, n, &Stamped::Unchanged);
+                }
             }
         }
-        let _ = n;
-        Ok(())
+        Ok(true)
     };
 
     // 1. Every exclusion, before any allow.
@@ -1928,21 +2063,24 @@ pub fn grant(
         );
     }
     for (path, n) in denies {
-        match locked(|| stamp(store, ids, path, n, created_now.contains(path.as_str()))) {
+        match stamp(store, ids, path, n, created_now.contains(path.as_str())) {
             Ok(Stamped::Skipped(why)) => report.skipped.push(Item {
                 path: path.clone(),
                 reason: why.to_owned(),
+                ..Default::default()
             }),
             Ok(s) => count(&mut report, n, &s),
-            // The deny is the second layer; the first — nothing above
-            // an exclusion carries an inheriting allow — holds without
-            // it. What the object's own access list lets the sandbox
-            // account do decides what to report. None of it leaves the
-            // grant incomplete.
             Err(e) => {
-                take_back(&mut report, path, n)?;
-                let (class, reason) = exclusion_without_deny(path, ids, &e);
-                report.note(class, path, reason);
+                if keeps_earlier(&mut report, path, Some(n), &e)? {
+                    continue;
+                }
+                // The deny is the second layer; the first — nothing
+                // above an exclusion carries an inheriting allow —
+                // holds without it. What the object's own access list
+                // lets the sandbox account do decides what to report.
+                unrecord(path)?;
+                let probe = exclusion_without_deny(path, ids, &e);
+                report.note_item(probe.class, probe.item(path));
             }
         }
     }
@@ -1952,14 +2090,10 @@ pub fn grant(
         .iter()
         .filter(|r| !planned_keys.contains(&r.path.to_lowercase()))
     {
-        match locked(|| strip(store, ids, r)) {
+        match strip(store, ids, r) {
             Ok(_) => report.removed += 1,
             Err(e) => {
-                report.complete = false;
-                report.failed.push(Item {
-                    path: r.path.clone(),
-                    reason: format!("remove stale entry: {e:#}"),
-                });
+                keeps_earlier(&mut report, &r.path, None, &e)?;
             }
         }
     }
@@ -1976,7 +2110,7 @@ pub fn grant(
     };
     let (mut top_done, mut top_now): (usize, Option<String>) = (0, None);
     // Containers that could not be written, as `path\` in lower case:
-    // nothing beneath one is granted.
+    // nothing beneath one is newly granted.
     let mut closed: Vec<String> = Vec::new();
     for (path, n) in planned.iter().filter(|(_, n)| n.kind != Kind::Denied) {
         let top = n.rel.first().map(|c| c.to_lowercase());
@@ -1993,23 +2127,34 @@ pub fn grant(
         }
         let lower = path.to_lowercase();
         if closed.iter().any(|c| lower.starts_with(c.as_str())) {
-            take_back(&mut report, path, n)?;
+            if earlier(path).is_none() {
+                unrecord(path)?;
+            }
             continue;
         }
-        match locked(|| stamp(store, ids, path, n, created_now.contains(path.as_str()))) {
+        match stamp(store, ids, path, n, created_now.contains(path.as_str())) {
             Ok(Stamped::Skipped(why)) => {
                 report.skipped.push(Item {
                     path: path.clone(),
                     reason: why.to_owned(),
+                    ..Default::default()
                 });
-                take_back(&mut report, path, n)?;
+                // What it was when an earlier run granted it is found
+                // by its identity and cleared, if it can be.
+                match earlier(path) {
+                    Some(r) => {
+                        if let Err(e) = strip(store, ids, r) {
+                            keeps_earlier(&mut report, path, None, &e)?;
+                        }
+                    }
+                    None => unrecord(path)?,
+                }
             }
             Ok(s) => count(&mut report, n, &s),
             // Not granted: nothing became readable through the grant,
-            // so the grant is whole without it. The path stays
-            // unreadable to sandboxed commands.
+            // so the grant is whole without it.
             Err(e) => {
-                if n.rel.is_empty() {
+                if n.rel.is_empty() && earlier(path).is_none() {
                     // Without the profile directory itself there is no
                     // grant to speak of; the record still says
                     // "incomplete", and `profile forget` clears it.
@@ -2017,7 +2162,10 @@ pub fn grant(
                         "the profile directory '{profile}' cannot be written"
                     )));
                 }
-                take_back(&mut report, path, n)?;
+                if keeps_earlier(&mut report, path, Some(n), &e)? {
+                    continue;
+                }
+                unrecord(path)?;
                 let beneath = if n.kind == Kind::Container {
                     closed.push(format!("{lower}\\"));
                     "; nothing beneath it is granted either"
@@ -2039,34 +2187,24 @@ pub fn grant(
         );
     }
 
-    // The record as it now is.
-    header.complete = report.complete;
-    let rows = db_rows(store.conn)?;
-    let mut paths = rows.clone();
-    // A stale entry that could not be removed stays listed.
-    let have: HashSet<String> = rows.iter().map(|r| r.path.to_lowercase()).collect();
-    for f in &report.failed {
-        if let Some(old) = before
-            .iter()
-            .find(|r| r.path == f.path && !have.contains(&r.path.to_lowercase()))
-        {
-            paths.push(old.clone());
-        }
-    }
+    // The record as it now is: every row, and nothing else. The run
+    // has ended, so it is complete — whatever it could not write is in
+    // the notes, by class.
+    header.complete = true;
+    report.complete = true;
+    let paths = db_rows(store.conn)?;
     let notes = report.notes();
-    locked(|| {
-        write_marker(
-            store.key,
-            &Marker {
-                header: Some(header),
-                extra: extra_strings,
-                exclusions,
-                ungranted_only,
-                paths,
-                notes,
-            },
-        )
-    })?;
+    write_marker(
+        store.key,
+        &Marker {
+            header: Some(header),
+            extra: extra_strings,
+            exclusions,
+            ungranted_only,
+            paths,
+            notes,
+        },
+    )?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
 }
@@ -2110,7 +2248,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
     let mut out = Forgotten::default();
     let mut failed_paths: HashSet<&str> = HashSet::new();
     for r in &all {
-        match locked(|| strip(store, ids, r)) {
+        match strip(store, ids, r) {
             Ok(true) => out.removed += 1,
             Ok(false) => out.absent += 1,
             Err(e) => {
@@ -2119,6 +2257,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                 out.failed.push(Item {
                     path: r.path.clone(),
                     reason: format!("{e:#}"),
+                    ..Default::default()
                 });
             }
         }
@@ -2140,7 +2279,6 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
             out.placeholders_removed += 1;
         }
     }
-    let _held = crate::state_db::acquire_session_lock()?;
     if out.failed.is_empty() {
         clear_marker(store.key)?;
         if store.key == persist::MARKER_KEY {
@@ -2196,12 +2334,10 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
             &loaded
         }
     };
-    // Crash recovery first, under the lock; the removal itself takes
-    // the lock per object.
-    let holder = crate::state_db::HolderPid(std::process::id());
-    crate::state_db::with_init_lock(holder, false, |_| Ok(()))?;
-    let conn = crate::state_db::open_db()?;
-    Ok(Some(forget(&Store::of(&conn), ids)?))
+    // Under the one lock for the whole run, like every change to the
+    // profile's entries. (No look at live holders here: the account
+    // they would run as is already gone.)
+    crate::state_db::with_profile_lock(|db| forget(&Store::of(db.conn()), ids)).map(Some)
 }
 
 // ─── Status ─────────────────────────────────────────────────────────
@@ -2263,13 +2399,50 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
     // What the last run left as it found it, by class and with the
     // reason: nothing of it makes the grant unusable, and all of it is
     // for the user to see.
-    for class in NoteClass::ALL {
-        out[class.as_str()] = m
-            .notes
-            .iter()
-            .filter(|n| n.class == class)
-            .map(|n| json!({ "path": n.path, "reason": n.reason }))
-            .collect();
+    //
+    // An exclusion without a deny is NOT reported as the run classed
+    // it. Whether its own access list keeps the sandbox account out is
+    // a fact about access lists, and those change: each is looked at
+    // again now — a handful of paths, one open each — so that a store
+    // that was closed when the grant ran and has since been opened up
+    // reads as unprotected at the next session start. (One that can
+    // now be denied is denied by the next run of the grant.) A look
+    // that fails says "unverifiable", never "closed".
+    let ids = Ids::load().ok();
+    let mut by_class: std::collections::BTreeMap<&str, Vec<Item>> = NoteClass::ALL
+        .into_iter()
+        .map(|c| (c.as_str(), Vec::new()))
+        .collect();
+    for n in &m.notes {
+        let (class, item) = match (n.class, &ids) {
+            (NoteClass::NotGranted | NoteClass::StaleAllow, _) => (
+                n.class,
+                Item {
+                    path: n.path.clone(),
+                    reason: n.reason.clone(),
+                    ..Default::default()
+                },
+            ),
+            (_, Some(ids)) => {
+                let probe =
+                    exclusion_as_it_is(&n.path, ids, "could not be written when the grant ran");
+                (probe.class, probe.item(&n.path))
+            }
+            // Whose reading is to be judged is not known: no claim is
+            // made either way.
+            (_, None) => {
+                let probe = Probe::unverifiable(
+                    "account_unknown",
+                    None,
+                    "it could not be examined: the sandbox account is not known".to_owned(),
+                );
+                (probe.class, probe.item(&n.path))
+            }
+        };
+        by_class.entry(class.as_str()).or_default().push(item);
+    }
+    for (class, items) in by_class {
+        out[class] = json!(items);
     }
     if with_paths {
         out["paths"] = m
@@ -2711,7 +2884,7 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(report.complete && report.failed.is_empty(), "{report:?}");
         let deny_dir = vec![(true, true, 0x3u8, ALL)];
         // The keys and the sign-in are denied where they really are …
@@ -2827,7 +3000,7 @@ mod tests {
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
         for run in ["first", "refresh"] {
-            let report = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+            let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
             // Whole: nothing of it is a failure, and nothing is left
             // open.
             assert!(report.complete, "{run}: {report:?}");
@@ -2876,76 +3049,6 @@ mod tests {
             "test",
         )
         .unwrap();
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// A live session's read deny over paths a run would newly allow:
-    /// the run writes nothing and says who is in the way.
-    #[test]
-    fn a_run_that_would_allow_what_a_live_session_denies_writes_nothing() {
-        let base = scratch("blocked");
-        let prof = base.join("profile");
-        write(&prof, r"Documents\a.txt");
-        write(&prof, r"Music\b.mp3");
-        let conn = crate::state_db::open_memory_db_for_tests();
-        let key = format!("{TEST_KEY}Blocked");
-        let store = Store {
-            conn: &conn,
-            key: &key,
-        };
-        clear_marker(&key).unwrap();
-        let ids = ids();
-        let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let root = canon(&prof);
-        let on_profile = [(4242u32, root.clone())];
-        let on_music = [(4242u32, format!(r"{root}\MUSIC"))];
-        let elsewhere = [(4242u32, r"\\?\C:\somewhere\else".to_owned())];
-
-        // A first run under a deny on the profile: everything would be
-        // newly allowed beneath it.
-        let report = grant(&store, &ids, &layout, &[], false, false, &on_profile).unwrap();
-        assert_eq!(report.blocked_by.len(), 1, "{report:?}");
-        assert!(report.blocked_by[0].reason.contains("4242"));
-        assert_eq!(report.writes + report.placeholders, 0);
-        assert_eq!(
-            status_json(&key, Ok(layout.clone()), false)["state"],
-            "none"
-        );
-        assert!(group_aces(&prof.join("Documents")).is_empty());
-        assert!(!prof.join(".aws").exists(), "nothing is created either");
-        // A deny that covers nothing of the profile is not in the way.
-        let report = grant(&store, &ids, &layout, &[], false, false, &elsewhere).unwrap();
-        assert!(
-            report.blocked_by.is_empty() && report.complete,
-            "{report:?}"
-        );
-        // Granted now, a refresh under the same denies adds nothing
-        // new and goes through …
-        for denies in [&on_profile, &on_music] {
-            let report = grant(&store, &ids, &layout, &[], false, false, denies).unwrap();
-            assert!(
-                report.blocked_by.is_empty() && report.writes == 0,
-                "{report:?}"
-            );
-        }
-        // … until there is something new beneath one of them.
-        write(&prof, r"Videos\c.mp4");
-        let report = grant(&store, &ids, &layout, &[], false, false, &on_music).unwrap();
-        assert!(
-            report.blocked_by.is_empty(),
-            "not beneath that deny: {report:?}"
-        );
-        write(&prof, r"Pictures\d.png");
-        let report = grant(&store, &ids, &layout, &[], false, false, &on_profile).unwrap();
-        assert_eq!(report.blocked_by.len(), 1, "{report:?}");
-        assert!(group_aces(&prof.join("Pictures")).is_empty());
-        assert_eq!(
-            status_json(&key, Ok(layout.clone()), false)["state"],
-            "current",
-            "a refused run leaves the record as it was"
-        );
-        let f = forget(&store, &ids).unwrap();
-        assert!(f.failed.is_empty(), "{f:?}");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -3018,7 +3121,7 @@ mod tests {
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
         for run in ["first", "refresh"] {
-            let report = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+            let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
             let paths = |items: &[Item]| items.iter().map(|i| i.path.clone()).collect::<Vec<_>>();
             // Nothing of this makes the grant incomplete or failed.
             assert!(
@@ -3075,7 +3178,141 @@ mod tests {
                 assert_eq!(report.writes, 0, "a refresh writes nothing: {report:?}");
             }
         }
-        // Removing the grant does not stumble over them either.
+        // The class is what the access list says NOW, not what the
+        // grant found: opened up since, `.azure` is unprotected at the
+        // next reading of the status, with no run of the grant in
+        // between …
+        let azure = prof.join(".azure");
+        let azure = azure.to_str().unwrap();
+        let reown = |sddl: &str| {
+            assert!(icacls(&[azure, "/setowner", &format!("*{me}")]));
+            acl::set_path_dacl_from_sddl(azure, &format!("D:P{sddl}"), "test").unwrap();
+            assert!(icacls(&[azure, "/setowner", "*S-1-5-18"]));
+        };
+        let class_of = |rel: &str| -> String {
+            let st = status_json(&key, Ok(layout.clone()), false);
+            ["not_granted", "self_closed", "unverifiable", "unprotected"]
+                .into_iter()
+                .find(|c| {
+                    st[*c]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|i| i["path"] == at(rel).as_str())
+                })
+                .unwrap_or("none")
+                .to_owned()
+        };
+        assert_eq!(class_of(".azure"), "self_closed");
+        reown(&format!(
+            "(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+        ));
+        assert_eq!(class_of(".azure"), "unprotected");
+        // … also when only what it hands down is open: the directory
+        // itself closed, everything put into it readable to Users.
+        reown(&format!(
+            "(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)(A;OICIIO;0x1200a9;;;BU)"
+        ));
+        assert_eq!(class_of(".azure"), "unprotected");
+        // Closed to the caller as well: no longer known.
+        reown("(A;OICI;FA;;;SY)");
+        assert_eq!(class_of(".azure"), "unverifiable");
+        // And back.
+        reown(&format!("(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)"));
+        assert_eq!(class_of(".azure"), "self_closed");
+        // The others read as they did.
+        assert_eq!(class_of(".docker"), "unprotected");
+        assert_eq!(class_of(".kube"), "unverifiable");
+
+        // A path an EARLIER run wrote on, whose access list has been
+        // taken out of the caller's hands since. Nothing is taken off
+        // it and the grant stays complete …
+        let docs = prof.join("Documents");
+        let docs = docs.to_str().unwrap().to_owned();
+        acl::set_path_dacl_from_sddl(
+            &docs,
+            &format!("D:P(A;OICI;0x1200a9;;;{GROUP})(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
+            "test",
+        )
+        .unwrap();
+        assert!(icacls(&[&docs, "/setowner", "*S-1-5-18"]));
+        disowned.push(docs.clone());
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        // … still wanted as it is: it keeps its entry, stays recorded,
+        // and is reported as not looked at again.
+        assert!(report.stale_allow.is_empty(), "{report:?}");
+        assert!(
+            report.skipped.iter().any(|i| i.path == at("Documents")),
+            "{report:?}"
+        );
+        assert_eq!(
+            group_aces(&prof.join("Documents")),
+            [(true, false, 0x3, RX)]
+        );
+        let st = status_json(&key, Ok(layout.clone()), true);
+        assert_eq!(st["state"], "current");
+        assert!(
+            st["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["path"] == at("Documents").as_str())
+        );
+        // Now it is to be EXCLUDED, and the allow cannot be taken
+        // back: that is said, as its own class, and nothing else
+        // changes — not incomplete, the entry untouched.
+        let report = grant(
+            &store,
+            &ids,
+            &layout,
+            &["Documents".to_owned()],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        assert_eq!(
+            report
+                .stale_allow
+                .iter()
+                .map(|i| i.path.clone())
+                .collect::<Vec<_>>(),
+            [at("Documents")]
+        );
+        assert_eq!(
+            group_aces(&prof.join("Documents")),
+            [(true, false, 0x3, RX)]
+        );
+        let st = status_json(&key, Ok(layout.clone()), false);
+        assert_eq!(st["state"], "current", "{st}");
+        assert_eq!(st["stale_allow"].as_array().unwrap().len(), 1);
+        // An exclusion whose deny is in place and cannot be looked at
+        // again is left alone, deny and all (the stamp is not undone).
+        // (`Documents` wanted as an allow again: back to "kept".)
+        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        assert!(
+            report.complete && report.stale_allow.is_empty(),
+            "{report:?}"
+        );
+
+        // Removing the grant: what cannot be written stays recorded
+        // and is reported; the rest is removed.
+        let f = forget(&store, &ids).unwrap();
+        assert_eq!(
+            f.failed.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+            [at("Documents")],
+            "{f:?}"
+        );
+        // Handed back, it comes off as well.
+        assert!(icacls(&[&docs, "/setowner", &format!("*{me}")]));
+        acl::set_path_dacl_from_sddl(
+            &docs,
+            &format!("D:P(A;OICI;0x1200a9;;;{GROUP})(A;OICI;FA;;;{me})"),
+            "test",
+        )
+        .unwrap();
+        // Removing the grant does not stumble over the others either.
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");
         assert_eq!(status_json(&key, Ok(layout), false)["state"], "none");
@@ -3108,7 +3345,7 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(report.complete && report.failed.is_empty(), "{report:?}");
         // `dotfiles` is a container, not granted whole, and the place
         // the link leads to exists again, denied.
@@ -3190,7 +3427,7 @@ mod tests {
         clear_marker(TEST_KEY).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(report.failed.is_empty(), "{report:?}");
 
@@ -3320,14 +3557,14 @@ mod tests {
         // exclusions: they are denied again, nothing else is written.
         write(&prof, r"NewTop\n.txt");
         assert!(group_aces(&prof.join("NewTop")).is_empty());
-        let again = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(again.complete && again.failed.is_empty(), "{again:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
         assert!(group_aces(&prof.join(".netrc")).iter().all(|a| a.1));
         // .ssh, .netrc, credentials.toml, NewTop.
         assert_eq!(again.writes, 4, "{again:?}");
-        let third = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let third = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert_eq!(third.writes, 0, "{third:?}");
         assert_eq!(explicit(&outside), outside_before);
 
@@ -3354,7 +3591,6 @@ mod tests {
             &["NewTop".to_owned(), r"AppData\Local\Temp\keys".to_owned()],
             false,
             false,
-            &[],
         )
         .unwrap();
         assert!(with_extra.complete, "{with_extra:?}");
@@ -3369,7 +3605,7 @@ mod tests {
 
         // A refresh that names no exclusion keeps the one an earlier
         // run added, and the record lists it with the built-in ones.
-        let kept = grant(&store, &ids, &layout, &[], false, false, &[]).unwrap();
+        let kept = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(kept.complete, "{kept:?}");
         assert_eq!(kept.writes, 0, "{kept:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
@@ -3404,18 +3640,9 @@ mod tests {
         assert_eq!(ungranted, [at(r"\appdata\local\temp")]);
         // Naming it again changes nothing; replacing the added list
         // with an empty one is what re-admits it.
-        let same = grant(
-            &store,
-            &ids,
-            &layout,
-            &["newtop".to_owned()],
-            false,
-            false,
-            &[],
-        )
-        .unwrap();
+        let same = grant(&store, &ids, &layout, &["newtop".to_owned()], false, false).unwrap();
         assert_eq!(same.writes, 0, "{same:?}");
-        let replaced = grant(&store, &ids, &layout, &[], true, false, &[]).unwrap();
+        let replaced = grant(&store, &ids, &layout, &[], true, false).unwrap();
         assert!(replaced.complete, "{replaced:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
         assert!(group_aces(&prof.join(r"AppData\Local\Temp\keys")).is_empty());
