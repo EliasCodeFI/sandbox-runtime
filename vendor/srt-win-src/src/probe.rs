@@ -1301,10 +1301,14 @@ mod tests {
         // The largest outcome in every field is still a report, and
         // still below the bit that marks one.
         let all = [Denied; FIELDS as usize];
-        let r = lowered(
-            report(all[0], all[1], all[2], all[3]),
-            [all[4], all[5], all[6], all[7]],
-        );
+        let r = Report {
+            range_off_loopback: all[8],
+            range_loopback: all[9],
+            ..lowered(
+                report(all[0], all[1], all[2], all[3]),
+                [all[4], all[5], all[6], all[7]],
+            )
+        };
         assert_eq!(Denied as u32, MASK);
         assert_eq!(r.encode(), REPORT_BASE | (REPORT_BASE - 1));
         assert_eq!(Report::decode(r.encode()), Some(r));
