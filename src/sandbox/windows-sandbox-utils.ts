@@ -1173,7 +1173,35 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
    * `--unless-held-by-others`.
    */
   keptGrantHolders: 'kept-grant-holders',
+  /**
+   * `acl grant` itself refuses a path that reaches an exclusion
+   * recorded with the profile read grant. This library makes the same
+   * check from the status it reads, and `srt-win`'s is what still
+   * holds when that status does not show a grant that is on disk.
+   */
+  profileSessionGrantCheck: 'profile-session-grant-check',
 } as const
+
+/**
+ * The capability this library needs for a session under the
+ * write-restricted token and `capabilities` (as `srt-win` reported
+ * them) does not list, if any.
+ *
+ * The capabilities are a property of the `srt-win` BUILD, not of what
+ * is recorded: they are required whether or not a profile read grant
+ * or a kept write grant exists at the moment. A grant can be made
+ * after the session started, by this process or another, and a status
+ * that does not mention one is not proof that none is on disk; what
+ * the library hands `srt-win` — a read deny named once, a removal
+ * guarded by the holder check — must be right in either case.
+ */
+export function missingWindowsSrtWinCapability(
+  capabilities: readonly string[],
+): string | undefined {
+  return Object.values(WINDOWS_SRT_WIN_CAPABILITIES).find(
+    c => !capabilities.includes(c),
+  )
+}
 
 function capabilityList(v: unknown): string[] {
   return Array.isArray(v)

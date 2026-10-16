@@ -91,6 +91,7 @@ import {
   forgetWindowsProfileReadAsync,
   WINDOWS_SRT_WIN_CAPABILITIES,
   windowsSrtWinOutdatedError,
+  missingWindowsSrtWinCapability,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -246,35 +247,53 @@ const windowsWfpVerified: { defaultToken: string | undefined } = {
 // it is the option's default, so a wrap made there never gets the
 // ordinary token.
 let windowsWriteRestrictedToken = true
-// Windows: the outcome of the look a command wrapped outside any
-// session takes at the profile read grant (assertWindowsDenyExpansion):
-// `true` once it found either no grant or an srt-win that expands read
-// denies over it.
-let windowsDenyExpansionChecked = false
+// Windows: the `srt-win` builds this process has seen report every
+// capability the library relies on (see
+// missingWindowsSrtWinCapability), by identity — windowsSrtWinIdentity.
+// Only a positive result is remembered: one that lacked a capability,
+// or could not be asked, is asked again the next time.
+const windowsCapableSrtWin = new Set<string>()
 
 /**
- * For a per-command read deny with no session behind it: refuse if a
- * profile read grant is recorded and `srt-win` does not say that it
- * writes a read deny on the recorded paths beneath it. Looked up once
- * per process; an `srt-win` whose status cannot be read is refused
- * too, since the deny could not be relied on.
+ * What tells one `srt-win` from another: the executable, the arguments
+ * put in front of every call, and — so that a file replaced in place
+ * is a different one — its size and modification time.
  */
-function assertWindowsDenyExpansion(srtWin: SrtWinSpawn): void {
-  if (windowsDenyExpansionChecked) return
-  const grant = getWindowsProfileReadStatus({ srtWin })
-  if (
-    grant.state !== 'none' &&
-    !grant.capabilities.includes(
-      WINDOWS_SRT_WIN_CAPABILITIES.profileDenyExpansion,
-    )
-  ) {
-    throw windowsSrtWinOutdatedError(
-      WINDOWS_SRT_WIN_CAPABILITIES.profileDenyExpansion,
-      `a command's read denies depend on while a profile read grant is ` +
-        `recorded`,
-    )
+function windowsSrtWinIdentity(srtWin: SrtWinSpawn): string {
+  let stat = ''
+  try {
+    const st = fs.statSync(srtWin.exe)
+    stat = `${st.size}:${st.mtimeMs}`
+  } catch {
+    // Not a path that can be looked at (resolved through PATH, say):
+    // the name and arguments are the identity.
   }
-  windowsDenyExpansionChecked = true
+  return JSON.stringify([srtWin.exe, srtWin.prependArgs, stat])
+}
+
+const WINDOWS_CAPABILITIES_WHY =
+  `a session under the write-restricted token depends on (its read ` +
+  `denies are written on the profile read grant's paths by srt-win, ` +
+  `and kept grants are checked and removed there)`
+
+/**
+ * For a per-command read deny: make sure the `srt-win` this command
+ * will run through is one that has reported every capability the
+ * library relies on. initialize() records the session's own; one
+ * passed per command, or used with no session behind it, is asked
+ * here — once per identity, and again every time while the answer is
+ * not a yes.
+ */
+function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
+  const id = windowsSrtWinIdentity(srtWin)
+  if (windowsCapableSrtWin.has(id)) return
+  const missing = missingWindowsSrtWinCapability(
+    getWindowsProfileReadStatus({ srtWin }).capabilities,
+  )
+  if (missing !== undefined) {
+    throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+  }
+  windowsCapableSrtWin.add(id)
 }
 
 // Windows: whether this session's commands read the user's profile
@@ -1215,8 +1234,14 @@ async function initializeSteps(
         // its holder records under its lock and removes nothing then
         // (`kept_grants_in_use`). That check is srt-win's, so it is
         // asked for by name: with grants to remove and an srt-win that
-        // keeps no holder records, nothing is removed. With no kept
-        // grant of either kind there is nothing to ask for.
+        // keeps no holder records, nothing is removed.
+        //
+        // That is the only capability this path needs, and only then.
+        // The ordinary token uses none of the others — no profile
+        // read grant exists under it, no kept root — so with no kept
+        // grant of either kind reported, a session with
+        // `writeRestrictedToken: false` runs against an srt-win that
+        // lists nothing, as it did before capabilities existed.
         if (
           (u.profileGrant || u.persistentGrants) &&
           !u.capabilities.includes(
@@ -1236,7 +1261,29 @@ async function initializeSteps(
             unlessHeldByOthers: process.pid,
           })
         }
-      } else if (u.profileGrant) {
+      } else {
+        // The write-restricted token (the default). What this library
+        // hands srt-win on this path is only right if srt-win does its
+        // part, and the two are not always the same build: every
+        // capability the library relies on is required here, from the
+        // status already in hand, before anything is granted.
+        //
+        // Whether or not a grant is recorded. The capabilities belong
+        // to the build, not to the grant state: a grant can be made
+        // after this session started, and a status that shows none —
+        // because the field is missing, or was renamed — is not proof
+        // that none is on disk. A status with no `capabilities`, or
+        // one that is not a list, has none.
+        const missing = missingWindowsSrtWinCapability(u.capabilities)
+        if (missing !== undefined) {
+          throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+        }
+        windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
+      }
+      if (
+        windowsWriteRestrictedTokenEnabled(runtimeConfig.windows) &&
+        u.profileGrant
+      ) {
         const grant = getWindowsProfileReadStatus({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
@@ -1252,28 +1299,6 @@ async function initializeSteps(
           )
         }
         if (grant.state === 'current') {
-          // A session read deny on or above a path the grant made
-          // readable holds only if it is also written on that path.
-          // srt-win does that from its record; this library names the
-          // deny once and no longer lists the paths. An srt-win that
-          // does not say it does so would leave such a deny
-          // ineffective, silently — so with a grant in force the
-          // session does not start on it.
-          //
-          // With NO grant recorded there is nothing for a deny to be
-          // expanded over, and nothing is required: sessions keep
-          // working against an older srt-win in that case.
-          if (
-            !grant.capabilities.includes(
-              WINDOWS_SRT_WIN_CAPABILITIES.profileDenyExpansion,
-            )
-          ) {
-            throw windowsSrtWinOutdatedError(
-              WINDOWS_SRT_WIN_CAPABILITIES.profileDenyExpansion,
-              `a session's read denies depend on while a profile read ` +
-                `grant is recorded`,
-            )
-          }
           profileExclusions = grant
           windowsProfileRead = 'granted'
         }
@@ -3035,15 +3060,15 @@ async function wrapWithSandboxArgv(
       // paths it covers.
       const denyRead = ranked.denyRead
       perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
-      // initialize() verified that this srt-win does that ('granted')
-      // or found no grant to expand over ('absent'). A command wrapped
-      // with no session behind it has had neither: look now, once.
-      if (
-        perExecDenyRead.length > 0 &&
-        windowsWriteRestrictedToken &&
-        windowsProfileRead === undefined
-      ) {
-        assertWindowsDenyExpansion(
+      // That holds whatever the grant state was at initialize(): the
+      // deny always goes in this one form, srt-win expands it from
+      // the record as it is when the command runs — so a grant made
+      // since is covered — and the srt-win it goes to is known to do
+      // so: the session's own was required to at initialize(), and
+      // one passed for this command, or used with no session, is
+      // asked now.
+      if (perExecDenyRead.length > 0 && windowsWriteRestrictedToken) {
+        assertWindowsSrtWinCapable(
           customConfig?.windows?.srtWin
             ? resolveSrtWin(customConfig.windows.srtWin)
             : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
@@ -3380,7 +3405,7 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
   windowsProfileRead = undefined
-  windowsDenyExpansionChecked = false
+  windowsCapableSrtWin.clear()
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the

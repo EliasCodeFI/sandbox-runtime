@@ -2052,6 +2052,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       hidden_from_logon: true,
     },
     cred_present: true,
+    capabilities: SRT_WIN_CAPABILITIES,
     marker_version: 1,
     real_user_sid: 'S-1-5-21-3',
     ca_cert_thumb: null,
@@ -4046,6 +4047,7 @@ function restoreGatedOnACompletedRevoke(
       hidden_from_logon: true,
     },
     cred_present: true,
+    capabilities: SRT_WIN_CAPABILITIES,
     marker_version: 1,
     real_user_sid: 'S-1-5-21-3',
     ca_cert_thumb: null,
@@ -8553,83 +8555,125 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         profileStatus = current()
       }
 
-      for (const [what, caps] of [
-        ['says nothing about what it does', undefined],
+      // The capabilities belong to the srt-win build, not to what is
+      // recorded: under the write-restricted token all of them are
+      // required, grant or no grant.
+      const states: [string, () => void][] = [
+        ['a grant is recorded', () => {}],
         [
-          'lists other capabilities only',
-          ['kept-grant-holders', 'something-else'],
+          'no grant is recorded',
+          () => {
+            profileStatus = { state: 'none' }
+            briefGrant = { state: 'none' }
+          },
         ],
-      ] as const) {
-        it(`a grant is recorded and srt-win ${what}: srt_win_outdated, nothing granted`, async () => {
-          old(caps as string[] | undefined)
-          for (const cfg of [
-            config(),
-            config({}, { denyRead: [home] }),
-            config({}, { allowWrite: [] }),
-          ]) {
-            calls = []
-            const e = await rejection(cfg)
-            expect(e).toBeInstanceOf(WindowsSandboxError)
-            expect(e.code).toBe('srt_win_outdated')
-            expect(e.message).toContain('profile-deny-expansion')
-            // The status was read; nothing was granted or stamped.
-            expect(names()).toEqual(['profile status'])
-            expect(SandboxManager.getConfig()).toBeUndefined()
-          }
+        [
+          'user status does not say whether one is',
+          () => {
+            briefGrant = undefined
+          },
+        ],
+      ]
+      for (const [state, arrange] of states) {
+        for (const [what, caps, missing] of [
+          ['has no capabilities field', undefined, 'profile-deny-expansion'],
+          [
+            'reports something that is not a list',
+            'all',
+            'profile-deny-expansion',
+          ],
+          ['reports an empty list', [], 'profile-deny-expansion'],
+          [
+            'lacks the deny expansion',
+            ['kept-grant-holders', 'profile-session-grant-check', 'other'],
+            'profile-deny-expansion',
+          ],
+          [
+            'lacks the holder check',
+            ['profile-deny-expansion', 'profile-session-grant-check'],
+            'kept-grant-holders',
+          ],
+          [
+            'lacks its own exclusion check',
+            ['profile-deny-expansion', 'kept-grant-holders'],
+            'profile-session-grant-check',
+          ],
+        ] as const) {
+          it(`${state} and srt-win ${what}: srt_win_outdated, nothing granted`, async () => {
+            old(caps as string[] | undefined)
+            arrange()
+            for (const cfg of [
+              config(),
+              config({}, { denyRead: [home] }),
+              config({}, { allowWrite: [] }),
+            ]) {
+              calls = []
+              const e = await rejection(cfg)
+              expect(e).toBeInstanceOf(WindowsSandboxError)
+              expect(e.code).toBe('srt_win_outdated')
+              expect(e.message).toContain(`'${missing}'`)
+              // Decided from the status in hand: nothing was asked of
+              // srt-win after it, and nothing granted or stamped.
+              expect(names()).toEqual([])
+              expect(SandboxManager.getConfig()).toBeUndefined()
+            }
+          })
+        }
+
+        it(`${state} and srt-win lists every capability: the session starts`, async () => {
+          old(SRT_WIN_CAPABILITIES)
+          arrange()
+          await SandboxManager.initialize(config({}, { denyRead: [home] }))
+          expect(stdinOf('acl grant')?.denyRead).toEqual([home])
         })
       }
 
-      it('a grant is recorded and srt-win lists the capability: the session starts', async () => {
-        old(['profile-deny-expansion'])
-        await SandboxManager.initialize(config({}, { denyRead: [home] }))
-        expect(names()).toEqual(['profile status', 'acl grant'])
-        expect(stdinOf('acl grant')?.denyRead).toEqual([home])
-        expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
-      })
-
-      it('no grant is recorded: nothing is required of an older srt-win, read denies included', async () => {
-        old(undefined)
-        profileStatus = { state: 'none' }
-        briefGrant = { state: 'none' }
-        await SandboxManager.initialize(config({}, { denyRead: [home] }))
-        expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
-        expect(stdinOf('acl grant')?.denyRead).toEqual([home])
-        await SandboxManager.reset()
-        // An srt-win from before the grant existed says nothing of it
-        // at all.
-        calls = []
-        briefGrant = undefined
-        await SandboxManager.initialize(config({}, { denyRead: [home] }))
-        expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
-        expect(names()).toEqual(['acl grant'])
-      })
-
-      it('a command wrapped with no session behind it looks for itself, once, before it relies on a read deny', async () => {
-        const cfg = config(
-          {},
-          { denyRead: [join(home, '.cargo')], allowWrite: [] },
-        )
-        const wrap = () =>
-          SandboxManager.wrapWithSandboxArgv('echo x', undefined, cfg)
-        old(undefined)
-        let thrown: unknown
-        try {
-          await wrap()
-        } catch (e) {
-          thrown = e
+      it('a per-command read deny is checked against the srt-win it will run through, each one, and a no is asked again', async () => {
+        // No session: the command's own srt-win is asked.
+        const other = join(work, 'other-srt-win.exe')
+        writeFileSync(other, 'x')
+        const via = (path?: string) =>
+          SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
+            ...config({}, { denyRead: [join(home, '.cargo')], allowWrite: [] }),
+            ...(path && { windows: { srtWin: { path } } }),
+          })
+        const refusedBy = async (path?: string) => {
+          try {
+            await via(path)
+          } catch (e) {
+            return (e as WindowsSandboxError).code
+          }
+          return undefined
         }
-        expect((thrown as WindowsSandboxError).code).toBe('srt_win_outdated')
-        expect(names()).toEqual(['profile status'])
-        // An srt-win that does it: wrapped, and not asked again for
-        // the next command.
+        const asked = () => names().filter(n => n === 'profile status').length
+        old(undefined)
+        expect(await refusedBy()).toBe('srt_win_outdated')
+        expect(asked()).toBe(1)
+        // Not remembered: asked again, and now it does.
         old(SRT_WIN_CAPABILITIES)
-        calls = []
-        const { argv } = await wrap()
+        const { argv } = await via()
         expect(argv.filter((_, i) => argv[i - 1] === '--deny-read')).toEqual([
           join(home, '.cargo'),
         ])
-        await wrap()
-        expect(names()).toEqual(['profile status'])
+        expect(asked()).toBe(2)
+        // Remembered for that one …
+        await via()
+        expect(asked()).toBe(2)
+        // … and not for another: a different srt-win is asked itself,
+        // however capable the first was.
+        old(undefined)
+        expect(await refusedBy(other)).toBe('srt_win_outdated')
+        expect(asked()).toBe(3)
+        old(SRT_WIN_CAPABILITIES)
+        expect(await refusedBy(other)).toBeUndefined()
+        expect(asked()).toBe(4)
+        await via(other)
+        await via()
+        expect(asked()).toBe(4)
+        // The same path with other contents is another srt-win.
+        writeFileSync(other, 'replaced with something longer')
+        await via(other)
+        expect(asked()).toBe(5)
         // No read deny, nothing to rely on: no look at all.
         await SandboxManager.reset()
         calls = []
@@ -8642,6 +8686,58 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(names()).toEqual([])
       })
 
+      it("within a session a per-command srt-win that differs from the session's is asked too", async () => {
+        await SandboxManager.initialize(config())
+        const other = join(work, 'other-srt-win.exe')
+        writeFileSync(other, 'x')
+        const cfg = (path?: string) => ({
+          ...config({}, { denyRead: [join(home, '.cargo')], allowWrite: [] }),
+          ...(path && { windows: { srtWin: { path } } }),
+        })
+        calls = []
+        // The session's own was required to be capable at initialize().
+        await SandboxManager.wrapWithSandboxArgv('echo x', undefined, cfg())
+        expect(names()).toEqual([])
+        old(undefined)
+        let code: string | undefined
+        try {
+          await SandboxManager.wrapWithSandboxArgv(
+            'echo x',
+            undefined,
+            cfg(other),
+          )
+        } catch (e) {
+          code = (e as WindowsSandboxError).code
+        }
+        expect(code).toBe('srt_win_outdated')
+        expect(names()).toEqual(['profile status'])
+      })
+
+      it('a grant made after initialize(): a per-command deny on the profile directory is handed over as srt-win expands it', async () => {
+        // The session starts with no grant recorded …
+        profileStatus = { state: 'none' }
+        briefGrant = { state: 'none' }
+        await SandboxManager.initialize(config({}, { allowWrite: [] }))
+        expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
+        // … and one is made while it runs.
+        profileStatus = current()
+        briefGrant = { state: 'present' }
+        calls = []
+        const { argv } = await SandboxManager.wrapWithSandboxArgv(
+          'echo x',
+          undefined,
+          config({}, { denyRead: [home], allowWrite: [] }),
+        )
+        // The deny goes in the one form there is, to an srt-win that
+        // was required to expand it whatever was recorded at the
+        // start: nothing depends on re-reading the state here.
+        expect(argv.filter((_, i) => argv[i - 1] === '--deny-read')).toEqual([
+          home,
+        ])
+        expect(argv).toContain('--write-restricted-token')
+        expect(names()).toEqual([])
+      })
+
       it('the token opt-out with a grant to remove needs the holder check: without it, srt_win_outdated and nothing removed', async () => {
         old(['profile-deny-expansion'])
         briefGrant = { state: 'present' }
@@ -8650,11 +8746,32 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(e.message).toContain('kept-grant-holders')
         expect(names()).toEqual([])
         // With no kept grant of either kind there is nothing to
-        // remove, and nothing is asked of it.
-        briefGrant = { state: 'none' }
-        profileStatus = { state: 'none' }
-        await SandboxManager.initialize(config(ORDINARY))
-        expect(names()).not.toContain('profile forget')
+        // remove, and nothing is asked of it: the ordinary token runs
+        // against an srt-win that lists nothing at all, with or
+        // without the field that would report a grant.
+        for (const brief of [{ state: 'none' }, undefined]) {
+          old(undefined)
+          briefGrant = brief
+          profileStatus = { state: 'none' }
+          calls = []
+          await SandboxManager.initialize(
+            config(ORDINARY, { denyRead: [join(home, '.cargo')] }),
+          )
+          expect(names()).not.toContain('profile forget')
+          expect(stdinOf('acl stamp')?.denyRead).toEqual([join(home, '.cargo')])
+          // Nor is it asked for a per-command read deny there.
+          calls = []
+          await SandboxManager.wrapWithSandboxArgv(
+            'echo x',
+            undefined,
+            config(ORDINARY, {
+              denyRead: [join(home, 'Documents')],
+              allowWrite: [],
+            }),
+          )
+          expect(names()).toEqual([])
+          await SandboxManager.reset()
+        }
       })
     })
 
