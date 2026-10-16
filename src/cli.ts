@@ -197,10 +197,9 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
-      '--loopback-port-range <lo-hi>',
-      'second loopback PERMIT port range, for local servers the sandbox ' +
-        'may connect to directly (default: none); must match ' +
-        'windows.loopbackPortRange',
+      '--allow-loopback',
+      'let sandboxed commands connect to any localhost port except a few ' +
+        'sensitive ones (default: off); must match network.allowLocalBinding',
     )
     .option(
       '--sandbox-user <name>',
@@ -213,20 +212,17 @@ async function main(): Promise<void> {
         resolveSrtWin,
         VENDORED_SRT_WIN_EXE,
         WINDOWS_INSTALL_NETWORK_EFFECT,
+        WINDOWS_ALLOW_LOOPBACK_EFFECT,
       } = await import('./sandbox/windows-sandbox-utils.js')
       const range =
         typeof o.proxyPortRange === 'string'
           ? (o.proxyPortRange.split('-').map(Number) as [number, number])
           : undefined
-      const loopbackRange =
-        typeof o.loopbackPortRange === 'string'
-          ? (o.loopbackPortRange.split('-').map(Number) as [number, number])
-          : undefined
       try {
         const r = installWindowsSandbox({
           sublayerGuid: o.sublayerGuid as string | undefined,
           proxyPortRange: range,
-          loopbackPortRange: loopbackRange,
+          allowLoopback: Boolean(o.allowLoopback),
           sandboxUser: o.sandboxUser as string | undefined,
           force: Boolean(o.force),
           // Our own CLI opts into the packaged exe explicitly —
@@ -246,12 +242,10 @@ async function main(): Promise<void> {
             (r.wfp.portRange
               ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
               : '') +
-            (r.wfp.loopbackPortRange
-              ? `, loopback port range ${r.wfp.loopbackPortRange[0]}-` +
-                `${r.wfp.loopbackPortRange[1]}`
-              : '') +
+            `, loopback ${r.wfp.allowLoopback ? 'open' : 'closed'}` +
             `\n\n` +
-            `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}`,
+            `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}` +
+            (r.wfp.allowLoopback ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}` : ''),
         )
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`)

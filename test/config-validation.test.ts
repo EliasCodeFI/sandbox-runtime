@@ -1,5 +1,8 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
-import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import {
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
+} from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2321,124 +2324,34 @@ describe('Config Validation', () => {
     })
   })
 
-  describe('windows.loopbackPortRange', () => {
-    const parse = (windows: Record<string, unknown>) =>
+  describe('network.allowLocalBinding', () => {
+    const parse = (network: Record<string, unknown>) =>
       SandboxRuntimeConfigSchema.safeParse({
-        network: { allowedDomains: [], deniedDomains: [] },
+        network: { allowedDomains: [], deniedDomains: [], ...network },
         filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-        windows,
       })
-    const messages = (windows: Record<string, unknown>): string[] => {
-      const r = parse(windows)
-      return r.success ? [] : r.error.issues.map(i => i.message)
-    }
 
-    test('is unset by default and round-trips when given', () => {
+    test('is unset by default and takes a boolean, nothing else', () => {
       const none = parse({})
       expect(none.success).toBe(true)
       if (none.success) {
-        expect(none.data.windows?.loopbackPortRange).toBeUndefined()
+        expect(none.data.network.allowLocalBinding).toBeUndefined()
       }
-      const given = parse({ loopbackPortRange: [3000, 3099] })
-      expect(given.success).toBe(true)
-      if (given.success) {
-        expect(given.data.windows?.loopbackPortRange).toEqual([3000, 3099])
+      for (const v of [true, false]) {
+        const r = parse({ allowLocalBinding: v })
+        expect(r.success).toBe(true)
+        if (r.success) expect(r.data.network.allowLocalBinding).toBe(v)
       }
-    })
-
-    test('accepts one port, the lowest start, and exactly 512 ports', () => {
-      for (const range of [
-        [8080, 8080],
-        [1024, 1535],
-        [65024, 65535],
-      ]) {
-        expect(parse({ loopbackPortRange: range }).success).toBe(true)
+      // No port list, range or mode word: it is a toggle.
+      for (const v of ['all', 1, [3000, 3099], null]) {
+        expect(parse({ allowLocalBinding: v }).success).toBe(false)
       }
     })
 
-    test('rejects low above high', () => {
-      expect(messages({ loopbackPortRange: [3099, 3000] })[0]).toMatch(
-        /low \(3099\) must be ≤ high \(3000\)/,
-      )
-    })
-
-    test('rejects more than 512 ports', () => {
-      expect(messages({ loopbackPortRange: [3000, 3512] })[0]).toMatch(
-        /too wide \(513 ports\); at most 512/,
-      )
-    })
-
-    test('rejects a range that starts below 1024', () => {
-      expect(messages({ loopbackPortRange: [1023, 1100] })[0]).toMatch(
-        /low port must be ≥ 1024/,
-      )
-      expect(parse({ loopbackPortRange: [80, 80] }).success).toBe(false)
-    })
-
-    test('rejects any port shared with the default proxy port range', () => {
-      for (const range of [
-        [60000, 60080],
-        [60089, 60100],
-        [60082, 60085],
-      ]) {
-        expect(messages({ loopbackPortRange: range })).toEqual([
-          'range overlaps the proxy port range 60080-60089',
-        ])
-      }
-      // Next to it on either side is fine.
-      expect(parse({ loopbackPortRange: [60000, 60079] }).success).toBe(true)
-      expect(parse({ loopbackPortRange: [60090, 60100] }).success).toBe(true)
-    })
-
-    test('compares against the configured proxy port range, not the default', () => {
-      const proxyPortRange = [50010, 50020]
-      expect(
-        messages({ proxyPortRange, loopbackPortRange: [50000, 50010] }),
-      ).toEqual(['range overlaps the proxy port range 50010-50020'])
-      expect(
-        parse({ proxyPortRange, loopbackPortRange: [60080, 60089] }).success,
-      ).toBe(true)
-    })
-
-    test.each([
-      [3389, 'remote desktop'],
-      [5985, 'remote management'],
-      [5986, 'remote management'],
-      [2375, 'container engine API'],
-      [2376, 'container engine API'],
-      [9222, 'browser remote debugging'],
-      [9229, 'JavaScript runtime inspector'],
-      [47001, 'remote management'],
-    ])('rejects a range that includes %d (%s)', (port, what) => {
-      // Alone, and at either end of a wider range.
-      expect(messages({ loopbackPortRange: [port, port] })[0]).toMatch(
-        new RegExp(`includes port ${port} \\(${what}`),
-      )
-      expect(parse({ loopbackPortRange: [port, port + 20] }).success).toBe(
-        false,
-      )
-      expect(parse({ loopbackPortRange: [port - 20, port] }).success).toBe(
-        false,
-      )
-    })
-
-    test('accepts ranges next to a sensitive port', () => {
-      expect(parse({ loopbackPortRange: [3390, 3400] }).success).toBe(true)
-      expect(parse({ loopbackPortRange: [9223, 9228] }).success).toBe(true)
-    })
-
-    test('rejects values that are not a pair of integer ports', () => {
-      for (const v of [
-        [3000],
-        [3000, 3001, 3002],
-        [3000.5, 3001],
-        ['3000', '3099'],
-        [3000, 65536],
-        [0, 10],
-        '3000-3099',
-        null,
-      ]) {
-        expect(parse({ loopbackPortRange: v }).success).toBe(false)
+    test('its description says what it does on each platform', () => {
+      const text = NetworkConfigSchema.shape.allowLocalBinding.description ?? ''
+      for (const platform of ['macOS', 'Windows', 'Linux']) {
+        expect(text).toContain(platform)
       }
     })
   })

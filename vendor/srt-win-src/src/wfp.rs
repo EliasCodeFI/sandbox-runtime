@@ -6,8 +6,8 @@
 //! At install time we provision the dedicated `srt-sandbox` local
 //! user account ([`crate::user`]) and persist **one machine-wide**
 //! filter set — three filters at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4`
-//! and `_V6` (6 total), plus one more per layer when a loopback port
-//! range is configured (8 total), all under one persistent sublayer
+//! and `_V6` (6 total), plus one more per layer when loopback is
+//! opened (8 total), all under one persistent sublayer
 //! ([`filter_specs`] is the list):
 //!
 //!   - **PERMIT loopback** (weight [`W_LOOPBACK`]) —
@@ -19,15 +19,18 @@
 //!     the two proxy ports; this range is the closest Windows
 //!     analogue without per-`initialize()` admin.)
 //!
-//!   - **PERMIT loopback range** (weight [`W_LOOPBACK`], optional) —
-//!     the same two conditions as the PERMIT above with a second,
-//!     configured port range (`srt-win install --loopback-port-range`).
-//!     Absent unless configured. It lets the sandboxed child connect
-//!     directly to local servers listening inside that range — a
-//!     development server, a database, a server another sandboxed
-//!     command started. It opens every listener on those loopback
-//!     ports, whoever owns it, so [`validate_loopback_port_range`]
-//!     bounds what the range may be.
+//!   - **PERMIT loopback, open** (weight [`W_LOOPBACK`], optional) —
+//!     the same address condition as the PERMIT above, with the port
+//!     condition replaced by every port outside
+//!     [`LOOPBACK_FLOOR_PORTS`] ([`open_loopback_port_ranges`]).
+//!     Absent unless installed with `srt-win install
+//!     --allow-loopback`. It lets the sandboxed child connect directly
+//!     to local servers — a development server, a database, a server
+//!     another sandboxed command started — over TCP and UDP alike (no
+//!     filter of the set has a protocol condition). It opens every
+//!     listener on loopback, whoever owns it, including any local
+//!     forwarder that carries traffic off the machine; the floor is
+//!     the short list of ports that stay blocked regardless.
 //!
 //!   - **BLOCK sandbox user** (weight [`W_BLOCK`]) — `ALE_USER_ID` SD
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
@@ -57,7 +60,7 @@
 //!
 //!   - A connect to a **loopback** destination on a socket created
 //!     while impersonating anonymous matches neither BLOCK: local
-//!     listeners outside the permitted port ranges are reachable that
+//!     listeners outside the permitted ports are reachable that
 //!     way.
 //!     `srt-win wfp verify` probes this and reports a connect as the
 //!     [`crate::probe::RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
@@ -85,11 +88,12 @@
 //! port_range?, user_sid, rev}`) so install/uninstall/status can
 //! locate them by enumeration. `rev` is [`FENCE_REVISION`]; a set
 //! written by an earlier build lacks it (or the anonymous BLOCK) and
-//! reads as `outdated`. The configured loopback range is part of what
-//! a session must agree with the install about: it is recorded in the
-//! `permit-loopback-range` tags and in the install record, and `wfp
-//! verify` / `exec` refuse a session configured with a different one
-//! ([`loopback_range_hint`]). BFE enumeration is admin-gated (see
+//! reads as `outdated`. Whether loopback is open is part of what a
+//! session must agree with the install about: it is recorded by the
+//! presence of the `permit-loopback-open` filters and in the install
+//! record, and `wfp verify` / `exec` refuse a session configured the
+//! other way, in either direction ([`loopback_mismatch_hint`]). BFE
+//! enumeration is admin-gated (see
 //! [`WfpAccessDenied`]) — `wfp status` returns `cannot-read` for a
 //! non-elevated caller; the non-elevated readiness check is `srt-win
 //! wfp verify` (a behavioral connect probe).
@@ -139,21 +143,17 @@ pub const DEFAULT_PROXY_PORT_RANGE: (u16, u16) = (60080, 60089);
 /// that.
 pub const MAX_PROXY_PORT_RANGE_WIDTH: u16 = 64;
 
-/// Most ports a configured loopback range may hold. The range opens
-/// every loopback listener on its ports to the sandbox, so it is kept
-/// to what a handful of local servers need.
-pub const MAX_LOOPBACK_PORT_RANGE_PORTS: u32 = 512;
-
-/// Lowest port a configured loopback range may start at: the
-/// well-known ports below it belong to system services.
-pub const MIN_LOOPBACK_PORT: u16 = 1024;
-
-/// Ports a configured loopback range may not include: local services
-/// that hand whoever connects to them control of the machine, of
-/// another account, or of another process. The TypeScript config
-/// validation carries the same list
-/// (`WINDOWS_LOOPBACK_SENSITIVE_PORTS`).
-pub const SENSITIVE_LOOPBACK_PORTS: [(u16, &str); 8] = [
+/// Loopback ports that stay blocked for the sandbox account in every
+/// mode, `--allow-loopback` included: local services that hand whoever
+/// connects to them control of the machine, of another account, or of
+/// another process, and the two best-known local forwarders. A floor,
+/// not a guarantee: a service of either kind on any other port is
+/// reachable once loopback is open. Ascending. The TypeScript library
+/// carries the same ports (`WINDOWS_LOOPBACK_FLOOR_PORTS`) to describe
+/// them.
+pub const LOOPBACK_FLOOR_PORTS: [(u16, &str); 10] = [
+    (53, "local DNS forwarder"),
+    (1080, "local SOCKS proxy"),
     (2375, "container engine API"),
     (2376, "container engine API (TLS)"),
     (3389, "remote desktop"),
@@ -163,6 +163,42 @@ pub const SENSITIVE_LOOPBACK_PORTS: [(u16, &str); 8] = [
     (9229, "JavaScript runtime inspector"),
     (47001, "remote management (compatibility listener)"),
 ];
+
+/// Whether `port` is one of [`LOOPBACK_FLOOR_PORTS`].
+pub fn is_loopback_floor_port(port: u16) -> bool {
+    LOOPBACK_FLOOR_PORTS.iter().any(|(p, _)| *p == port)
+}
+
+/// Every port from 1 to 65535 that is not in `floor`, as inclusive
+/// ranges in ascending order. `floor` must be ascending.
+///
+/// Port 0 is in no range. It is never the destination of a TCP or UDP
+/// connect, and for ICMP the engine presents the message code in the
+/// remote-port field, so leaving 0 out also keeps an echo request
+/// (code 0) from matching a port condition built from these ranges.
+pub(crate) fn port_ranges_outside(floor: &[u16]) -> Vec<(u16, u16)> {
+    let mut ranges = Vec::new();
+    let mut next: u32 = 1;
+    for &p in floor {
+        let p = u32::from(p);
+        if p > next {
+            ranges.push((next as u16, (p - 1) as u16));
+        }
+        next = next.max(p + 1);
+    }
+    if next <= u32::from(u16::MAX) {
+        ranges.push((next as u16, u16::MAX));
+    }
+    ranges
+}
+
+/// The remote ports of the open-loopback PERMIT: everything but
+/// [`LOOPBACK_FLOOR_PORTS`]. A port condition takes a range, and
+/// conditions on one field are OR'ed, so "all but the floor" is the
+/// complement written out as ranges.
+pub(crate) fn open_loopback_port_ranges() -> Vec<(u16, u16)> {
+    port_ranges_outside(&LOOPBACK_FLOOR_PORTS.map(|(p, _)| p))
+}
 
 // WFP error codes we treat as benign idempotency outcomes.
 const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
@@ -367,24 +403,27 @@ fn cond_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0
     }
 }
 
-/// The two conditions of a loopback PERMIT at one ALE connect layer:
-/// the remote address is loopback (`127.0.0.0/8` or `::1`) AND the
-/// remote port is in `range`. Shared by the proxy-range PERMIT and
-/// the configured-range PERMIT so the two can only differ in their
-/// ports. The caller keeps all three referents alive until the filter
-/// is added.
+/// The conditions of a loopback PERMIT at one ALE connect layer: the
+/// remote address is loopback (`127.0.0.0/8` or `::1`) AND the remote
+/// port is in one of `ranges` (conditions on the same field are
+/// OR'ed). Shared by the proxy-range PERMIT and the open-loopback
+/// PERMIT so the two can only differ in their ports. The caller keeps
+/// every referent alive until the filter is added.
 fn loopback_permit_conditions(
     v4: bool,
     v4_loop: &mut FWP_V4_ADDR_AND_MASK,
     v6_loop: &mut FWP_BYTE_ARRAY16,
-    range: &mut FWP_RANGE0,
-) -> [FWPM_FILTER_CONDITION0; 2] {
+    ranges: &mut [FWP_RANGE0],
+) -> Vec<FWPM_FILTER_CONDITION0> {
     let addr = if v4 {
         cond_v4_subnet(FWPM_CONDITION_IP_REMOTE_ADDRESS, v4_loop)
     } else {
         cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, v6_loop)
     };
-    [addr, cond_range(FWPM_CONDITION_IP_REMOTE_PORT, range)]
+    let ports = ranges
+        .iter_mut()
+        .map(|r| cond_range(FWPM_CONDITION_IP_REMOTE_PORT, r));
+    std::iter::once(addr).chain(ports).collect()
 }
 
 // ────────────────────── filter tagging ──────────────────────
@@ -392,9 +431,8 @@ fn loopback_permit_conditions(
 /// JSON payload stored in each filter's `providerData` so we can
 /// identify our own filters during enumerate/uninstall without fixed
 /// filter GUIDs. The optional `port_range` mirrors the
-/// `IP_REMOTE_PORT` range condition on `permit-loopback-user` and
-/// `permit-loopback-range` so `wfp status` can report both without
-/// unsafe condition-walking.
+/// `IP_REMOTE_PORT` range condition on `permit-loopback-user` so
+/// `wfp status` can report it without unsafe condition-walking.
 /// `user_sid` is always set on filters this version writes; legacy
 /// installs (the discriminator-group filter set this version
 /// supersedes) wrote it as `None`, and [`install_filters`]/
@@ -404,10 +442,10 @@ pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// `permit-loopback-user` / `permit-loopback-range` /
+    /// `permit-loopback-user` / `permit-loopback-open` /
     /// `block-user` / `block-anonymous`.
     pub kind: String,
-    /// `[low, high]` for the two PERMIT kinds; `None` otherwise.
+    /// `[low, high]` for `permit-loopback-user`; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
     /// Sandbox user SID. `None` only on legacy installs that predate
@@ -438,8 +476,8 @@ impl FilterTag {
 /// Tag kind of the PERMIT for the proxy port range. (The name is
 /// historical; the filter carries no user condition.)
 pub(crate) const KIND_PERMIT_PROXY: &str = "permit-loopback-user";
-/// Tag kind of the PERMIT for the configured loopback port range.
-pub(crate) const KIND_PERMIT_RANGE: &str = "permit-loopback-range";
+/// Tag kind of the open-loopback PERMIT.
+pub(crate) const KIND_PERMIT_OPEN: &str = "permit-loopback-open";
 pub(crate) const KIND_BLOCK_USER: &str = "block-user";
 pub(crate) const KIND_BLOCK_ANONYMOUS: &str = "block-anonymous";
 
@@ -449,6 +487,9 @@ pub(crate) enum FilterShape {
     /// PERMIT: remote address is loopback AND remote port is in the
     /// range.
     PermitLoopback((u16, u16)),
+    /// PERMIT: remote address is loopback AND remote port is in one
+    /// of [`open_loopback_port_ranges`].
+    PermitLoopbackOpen,
     /// BLOCK: the token is the sandbox account's.
     BlockUser,
     /// BLOCK: the token is anonymous AND the remote address is not
@@ -475,20 +516,19 @@ impl FilterSpec {
 }
 
 /// The filters [`install_filters`] adds at each ALE connect layer.
-/// The configured loopback range adds exactly one PERMIT and changes
-/// nothing else.
-pub(crate) fn filter_specs(
-    proxy_range: (u16, u16),
-    loopback_range: Option<(u16, u16)>,
-) -> Vec<FilterSpec> {
-    let permit = |kind, range| FilterSpec {
-        kind,
+/// `allow_loopback` adds exactly one PERMIT and changes nothing else.
+pub(crate) fn filter_specs(proxy_range: (u16, u16), allow_loopback: bool) -> Vec<FilterSpec> {
+    let mut specs = vec![FilterSpec {
+        kind: KIND_PERMIT_PROXY,
         weight: W_LOOPBACK,
-        shape: FilterShape::PermitLoopback(range),
-    };
-    let mut specs = vec![permit(KIND_PERMIT_PROXY, proxy_range)];
-    if let Some(r) = loopback_range {
-        specs.push(permit(KIND_PERMIT_RANGE, r));
+        shape: FilterShape::PermitLoopback(proxy_range),
+    }];
+    if allow_loopback {
+        specs.push(FilterSpec {
+            kind: KIND_PERMIT_OPEN,
+            weight: W_LOOPBACK,
+            shape: FilterShape::PermitLoopbackOpen,
+        });
     }
     specs.push(FilterSpec {
         kind: KIND_BLOCK_USER,
@@ -504,9 +544,9 @@ pub(crate) fn filter_specs(
 }
 
 /// Number of filters in the set: 3 per layer × v4/v6, plus one per
-/// layer when a loopback port range is configured.
-pub fn filter_count(loopback_range: Option<(u16, u16)>) -> usize {
-    ALE_LAYERS.len() * filter_specs(DEFAULT_PROXY_PORT_RANGE, loopback_range).len()
+/// layer when loopback is open.
+pub fn filter_count(allow_loopback: bool) -> usize {
+    ALE_LAYERS.len() * filter_specs(DEFAULT_PROXY_PORT_RANGE, allow_loopback).len()
 }
 
 /// Revision of the filter set this build installs and requires.
@@ -517,11 +557,11 @@ pub fn filter_count(loopback_range: Option<(u16, u16)>) -> usize {
 ///      this revision carry no `rev`).
 ///   2. adds the anonymous BLOCK and the all-packages ACEs on the
 ///      sandbox-user descriptor.
-///   3. may carry the configured loopback-range PERMIT, and records
-///      that range (or its absence) beside the revision. A set without
-///      the PERMIT has the same filters as revision 2; the number
-///      moves so that a build which does not know about the range
-///      never accepts a set that may carry one.
+///   3. may carry the open-loopback PERMIT, and records whether it
+///      does beside the revision. A set without the PERMIT has the
+///      same filters as revision 2; the number moves so that a build
+///      which does not know about open loopback never accepts a set
+///      that may have it.
 ///
 /// Recorded twice: in every filter's tag (what an elevated `wfp
 /// status` reads) and in the install record (what the non-elevated
@@ -546,8 +586,8 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 // Filter weights — kept below 2^60 so they stay in WFP's
 // "manual weight" class (top 4 bits are auto-classifier). The
 // loopback PERMITs must sit **above** the user-SID BLOCK so the
-// sandbox user can still reach the host proxies (and, when one is
-// configured, the loopback port range). Module-level so
+// sandbox user can still reach the host proxies (and, when it is
+// open, the rest of loopback). Module-level so
 // [`install_filters`] and the const-asserts in `tests` share one
 // source of truth.
 pub(crate) const W_LOOPBACK: u64 = 0x0F80_0000_0000_0000;
@@ -827,18 +867,17 @@ pub(crate) const fn non_loopback_v6_ranges() -> [([u8; 16], [u8; 16]); 2] {
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
 /// — including legacy discriminator-group-keyed filters from a
-/// pre-separate-user install, and a loopback-range PERMIT for a range
-/// that is no longer configured — are deleted first, then a fresh set
-/// is added, all inside one WFP transaction.
+/// pre-separate-user install, and an open-loopback PERMIT that is no
+/// longer asked for — are deleted first, then a fresh set is added,
+/// all inside one WFP transaction.
 pub fn install_filters(
     sublayer: &GUID,
     sandbox_user_sid: &str,
     port_range: (u16, u16),
-    loopback_range: Option<(u16, u16)>,
+    allow_loopback: bool,
 ) -> Result<()> {
     debug_assert!(port_range.0 <= port_range.1);
-    debug_assert!(loopback_range.is_none_or(|(lo, hi)| lo <= hi));
-    let specs = filter_specs(port_range, loopback_range);
+    let specs = filter_specs(port_range, allow_loopback);
     let sd_user = OwnedSd::from_sddl(&sddl_sandbox_user(sandbox_user_sid))
         .context("build sandbox-user SD")?;
     let sd_anon = OwnedSd::from_sddl(&sddl_anonymous()).context("build anonymous SD")?;
@@ -923,10 +962,33 @@ pub fn install_filters(
                     // PERMIT loopback ∩ port-range (no user
                     // condition).
                     FilterShape::PermitLoopback((lo, hi)) => {
-                        let mut ports = FWP_RANGE0 {
+                        let mut ports = [FWP_RANGE0 {
                             valueLow: fwp_uint16(lo),
                             valueHigh: fwp_uint16(hi),
-                        };
+                        }];
+                        let mut c =
+                            loopback_permit_conditions(v4, &mut v4_loop, &mut v6_loop, &mut ports);
+                        add_filter(
+                            engine.h(),
+                            sublayer,
+                            layer,
+                            &name,
+                            spec.weight,
+                            FWP_ACTION_PERMIT,
+                            &mut c,
+                            &mut tag,
+                        )?;
+                    }
+                    // PERMIT loopback ∩ every port outside the floor
+                    // (no user condition).
+                    FilterShape::PermitLoopbackOpen => {
+                        let mut ports: Vec<FWP_RANGE0> = open_loopback_port_ranges()
+                            .into_iter()
+                            .map(|(lo, hi)| FWP_RANGE0 {
+                                valueLow: fwp_uint16(lo),
+                                valueHigh: fwp_uint16(hi),
+                            })
+                            .collect();
                         let mut c =
                             loopback_permit_conditions(v4, &mut v4_loop, &mut v6_loop, &mut ports);
                         add_filter(
@@ -1001,9 +1063,9 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
 
 /// Status of the WFP fence under `sublayer` — see
 /// [`classify_fence`] for `absent` / `installed` / `outdated`.
-/// `port_range` is read from the first `permit-loopback-user` tag,
-/// `loopback_port_range` from the first `permit-loopback-range` tag
-/// (`null` when the set carries none).
+/// `port_range` is read from the first `permit-loopback-user` tag;
+/// `allow_loopback` is whether the set carries a `permit-loopback-open`
+/// filter.
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -1016,10 +1078,14 @@ pub struct WfpStatus {
     pub filters: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
-    /// The configured loopback port range the installed set opens, or
-    /// `null` for none. Read off the filters by an elevated caller;
-    /// a non-elevated one (`cannot-read`) gets the install record's.
-    pub loopback_port_range: Option<[u16; 2]>,
+    /// Whether the installed set opens loopback. Read off the filters
+    /// by an elevated caller; a non-elevated one (`cannot-read`) gets
+    /// the install record's.
+    pub allow_loopback: bool,
+    /// [`open_loopback_notice`], present exactly when `allow_loopback`
+    /// is true once the install record has been folded in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loopback_notice: Option<String>,
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
@@ -1040,7 +1106,7 @@ pub fn outdated_hint(have: Option<u32>) -> String {
     }
     // What the installed revision is missing.
     let gained = match have {
-        Some(r) if r >= 2 => "which records the loopback port range the filters open",
+        Some(r) if r >= 2 => "which records whether the filters open loopback",
         _ => "which also blocks connects made while impersonating the anonymous token",
     };
     let have = match have {
@@ -1054,46 +1120,52 @@ pub fn outdated_hint(have: Option<u32>) -> String {
     )
 }
 
-/// `LOW-HIGH`, or `none`.
-pub fn fmt_loopback_range(r: Option<(u16, u16)>) -> String {
-    match r {
-        Some((lo, hi)) => format!("{lo}-{hi}"),
-        None => "none".to_string(),
-    }
+/// `open` or `closed`.
+pub fn fmt_loopback(open: bool) -> &'static str {
+    if open { "open" } else { "closed" }
 }
 
-/// What to tell the operator when the loopback port range the session
-/// is configured with is not the one the installed filter set opens.
-/// One wording for `wfp status`, `wfp verify` and `exec`. Names the
-/// install command that makes the machine match the session.
-pub fn loopback_range_hint(
-    installed: Option<(u16, u16)>,
-    configured: Option<(u16, u16)>,
-) -> String {
-    let flag = match configured {
-        Some((lo, hi)) => format!(" --loopback-port-range {lo}-{hi}"),
-        None => String::new(),
-    };
+/// What to say wherever loopback is found open, so that "egress
+/// blocked" is not read as the whole story.
+pub fn open_loopback_notice() -> String {
+    let floor: Vec<String> = LOOPBACK_FLOOR_PORTS
+        .iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    format!(
+        "loopback is open: the sandbox account can connect to every TCP \
+         and UDP port on 127.0.0.0/8 and ::1 except {}. Every service \
+         listening on localhost is reachable from sandboxed commands, \
+         and any local forwarder (a DNS stub, a SOCKS or HTTP proxy, a \
+         VPN agent) reachable there gives them a way off the machine; \
+         the egress block covers direct connections only",
+        floor.join(", "),
+    )
+}
+
+/// What to tell the operator when the session's loopback mode is not
+/// the one the installed filter set has, in either direction. One
+/// wording for `wfp verify` and `exec`. Names the install command that
+/// makes the machine match the session.
+pub fn loopback_mismatch_hint(installed: bool, configured: bool) -> String {
+    let flag = if configured { " --allow-loopback" } else { "" };
     format!(
         "the network fence on this machine does not match this \
-         session's loopback port range (installed: {}; configured: \
-         {}) — re-run `srt-win install{flag} --force` (one UAC prompt)",
-        fmt_loopback_range(installed),
-        fmt_loopback_range(configured),
+         session's loopback mode (installed: {}; configured: {}) — \
+         re-run `srt-win install{flag} --force` (one UAC prompt)",
+        fmt_loopback(installed),
+        fmt_loopback(configured),
     )
 }
 
 /// What to tell the operator when the install record and the session
-/// agree on a loopback port range but a connect to a listener inside
-/// it was blocked: the filters in place are not the ones recorded.
-pub fn loopback_range_closed_hint(configured: (u16, u16)) -> String {
-    format!(
-        "the network fence on this machine does not open the \
-         configured loopback port range {}-{} (a connect to a loopback \
-         listener inside it was blocked) — re-run `srt-win install \
-         --loopback-port-range {}-{} --force` (one UAC prompt)",
-        configured.0, configured.1, configured.0, configured.1,
-    )
+/// agree that loopback is open but a connect to a loopback listener
+/// was blocked: the filters in place are not the ones recorded.
+pub fn loopback_closed_hint() -> String {
+    "the network fence on this machine does not open loopback (a \
+     connect to a loopback listener was blocked) — re-run `srt-win \
+     install --allow-loopback --force` (one UAC prompt)"
+        .to_string()
 }
 
 /// Classify an enumerated filter set, given `(layer, tag)` for every
@@ -1104,9 +1176,8 @@ pub fn loopback_range_closed_hint(configured: (u16, u16)) -> String {
 ///     at [`FENCE_REVISION`] on BOTH ALE connect layers.
 ///   - `outdated` — anything in between: a set written by an earlier
 ///     build (no `rev`, no anonymous BLOCK), or one missing a layer.
-///     Also a set whose loopback-range PERMITs do not form one range:
-///     present on one layer only, written at another revision, or
-///     disagreeing about the ports.
+///     Also a set whose open-loopback PERMITs are not whole: present
+///     on one layer only, or written at another revision.
 ///
 /// Extra filters are ignored, so enterprise tooling that adds its own
 /// under the same sublayer does not break detection.
@@ -1120,56 +1191,46 @@ pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
                 .any(|(l, t)| l == layer && t.kind == *kind && t.rev == Some(FENCE_REVISION))
         })
     });
-    let ranges: Vec<&(&str, FilterTag)> = tags
+    let open: Vec<&(&str, FilterTag)> = tags
         .iter()
-        .filter(|(_, t)| t.kind == KIND_PERMIT_RANGE)
+        .filter(|(_, t)| t.kind == KIND_PERMIT_OPEN)
         .collect();
-    let range_whole = ranges.is_empty()
-        || (ranges[0].1.port_range.is_some()
-            && ranges.iter().all(|(_, t)| {
-                t.rev == Some(FENCE_REVISION) && t.port_range == ranges[0].1.port_range
-            })
+    let open_whole = open.is_empty()
+        || (open.iter().all(|(_, t)| t.rev == Some(FENCE_REVISION))
             && ALE_LAYERS
                 .iter()
-                .all(|(_, layer)| ranges.iter().any(|(l, _)| l == layer)));
-    if current && range_whole {
+                .all(|(_, layer)| open.iter().any(|(l, _)| l == layer)));
+    if current && open_whole {
         "installed"
     } else {
         "outdated"
     }
 }
 
-/// Fold the install record's loopback port range into an enumerated
+/// Fold the install record's loopback mode into an enumerated
 /// status. `recorded` is `None` when the machine has no install
-/// record, `Some(range)` when it has one.
+/// record.
 ///
 /// A non-elevated caller (`cannot-read`) has only the record, so it
-/// reports the record's range. An elevated caller that enumerated an
-/// `installed` set whose range differs from the record's reports
+/// reports the record's mode. An elevated caller that enumerated an
+/// `installed` set whose mode differs from the record's reports
 /// `outdated`: the non-elevated broker would otherwise hold sessions
-/// to a range the filters do not have.
-pub fn apply_recorded_loopback_range(
-    mut st: WfpStatus,
-    recorded: Option<Option<(u16, u16)>>,
-) -> WfpStatus {
-    let Some(recorded) = recorded else {
-        return st;
-    };
-    let as_tag = recorded.map(|(lo, hi)| [lo, hi]);
-    match st.state {
-        "cannot-read" => st.loopback_port_range = as_tag,
-        "installed" if st.loopback_port_range != as_tag => {
+/// to a mode the filters do not have.
+pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> WfpStatus {
+    match (st.state, recorded) {
+        ("cannot-read", Some(open)) => st.allow_loopback = open,
+        ("installed", Some(open)) if st.allow_loopback != open => {
             st.state = "outdated";
             st.hint = Some(format!(
-                "the filters open loopback port range {} but the \
-                 install record says {} — re-run `srt-win install` \
-                 (one UAC prompt)",
-                fmt_loopback_range(st.loopback_port_range.map(|[lo, hi]| (lo, hi))),
-                fmt_loopback_range(recorded),
+                "the filters have loopback {} but the install record \
+                 says {} — re-run `srt-win install` (one UAC prompt)",
+                fmt_loopback(st.allow_loopback),
+                fmt_loopback(open),
             ));
         }
         _ => {}
     }
+    st.loopback_notice = st.allow_loopback.then(open_loopback_notice);
     st
 }
 
@@ -1217,7 +1278,6 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
     };
     let mut tags: Vec<(&'static str, FilterTag)> = Vec::new();
     let mut port_range: Option<[u16; 2]> = None;
-    let mut loopback_port_range: Option<[u16; 2]> = None;
     let mut user_sid: Option<String> = None;
     let enum_result = for_each_tagged_filter(&engine, sublayer, |layer, _, tag| {
         if user_sid.is_none() {
@@ -1225,9 +1285,6 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         if tag.kind == KIND_PERMIT_PROXY {
             port_range = tag.port_range;
-        }
-        if tag.kind == KIND_PERMIT_RANGE && loopback_port_range.is_none() {
-            loopback_port_range = tag.port_range;
         }
         tags.push((layer, tag.clone()));
     });
@@ -1242,7 +1299,8 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         state,
         filters: tags.len(),
         port_range,
-        loopback_port_range,
+        allow_loopback: tags.iter().any(|(_, t)| t.kind == KIND_PERMIT_OPEN),
+        loopback_notice: None,
         user_sid,
         hint: (state == "outdated").then(|| {
             // The oldest revision present is the one worth naming.
@@ -1256,7 +1314,8 @@ fn cannot_read(e: anyhow::Error) -> WfpStatus {
         state: "cannot-read",
         filters: 0,
         port_range: None,
-        loopback_port_range: None,
+        allow_loopback: false,
+        loopback_notice: None,
         user_sid: None,
         hint: Some(format!(
             "{e}; elevation required for filter enum — run `srt-win \
@@ -1269,7 +1328,17 @@ fn cannot_read(e: anyhow::Error) -> WfpStatus {
 /// inclusive. Validates `low <= high` and width `<=
 /// MAX_PROXY_PORT_RANGE_WIDTH`.
 pub fn parse_port_range(s: &str) -> Result<(u16, u16)> {
-    let (lo, hi) = parse_low_high(s)?;
+    let (lo_s, hi_s) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow!("expected LOW-HIGH (e.g. 60080-60089)"))?;
+    let lo: u16 = lo_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid low port '{lo_s}'"))?;
+    let hi: u16 = hi_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid high port '{hi_s}'"))?;
     if lo == 0 {
         // Port 0 is "any" at bind time and never appears as a
         // remote port, so it's a dead slot in the range.
@@ -1285,73 +1354,6 @@ pub fn parse_port_range(s: &str) -> Result<(u16, u16)> {
             MAX_PROXY_PORT_RANGE_WIDTH + 1
         ));
     }
-    Ok((lo, hi))
-}
-
-/// Check a configured loopback port range (both ends inclusive):
-///
-///   - `low <= high`;
-///   - at most [`MAX_LOOPBACK_PORT_RANGE_PORTS`] ports;
-///   - `low >=` [`MIN_LOOPBACK_PORT`];
-///   - no port in common with `proxy_range` (the proxy PERMIT already
-///     covers those, and the fence probe relies on telling the two
-///     apart) — skipped when the caller does not know the proxy range;
-///   - no port of [`SENSITIVE_LOOPBACK_PORTS`].
-pub fn validate_loopback_port_range(
-    (lo, hi): (u16, u16),
-    proxy_range: Option<(u16, u16)>,
-) -> Result<()> {
-    if lo > hi {
-        return Err(anyhow!("low ({lo}) > high ({hi})"));
-    }
-    let ports = u32::from(hi - lo) + 1;
-    if ports > MAX_LOOPBACK_PORT_RANGE_PORTS {
-        return Err(anyhow!(
-            "range too wide ({ports} ports); at most {MAX_LOOPBACK_PORT_RANGE_PORTS}"
-        ));
-    }
-    if lo < MIN_LOOPBACK_PORT {
-        return Err(anyhow!("low port must be >= {MIN_LOOPBACK_PORT}"));
-    }
-    if let Some((plo, phi)) = proxy_range
-        && lo <= phi
-        && plo <= hi
-    {
-        return Err(anyhow!("range overlaps the proxy port range {plo}-{phi}"));
-    }
-    if let Some((port, what)) = SENSITIVE_LOOPBACK_PORTS
-        .iter()
-        .find(|(p, _)| (lo..=hi).contains(p))
-    {
-        return Err(anyhow!(
-            "range includes port {port} ({what}), which must not be \
-             reachable from the sandbox"
-        ));
-    }
-    Ok(())
-}
-
-/// Parse and validate a `--loopback-port-range LOW-HIGH` argument —
-/// see [`validate_loopback_port_range`].
-pub fn parse_loopback_port_range(s: &str, proxy_range: Option<(u16, u16)>) -> Result<(u16, u16)> {
-    let range = parse_low_high(s)?;
-    validate_loopback_port_range(range, proxy_range)?;
-    Ok(range)
-}
-
-/// Split `LOW-HIGH` into two ports. No range rules.
-fn parse_low_high(s: &str) -> Result<(u16, u16)> {
-    let (lo_s, hi_s) = s
-        .split_once('-')
-        .ok_or_else(|| anyhow!("expected LOW-HIGH (e.g. 60080-60089)"))?;
-    let lo: u16 = lo_s
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("invalid low port '{lo_s}'"))?;
-    let hi: u16 = hi_s
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("invalid high port '{hi_s}'"))?;
     Ok((lo, hi))
 }
 
@@ -1478,25 +1480,18 @@ mod tests {
 
     const ALL_KINDS: [&str; 3] = ["permit-loopback-user", "block-user", "block-anonymous"];
 
-    fn range_tag(range: [u16; 2], rev: Option<u32>) -> FilterTag {
-        FilterTag {
-            port_range: Some(range),
-            ..tag(KIND_PERMIT_RANGE, rev)
-        }
-    }
-
-    /// A current set plus a loopback-range PERMIT on both layers.
-    fn set_with_range(range: [u16; 2]) -> Vec<(&'static str, FilterTag)> {
+    /// A current set plus the open-loopback PERMIT on both layers.
+    fn set_with_open_loopback() -> Vec<(&'static str, FilterTag)> {
         let mut set = full_set(Some(FENCE_REVISION), &ALL_KINDS);
         for (_, layer) in ALE_LAYERS {
-            set.push((layer, range_tag(range, Some(FENCE_REVISION))));
+            set.push((layer, tag(KIND_PERMIT_OPEN, Some(FENCE_REVISION))));
         }
         set
     }
 
     #[test]
-    fn filter_list_without_a_range_is_the_three_filter_set() {
-        let specs = filter_specs((60080, 60089), None);
+    fn filter_list_with_loopback_closed_is_the_three_filter_set() {
+        let specs = filter_specs((60080, 60089), false);
         assert_eq!(
             specs.iter().map(|s| s.kind).collect::<Vec<_>>(),
             ["permit-loopback-user", "block-user", "block-anonymous"]
@@ -1506,78 +1501,135 @@ mod tests {
         assert_eq!(specs[1].shape, FilterShape::BlockUser);
         assert_eq!(specs[2].shape, FilterShape::BlockAnonymous);
         assert_eq!(specs[1].port_range(), None);
-        assert_eq!(filter_count(None), 6);
+        assert_eq!(filter_count(false), 6);
     }
 
     #[test]
-    fn filter_list_with_a_range_adds_exactly_one_permit() {
-        let without = filter_specs((60080, 60089), None);
-        let with = filter_specs((60080, 60089), Some((3000, 3099)));
+    fn filter_list_with_loopback_open_adds_exactly_one_permit() {
+        let closed = filter_specs((60080, 60089), false);
+        let open = filter_specs((60080, 60089), true);
         assert_eq!(
-            with.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            open.iter().map(|s| s.kind).collect::<Vec<_>>(),
             [
                 "permit-loopback-user",
-                "permit-loopback-range",
+                "permit-loopback-open",
                 "block-user",
                 "block-anonymous"
             ]
         );
-        assert_eq!(filter_count(Some((3000, 3099))), 8);
-        // The added filter is a loopback PERMIT over the configured
-        // ports, at the weight of the proxy PERMIT: above the BLOCKs.
-        let added = with[1];
-        assert_eq!(added.shape, FilterShape::PermitLoopback((3000, 3099)));
+        assert_eq!(filter_count(true), 8);
+        // The added filter is a loopback PERMIT at the weight of the
+        // proxy PERMIT: above the BLOCKs.
+        let added = open[1];
+        assert_eq!(added.shape, FilterShape::PermitLoopbackOpen);
         assert_eq!(added.weight, W_LOOPBACK);
         assert!(added.weight > W_BLOCK);
-        // Everything else is the set without a range, unchanged.
-        let rest: Vec<FilterSpec> = with
+        // Everything else is the closed set, unchanged — the proxy
+        // PERMIT included.
+        let rest: Vec<FilterSpec> = open
             .iter()
             .copied()
-            .filter(|s| s.kind != KIND_PERMIT_RANGE)
+            .filter(|s| s.kind != KIND_PERMIT_OPEN)
             .collect();
-        assert_eq!(rest, without);
-        // Only PERMITs carry ports, and only loopback PERMITs exist.
-        for s in &with {
+        assert_eq!(rest, closed);
+        // The only PERMITs are the two loopback ones.
+        for s in &open {
             assert_eq!(
-                s.port_range().is_some(),
-                matches!(s.shape, FilterShape::PermitLoopback(_))
+                s.weight == W_LOOPBACK,
+                matches!(
+                    s.shape,
+                    FilterShape::PermitLoopback(_) | FilterShape::PermitLoopbackOpen
+                )
+            );
+        }
+    }
+
+    /// Whether `ranges` is ascending, without overlap, and covers
+    /// exactly the ports from 1 to 65535 that are not in `floor`.
+    fn is_complement(ranges: &[(u16, u16)], floor: &[u16]) -> bool {
+        let ordered =
+            ranges.iter().all(|(lo, hi)| lo <= hi) && ranges.windows(2).all(|w| w[0].1 < w[1].0);
+        let covered = |p: u16| {
+            ranges
+                .iter()
+                .filter(|(lo, hi)| (*lo..=*hi).contains(&p))
+                .count()
+        };
+        ordered
+            && covered(0) == 0
+            && (1..=u16::MAX).all(|p| covered(p) == usize::from(!floor.contains(&p)))
+    }
+
+    #[test]
+    fn open_loopback_ports_are_everything_but_the_floor() {
+        let floor = LOOPBACK_FLOOR_PORTS.map(|(p, _)| p);
+        assert!(floor.windows(2).all(|w| w[0] < w[1]), "floor not ascending");
+        let ranges = open_loopback_port_ranges();
+        assert!(is_complement(&ranges, &floor), "{ranges:?}");
+        assert_eq!(
+            ranges,
+            [
+                (1, 52),
+                (54, 1079),
+                (1081, 2374),
+                (2377, 3388),
+                (3390, 5984),
+                (5987, 9221),
+                (9223, 9228),
+                (9230, 47000),
+                (47002, 65535),
+            ]
+        );
+        for required in [53, 1080, 2375, 2376, 3389, 5985, 5986, 9222, 9229, 47001] {
+            assert!(is_loopback_floor_port(required), "{required}");
+        }
+        assert!(!is_loopback_floor_port(8080));
+        // The proxy ports are not on the floor: their own PERMIT is
+        // what opens them, with loopback open or closed.
+        let (lo, hi) = DEFAULT_PROXY_PORT_RANGE;
+        assert!((lo..=hi).all(|p| !is_loopback_floor_port(p)));
+    }
+
+    #[test]
+    fn port_ranges_outside_handles_the_edges() {
+        assert_eq!(port_ranges_outside(&[]), [(1, 65535)]);
+        // The first and last ports, alone and adjacent to another.
+        assert_eq!(port_ranges_outside(&[1]), [(2, 65535)]);
+        assert_eq!(port_ranges_outside(&[65535]), [(1, 65534)]);
+        assert_eq!(port_ranges_outside(&[1, 2, 65534, 65535]), [(3, 65533)]);
+        // Port 0 is never in a range, listed or not.
+        assert_eq!(port_ranges_outside(&[0]), [(1, 65535)]);
+        // A repeated port changes nothing.
+        assert_eq!(port_ranges_outside(&[80, 80]), [(1, 79), (81, 65535)]);
+        for floor in [
+            &[1u16, 3, 5][..],
+            &[2, 3, 4],
+            &[65533, 65535],
+            &[0, 1, 65535],
+        ] {
+            assert!(
+                is_complement(&port_ranges_outside(floor), floor),
+                "{floor:?}"
             );
         }
     }
 
     #[test]
-    fn classify_fence_with_a_loopback_range() {
-        assert_eq!(classify_fence(&set_with_range([3000, 3099])), "installed");
+    fn classify_fence_with_loopback_open() {
+        assert_eq!(classify_fence(&set_with_open_loopback()), "installed");
         // On one layer only.
-        let mut half = set_with_range([3000, 3099]);
+        let mut half = set_with_open_loopback();
         let v6 = ALE_LAYERS[1].1;
-        half.retain(|(l, t)| !(*l == v6 && t.kind == KIND_PERMIT_RANGE));
+        half.retain(|(l, t)| !(*l == v6 && t.kind == KIND_PERMIT_OPEN));
         assert_eq!(classify_fence(&half), "outdated");
-        // The two layers disagree about the ports.
-        let mut split = full_set(Some(FENCE_REVISION), &ALL_KINDS);
-        split.push((
-            ALE_LAYERS[0].1,
-            range_tag([3000, 3099], Some(FENCE_REVISION)),
-        ));
-        split.push((
-            ALE_LAYERS[1].1,
-            range_tag([3000, 3100], Some(FENCE_REVISION)),
-        ));
-        assert_eq!(classify_fence(&split), "outdated");
         // Written at another revision.
         let mut old = full_set(Some(FENCE_REVISION), &ALL_KINDS);
         for (_, layer) in ALE_LAYERS {
-            old.push((layer, range_tag([3000, 3099], Some(FENCE_REVISION - 1))));
+            old.push((layer, tag(KIND_PERMIT_OPEN, Some(FENCE_REVISION - 1))));
         }
         assert_eq!(classify_fence(&old), "outdated");
-        // A range PERMIT without its ports recorded.
-        let mut bare = full_set(Some(FENCE_REVISION), &ALL_KINDS);
-        for (_, layer) in ALE_LAYERS {
-            bare.push((layer, tag(KIND_PERMIT_RANGE, Some(FENCE_REVISION))));
-        }
-        assert_eq!(classify_fence(&bare), "outdated");
         // PERMITs alone fence nothing.
-        let only: Vec<_> = set_with_range([3000, 3099])
+        let only: Vec<_> = set_with_open_loopback()
             .into_iter()
             .filter(|(_, t)| t.kind.starts_with("permit"))
             .collect();
@@ -1585,52 +1637,66 @@ mod tests {
     }
 
     #[test]
-    fn recorded_loopback_range_is_reported_and_compared() {
-        let with = |state, range| WfpStatus {
-            loopback_port_range: range,
+    fn recorded_loopback_mode_is_reported_and_compared() {
+        let with = |state, open| WfpStatus {
+            allow_loopback: open,
             ..status(state)
         };
-        // Non-elevated: the record's range is what gets reported.
-        let st = apply_recorded_loopback_range(with("cannot-read", None), Some(Some((3000, 3099))));
-        assert_eq!(st.state, "cannot-read");
-        assert_eq!(st.loopback_port_range, Some([3000, 3099]));
-        // Elevated, filters and record agree.
-        for (tags, rec) in [(None, None), (Some([3000, 3099]), Some((3000, 3099)))] {
-            let st = apply_recorded_loopback_range(with("installed", tags), Some(rec));
-            assert_eq!(st.state, "installed");
-            assert_eq!(st.loopback_port_range, tags);
+        // Non-elevated: the record's mode is what gets reported.
+        for open in [false, true] {
+            let st = apply_recorded_loopback(with("cannot-read", false), Some(open));
+            assert_eq!(st.state, "cannot-read");
+            assert_eq!(st.allow_loopback, open);
+            assert_eq!(st.loopback_notice.is_some(), open);
         }
-        // Elevated, they disagree — either way round, or on the ports.
-        for (tags, rec) in [
-            (Some([3000, 3099]), None),
-            (None, Some((3000, 3099))),
-            (Some([3000, 3099]), Some((3000, 3098))),
-        ] {
-            let st = apply_recorded_loopback_range(with("installed", tags), Some(rec));
-            assert_eq!(st.state, "outdated", "{tags:?} vs {rec:?}");
+        // Elevated, filters and record agree.
+        for open in [false, true] {
+            let st = apply_recorded_loopback(with("installed", open), Some(open));
+            assert_eq!(st.state, "installed");
+            assert_eq!(st.allow_loopback, open);
+            assert_eq!(st.loopback_notice.is_some(), open);
+        }
+        // Elevated, they disagree — either way round.
+        for open in [false, true] {
+            let st = apply_recorded_loopback(with("installed", open), Some(!open));
+            assert_eq!(st.state, "outdated", "filters {open}, record {}", !open);
             assert!(st.hint.unwrap().contains("srt-win install"));
+            assert_eq!(st.allow_loopback, open);
         }
         // No install record, or nothing installed: left alone.
-        let st = apply_recorded_loopback_range(with("installed", Some([3000, 3099])), None);
+        let st = apply_recorded_loopback(with("installed", true), None);
         assert_eq!(st.state, "installed");
+        assert!(st.loopback_notice.is_some());
         for s in ["absent", "outdated"] {
-            let st = apply_recorded_loopback_range(with(s, None), Some(Some((3000, 3099))));
+            let st = apply_recorded_loopback(with(s, false), Some(true));
             assert_eq!(st.state, s);
-            assert_eq!(st.loopback_port_range, None);
+            assert!(!st.allow_loopback && st.loopback_notice.is_none());
         }
     }
 
     #[test]
-    fn loopback_range_hints_name_the_install_command() {
-        let h = loopback_range_hint(None, Some((3000, 3099)));
-        assert!(h.contains("installed: none"));
-        assert!(h.contains("configured: 3000-3099"));
-        assert!(h.contains("srt-win install --loopback-port-range 3000-3099 --force"));
-        let h = loopback_range_hint(Some((3000, 3099)), None);
-        assert!(h.contains("installed: 3000-3099"));
-        assert!(h.contains("configured: none"));
+    fn loopback_hints_name_the_install_command() {
+        let h = loopback_mismatch_hint(false, true);
+        assert!(h.contains("installed: closed"));
+        assert!(h.contains("configured: open"));
+        assert!(h.contains("srt-win install --allow-loopback --force"));
+        let h = loopback_mismatch_hint(true, false);
+        assert!(h.contains("installed: open"));
+        assert!(h.contains("configured: closed"));
         assert!(h.contains("srt-win install --force"));
-        assert!(loopback_range_closed_hint((3000, 3099)).contains("srt-win install"));
+        assert!(loopback_closed_hint().contains("srt-win install --allow-loopback"));
+    }
+
+    /// The notice says loopback is open, names every floor port, and
+    /// says that a local forwarder is a way off the machine.
+    #[test]
+    fn open_loopback_notice_is_plain() {
+        let n = open_loopback_notice();
+        assert!(n.starts_with("loopback is open"));
+        for (port, _) in LOOPBACK_FLOOR_PORTS {
+            assert!(n.contains(&port.to_string()), "{port}");
+        }
+        assert!(n.contains("forwarder") && n.contains("off the machine"));
     }
 
     #[test]
@@ -1638,93 +1704,8 @@ mod tests {
         assert!(outdated_hint(None).contains("anonymous"));
         assert!(outdated_hint(Some(1)).contains("anonymous"));
         let h = outdated_hint(Some(2));
-        assert!(h.contains("revision 2") && h.contains("loopback port range"));
+        assert!(h.contains("revision 2") && h.contains("open loopback"));
         assert!(!h.contains("anonymous"));
-    }
-
-    const PROXY: Option<(u16, u16)> = Some(DEFAULT_PROXY_PORT_RANGE);
-
-    #[test]
-    fn loopback_port_range_ok() {
-        assert_eq!(
-            parse_loopback_port_range("3000-3099", PROXY).unwrap(),
-            (3000, 3099)
-        );
-        // One port; the lowest allowed start; exactly the cap.
-        assert_eq!(
-            parse_loopback_port_range("8080-8080", PROXY).unwrap(),
-            (8080, 8080)
-        );
-        assert_eq!(
-            parse_loopback_port_range("1024-1535", PROXY).unwrap(),
-            (1024, 1535)
-        );
-        // Adjacent to the proxy range on either side, not inside it.
-        assert!(validate_loopback_port_range((60000, 60079), PROXY).is_ok());
-        assert!(validate_loopback_port_range((60090, 60100), PROXY).is_ok());
-        // Adjacent to a sensitive port on either side.
-        assert!(validate_loopback_port_range((3390, 3400), PROXY).is_ok());
-        assert!(validate_loopback_port_range((9223, 9228), PROXY).is_ok());
-        // Top of the port space.
-        assert!(validate_loopback_port_range((65024, 65535), PROXY).is_ok());
-    }
-
-    #[test]
-    fn loopback_port_range_rejects() {
-        let err = |s: &str| {
-            parse_loopback_port_range(s, PROXY)
-                .expect_err(s)
-                .to_string()
-        };
-        assert!(err("3099-3000").contains("low"));
-        assert!(err("3000-3512").contains("too wide")); // 513 ports
-        assert!(err("1023-1100").contains(">= 1024"));
-        assert!(err("0-10").contains(">= 1024"));
-        assert!(err("3000").contains("LOW-HIGH"));
-        assert!(err("a-b").contains("invalid"));
-        assert!(err("3000-65536").contains("invalid"));
-        // Any port shared with the proxy range, at either end or inside.
-        for s in ["60000-60080", "60089-60100", "60082-60085", "60000-60200"] {
-            assert!(err(s).contains("proxy port range"), "{s}");
-        }
-        // The overlap is against the proxy range in use, not the default.
-        assert!(validate_loopback_port_range((50000, 50010), Some((50010, 50020))).is_err());
-        assert!(validate_loopback_port_range((60080, 60089), Some((50010, 50020))).is_ok());
-        // With no proxy range to compare against, only that rule is skipped.
-        assert!(validate_loopback_port_range((60080, 60089), None).is_ok());
-        assert!(validate_loopback_port_range((3380, 3390), None).is_err());
-    }
-
-    #[test]
-    fn loopback_port_range_rejects_every_sensitive_port() {
-        for (port, what) in SENSITIVE_LOOPBACK_PORTS {
-            // Alone, at the low end, at the high end, in the middle.
-            for (lo, hi) in [
-                (port, port),
-                (port, port + 10),
-                (port - 10, port),
-                (port - 5, port + 5),
-            ] {
-                let e = validate_loopback_port_range((lo, hi), None)
-                    .expect_err("sensitive port accepted")
-                    .to_string();
-                assert!(e.contains("must not be reachable"), "{e}");
-                // A wider range may hold a second listed port; the
-                // single-port range names this one.
-                if lo == hi {
-                    assert!(e.contains(&port.to_string()) && e.contains(what), "{e}");
-                }
-            }
-        }
-        for required in [2375, 2376, 3389, 5985, 5986, 9222, 9229] {
-            assert!(SENSITIVE_LOOPBACK_PORTS.iter().any(|(p, _)| *p == required));
-        }
-        // Every listed port is one a range could otherwise hold.
-        assert!(
-            SENSITIVE_LOOPBACK_PORTS
-                .iter()
-                .all(|(p, _)| *p >= MIN_LOOPBACK_PORT)
-        );
     }
 
     #[test]
@@ -1736,7 +1717,7 @@ mod tests {
             "absent"
         );
         let current = full_set(Some(FENCE_REVISION), &ALL_KINDS);
-        assert_eq!(current.len(), filter_count(None));
+        assert_eq!(current.len(), filter_count(false));
         assert_eq!(classify_fence(&current), "installed");
         // The set an earlier build wrote: no rev, no anonymous BLOCK.
         assert_eq!(
@@ -1761,7 +1742,8 @@ mod tests {
             state,
             filters: 0,
             port_range: None,
-            loopback_port_range: None,
+            allow_loopback: false,
+            loopback_notice: None,
             user_sid: None,
             hint: None,
         }
