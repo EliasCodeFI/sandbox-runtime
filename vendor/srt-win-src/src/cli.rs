@@ -880,11 +880,14 @@ enum WfpCmd {
     ///   - `untrusted_integrity_probe`,
     ///     `untrusted_integrity_loopback_probe` — the same at
     ///     untrusted integrity.
-    ///   - `residuals` — names of the gaps `anonymous_loopback_probe`
-    ///     and `deny_only_probe` found open (`anonymous-loopback`,
-    ///     `deny-only-user-sid`). The filters cannot close these;
+    ///   - `residuals` — names of the gaps `anonymous_probe`,
+    ///     `anonymous_loopback_probe` and `deny_only_probe` found
+    ///     open (`anonymous-egress`, `anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters do not close these;
     ///     they are reported, with a warning on stderr, and do not
-    ///     change the exit code.
+    ///     change the exit code. `anonymous-egress` is expected
+    ///     wherever the machine has an off-loopback address: no
+    ///     filter is keyed on the anonymous token.
     ///
     /// Every probe but `egress_probe` makes its connect twice: once
     /// on a socket created before the token is assumed and once on a
@@ -894,9 +897,9 @@ enum WfpCmd {
     /// carries one line per ordering, each naming it (`socket before
     /// token`, `socket after token`).
     ///
-    /// Every other probe must be blocked: `egress_probe`,
-    /// `anonymous_probe` and the four lowered-integrity ones, whose
-    /// token still carries the sandbox account's SID. Exits **0**
+    /// Every other probe must be blocked: `egress_probe` and the
+    /// four lowered-integrity ones, whose token still carries the
+    /// sandbox account's SID. Exits **0**
     /// (all of them were blocked, or skipped for want of an
     /// off-loopback address = fence active), **3** (one got past the
     /// filters = fence MISSING), **2** (one was inconclusive — `error`
@@ -1504,6 +1507,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!(
                     "srt-win: warning: wfp verify: residual '{residual}': {}",
                     match *residual {
+                        probe::RESIDUAL_ANONYMOUS_EGRESS =>
+                            "a connect to an off-loopback destination made \
+                             while impersonating the anonymous token is not \
+                             blocked: no filter is keyed on that token \
+                             (see the per-ordering lines above)",
                         probe::RESIDUAL_ANONYMOUS_LOOPBACK =>
                             "a connect to a loopback destination made while \
                              impersonating the anonymous token is not blocked \

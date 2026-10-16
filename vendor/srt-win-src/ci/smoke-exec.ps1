@@ -150,10 +150,14 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # Same run as V1. Beside the plain connect the runner tries one
 # while impersonating the anonymous token, aimed at this machine's
 # own off-loopback address (srt-win picks it; `skipped` when there is
-# none), which the anonymous BLOCK must refuse. The two remaining
-# attempts are shapes no filter covers; they must be REPORTED, and
-# what they report is recorded here, not asserted: a connect is the
-# documented residual and is named in `residuals`.
+# none), one under that token to the loopback listener, and one under
+# a deny-only copy of its own token. No filter covers these three
+# shapes; they must be REPORTED, and what they report is recorded
+# here, not asserted: a connect is the documented residual and is
+# named in `residuals`. The off-loopback anonymous connect is EXPECTED
+# to get through (`anonymous-egress`): no filter is keyed on the
+# anonymous token. None of the three changes the exit code, which V1
+# above required to be 0 on the plain connect being blocked.
 #
 # Every one of these is the worse of two connects - one on a socket
 # created before the token is assumed, one on a socket created after.
@@ -164,10 +168,8 @@ foreach ($f in 'anonymous_probe','anonymous_loopback_probe','deny_only_probe','r
 }
 if ($v.anonymous_probe -eq 'skipped') {
   Write-Host 'V1b note: anonymous attempt skipped (no off-loopback address on this runner)'
-} elseif ($v.anonymous_probe -ne 'blocked') {
-  throw "V1b: anonymous-token connect to $($v.anonymous_target) expected blocked, got '$($v.anonymous_probe)'"
 }
-foreach ($pair in @(@('anonymous_loopback_probe','anonymous-loopback'), @('deny_only_probe','deny-only-user-sid'))) {
+foreach ($pair in @(@('anonymous_probe','anonymous-egress'), @('anonymous_loopback_probe','anonymous-loopback'), @('deny_only_probe','deny-only-user-sid'))) {
   $got = $v.($pair[0])
   $open = $got -in 'connected','refused'
   if ($open -ne ($v.residuals -contains $pair[1])) {
@@ -790,6 +792,18 @@ function Probe-Orderings([string] $out, [string] $label, [string] $row) {
   return $r
 }
 
+# Print what happened to a shape in each ordering, beside what
+# `wfp verify` reported for it. Never fails: for a shape no filter
+# covers.
+function Write-OrderingsObserved([string] $out, [string] $label, [string] $row, [string] $residual, [string] $verifyField) {
+  $o = Probe-Orderings $out $label $row
+  Write-Host ("$row obs: $residual " +
+              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
+              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
+              "wfp verify $verifyField=$($verify.$verifyField) " +
+              "residuals=[$($verify.residuals -join ',')]")
+}
+
 # Assert that a shape was blocked in both orderings. A token the child
 # could not assume, or could not create a socket under, is a route
 # that does not exist from inside exec: it is reported as NOT
@@ -812,11 +826,13 @@ function Assert-BothOrderingsBlocked([string] $out, [string] $label, [string] $r
   }
 }
 
-# R5g: anonymous, off-loopback - ASSERTED in both orderings. The
-# destination is one of this runner's own addresses with a live
-# listener, so "not blocked" would be an actual connect rather than a
-# timeout. block-anonymous is what must refuse the socket-after
-# ordering.
+# R5g: anonymous, off-loopback - an OBSERVATION. The destination is
+# one of this runner's own addresses with a live listener, so "not
+# blocked" is an actual connect rather than a timeout. No filter is
+# keyed on the anonymous token, so the socket-after ordering is
+# expected to connect; this row prints what happened in each ordering
+# beside what `wfp verify` reported for the same shape. It fails only
+# if the PLAIN connect to that address gets through.
 $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ea SilentlyContinue |
   Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
   Select-Object -First 1).IPAddress
@@ -837,8 +853,7 @@ if (-not $lanIp) {
     if ($r.out -notmatch 'PLAIN=WSA:10013') {
       throw "R5g: plain connect to ${lanIp}:$lanPort expected WSA:10013 (block-user). raw: $($r.raw)"
     }
-    Assert-BothOrderingsBlocked $r.out 'ANON' 'R5g' `
-      "off-loopback connect to ${lanIp}:$lanPort while impersonating anonymous" $r.raw
+    Write-OrderingsObserved $r.out 'ANON' 'R5g' 'anonymous-egress' 'anonymous_probe'
   } finally {
     $lanLsn.Stop()
   }
@@ -865,12 +880,7 @@ try {
   # covers a loopback connect on a socket created while impersonating
   # anonymous; this row prints what happened in each ordering beside
   # what `wfp verify` reported for the same shape, and never fails.
-  $o = Probe-Orderings $r.out 'ANON' 'R5h'
-  Write-Host ("R5h obs: anonymous-loopback " +
-              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
-              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
-              "wfp verify anonymous_loopback_probe=$($verify.anonymous_loopback_probe) " +
-              "residuals=[$($verify.residuals -join ',')]")
+  Write-OrderingsObserved $r.out 'ANON' 'R5h' 'anonymous-loopback' 'anonymous_loopback_probe'
 
   # R5i: a lowered-integrity copy of the child's own token - ASSERTED
   # in both orderings. A process may lower the integrity level of a
@@ -887,12 +897,7 @@ try {
   # no filter here can name that token; this row prints what happened
   # in each ordering beside what `wfp verify` reported, and never
   # fails.
-  $o = Probe-Orderings $r.out 'DENYONLY' 'R5j'
-  Write-Host ("R5j obs: deny-only-user-sid " +
-              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
-              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
-              "wfp verify deny_only_probe=$($verify.deny_only_probe) " +
-              "residuals=[$($verify.residuals -join ',')]")
+  Write-OrderingsObserved $r.out 'DENYONLY' 'R5j' 'deny-only-user-sid' 'deny_only_probe'
 } finally {
   $tokLsn.Stop()
 }
@@ -1387,21 +1392,154 @@ try {
 
 # ── U-rows: a fence written by an earlier build ─────────────────
 # An install from a build that predates the fence revision record has
-# everything this one has EXCEPT the `FenceRevision` value (and the
-# filters that came with it). Removing the value reproduces what the
+# no `FenceRevision` value. Removing the value reproduces what the
 # non-elevated broker can see of such an install — it cannot
-# enumerate filters, so the record is what it goes by. The filters
-# themselves are left in place: nothing in this script can delete a
-# single WFP filter, so the tag-based half of `wfp status` (a set
-# missing block-anonymous) is covered by the cargo unit tests only.
+# enumerate filters, so the record is what it goes by.
+#
+# An earlier revision of the filter set also carried a BLOCK keyed on
+# the anonymous token (`block-anonymous`), which this build does not
+# install and must remove. U0b puts a filter with that revision's tag
+# and name under the sublayer, so that the reinstall in U4 and the
+# uninstall in the teardown have one to delete.
+
+# The filters under the test sublayer as the system's own dump of the
+# filtering engine lists them: how many there are, and which of them
+# name the anonymous token — by display name, or as `ANONYMOUS LOGON`
+# (`S-1-5-7`, `AN` in SDDL) in a condition's security descriptor.
+# Independent of srt-win's own enumeration. `$null` when the dump
+# could not be produced or read.
+function Get-SublayerFilterDump {
+  $file = Join-Path ([System.IO.Path]::GetTempPath()) "srt-wfp-$PID.xml"
+  try {
+    & netsh wfp show filters "file=$file" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $file)) { return $null }
+    $doc = [xml]::new()
+    $doc.Load($file)
+    $mine = @($doc.SelectNodes('//item[subLayerKey]') | Where-Object {
+      $_.subLayerKey.Trim('{}') -ieq $Sublayer
+    })
+    $anon = @($mine | Where-Object {
+      $_.OuterXml -match '(?i)block-anonymous|S-1-5-7(?![\d-])|;;;AN\)'
+    })
+    return @{ count = $mine.Count; anonymous = @($anon | ForEach-Object { $_.SelectSingleNode('displayData/name').InnerText }) }
+  } catch {
+    Write-Host "filter dump unreadable: $_"
+    return $null
+  } finally {
+    Remove-Item $file -Force -ea SilentlyContinue
+  }
+}
+
+# Assert on the dump that the sublayer holds `$want` filters naming
+# the anonymous token. The dump counts only when it lists exactly the
+# filters `wfp status` counted; otherwise the row says it was not
+# exercised and the status count stands alone.
+function Assert-AnonymousFiltersInDump([string] $row, [int] $statusCount, [int] $want) {
+  $d = Get-SublayerFilterDump
+  if ($null -eq $d -or $d.count -ne $statusCount) {
+    $saw = if ($null -eq $d) { 'no dump' } else { "$($d.count) filters" }
+    Write-Host "$row NOT EXERCISED (dump): expected $statusCount filters under the sublayer in the engine dump, saw $saw"
+    return
+  }
+  if ($d.anonymous.Count -ne $want) {
+    throw "${row}: expected $want filter(s) naming the anonymous token under the sublayer, the engine dump shows $($d.anonymous.Count): $($d.anonymous -join ', ')"
+  }
+  Write-Host "$row ok (dump): $($d.count) filters under the sublayer, $want naming the anonymous token"
+}
+
+# Add one filter under the test sublayer that carries the tag and the
+# display name the earlier revision gave its anonymous BLOCK. It is a
+# PERMIT with no conditions and no weight of its own, not persistent:
+# it changes no verdict (the BLOCK outweighs it for the sandbox
+# account, and everyone else is permitted already) and is gone at the
+# next restart whatever happens here. What matters is the tag: install
+# and uninstall find the filters to delete by it.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SrtOldFilter {
+  [StructLayout(LayoutKind.Sequential)] struct Blob { public uint size; public IntPtr data; }
+  [StructLayout(LayoutKind.Sequential)] struct Value { public uint type; public ulong value; }
+  [StructLayout(LayoutKind.Sequential)] struct FilterAction { public uint type; public Guid filterType; }
+  [StructLayout(LayoutKind.Sequential)] struct Filter {
+    public Guid filterKey;
+    public IntPtr name;
+    public IntPtr description;
+    public uint flags;
+    public IntPtr providerKey;
+    public Blob providerData;
+    public Guid layerKey;
+    public Guid subLayerKey;
+    public Value weight;
+    public uint numFilterConditions;
+    public IntPtr filterCondition;
+    public FilterAction action;
+    public ulong context0;
+    public ulong context1;
+    public IntPtr reserved;
+    public ulong filterId;
+    public Value effectiveWeight;
+  }
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineOpen0(IntPtr server, uint authn, IntPtr identity, IntPtr session, out IntPtr engine);
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterAdd0(IntPtr engine, ref Filter filter, IntPtr sd, out ulong id);
+  // Returns 0, or the failing call's name and code.
+  public static string Add(string sublayer, string name, string tag) {
+    IntPtr engine;
+    uint rc = FwpmEngineOpen0(IntPtr.Zero, 0xFFFFFFFF, IntPtr.Zero, IntPtr.Zero, out engine);
+    if (rc != 0) return "FwpmEngineOpen0:0x" + rc.ToString("x8");
+    byte[] tagBytes = Encoding.UTF8.GetBytes(tag);
+    IntPtr tagPtr = Marshal.AllocHGlobal(tagBytes.Length);
+    IntPtr namePtr = Marshal.StringToHGlobalUni(name);
+    try {
+      Marshal.Copy(tagBytes, 0, tagPtr, tagBytes.Length);
+      Filter f = new Filter();
+      f.name = namePtr;
+      f.description = namePtr;
+      f.providerData.size = (uint)tagBytes.Length;
+      f.providerData.data = tagPtr;
+      // FWPM_LAYER_ALE_AUTH_CONNECT_V4
+      f.layerKey = new Guid("c38d57d1-05a7-4c33-904f-7fbceee60e82");
+      f.subLayerKey = new Guid(sublayer);
+      f.action.type = 0x1002; // FWP_ACTION_PERMIT
+      ulong id;
+      rc = FwpmFilterAdd0(engine, ref f, IntPtr.Zero, out id);
+      return rc == 0 ? "0" : "FwpmFilterAdd0:0x" + rc.ToString("x8");
+    } finally {
+      Marshal.FreeHGlobal(tagPtr);
+      Marshal.FreeHGlobal(namePtr);
+      FwpmEngineClose0(engine);
+    }
+  }
+}
+'@
+function Add-OldAnonymousFilter([string] $row) {
+  $tag = '{"tool":"srt-win","kind":"block-anonymous","user_sid":"' + $sbSid + '","rev":2}'
+  $rc = [SrtOldFilter]::Add($Sublayer, 'srt-win-v4-block-anonymous', $tag)
+  if ($rc -ne '0') { throw "${row}: could not add the earlier revision's filter under the sublayer: $rc" }
+}
+
 $regBase = 'HKLM:\SOFTWARE\sandbox-runtime'
 $rev = (Get-ItemProperty $regBase -ea Stop).FenceRevision
 if (-not $rev) { throw "U0: install did not record FenceRevision under $regBase" }
 $st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
-if ($st0.state -ne 'installed' -or $st0.filters -lt 6) {
-  throw "U0: fresh install expected installed/>=6 filters, got $($st0.state)/$($st0.filters)"
+# Exactly 4: `filters` counts every srt-win filter under the sublayer,
+# so a fifth would be one this build must not install.
+if ($st0.state -ne 'installed' -or $st0.filters -ne 4) {
+  throw "U0: fresh install expected installed/4 filters, got $($st0.state)/$($st0.filters)"
 }
-Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters"
+Assert-AnonymousFiltersInDump 'U0' $st0.filters 0
+Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters, none for the anonymous token"
+
+# U0b: the earlier revision's anonymous filter, under the sublayer.
+Add-OldAnonymousFilter 'U0b'
+$st0b = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($st0b.filters -ne $st0.filters + 1) {
+  throw "U0b: expected $($st0.filters + 1) filters with the earlier revision's filter added, got $($st0b.filters)"
+}
+Assert-AnonymousFiltersInDump 'U0b' $st0b.filters 1
+Write-Host "U0b ok: sublayer holds $($st0b.filters) filters, one tagged block-anonymous at revision 2"
 Remove-ItemProperty $regBase -Name FenceRevision -ea Stop
 
 # U1: status (both forms) reports the fence as out of date, with the repair.
@@ -1436,9 +1574,12 @@ Run @('install',
       '--sublayer-guid',$Sublayer,
       '--proxy-port-range',$PortRange)
 $u4 = J @('wfp','status','--sublayer-guid',$Sublayer)
+# Back to the fresh install's count: the reinstall deleted the earlier
+# revision's anonymous filter (U0b) along with the rest.
 if ($u4.state -ne 'installed' -or $u4.filters -ne $st0.filters) {
   throw "U4: after reinstall expected installed/$($st0.filters) filters, got $($u4.state)/$($u4.filters)"
 }
+Assert-AnonymousFiltersInDump 'U4' $u4.filters 0
 if ((Get-ItemProperty $regBase -ea Stop).FenceRevision -ne $rev) {
   throw 'U4: reinstall did not restore FenceRevision'
 }
@@ -1446,9 +1587,12 @@ $r = RExec @('--', $cmd, '/c', 'echo U4-RAN')
 if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
   throw "U4: exec after reinstall failed. exit=$($r.exit) raw: $($r.raw)"
 }
-Write-Host 'U4 ok: reinstall restores the fence; exec runs again'
+Write-Host 'U4 ok: reinstall restores the fence and removes the earlier revision''s anonymous filter; exec runs again'
 
 # ── teardown ─────────────────────────────────────────────────────
+# With the earlier revision's anonymous filter under the sublayer
+# again: uninstall must delete it too (0 filters below).
+Add-OldAnonymousFilter 'teardown'
 Run @('uninstall','--sublayer-guid',$Sublayer)
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
@@ -1457,4 +1601,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b, R11, R12, G1-G6/G3b, U0-U4)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b, R11, R12, G1-G6/G3b, U0/U0b-U4)'
