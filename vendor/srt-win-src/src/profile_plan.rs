@@ -835,9 +835,24 @@ pub enum LinkTarget {
     /// Inside the profile: the target's components beneath it (empty
     /// for the profile directory itself).
     Inside(Vec<String>),
-    /// Outside the profile, or nowhere that can be resolved (a
-    /// dangling link, a cycle), with a word about it.
+    /// Outside the profile, or not a redirection at all, with a word
+    /// about it. Nothing there is granted, so nothing follows.
     Elsewhere(String),
+    /// Where it leads could not be established: the link's data could
+    /// not be read or makes no sense, or the way there could not be
+    /// looked at. The rule it stands under may apply anywhere, so the
+    /// plan stops ([`plan_resolved`]) rather than grant around it.
+    Unreadable(String),
+}
+
+/// Why a link has no destination to follow ([`link_destination`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoDestination {
+    /// It leads off this machine's drive letters, or is not a
+    /// redirection: known not to be inside the profile.
+    Elsewhere(String),
+    /// Its data cannot be made sense of.
+    Malformed(String),
 }
 
 /// What a reparse point says about where it leads, as read from the
@@ -911,31 +926,36 @@ pub fn parse_reparse(buf: &[u8]) -> Result<LinkData, String> {
 /// anything else in the object namespace are refused, so that the
 /// caller never opens them: resolving a link must not be a way to
 /// make the grant contact a server.
-pub fn link_destination(link: &str, data: &LinkData, rest: &[String]) -> Result<String, String> {
+pub fn link_destination(
+    link: &str,
+    data: &LinkData,
+    rest: &[String],
+) -> Result<String, NoDestination> {
+    use NoDestination::{Elsewhere, Malformed};
     let drive_of = |p: &str| -> Option<(char, String)> {
         let b = p.as_bytes();
         (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
             .then(|| (b[0] as char, p[3..].to_owned()))
     };
-    let link_plain = link
-        .strip_prefix(r"\\?\")
-        .ok_or_else(|| format!("'{link}' is not a drive path"))?;
-    let (link_drive, link_tail) =
-        drive_of(link_plain).ok_or_else(|| format!("'{link}' is not a drive path"))?;
-    let absolute = |target: &str| -> Result<(char, String), String> {
+    let not_drive = || Elsewhere(format!("'{link}' is not a drive path"));
+    let link_plain = link.strip_prefix(r"\\?\").ok_or_else(not_drive)?;
+    let (link_drive, link_tail) = drive_of(link_plain).ok_or_else(not_drive)?;
+    let absolute = |target: &str| -> Result<(char, String), NoDestination> {
         let plain = target
             .strip_prefix(r"\??\")
             .or_else(|| target.strip_prefix(r"\\?\"))
             .unwrap_or(target);
         drive_of(plain).ok_or_else(|| {
-            format!("leads to '{target}', which is not on a drive of this machine; not followed")
+            Elsewhere(format!(
+                "leads to '{target}', which is not on a drive of this machine; not followed"
+            ))
         })
     };
     let (drive, tail) = match data {
         LinkData::Other(tag) => {
-            return Err(format!(
+            return Err(Elsewhere(format!(
                 "a reparse point of another kind ({tag:#x}); not followed"
-            ));
+            )));
         }
         LinkData::Junction(target) => absolute(target)?,
         LinkData::Symlink {
@@ -949,7 +969,7 @@ pub fn link_destination(link: &str, data: &LinkData, rest: &[String]) -> Result<
             if let Some(rooted) = target.strip_prefix('\\') {
                 // Relative to the root of the link's drive.
                 if rooted.starts_with('\\') {
-                    return Err(format!("leads to '{target}'; not followed"));
+                    return Err(Elsewhere(format!("leads to '{target}'; not followed")));
                 }
                 (link_drive, rooted.to_owned())
             } else {
@@ -967,9 +987,9 @@ pub fn link_destination(link: &str, data: &LinkData, rest: &[String]) -> Result<
         match c {
             "" | "." => {}
             ".." => {
-                comps
-                    .pop()
-                    .ok_or_else(|| format!("'{link}' leads above the root of its drive"))?;
+                comps.pop().ok_or_else(|| {
+                    Malformed(format!("'{link}' leads above the root of its drive"))
+                })?;
             }
             c => comps.push(c),
         }
@@ -1078,9 +1098,15 @@ pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
 /// profile, that rule carried over to the link's target (see the
 /// module doc). The returned rules are what the grant records.
 ///
+/// A target that does not exist is still a target: where the link
+/// leads is known from the link, and what is put there later must not
+/// be readable.
+///
 /// A link that leads to the profile directory itself from a place a
 /// rule covers would exclude the whole profile; that is an error, as
-/// is a chain of links longer than [`MAX_LINK_ROUNDS`].
+/// is a chain of links longer than [`MAX_LINK_ROUNDS`], and a link
+/// whose destination cannot be established at all
+/// ([`LinkTarget::Unreadable`]).
 pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, Rules), String> {
     let mut rules = rules.clone();
     for _ in 0..=MAX_LINK_ROUNDS {
@@ -1101,8 +1127,17 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
         let Found { nodes: out, hits } = found;
         let mut grew = false;
         for hit in hits {
-            let LinkTarget::Inside(target) = tree.resolve_link(&hit.rel) else {
-                continue;
+            let target = match tree.resolve_link(&hit.rel) {
+                LinkTarget::Inside(target) => target,
+                LinkTarget::Elsewhere(_) => continue,
+                LinkTarget::Unreadable(why) => {
+                    return Err(format!(
+                        "'{}' is a link that stands where an exclusion applies, and where it \
+                         leads could not be established ({why}); the profile cannot be \
+                         granted around it",
+                        hit.rel.join("\\")
+                    ));
+                }
             };
             if target.is_empty() {
                 return Err(format!(
@@ -1121,12 +1156,20 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
                 spelled.extend(from.spelled[depth..].iter().cloned());
                 let same = |r: &Rule| r.pats == pats && r.ungranted == from.ungranted;
                 if !rules.rules.iter().any(same) {
+                    // The carried-over rule is the source rule at
+                    // another place: denied or left to its owner
+                    // (`stamp`), created when missing or not
+                    // (`placeholder`), exactly as the source is. A
+                    // target that does not exist yet thus gets the
+                    // placeholder a missing directory of that name
+                    // would, and a directory with a DACL writer of
+                    // its own is not given a second one.
                     rules.rules.push(Rule {
                         pats,
                         spelled,
-                        stamp: true,
+                        stamp: from.stamp,
                         ungranted: from.ungranted,
-                        placeholder: false,
+                        placeholder: from.placeholder,
                     });
                     grew = true;
                 }
@@ -1431,6 +1474,8 @@ mod tests {
         /// Link path → where it points: a path beneath the profile
         /// (`""` for the profile itself), or `None` for outside it.
         links: BTreeMap<String, Option<String>>,
+        /// Links whose destination cannot be established.
+        broken: Vec<String>,
     }
 
     fn entry(name: &str, is_dir: bool) -> Entry {
@@ -1513,6 +1558,9 @@ mod tests {
 
     impl Tree for Mem {
         fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
+            if self.broken.contains(&rel.join("\\")) {
+                return LinkTarget::Unreadable("access denied".to_owned());
+            }
             match self.real(&rel.join("\\")) {
                 Some(real) => LinkTarget::Inside(split_path(&real)),
                 None => LinkTarget::Elsewhere("outside the profile".to_owned()),
@@ -1540,6 +1588,14 @@ mod tests {
             .iter()
             .map(|n| (n.rel.join("\\"), (n.kind, n.missing)))
             .collect()
+    }
+
+    /// The node planned for `path`.
+    fn by<'a>(nodes: &'a [Node], path: &str) -> &'a Node {
+        nodes
+            .iter()
+            .find(|n| n.rel.join("\\") == path)
+            .unwrap_or_else(|| panic!("no node for '{path}'"))
     }
 
     fn names(rel: &[String]) -> Vec<Name> {
@@ -1863,6 +1919,100 @@ mod tests {
         let mut cut = buffer(0xA000_0003, None, r"\??\C:\t", "");
         cut.truncate(cut.len() - 4);
         assert!(parse_reparse(&cut).is_err());
+    }
+
+    /// A link whose target is not there yet, and one that cannot be
+    /// read.
+    #[test]
+    fn a_missing_link_target_is_still_protected_and_an_unreadable_link_stops_the_plan() {
+        // `.ssh` → `dotfiles\.ssh`, which does not exist; `dotfiles`
+        // does. The rule lands there with the placeholder a missing
+        // `.ssh` would get, and `dotfiles` is a container, not granted
+        // whole.
+        let mut t = Mem::default();
+        t.add(r"dotfiles\README").add(r"Documents\a.txt");
+        t.link(".ssh", Some(r"dotfiles\.ssh"));
+        let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"dotfiles\.ssh"), Some(&(Kind::Denied, true)));
+        assert_eq!(k.get(r"dotfiles\README").map(|v| v.0), Some(Kind::File));
+        assert!(rules.excludes(&names(&split_path(r"dotfiles\.ssh\id_new"))));
+        // Nor does `dotfiles` itself have to exist.
+        let mut t = Mem::default();
+        t.add(r"Documents\a.txt");
+        t.link(".ssh", Some(r"dotfiles\.ssh"));
+        let nodes = plan(&mut t, &super::tests::rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get("dotfiles"), Some(&(Kind::Container, true)));
+        assert_eq!(k.get(r"dotfiles\.ssh"), Some(&(Kind::Denied, true)));
+        // A file rule carried over creates nothing, as a missing file
+        // of that name gets nothing — but is excluded when it appears.
+        let mut t = Mem::default();
+        t.add(r"dotfiles\README");
+        t.link(".config", Some(r"dotfiles\.config"));
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        assert!(!kinds(&nodes).contains_key(r"dotfiles\.config\hub"));
+        assert!(rules.excludes(&names(&split_path(r"dotfiles\.config\hub"))));
+
+        // A link where a rule points whose destination cannot be
+        // established: no plan, rather than one that grants around it.
+        let mut t = Mem::default();
+        t.add(r"dotfiles\.ssh\id").add(r"Documents\a.txt");
+        t.link(".ssh", Some(r"dotfiles\.ssh"));
+        t.broken.push(".ssh".to_owned());
+        let err = plan(&mut t, &super::tests::rules()).unwrap_err();
+        assert!(
+            err.contains(".ssh") && err.contains("could not be established"),
+            "{err}"
+        );
+        // The same link where no rule points is only skipped.
+        let mut t = Mem::default();
+        t.add(r"work\x");
+        t.link("shortcut", Some("work"));
+        t.broken.push("shortcut".to_owned());
+        assert!(plan(&mut t, &super::tests::rules()).is_ok());
+    }
+
+    /// A rule carried over to a link's target keeps the source rule's
+    /// way of being applied.
+    #[test]
+    fn a_carried_over_rule_keeps_the_flags_of_its_source() {
+        // The local application data reached through a junction: the
+        // state directory's rule (excluded, but its DACL is its
+        // owner's to write) lands on the target as the same kind of
+        // rule, not as a stamped deny.
+        let mut t = Mem::default();
+        t.add(r"data\Local\sandbox-runtime\state.db")
+            .add(r"data\Local\Microsoft\Credentials\blob")
+            .add(r"data\Local\Programs\tool.exe")
+            .add(r"AppData\Roaming\npm\x.cmd");
+        t.link(r"AppData\Local", Some(r"data\Local"));
+        let original = rules();
+        let (nodes, rules) = plan_resolved(&mut t, &original).unwrap();
+        let state = by(&nodes, r"data\Local\sandbox-runtime");
+        assert_eq!(state.kind, Kind::Denied);
+        assert!(!state.stamp, "the state directory is left to its owner");
+        let creds = by(&nodes, r"data\Local\Microsoft\Credentials");
+        assert!(creds.kind == Kind::Denied && creds.stamp);
+        // Temp, ungranted-only, stays ungranted-only there.
+        assert!(rules.ungranted(&names(&split_path(r"data\Local\Temp"))));
+        assert!(!rules.excludes(&names(&split_path(r"data\Local\Temp"))));
+        // Every carried-over rule has, in its flags, a rule it can
+        // have been carried over from.
+        assert!(rules.rules.len() > original.rules.len());
+        for d in &rules.rules[original.rules.len()..] {
+            assert!(
+                original.rules.iter().any(|r| {
+                    r.stamp == d.stamp
+                        && r.placeholder == d.placeholder
+                        && r.ungranted == d.ungranted
+                        && (0..r.pats.len()).any(|j| d.pats.ends_with(&r.pats[j..]))
+                }),
+                "{:?} has the flags of no rule it could come from",
+                d.spelled
+            );
+        }
     }
 
     #[test]
@@ -2333,6 +2483,23 @@ mod tests {
             // The rules as the plan ends up with them: the original
             // ones, and those carried over to the targets of links.
             let (nodes, rules) = plan_resolved(&mut t, &original).unwrap();
+            // A rule carried over to a link's target is applied the way
+            // a rule before it is — the built-in one it started as, or
+            // the carried-over one it was carried on from: the same
+            // stamp, placeholder and kind for the same remainder.
+            for (n, d) in rules.rules.iter().enumerate().skip(original.rules.len()) {
+                assert!(
+                    rules.rules[..n].iter().any(|r| {
+                        r.stamp == d.stamp
+                            && r.placeholder == d.placeholder
+                            && r.ungranted == d.ungranted
+                            // (the whole rule may have ended at the link)
+                            && (0..=r.pats.len()).any(|j| d.pats.ends_with(&r.pats[j..]))
+                    }),
+                    "round {round}: {:?} has the flags of no rule it could come from",
+                    d.spelled
+                );
+            }
             let by_rel: BTreeMap<String, &Node> =
                 nodes.iter().map(|n| (n.rel.join("\\"), n)).collect();
             assert_eq!(by_rel.len(), nodes.len(), "round {round}: a path twice");
