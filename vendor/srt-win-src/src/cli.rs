@@ -769,11 +769,14 @@ enum WfpCmd {
     ///     `open_off_loopback_target`: a non-loopback address of this
     ///     machine at that listener's port. `skipped` without
     ///     `--allow-loopback`.
-    ///   - `residuals` — names of the gaps `anonymous_loopback_probe`
-    ///     and `deny_only_probe` found open (`anonymous-loopback`,
-    ///     `deny-only-user-sid`). The filters cannot close these;
+    ///   - `residuals` — names of the gaps `anonymous_probe`,
+    ///     `anonymous_loopback_probe` and `deny_only_probe` found
+    ///     open (`anonymous-egress`, `anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters do not close these;
     ///     they are reported, with a warning on stderr, and do not
-    ///     change the exit code.
+    ///     change the exit code. `anonymous-egress` is expected
+    ///     wherever the machine has an off-loopback address: no
+    ///     filter is keyed on the anonymous token.
     ///
     /// Every probe but `egress_probe` and the two `open_*` ones
     /// (all three run under the runner's own token) makes its connect
@@ -785,7 +788,7 @@ enum WfpCmd {
     /// it (`socket before token`, `socket after token`).
     ///
     /// Every other probe but `open_loopback_probe` must be blocked:
-    /// `egress_probe`, `anonymous_probe`, the four lowered-integrity
+    /// `egress_probe`, the four lowered-integrity
     /// ones, whose token still carries the sandbox account's SID, and
     /// `open_off_loopback_probe`. Exits **0** (all of them were
     /// blocked, or skipped for want of an off-loopback address or
@@ -1405,6 +1408,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!(
                     "srt-win: warning: wfp verify: residual '{residual}': {}",
                     match *residual {
+                        probe::RESIDUAL_ANONYMOUS_EGRESS =>
+                            "a connect to an off-loopback destination made \
+                             while impersonating the anonymous token is not \
+                             blocked: no filter is keyed on that token \
+                             (see the per-ordering lines above)",
                         probe::RESIDUAL_ANONYMOUS_LOOPBACK =>
                             "a connect to a loopback destination made while \
                              impersonating the anonymous token is not blocked \
