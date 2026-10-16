@@ -42,9 +42,8 @@ import type {
   SrtWinConfig,
 } from '../../src/sandbox/sandbox-config.js'
 import {
+  SandboxRuntimeConfigSchema,
   WindowsConfigSchema,
-  WINDOWS_LOOPBACK_SENSITIVE_PORTS,
-  windowsLoopbackPortRangeIssue,
 } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
@@ -86,6 +85,8 @@ import {
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   VENDORED_SRT_WIN_EXE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
+  WINDOWS_LOOPBACK_FLOOR_PORTS,
   WINDOWS_LOOPBACK_NO_PROXY,
   type WindowsWfpVerifyResult,
   type WindowsAclGrantOptions,
@@ -941,43 +942,54 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
   })
 
-  it('loopbackPortRange: passed to exec before --, and absent without one', () => {
+  it('allowLoopback: passed to exec before --, and absent without it', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const { argv } = wrapCommandWithSandboxWindows({
       command: 'x',
-      loopbackPortRange: [3000, 3099],
+      allowLoopback: true,
       srtWin,
     })
-    const at = argv.indexOf('--loopback-port-range')
+    const at = argv.indexOf('--allow-loopback')
     expect(at).toBeGreaterThan(argv.indexOf('exec'))
     expect(at).toBeLessThan(argv.indexOf('--'))
-    expect(argv[at + 1]).toBe('3000-3099')
-    const without = wrapCommandWithSandboxWindows({ command: 'x', srtWin })
-    expect(without.argv).not.toContain('--loopback-port-range')
+    for (const off of [{}, { allowLoopback: false }]) {
+      const without = wrapCommandWithSandboxWindows({
+        command: 'x',
+        ...off,
+        srtWin,
+      })
+      expect(without.argv).not.toContain('--allow-loopback')
+    }
   })
 
-  it('loopbackPortRange: NO_PROXY names the loopback hosts, and only those', () => {
+  it('allowLoopback: NO_PROXY names the loopback hosts, and only those', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const { argv } = wrapCommandWithSandboxWindows({
+    const proxied = {
       command: 'curl http://127.0.0.1:3000/',
       httpProxyPort: 60080,
       socksProxyPort: 60080,
-      loopbackPortRange: [3000, 3099],
       srtWin,
-    })
-    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    // With a range the fence permits direct loopback connects inside
-    // it, so proxy-aware clients are told to make them. The
+    }
+    const envOf = (argv: string[]) =>
+      argv.filter((_, i) => argv[i - 1] === '--env')
+    const envArgs = envOf(
+      wrapCommandWithSandboxWindows({ ...proxied, allowLoopback: true }).argv,
+    )
+    // With loopback open the fence permits direct loopback connects,
+    // so proxy-aware clients are told to make them. The
     // private-network entries of the POSIX list stay out: the fence
     // still blocks those destinations.
     expect(WINDOWS_LOOPBACK_NO_PROXY).toBe('localhost,127.0.0.1,::1')
     expect(envArgs).toContain(`NO_PROXY=${WINDOWS_LOOPBACK_NO_PROXY}`)
     expect(envArgs).toContain(`no_proxy=${WINDOWS_LOOPBACK_NO_PROXY}`)
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
+    // Loopback closed: no NO_PROXY at all.
+    const closed = envOf(wrapCommandWithSandboxWindows(proxied).argv)
+    expect(closed.some(e => /^no_proxy=/i.test(e))).toBe(false)
     // No proxy, nothing to bypass.
     const bare = wrapCommandWithSandboxWindows({
       command: 'x',
-      loopbackPortRange: [3000, 3099],
+      allowLoopback: true,
       srtWin,
     })
     expect(bare.argv.some(a => /^no_proxy=/i.test(a))).toBe(false)
@@ -1108,93 +1120,54 @@ describe('WindowsConfigSchema.writeRestrictedToken (pure, all platforms)', () =>
   })
 })
 
-describe('windows.loopbackPortRange (pure, all platforms)', () => {
-  const PROXY = [60080, 60089] as const
-
-  it('WindowsConfigSchema: unset by default; the field carries its own rules', () => {
-    const none = WindowsConfigSchema.safeParse({})
-    expect(none.success && none.data.loopbackPortRange).toBeUndefined()
-    const ok = (r: unknown) =>
-      WindowsConfigSchema.safeParse({ loopbackPortRange: r }).success
-    expect(ok([3000, 3099])).toBe(true)
-    expect(ok([1024, 1535])).toBe(true) // exactly 512 ports
-    expect(ok([3099, 3000])).toBe(false) // low > high
-    expect(ok([3000, 3512])).toBe(false) // 513 ports
-    expect(ok([1023, 1100])).toBe(false) // below 1024
-    expect(ok([3380, 3390])).toBe(false) // remote desktop
-    expect(ok([3000.5, 3001])).toBe(false)
-    expect(ok([3000, 65536])).toBe(false)
-    // The overlap with the proxy range needs both fields: it is
-    // checked by SandboxRuntimeConfigSchema (config-validation.test.ts)
-    // and by the install.
-    expect(ok([60080, 60089])).toBe(true)
-  })
-
-  it('windowsLoopbackPortRangeIssue: one message per rule, undefined when acceptable', () => {
-    const issue = windowsLoopbackPortRangeIssue
-    expect(issue([3000, 3099], PROXY)).toBeUndefined()
-    expect(issue([8080, 8080], PROXY)).toBeUndefined()
-    expect(issue([3099, 3000], PROXY)).toMatch(/low \(3099\) must be ≤ high/)
-    expect(issue([3000, 3512], PROXY)).toMatch(/too wide \(513 ports\)/)
-    expect(issue([1023, 1100], PROXY)).toMatch(/≥ 1024/)
-    expect(issue([0, 10], PROXY)).toMatch(/between 1 and 65535/)
-    expect(issue([3000, 65536], PROXY)).toMatch(/between 1 and 65535/)
-    expect(issue([NaN, 3000], PROXY)).toMatch(/integers/)
-    for (const r of [
-      [60000, 60080],
-      [60089, 60100],
-      [60082, 60085],
-    ] as const) {
-      expect(issue(r, PROXY)).toBe(
-        'range overlaps the proxy port range 60080-60089',
-      )
-    }
-    expect(issue([60000, 60079], PROXY)).toBeUndefined()
-    expect(issue([60090, 60100], PROXY)).toBeUndefined()
-    // Against the proxy range given, and skipped when none is.
-    expect(issue([50000, 50010], [50010, 50020])).toMatch(/50010-50020/)
-    expect(issue([60080, 60089])).toBeUndefined()
-  })
-
-  it('windowsLoopbackPortRangeIssue: every sensitive port is refused, wherever it falls in the range', () => {
-    for (const [port, what] of WINDOWS_LOOPBACK_SENSITIVE_PORTS) {
-      expect(windowsLoopbackPortRangeIssue([port, port])).toBe(
-        `range includes port ${port} (${what}), which must not be ` +
-          `reachable from the sandbox`,
-      )
-      for (const r of [
-        [port, port + 10],
-        [port - 10, port],
-        [port - 5, port + 5],
-      ] as const) {
-        expect(windowsLoopbackPortRangeIssue(r)).toMatch(
-          /must not be reachable/,
-        )
-      }
-    }
-    const ports = WINDOWS_LOOPBACK_SENSITIVE_PORTS.map(([p]) => p)
-    for (const required of [3389, 5985, 5986, 2375, 2376, 9222, 9229]) {
-      expect(ports).toContain(required)
-    }
-  })
-
-  it('the sensitive-port list is the one srt-win enforces', () => {
-    // `SENSITIVE_LOOPBACK_PORTS` in the Rust source, parsed as text:
-    // the two lists are kept by hand and must not drift.
+describe('network.allowLocalBinding on Windows (pure, all platforms)', () => {
+  it('the ports that stay blocked are the ones srt-win leaves out of the permit', () => {
+    // `LOOPBACK_FLOOR_PORTS` in the Rust source, parsed as text: the
+    // two lists are kept by hand and must not drift.
     const rust = readFileSync(
       join(import.meta.dir, '../../vendor/srt-win-src/src/wfp.rs'),
       'utf8',
     )
-    const body =
-      /pub const SENSITIVE_LOOPBACK_PORTS[^=]*=\s*\[([\s\S]*?)\];/.exec(rust)
-    expect(body).not.toBeNull()
-    const rustList = [...body![1].matchAll(/\((\d+),\s*"([^"]*)"\)/g)].map(
-      m => [Number(m[1]), m[2]] as const,
+    const body = /pub const LOOPBACK_FLOOR_PORTS[^=]*=\s*\[([\s\S]*?)\];/.exec(
+      rust,
     )
-    expect(rustList.length).toBeGreaterThan(0)
-    expect(rustList).toEqual([...WINDOWS_LOOPBACK_SENSITIVE_PORTS])
-    expect(rust).toMatch(/MAX_LOOPBACK_PORT_RANGE_PORTS: u32 = 512;/)
-    expect(rust).toMatch(/MIN_LOOPBACK_PORT: u16 = 1024;/)
+    expect(body).not.toBeNull()
+    const rustPorts = [...body![1].matchAll(/\((\d+),\s*"[^"]*"\)/g)].map(m =>
+      Number(m[1]),
+    )
+    expect(rustPorts).toEqual([...WINDOWS_LOOPBACK_FLOOR_PORTS])
+    expect(rustPorts).toEqual([
+      53, 1080, 2375, 2376, 3389, 5985, 5986, 9222, 9229, 47001,
+    ])
+    // Ascending, which the complement ranges are computed from.
+    expect([...rustPorts].sort((a, b) => a - b)).toEqual(rustPorts)
+  })
+
+  it('the effect text says loopback is open, names every blocked port and the way off the machine', () => {
+    expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/^Loopback is open/)
+    for (const port of WINDOWS_LOOPBACK_FLOOR_PORTS) {
+      expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toContain(String(port))
+    }
+    expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/forwarder/)
+    expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/off the machine/)
+  })
+
+  it('there is no loopback port range: the schema drops the key like any unknown one', () => {
+    // WindowsConfigSchema is not strict, so the retired key is
+    // dropped like any other unknown one — it configures nothing.
+    const r = SandboxRuntimeConfigSchema.safeParse({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      windows: { loopbackPortRange: [3000, 3099] },
+    })
+    expect(r.success).toBe(true)
+    if (r.success) {
+      expect(r.data.windows).toEqual({})
+      expect(r.data.network.allowLocalBinding).toBeUndefined()
+    }
+    expect(
+      WindowsConfigSchema.safeParse({ loopbackPortRange: 'x' }).success,
+    ).toBe(true)
   })
 })
 
@@ -1654,7 +1627,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
 
   /** The values of `flag` in what one command is wrapped to. */
   const flagged = async (
-    flag: '--deny-read' | '--deny-write' | '--loopback-port-range',
+    flag: '--deny-read' | '--deny-write',
     customConfig?: Partial<SandboxRuntimeConfig>,
   ): Promise<string[]> => {
     const { argv } = await SandboxManager.wrapWithSandboxArgv(
@@ -1785,87 +1758,114 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     residuals: [],
     warnings: [],
   } as const
-  const withRange = (
-    loopbackPortRange?: [number, number],
-  ): SandboxRuntimeConfig => {
+  const withLoopback = (allowLocalBinding?: boolean): SandboxRuntimeConfig => {
     const base = configOf({})
-    return { ...base, windows: { ...base.windows, loopbackPortRange } }
+    return { ...base, network: { ...base.network, allowLocalBinding } }
+  }
+  /** Whether one command is wrapped with `--allow-loopback`. */
+  const opensLoopback = async (
+    customConfig?: Partial<SandboxRuntimeConfig>,
+  ): Promise<boolean> => {
+    const { argv } = await SandboxManager.wrapWithSandboxArgv(
+      'rem',
+      undefined,
+      customConfig,
+    )
+    return argv.slice(0, argv.indexOf('--')).includes('--allow-loopback')
   }
 
-  it('loopbackPortRange: the session range reaches the fence probe and every exec', async () => {
+  it('allowLocalBinding: the session mode reaches the fence probe and every exec', async () => {
     const verify = spyOn(winUtils, 'verifyWindowsWfpEgress')
     spies.push(verify)
     verify.mockClear()
-    await SandboxManager.initialize(withRange([3000, 3099]))
-    expect(verify.mock.calls.length).toBe(1)
-    expect(verify.mock.calls[0][0]).toMatchObject({
-      loopbackPortRange: [3000, 3099],
-    })
-    expect(await flagged('--loopback-port-range')).toEqual(['3000-3099'])
+    await SandboxManager.initialize(withLoopback(true))
+    expect(verify.mock.calls.at(-1)?.[0]).toMatchObject({ allowLoopback: true })
+    expect(await opensLoopback()).toBe(true)
   })
 
-  it('loopbackPortRange: no range configured, no flag', async () => {
-    await SandboxManager.initialize(withRange())
-    expect(await flagged('--loopback-port-range')).toEqual([])
-  })
-
-  it('loopbackPortRange: the probe runs again when the configured range changes, not otherwise', async () => {
+  it('allowLocalBinding: unset or false, the probe is told loopback is closed and there is no flag', async () => {
     const verify = spyOn(winUtils, 'verifyWindowsWfpEgress')
     spies.push(verify)
-    await SandboxManager.initialize(withRange([3100, 3199]))
+    for (const off of [undefined, false]) {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(withLoopback(off))
+      expect(await opensLoopback()).toBe(false)
+    }
+    for (const call of verify.mock.calls) {
+      expect(call[0]?.allowLoopback).toBe(false)
+    }
+  })
+
+  it('allowLocalBinding: the probe runs again when the configured mode changes, not otherwise', async () => {
+    const verify = spyOn(winUtils, 'verifyWindowsWfpEgress')
+    spies.push(verify)
+    await SandboxManager.initialize(withLoopback(true))
     verify.mockClear()
-    // Same range, ordinary token: the fence is install-scoped, one
+    // Same mode, ordinary token: the fence is install-scoped, one
     // probe covers it. The write-restricted token differs per session,
     // so every initialize() probes with it.
     const again = writeRestrictedToken === false ? 0 : 1
     await SandboxManager.reset()
-    await SandboxManager.initialize(withRange([3100, 3199]))
+    await SandboxManager.initialize(withLoopback(true))
     expect(verify.mock.calls.length).toBe(again)
-    // Another range, and then none: each is a different fence to hold
-    // the install to.
+    // The other mode, and back: each is a different fence to hold the
+    // install to.
     await SandboxManager.reset()
-    await SandboxManager.initialize(withRange([3200, 3299]))
+    await SandboxManager.initialize(withLoopback())
     expect(verify.mock.calls.length).toBe(again + 1)
+    expect(verify.mock.calls[again][0]?.allowLoopback).toBe(false)
     await SandboxManager.reset()
-    await SandboxManager.initialize(withRange())
+    await SandboxManager.initialize(withLoopback(true))
     expect(verify.mock.calls.length).toBe(again + 2)
-    expect(verify.mock.calls[again + 1][0]?.loopbackPortRange).toBeUndefined()
+    expect(verify.mock.calls[again + 1][0]?.allowLoopback).toBe(true)
   })
 
-  it('loopbackPortRange: a session whose range is not the installed one does not start', async () => {
+  it('allowLocalBinding: a session whose mode is not the installed one does not start, in either direction', async () => {
     const verify = spyOn(winUtils, 'verifyWindowsWfpEgress')
     spies.push(verify)
-    const refusal = new WindowsSandboxError(
-      'wfp_fence_outdated',
-      'WFP egress fence does not match windows.loopbackPortRange — re-run ' +
-        'the install',
-    )
-    verify.mockRejectedValue(refusal)
-    const err = await SandboxManager.initialize(withRange([3300, 3399])).catch(
-      e => e as WindowsSandboxError,
-    )
-    expect(err).toBe(refusal)
-    // Nothing was left initialized to wrap a command with.
-    expect(SandboxManager.getConfig()).toBeUndefined()
-    // The refusal is not remembered as a pass: the same range is
-    // probed again once the install has been re-run.
-    verify.mockClear()
-    verify.mockResolvedValue(VERIFY_OK as unknown as WindowsWfpVerifyResult)
-    await SandboxManager.initialize(withRange([3300, 3399]))
-    expect(verify.mock.calls.length).toBe(1)
-    expect(await flagged('--loopback-port-range')).toEqual(['3300-3399'])
+    for (const open of [true, false]) {
+      await SandboxManager.reset()
+      // Leave the other mode verified, so this one has to be probed.
+      verify.mockResolvedValue(VERIFY_OK as unknown as WindowsWfpVerifyResult)
+      await SandboxManager.initialize(withLoopback(!open))
+      await SandboxManager.reset()
+      const refusal = new WindowsSandboxError(
+        'wfp_fence_outdated',
+        'WFP egress fence does not match network.allowLocalBinding — re-run ' +
+          'the install',
+      )
+      verify.mockRejectedValue(refusal)
+      const err = await SandboxManager.initialize(withLoopback(open)).catch(
+        e => e as WindowsSandboxError,
+      )
+      expect(err).toBe(refusal)
+      // Nothing was left initialized to wrap a command with.
+      expect(SandboxManager.getConfig()).toBeUndefined()
+      // The refusal is not remembered as a pass: the same mode is
+      // probed again once the install has been re-run.
+      verify.mockClear()
+      verify.mockResolvedValue(VERIFY_OK as unknown as WindowsWfpVerifyResult)
+      await SandboxManager.initialize(withLoopback(open))
+      expect(verify.mock.calls.length).toBe(1)
+      expect(await opensLoopback()).toBe(open)
+    }
   })
 
-  it('loopbackPortRange: a range one command brings is passed on, for srt-win to hold to the install', async () => {
-    await SandboxManager.initialize(withRange())
+  it('allowLocalBinding: a mode one command brings is passed on, for srt-win to hold to the install', async () => {
+    await SandboxManager.initialize(withLoopback())
+    const network = { allowedDomains: [], deniedDomains: [] }
     expect(
-      await flagged('--loopback-port-range', {
-        windows: {
-          srtWin: { path: process.execPath },
-          loopbackPortRange: [3400, 3499],
-        },
+      await opensLoopback({ network: { ...network, allowLocalBinding: true } }),
+    ).toBe(true)
+    await SandboxManager.reset()
+    await SandboxManager.initialize(withLoopback(true))
+    expect(
+      await opensLoopback({
+        network: { ...network, allowLocalBinding: false },
       }),
-    ).toEqual(['3400-3499'])
+    ).toBe(false)
+    // A command that says nothing about it runs with the session's.
+    expect(await opensLoopback({ network })).toBe(true)
   })
 
   it('the session: an allowWrite beneath a denyWrite is a read grant', async () => {
@@ -2106,6 +2106,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     status: number,
     delayMs = 0,
     onClose?: () => void,
+    stderr = '',
   ) {
     const mkStream = () => {
       const s = new EventEmitter() as EventEmitter & {
@@ -2132,6 +2133,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     const fire = () => {
       onClose?.()
       child.stdout.emit('data', stdout)
+      if (stderr) child.stderr.emit('data', stderr)
       child.emit('close', status, null)
     }
     if (delayMs === Infinity) {
@@ -2142,7 +2144,11 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   }
 
   const stubSpawn = (
-    behaviour: (argv: readonly string[]) => { status: number; stdout: string },
+    behaviour: (argv: readonly string[]) => {
+      status: number
+      stdout: string
+      stderr?: string
+    },
     delayMs = 0,
     onClose?: () => void,
   ) => {
@@ -2151,7 +2157,12 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       argv: readonly string[],
     ) => {
       const b = behaviour(argv)
-      return { status: b.status, stdout: b.stdout, stderr: '', error: null }
+      return {
+        status: b.status,
+        stdout: b.stdout,
+        stderr: b.stderr ?? '',
+        error: null,
+      }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any)
     spawnSpy = spyOn(child_process, 'spawn').mockImplementation(((
@@ -2159,7 +2170,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       argv: readonly string[],
     ) => {
       const b = behaviour(argv)
-      return mkFakeChild(b.stdout, b.status, delayMs, onClose)
+      return mkFakeChild(b.stdout, b.status, delayMs, onClose, b.stderr)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any)
   }
@@ -2861,13 +2872,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(maxInFlight).toBe(2)
   })
 
-  // ── loopback port range: install, status, dependency check ──────
-  it('installWindowsSandbox{,Async}: loopbackPortRange becomes --loopback-port-range', async () => {
+  // ── open loopback: install, status, dependency check ────────────
+  it('installWindowsSandbox{,Async}: allowLoopback becomes --allow-loopback', async () => {
     stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
     const srtWin = resolveSrtWin({ path: process.execPath })
     const opts = {
       proxyPortRange: [60080, 60089] as const,
-      loopbackPortRange: [3000, 3099] as const,
+      allowLoopback: true,
       force: true,
       srtWin,
     }
@@ -2879,122 +2890,107 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       'install',
       '--proxy-port-range',
       '60080-60089',
-      '--loopback-port-range',
-      '3000-3099',
+      '--allow-loopback',
       '--force',
     ])
-    // Without the option the flag is absent: the install then opens
-    // no second range (and removes one that was there).
-    spawnSyncSpy.mockClear()
-    installWindowsSandbox({ srtWin })
-    expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
-      SRT_WIN_DISPATCH_ARG1,
-      'install',
-    ])
+    // Without the option (or with it false) the flag is absent: the
+    // install then leaves loopback closed, and closes it if it was
+    // open.
+    for (const off of [{}, { allowLoopback: false }]) {
+      spawnSyncSpy.mockClear()
+      installWindowsSandbox({ ...off, srtWin })
+      expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
+        SRT_WIN_DISPATCH_ARG1,
+        'install',
+      ])
+    }
   })
 
-  it('installWindowsSandbox{,Async}: an unacceptable loopbackPortRange throws before anything is spawned', async () => {
-    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+  it('installWindowsSandbox{,Async}: an srt-win that does not know --allow-loopback is reported as too old, not as a usage error', async () => {
+    // What an argument parser that predates the flag prints.
+    const usage =
+      "error: unexpected argument '--allow-loopback' found\n\n" +
+      'Usage: srt-win install [OPTIONS]\n'
+    stubSpawn(() => ({ status: 2, stdout: '', stderr: usage }))
     const srtWin = resolveSrtWin({ path: process.execPath })
-    for (const [range, why] of [
-      [[3380, 3390], /3389 \(remote desktop\)/],
-      [[3000, 3512], /too wide/],
-      [[1000, 1100], /≥ 1024/],
-      [[60085, 60100], /overlaps the proxy port range 60080-60089/],
-    ] as const) {
-      let err: unknown
-      try {
-        installWindowsSandbox({ loopbackPortRange: range, srtWin })
-      } catch (e) {
-        err = e
-      }
-      expect(err).toBeInstanceOf(WindowsSandboxError)
-      expect((err as WindowsSandboxError).code).toBe(
-        'loopback_port_range_invalid',
-      )
-      expect((err as WindowsSandboxError).message).toMatch(why)
-      const asyncErr = await installWindowsSandboxAsync({
-        loopbackPortRange: range,
-        srtWin,
-      }).catch(e => e as WindowsSandboxError)
-      expect((asyncErr as WindowsSandboxError).code).toBe(
-        'loopback_port_range_invalid',
-      )
+    let err: unknown
+    try {
+      installWindowsSandbox({ allowLoopback: true, srtWin })
+    } catch (e) {
+      err = e
     }
-    // The overlap is against the proxy range being installed.
-    expect(() =>
-      installWindowsSandbox({
-        proxyPortRange: [50010, 50020],
-        loopbackPortRange: [50000, 50010],
-        srtWin,
-      }),
-    ).toThrow(/overlaps the proxy port range 50010-50020/)
-    expect(spawnSyncSpy.mock.calls.length).toBe(0)
-    expect(spawnSpy.mock.calls.length).toBe(0)
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('srt_win_too_old')
+    expect((err as WindowsSandboxError).message).toMatch(/srt-win is too old/)
+    const asyncErr = await installWindowsSandboxAsync({
+      allowLoopback: true,
+      srtWin,
+    }).catch(e => e as WindowsSandboxError)
+    expect((asyncErr as WindowsSandboxError).code).toBe('srt_win_too_old')
   })
 
   const rawWfp = (over: Record<string, unknown>): string =>
     JSON.stringify({ ...JSON.parse(RAW_WFP), ...over })
 
-  it('getWindowsWfpStatus{,Async}: reports the installed loopback port range, or none', async () => {
+  it('getWindowsWfpStatus{,Async}: reports whether the install opens loopback', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     stubSpawn(() => ({
       status: 0,
-      stdout: rawWfp({ filters: 8, loopback_port_range: [3000, 3099] }),
+      stdout: rawWfp({ filters: 8, allow_loopback: true }),
     }))
     const sync = getWindowsWfpStatus({ srtWin })
-    expect(sync.loopbackPortRange).toEqual([3000, 3099])
+    expect(sync.allowLoopback).toBe(true)
     expect(sync.portRange).toEqual([60080, 60089])
     expect(await getWindowsWfpStatusAsync({ srtWin })).toEqual(sync)
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // `null` (no range installed) and an srt-win that predates the
-    // field both read as none.
-    for (const over of [{ loopback_port_range: null }, {}]) {
+    // `false`, and an srt-win that predates the field (which cannot
+    // have opened loopback), both read as closed.
+    for (const over of [{ allow_loopback: false }, {}]) {
       stubSpawn(() => ({ status: 0, stdout: rawWfp(over) }))
-      expect(getWindowsWfpStatus({ srtWin }).loopbackPortRange).toBeUndefined()
+      expect(getWindowsWfpStatus({ srtWin }).allowLoopback).toBe(false)
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
     }
   })
 
-  it('checkWindowsDependencies{,Async}: an install whose loopback port range is not the configured one is an error naming the reinstall', async () => {
+  it('checkWindowsDependencies{,Async}: an install whose loopback mode is not the configured one is an error naming the reinstall, in either direction', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const cases: Array<{
-      installed: [number, number] | null
-      configured: [number, number] | null
+      installed: boolean
+      configured: boolean
       state: string
       expect: RegExp
       command: string
     }> = [
       {
-        installed: null,
-        configured: [3000, 3099],
+        installed: false,
+        configured: true,
         state: 'installed',
-        expect: /installed: none; configured: 3000-3099/,
-        command: 'windows-install --loopback-port-range 3000-3099 --force',
+        expect: /installed: loopback closed; configured: open/,
+        command: 'windows-install --allow-loopback --force',
       },
       {
-        installed: [3000, 3099],
-        configured: null,
+        installed: true,
+        configured: false,
         state: 'installed',
-        expect: /installed: 3000-3099; configured: none/,
+        expect: /installed: loopback open; configured: closed/,
         command: 'windows-install --force',
       },
+      // Non-elevated: the mode comes from the install record.
       {
-        installed: [3000, 3099],
-        configured: [4000, 4099],
-        state: 'installed',
-        expect: /installed: 3000-3099; configured: 4000-4099/,
-        command: 'windows-install --loopback-port-range 4000-4099 --force',
-      },
-      // Non-elevated: the range comes from the install record.
-      {
-        installed: [3000, 3099],
-        configured: null,
+        installed: true,
+        configured: false,
         state: 'cannot-read',
-        expect: /installed: 3000-3099; configured: none/,
+        expect: /installed: loopback open; configured: closed/,
         command: 'windows-install --force',
+      },
+      {
+        installed: false,
+        configured: true,
+        state: 'cannot-read',
+        expect: /installed: loopback closed; configured: open/,
+        command: 'windows-install --allow-loopback --force',
       },
     ]
     for (const c of cases) {
@@ -3002,12 +2998,12 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
         status: 0,
         stdout: argv.includes('user')
           ? RAW_USER
-          : rawWfp({ state: c.state, loopback_port_range: c.installed }),
+          : rawWfp({ state: c.state, allow_loopback: c.installed }),
       }))
-      const opts = { srtWin, loopbackPortRange: c.configured }
+      const opts = { srtWin, allowLoopback: c.configured }
       const sync = checkWindowsDependencies(opts)
       expect(sync.errors.length).toBe(1)
-      expect(sync.errors[0]).toMatch(/do not match windows\.loopbackPortRange/)
+      expect(sync.errors[0]).toMatch(/do not match network\.allowLocalBinding/)
       expect(sync.errors[0]).toMatch(c.expect)
       expect(sync.errors[0]).toContain(c.command)
       expect(await checkWindowsDependenciesAsync(opts)).toEqual(sync)
@@ -3016,31 +3012,37 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('checkWindowsDependencies{,Async}: a matching loopback port range, or none to compare, is not an error', async () => {
+  it('checkWindowsDependencies{,Async}: a matching loopback mode, or none to compare, is not an error — and open loopback is always said', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const run = async (
-      installed: [number, number] | null,
-      loopbackPortRange?: [number, number] | null,
-    ) => {
+    const run = async (installed: boolean, allowLoopback?: boolean) => {
       stubSpawn(argv => ({
         status: 0,
         stdout: argv.includes('user')
           ? RAW_USER
-          : rawWfp({ loopback_port_range: installed }),
+          : rawWfp({ allow_loopback: installed }),
       }))
-      const sync = checkWindowsDependencies({ srtWin, loopbackPortRange })
+      const sync = checkWindowsDependencies({ srtWin, allowLoopback })
       expect(
-        await checkWindowsDependenciesAsync({ srtWin, loopbackPortRange }),
+        await checkWindowsDependenciesAsync({ srtWin, allowLoopback }),
       ).toEqual(sync)
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
-      return sync.errors
+      return sync
     }
-    expect(await run([3000, 3099], [3000, 3099])).toEqual([])
-    expect(await run(null, null)).toEqual([])
+    expect((await run(true, true)).errors).toEqual([])
+    expect((await run(false, false)).errors).toEqual([])
     // The caller did not say what is configured: nothing to compare.
-    expect(await run([3000, 3099])).toEqual([])
-    expect(await run(null)).toEqual([])
+    expect((await run(true)).errors).toEqual([])
+    expect((await run(false)).errors).toEqual([])
+    // Found open: the warning says what that exposes. Found closed:
+    // nothing to say.
+    expect((await run(true, true)).warnings).toContain(
+      WINDOWS_ALLOW_LOOPBACK_EFFECT,
+    )
+    expect((await run(true)).warnings).toContain(WINDOWS_ALLOW_LOOPBACK_EFFECT)
+    expect((await run(false, false)).warnings).not.toContain(
+      WINDOWS_ALLOW_LOOPBACK_EFFECT,
+    )
   })
 
   // ── fence revision: status ──────────────────────────────────────
@@ -3066,6 +3068,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       state: 'outdated',
       filters: 4,
       portRange: [60080, 60089],
+      allowLoopback: false,
       userSid: 'S-1-5-21-1',
       hint: 'the network fence on this machine is out of date',
     })
@@ -3300,36 +3303,37 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(odd.probes.denyOnly).toBe('error')
   })
 
-  // ── fence probe: the loopback port range ────────────────────────
-  const RANGE = [3000, 3099] as const
-  const rangedOut = (over: Record<string, unknown> = {}): string =>
+  // ── fence probe: open loopback ──────────────────────────────────
+  const openOut = (over: Record<string, unknown> = {}): string =>
     verifyOut({
-      loopback_port_range: RANGE,
-      range_off_loopback_probe: 'blocked',
-      range_off_loopback_target: '10.0.0.5:3000',
-      range_loopback_probe: 'connected',
-      range_loopback_target: '127.0.0.1:3000',
+      target: '127.0.0.1:9229',
+      allow_loopback: true,
+      open_off_loopback_probe: 'blocked',
+      open_off_loopback_target: '10.0.0.5:50123',
+      open_loopback_probe: 'connected',
+      open_loopback_target: '127.0.0.1:50123',
+      lowered_integrity_target: '10.0.0.5:50123',
+      loopback_notice: 'loopback is open',
       ...over,
     })
-  const runRangedVerify = (status: number, stdout: string) => {
+  const runOpenVerify = (status: number, stdout: string) => {
     stubSpawn(() => ({ status, stdout }))
     return verifyWindowsWfpEgress({
-      target: '127.0.0.1:49999',
-      loopbackPortRange: RANGE,
+      target: '127.0.0.1:9229',
+      allowLoopback: true,
       srtWin: resolveSrtWin({ path: process.execPath }),
     })
   }
 
-  it('verifyWindowsWfpEgress: loopbackPortRange is passed as --loopback-port-range and its two attempts are reported', async () => {
-    const r = await runRangedVerify(0, rangedOut())
+  it('verifyWindowsWfpEgress: allowLoopback is passed as --allow-loopback, its two attempts are reported, and the result says loopback is open', async () => {
+    const r = await runOpenVerify(0, openOut())
     expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
       SRT_WIN_DISPATCH_ARG1,
       'wfp',
       'verify',
       '--target',
-      '127.0.0.1:49999',
-      '--loopback-port-range',
-      '3000-3099',
+      '127.0.0.1:9229',
+      '--allow-loopback',
       '--write-restricted-token',
     ])
     expect(r.probes).toEqual({
@@ -3341,167 +3345,264 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       lowIntegrityLoopback: 'blocked',
       untrustedIntegrity: 'blocked',
       untrustedIntegrityLoopback: 'blocked',
-      rangeOffLoopback: 'blocked',
-      rangeLoopback: 'connected',
+      openOffLoopback: 'blocked',
+      openLoopback: 'connected',
     })
-    expect(r.warnings).toEqual([])
+    // A clean pass still carries the plain statement of what is open.
+    expect(r.warnings).toEqual([WINDOWS_ALLOW_LOOPBACK_EFFECT])
   })
 
-  it('verifyWindowsWfpEgress: with a range, a lowered-integrity attempt getting out names the in-range target it was aimed at', async () => {
-    const err = await runRangedVerify(
+  it('verifyWindowsWfpEgress: with loopback closed there is no flag, no open-loopback attempt and no such warning', async () => {
+    for (const off of [{}, { allowLoopback: false }]) {
+      stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+      const r = await verifyWindowsWfpEgress({
+        target: '127.0.0.1:49999',
+        ...off,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      })
+      expect(spawnSyncSpy.mock.calls[0][1]).not.toContain('--allow-loopback')
+      expect(r.probes.openLoopback).toBeUndefined()
+      expect(r.probes.openOffLoopback).toBeUndefined()
+      expect(r.warnings).toEqual([])
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: with loopback open, a lowered-integrity attempt getting out names the target it was aimed at', async () => {
+    const err = await runOpenVerify(
       3,
-      rangedOut({
-        low_integrity_probe: 'connected',
-        lowered_integrity_target: '10.0.0.5:3000',
-      }),
+      openOut({ low_integrity_probe: 'connected' }),
     ).catch(e => e as WindowsSandboxError)
     expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
     expect((err as WindowsSandboxError).message).toMatch(
-      /low-integrity copy of its token to 10\.0\.0\.5:3000/,
+      /low-integrity copy of its token to 10\.0\.0\.5:50123/,
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
     // Every attempt the fence must refuse rejects whatever the exit
-    // code says, the range's off-loopback one included.
-    const quiet = await runRangedVerify(
-      0,
-      rangedOut({ range_off_loopback_probe: 'connected' }),
-    ).catch(e => e as WindowsSandboxError)
-    expect((quiet as WindowsSandboxError).code).toBe('wfp_fence_inactive')
+    // code says: the off-loopback one at an open port, and the one at
+    // a port that stays blocked.
+    for (const leak of [
+      { open_off_loopback_probe: 'connected' },
+      { egress_probe: 'connected' },
+    ]) {
+      const quiet = await runOpenVerify(0, openOut(leak)).catch(
+        e => e as WindowsSandboxError,
+      )
+      expect((quiet as WindowsSandboxError).code).toBe('wfp_fence_inactive')
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+    }
   })
 
-  it('verifyWindowsWfpEgress: the listener it binds is outside the proxy range and the loopback port range', async () => {
-    // Stand-in for net.createServer whose listeners report ports in
-    // order: one inside each permitted range, then one outside both.
-    const ports = [60085, 3050, 3099, 49999]
+  /**
+   * Stand-in for net.createServer. `taken` ports fail to listen; a
+   * listen on port 0 is handed the next of `ephemeral`.
+   */
+  const fakeServers = (taken: number[], ephemeral: number[] = []) => {
+    const asked: number[] = []
     const closed: number[] = []
-    const createServer = spyOn(net, 'createServer').mockImplementation((() => {
-      const port = ports.shift()!
+    const spy = spyOn(net, 'createServer').mockImplementation((() => {
+      let port = -1
       const s = new EventEmitter() as EventEmitter & {
-        listen(): void
+        listen(p: number): void
         address(): { port: number }
         close(): void
       }
-      s.listen = () => void setImmediate(() => s.emit('listening'))
+      s.listen = (p: number) => {
+        asked.push(p)
+        port = p === 0 ? ephemeral.shift()! : p
+        setImmediate(() =>
+          taken.includes(port)
+            ? s.emit('error', new Error('EADDRINUSE'))
+            : s.emit('listening'),
+        )
+      }
       s.address = () => ({ port })
       s.close = () => void closed.push(port)
       return s
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any)
+    return { asked, closed, spy }
+  }
+
+  it('verifyWindowsWfpEgress: with loopback open the listener goes on the first free port that stays blocked', async () => {
+    const [first, second, third] = WINDOWS_LOOPBACK_FLOOR_PORTS
+    const servers = fakeServers([first, second])
     try {
-      stubSpawn(() => ({ status: 0, stdout: rangedOut() }))
+      stubSpawn(() => ({ status: 0, stdout: openOut() }))
       await verifyWindowsWfpEgress({
-        loopbackPortRange: RANGE,
+        allowLoopback: true,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      })
+      const argv = spawnSyncSpy.mock.calls[0][1] as string[]
+      expect(argv[argv.indexOf('--target') + 1]).toBe(`127.0.0.1:${third}`)
+      // Never an ephemeral port: with loopback open that one is
+      // permitted, and a connect to it would read as a missing fence.
+      expect(servers.asked).toEqual([first, second, third])
+      // Every listener is closed, the chosen one last.
+      expect(servers.closed).toEqual([first, second, third])
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: with loopback open and none of those ports free, it rejects without probing', async () => {
+    const servers = fakeServers([...WINDOWS_LOOPBACK_FLOOR_PORTS])
+    try {
+      stubSpawn(() => ({ status: 0, stdout: openOut() }))
+      const err = await verifyWindowsWfpEgress({
+        allowLoopback: true,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      }).catch(e => e as WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('wfp_verify_bind_failed')
+      expect(servers.asked).toEqual([...WINDOWS_LOOPBACK_FLOOR_PORTS])
+      expect(spawnSyncSpy.mock.calls.length).toBe(0)
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: with loopback closed the listener is an ephemeral port outside the proxy range', async () => {
+    const servers = fakeServers([], [60085, 49999])
+    try {
+      stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+      await verifyWindowsWfpEgress({
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
       const argv = spawnSyncSpy.mock.calls[0][1] as string[]
       expect(argv[argv.indexOf('--target') + 1]).toBe('127.0.0.1:49999')
-      // Every listener is closed, the chosen one last.
-      expect(closed).toEqual([60085, 3050, 3099, 49999])
+      expect(servers.asked).toEqual([0, 0])
+      expect(servers.closed).toEqual([60085, 49999])
     } finally {
-      createServer.mockRestore()
+      servers.spy.mockRestore()
     }
   })
 
-  it('verifyWindowsWfpEgress: a range that is not the installed one rejects (wfp_fence_outdated) with the install command for this session', async () => {
+  it('verifyWindowsWfpEgress: a loopback mode that is not the installed one rejects (wfp_fence_outdated) with the install command for this session, in either direction', async () => {
     const hint =
       "the network fence on this machine does not match this session's " +
-      'loopback port range (installed: none; configured: 3000-3099)'
-    const err = await runRangedVerify(
+      'loopback mode (installed: closed; configured: open)'
+    const err = await runOpenVerify(
       19,
       JSON.stringify({
         egress_probe: 'not-run',
-        target: '127.0.0.1:49999',
+        target: '127.0.0.1:9229',
         outdated: true,
-        loopback_port_range_mismatch: true,
-        loopback_port_range: RANGE,
+        allow_loopback_mismatch: true,
+        allow_loopback: true,
         hint,
       }),
     ).catch(e => e as WindowsSandboxError)
     expect(err).toBeInstanceOf(WindowsSandboxError)
     expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
+    expect((err as WindowsSandboxError).message).toMatch(
+      /does not match network\.allowLocalBinding/,
+    )
     expect((err as WindowsSandboxError).message).toContain(hint)
     expect((err as WindowsSandboxError).message).toContain(
-      'npx sandbox-runtime windows-install --loopback-port-range 3000-3099 --force',
+      'npx sandbox-runtime windows-install --allow-loopback --force',
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // Configured without a range while the install has one: the
-    // command that removes it.
-    const none = await runVerify(
+    // Configured closed while the install is open: the command that
+    // closes it. The session does not run on the open install.
+    const closed = await runVerify(
       19,
       JSON.stringify({
         egress_probe: 'not-run',
         target: '127.0.0.1:49999',
         outdated: true,
-        loopback_port_range_mismatch: true,
-        loopback_port_range: null,
-        hint: 'installed: 3000-3099; configured: none',
+        allow_loopback_mismatch: true,
+        allow_loopback: false,
+        hint: 'installed: open; configured: closed',
       }),
     ).catch(e => e as WindowsSandboxError)
-    expect((none as WindowsSandboxError).code).toBe('wfp_fence_outdated')
-    expect((none as WindowsSandboxError).message).toContain(
+    expect((closed as WindowsSandboxError).code).toBe('wfp_fence_outdated')
+    expect((closed as WindowsSandboxError).message).toContain(
       '`npx sandbox-runtime windows-install --force`',
     )
   })
 
-  it('verifyWindowsWfpEgress: an in-range port reached off loopback rejects (wfp_fence_inactive) and says which', async () => {
+  it('verifyWindowsWfpEgress: an srt-win that does not know --allow-loopback rejects as too old', async () => {
+    stubSpawn(() => ({
+      status: 2,
+      stdout: '',
+      stderr:
+        "error: unexpected argument '--allow-loopback' found\n\n" +
+        'Usage: srt-win wfp verify --target <TARGET>\n',
+    }))
+    const err = await verifyWindowsWfpEgress({
+      target: '127.0.0.1:9229',
+      allowLoopback: true,
+      srtWin: resolveSrtWin({ path: process.execPath }),
+    }).catch(e => e as WindowsSandboxError)
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('srt_win_too_old')
+    expect((err as WindowsSandboxError).message).toMatch(
+      /too old for network\.allowLocalBinding/,
+    )
+  })
+
+  it('verifyWindowsWfpEgress: an open port reached off loopback rejects (wfp_fence_inactive) and says which', async () => {
     for (const through of ['connected', 'refused']) {
-      const err = await runRangedVerify(
+      const err = await runOpenVerify(
         3,
-        rangedOut({ range_off_loopback_probe: through }),
+        openOut({ open_off_loopback_probe: through }),
       ).catch(e => e as WindowsSandboxError)
       expect(err).toBeInstanceOf(WindowsSandboxError)
       expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
       expect((err as WindowsSandboxError).message).toMatch(
-        /loopback-port-range port on a non-loopback address\) to 10\.0\.0\.5:3000/,
+        /port open on loopback, on a non-loopback address\) to 10\.0\.0\.5:50123/,
       )
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
     }
   })
 
-  it('verifyWindowsWfpEgress: the range found closed rejects (wfp_fence_outdated)', async () => {
-    const err = await runRangedVerify(
+  it('verifyWindowsWfpEgress: loopback found closed where it is recorded open rejects (wfp_fence_outdated)', async () => {
+    const err = await runOpenVerify(
       19,
-      rangedOut({
-        range_loopback_probe: 'blocked',
+      openOut({
+        open_loopback_probe: 'blocked',
         outdated: true,
-        loopback_port_range_mismatch: true,
-        hint: 'the network fence on this machine does not open the configured loopback port range 3000-3099',
+        allow_loopback_mismatch: true,
+        hint: 'the network fence on this machine does not open loopback',
       }),
     ).catch(e => e as WindowsSandboxError)
     expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
     expect((err as WindowsSandboxError).message).toMatch(
-      /does not open the configured loopback port range 3000-3099/,
+      /does not open loopback/,
     )
     expect((err as WindowsSandboxError).message).toContain(
-      'windows-install --loopback-port-range 3000-3099 --force',
+      'windows-install --allow-loopback --force',
     )
   })
 
-  it('verifyWindowsWfpEgress: skipped range attempts resolve, each with a warning', async () => {
-    const r = await runRangedVerify(
+  it('verifyWindowsWfpEgress: skipped open-loopback attempts resolve, each with a warning', async () => {
+    const r = await runOpenVerify(
       0,
-      rangedOut({
-        range_off_loopback_probe: 'skipped',
-        range_off_loopback_target: null,
-        range_loopback_probe: 'skipped',
-        range_loopback_target: null,
+      openOut({
+        open_off_loopback_probe: 'skipped',
+        open_off_loopback_target: null,
+        open_loopback_probe: 'skipped',
+        open_loopback_target: null,
       }),
     )
-    expect(r.probes.rangeOffLoopback).toBe('skipped')
-    expect(r.probes.rangeLoopback).toBe('skipped')
-    expect(r.warnings.length).toBe(2)
+    expect(r.probes.openOffLoopback).toBe('skipped')
+    expect(r.probes.openLoopback).toBe('skipped')
+    expect(r.warnings.length).toBe(3)
     expect(r.warnings[0]).toMatch(/off-loopback attempt .* skipped/)
     expect(r.warnings[1]).toMatch(/reachability attempt was skipped/)
+    expect(r.warnings[2]).toBe(WINDOWS_ALLOW_LOOPBACK_EFFECT)
   })
 
-  it('verifyWindowsWfpEgress: an inconclusive range attempt rejects', async () => {
+  it('verifyWindowsWfpEgress: an inconclusive open-loopback attempt rejects', async () => {
     expect(
-      await runRangedVerify(
+      await runOpenVerify(
         2,
-        rangedOut({ range_loopback_probe: 'unreachable' }),
+        openOut({ open_loopback_probe: 'unreachable' }),
       ).then(
         () => 'resolved',
         e => (e as WindowsSandboxError).code,

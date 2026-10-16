@@ -98,6 +98,7 @@ export {
   parseWindowsSandboxError,
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
   SRT_WIN_DISPATCH_ARG1,
   spawnWrappedCommandWindows,
   writeStdinPayload,

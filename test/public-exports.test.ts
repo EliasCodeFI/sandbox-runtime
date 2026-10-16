@@ -30,6 +30,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'SandboxViolationStore',
   'SrtWinConfigSchema',
   'VENDORED_SRT_WIN_EXE',
+  'WINDOWS_ALLOW_LOOPBACK_EFFECT',
   'WINDOWS_PROFILE_READ_ENV_VARS',
   'WindowsConfigSchema',
   'WindowsSandboxError',

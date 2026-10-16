@@ -1734,23 +1734,24 @@ if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
 }
 Write-Host 'U4 ok: reinstall restores the fence; exec runs again'
 
-# ── L-rows: the configured loopback port range ──────────────────
-# `install --loopback-port-range` adds one PERMIT per layer: loopback
-# address AND a port inside the range. The rows run the same four
-# connects with no range installed (all refused), then with one
-# (in-range loopback reachable on 127.0.0.1 and ::1, everything else
-# still refused), and show that a session whose range differs from
-# the installed one is not launched.
+# ── L-rows: open loopback ────────────────────────────────────────
+# `install --allow-loopback` adds one PERMIT per layer: loopback
+# address AND any port but a short fixed list. The rows run the same
+# connects with loopback closed, as a default install leaves it (all
+# refused but the proxy port), then with it open (loopback reachable
+# on 127.0.0.1 and ::1 over TCP and UDP, the listed ports and
+# everything off loopback still refused), and show that a session
+# whose loopback mode differs from the installed one is not launched,
+# in either direction.
 #
-# The range sits clear of the proxy range, of every fixed port the
+# The listeners sit clear of the proxy range, of every fixed port the
 # rows above listen on, and of the dynamic port range (49152 and up),
 # where Windows keeps its per-machine excluded ranges and hands out
-# ephemeral ports. Each listener still takes the first port of its
-# slice that binds.
-$LbRange = '41000-41063'
-$LbLo    = 41000
-$LbHi    = 41063
-$LbOther = '42000-42063'
+# ephemeral ports. Each listener takes the first port of its slice
+# that binds.
+$LbLo = 41000
+# Two of the ports that stay blocked with loopback open.
+$LbFloor = @(9229, 1080)
 
 # One raw TCP connect from inside the sandbox. Prints CONNECTED or
 # code=<SocketErrorCode> (AccessDenied = refused by a filter).
@@ -1843,8 +1844,8 @@ function SbServerRoundTrip {
   }
 }
 
-# A port of the range that binds on this runner right now, for a
-# listener that some other process is about to open.
+# A port that binds on this runner right now, for a listener that
+# some other process is about to open.
 function Free-LbPort {
   param([int[]] $Candidates)
   $l = Bind-Listener $Candidates
@@ -1853,9 +1854,50 @@ function Free-LbPort {
   return $port
 }
 
-# L0: no range installed. Live listeners inside the would-be range on
+# A UDP echo server on 127.0.0.1:$Port in a process of its own (this
+# account, not the sandbox): it answers one datagram and exits.
+# Returns once it is bound.
+function Start-UdpEcho {
+  param([string] $Row, [int] $Port)
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName               = $pwsh
+  $psi.UseShellExecute        = $false
+  $psi.RedirectStandardOutput = $true
+  $server =
+    "`$u = New-Object Net.Sockets.UdpClient(" +
+      "(New-Object Net.IPEndPoint([Net.IPAddress]::Loopback, $Port))); " +
+    "`$u.Client.ReceiveTimeout = 240000; " +
+    "`$ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0); " +
+    "Write-Output READY; " +
+    "`$d = `$u.Receive([ref]`$ep); [void]`$u.Send(`$d, `$d.Length, `$ep); Write-Output ECHOED"
+  foreach ($a in @('-NoProfile', '-Command', $server)) { $null = $psi.ArgumentList.Add($a) }
+  $p = [System.Diagnostics.Process]::Start($psi)
+  if ($p.StandardOutput.ReadLine() -ne 'READY') {
+    try { $p.Kill($true) } catch { }
+    throw "${Row}: UDP echo server did not come up on 127.0.0.1:$Port"
+  }
+  return $p
+}
+
+# One UDP datagram from inside the sandbox to 127.0.0.1:$Port, and the
+# wait for its echo. Prints ECHO=<payload>, or code=<SocketErrorCode>
+# (AccessDenied = refused by a filter; TimedOut = no answer).
+function SbUdpEcho {
+  param([int] $Port, [string[]] $ExecFlags = @())
+  $client =
+    "try { `$u = New-Object Net.Sockets.UdpClient; `$u.Client.ReceiveTimeout = 15000; " +
+    "`$u.Connect('127.0.0.1', $Port); " +
+    "`$b = [Text.Encoding]::ASCII.GetBytes('udp-ping'); [void]`$u.Send(`$b, `$b.Length); " +
+    "`$ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0); " +
+    "Write-Output ('ECHO=' + [Text.Encoding]::ASCII.GetString(`$u.Receive([ref]`$ep))) } " +
+    "catch { Write-Output ('code=' + `$_.Exception.InnerException.SocketErrorCode) }"
+  return RExec ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command', $client))
+}
+
+# L0: loopback closed (the default install). Live listeners on
 # 127.0.0.1 and ::1, and on a non-loopback address of this runner;
-# every sandboxed connect is refused by a filter.
+# every sandboxed connect is refused by a filter, over UDP too. The
+# proxy port range is still reachable.
 $l0v4 = Bind-Listener ($LbLo..($LbLo + 7))
 $l0v6 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
 try {
@@ -1872,201 +1914,236 @@ if (-not $lanIp) {
 }
 $rt = SbServerRoundTrip 'L0' (Free-LbPort (($LbLo + 24)..($LbLo + 31)))
 if ($rt.client.out -match 'CONNECTED' -or $rt.client.out -notmatch 'AccessDenied') {
-  throw "L0: connect to a sandbox-started server expected AccessDenied with no range installed. raw: $($rt.client.raw)"
+  throw "L0: connect to a sandbox-started server expected AccessDenied with loopback closed. raw: $($rt.client.raw)"
 }
-Write-Host 'L0 ok: with no range installed, in-range loopback (v4, v6), non-loopback and sandbox-to-sandbox connects are all refused'
+$l0udpPort = $LbLo + 32
+$l0udp = Start-UdpEcho 'L0' $l0udpPort
+try {
+  # No answer is the requirement; how the refusal surfaces to a
+  # datagram sender is logged, not asserted.
+  $r = SbUdpEcho $l0udpPort
+  if ($r.out -match 'ECHO=' -or $r.out -notmatch 'code=') {
+    throw "L0: UDP to 127.0.0.1:$l0udpPort expected no echo with loopback closed. raw: $($r.raw)"
+  }
+  Write-Host "L0: UDP to 127.0.0.1:$l0udpPort with loopback closed: $(($r.out -split "`n" | Select-String 'code=') -join ' ')"
+} finally {
+  try { $l0udp.Kill($true) } catch { }
+}
+$l0proxy = Bind-Listener ($PortHi..$PortLo)
+try { Assert-SbConnected 'L0' '127.0.0.1' $l0proxy.LocalEndpoint.Port } finally { $l0proxy.Stop() }
+Write-Host 'L0 ok: with loopback closed, loopback (v4, v6, UDP), non-loopback and sandbox-to-sandbox connects are all refused; the proxy port range is reachable'
 
-# L0b: a session configured with a range the install does not have is
-# refused (exit 19) by exec and by wfp verify, naming the reinstall.
-$r = RExec @('--loopback-port-range', $LbRange, '--', $cmd, '/c', 'echo L0b-RAN')
-if ($r.exit -ne 19) { throw "L0b: exec expected exit 19 (range not installed), got $($r.exit). raw: $($r.raw)" }
-if ($r.raw -match 'L0b-RAN') { throw "L0b: child RAN with a range the install lacks. raw: $($r.raw)" }
-if ($r.raw -notmatch '(?i)loopback port range' -or $r.raw -notmatch '(?i)srt-win install') {
-  throw "L0b: exec message lacks the range / reinstall hint. raw: $($r.raw)"
+# L0b: a session that expects loopback open on an install that has it
+# closed is refused (exit 19) by exec and by wfp verify, naming the
+# reinstall.
+$r = RExec @('--allow-loopback', '--', $cmd, '/c', 'echo L0b-RAN')
+if ($r.exit -ne 19) { throw "L0b: exec expected exit 19 (loopback not open), got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'L0b-RAN') { throw "L0b: child RAN expecting open loopback on a closed install. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)loopback mode' -or $r.raw -notmatch '(?i)srt-win install --allow-loopback') {
+  throw "L0b: exec message lacks the loopback mode / reinstall hint. raw: $($r.raw)"
 }
-$lvLsn = Bind-Listener (49970..49979)
-$lvOut = & $Exe wfp verify --target "127.0.0.1:$($lvLsn.LocalEndpoint.Port)" --loopback-port-range $LbRange
+$lvOut = & $Exe wfp verify --target "127.0.0.1:$($LbFloor[0])" --allow-loopback
 $lvExit = $LASTEXITCODE
-$lvLsn.Stop()
 if ($lvExit -ne 19) { throw "L0b: wfp verify expected exit 19, got $lvExit. out: $lvOut" }
 $lvDoc = $lvOut | ConvertFrom-Json
-if (-not $lvDoc.outdated -or $lvDoc.hint -notmatch '(?i)srt-win install') {
-  throw "L0b: wfp verify output lacks outdated=true / the reinstall hint: $lvOut"
+if (-not $lvDoc.outdated -or -not $lvDoc.allow_loopback_mismatch -or $lvDoc.hint -notmatch '(?i)srt-win install') {
+  throw "L0b: wfp verify output lacks outdated / allow_loopback_mismatch / the reinstall hint: $lvOut"
 }
-Write-Host 'L0b ok: a session with a range the install lacks is refused (exec 19, wfp verify 19)'
+Write-Host 'L0b ok: a session expecting open loopback on a closed install is refused (exec 19, wfp verify 19)'
 
-# L0c: ranges install refuses, before changing anything.
-foreach ($bad in @(
-    @('3099-3000',   'low > high'),
-    @('3000-3512',   'more than 512 ports'),
-    @('1000-1100',   'starts below 1024'),
-    @('60085-60100', 'overlaps the proxy port range'),
-    @('3380-3390',   'includes 3389'),
-    @('5980-5990',   'includes 5985/5986'),
-    @('2370-2380',   'includes 2375/2376'),
-    @('9220-9230',   'includes 9222/9229'))) {
-  & $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --loopback-port-range $bad[0] --force 2>$null
-  if ($LASTEXITCODE -eq 0) { throw "L0c: install accepted --loopback-port-range $($bad[0]) ($($bad[1]))" }
-}
-$l0c = J @('wfp','status','--sublayer-guid',$Sublayer)
-if ($l0c.state -ne 'installed' -or $l0c.filters -ne $st0.filters -or $null -ne $l0c.loopback_port_range) {
-  throw "L0c: a refused range changed the install: $($l0c | ConvertTo-Json -Compress)"
-}
-Write-Host 'L0c ok: install refuses out-of-policy ranges and leaves the fence as it was'
-
-# L1: adding a range to an existing install is a config change:
+# L1: opening loopback on an existing install is a config change:
 # refused (13) without --force, applied with it.
-& $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --loopback-port-range $LbRange 2>$null
-if ($LASTEXITCODE -ne 13) { throw "L1: install with a new range and no --force expected exit 13, got $LASTEXITCODE" }
+& $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --allow-loopback 2>$null
+if ($LASTEXITCODE -ne 13) { throw "L1: install --allow-loopback without --force expected exit 13, got $LASTEXITCODE" }
 Run @('install',
       '--sublayer-guid',$Sublayer,
       '--proxy-port-range',$PortRange,
-      '--loopback-port-range',$LbRange,
+      '--allow-loopback',
       '--force')
 $l1 = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($l1.state -ne 'installed' -or $l1.filters -ne ($st0.filters + 2)) {
   throw "L1: expected installed/$($st0.filters + 2) filters, got $($l1.state)/$($l1.filters)"
 }
-if (($l1.loopback_port_range -join '-') -ne $LbRange) {
-  throw "L1: wfp status loopback_port_range expected $LbRange, got '$($l1.loopback_port_range -join '-')'"
+if ($l1.allow_loopback -ne $true -or $l1.loopback_notice -notmatch '(?i)loopback is open') {
+  throw "L1: wfp status expected allow_loopback=true with a loopback_notice, got $($l1 | ConvertTo-Json -Compress)"
 }
 if (($l1.port_range -join '-') -ne $PortRange) {
   throw "L1: wfp status port_range changed: '$($l1.port_range -join '-')'"
 }
 $l1c = J @('status','--sublayer-guid',$Sublayer)
-if (($l1c.wfp.loopback_port_range -join '-') -ne $LbRange) {
-  throw "L1: status .wfp.loopback_port_range expected $LbRange, got '$($l1c.wfp.loopback_port_range -join '-')'"
+if ($l1c.wfp.allow_loopback -ne $true -or $l1c.wfp.loopback_notice -notmatch '(?i)off the machine') {
+  throw "L1: status .wfp expected allow_loopback=true with a loopback_notice, got $($l1c.wfp | ConvertTo-Json -Compress)"
 }
-if ((Get-ItemProperty $regBase -ea Stop).LoopbackPortRange -ne $LbRange) {
-  throw 'L1: install did not record LoopbackPortRange'
+if ((Get-ItemProperty $regBase -ea Stop).AllowLoopback -ne 1) {
+  throw 'L1: install did not record AllowLoopback'
 }
-Write-Host "L1 ok: range installed ($LbRange): $($l1.filters) filters, reported by wfp status and status"
+Write-Host "L1 ok: loopback opened: $($l1.filters) filters, reported by wfp status and status with the notice"
 
-$lb = @('--loopback-port-range', $LbRange)
+$lb = @('--allow-loopback')
 
-# L2: wfp verify with the range. The plain target is outside both
-# ranges and still blocked; a non-loopback address at an in-range
-# port is blocked; srt-win's own in-range loopback listener connects.
-$l2Lsn = Bind-Listener (49960..49969)
-$l2out = & $Exe wfp verify --target "127.0.0.1:$($l2Lsn.LocalEndpoint.Port)" @lb
+# L2: wfp verify with loopback open. The plain target is one of the
+# ports that stay blocked; srt-win's own loopback listener on an
+# arbitrary port connects; that port on a non-loopback address is
+# blocked; the result says loopback is open.
+$l2Lsn = $null
+try { $l2Lsn = Bind-Listener $LbFloor } catch { Write-Host 'L2 note: no blocked port free to listen on; probing one without a listener' }
+$l2port = if ($l2Lsn) { $l2Lsn.LocalEndpoint.Port } else { $LbFloor[0] }
+$l2out = & $Exe wfp verify --target "127.0.0.1:$l2port" @lb
 $l2exit = $LASTEXITCODE
-$l2Lsn.Stop()
+if ($l2Lsn) { $l2Lsn.Stop() }
 Write-Host "L2: wfp verify exit=$l2exit stdout='$l2out'"
-if ($l2exit -ne 0) { throw "L2: wfp verify with the installed range expected exit 0, got $l2exit" }
+if ($l2exit -ne 0) { throw "L2: wfp verify with loopback open expected exit 0, got $l2exit" }
 $l2 = $l2out | ConvertFrom-Json
-if ($l2.egress_probe -ne 'blocked') { throw "L2: out-of-range loopback expected blocked, got '$($l2.egress_probe)'" }
-if ($l2.range_loopback_probe -ne 'connected') {
-  throw "L2: in-range loopback listener ($($l2.range_loopback_target)) expected connected, got '$($l2.range_loopback_probe)'"
+if ($l2.egress_probe -ne 'blocked') { throw "L2: loopback port $l2port expected blocked, got '$($l2.egress_probe)'" }
+if ($l2.open_loopback_probe -ne 'connected') {
+  throw "L2: loopback listener ($($l2.open_loopback_target)) expected connected, got '$($l2.open_loopback_probe)'"
 }
-if ($l2.range_off_loopback_probe -eq 'skipped') {
-  Write-Host 'L2 note: off-loopback range attempt skipped (no off-loopback address on this runner)'
-} elseif ($l2.range_off_loopback_probe -ne 'blocked') {
-  throw "L2: in-range port on $($l2.range_off_loopback_target) expected blocked, got '$($l2.range_off_loopback_probe)'"
+if ($l2.open_off_loopback_probe -eq 'skipped') {
+  Write-Host 'L2 note: off-loopback attempt skipped (no off-loopback address on this runner)'
+} elseif ($l2.open_off_loopback_probe -ne 'blocked') {
+  throw "L2: open port on $($l2.open_off_loopback_target) expected blocked, got '$($l2.open_off_loopback_probe)'"
 }
-# With a range, the lowered-integrity attempts' off-loopback half is
-# aimed at the in-range port too, and all four are still blocked.
-if ($l2.range_off_loopback_target -and $l2.lowered_integrity_target -ne $l2.range_off_loopback_target) {
-  throw "L2: lowered_integrity_target expected $($l2.range_off_loopback_target), got '$($l2.lowered_integrity_target)'"
+if ($l2.allow_loopback -ne $true -or $l2.loopback_notice -notmatch '(?i)loopback is open') {
+  throw "L2: wfp verify output does not say loopback is open: $l2out"
+}
+# With loopback open, the lowered-integrity attempts' off-loopback
+# half is aimed at the open port too, and all four are still blocked.
+if ($l2.open_off_loopback_target -and $l2.lowered_integrity_target -ne $l2.open_off_loopback_target) {
+  throw "L2: lowered_integrity_target expected $($l2.open_off_loopback_target), got '$($l2.lowered_integrity_target)'"
 }
 foreach ($f in $loweredFields) {
   $got = $l2.$f
   if ($got -eq 'skipped' -and $f -notlike '*_loopback_probe') {
     Write-Host "L2 note: $f skipped (no off-loopback address on this runner)"
   } elseif ($got -ne 'blocked') {
-    throw "L2: $f expected blocked with the range installed, got '$got'. out: $l2out"
+    throw "L2: $f expected blocked with loopback open, got '$got'. out: $l2out"
   }
 }
-# A must-be-blocked target inside the range is refused as a usage
-# error, not probed.
+# A must-be-blocked target that open loopback permits is refused as a
+# usage error, not probed.
 & $Exe wfp verify --target "127.0.0.1:$LbLo" @lb 2>$null | Out-Null
-if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an in-range --target expected exit 1, got $LASTEXITCODE" }
-Write-Host 'L2 ok: wfp verify probes the range (loopback connected, off-loopback blocked) and refuses an in-range target'
+if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an open-loopback --target expected exit 1, got $LASTEXITCODE" }
+Write-Host 'L2 ok: wfp verify probes open loopback (listener connected, blocked port and off-loopback blocked), says it is open, and refuses an open target'
 
-# L3/L4: in-range loopback listeners are reachable on 127.0.0.1 and ::1.
-$l3v4 = Bind-Listener ($LbLo..($LbLo + 7))
-$l3v6 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
-try {
-  Assert-SbConnected 'L3' '127.0.0.1' $l3v4.LocalEndpoint.Port $lb
-  Write-Host "L3 ok: in-range loopback 127.0.0.1:$($l3v4.LocalEndpoint.Port) reachable"
-  Assert-SbConnected 'L4' '::1' $l3v6.LocalEndpoint.Port $lb
-  Write-Host "L4 ok: in-range loopback [::1]:$($l3v6.LocalEndpoint.Port) reachable"
-} finally {
-  $l3v4.Stop(); $l3v6.Stop()
-}
-
-# L5: loopback outside both ranges is still refused, on either side
-# of the range and on ::1.
-$l5ports = @()
-foreach ($side in @((($LbLo - 1)..($LbLo - 8)), (($LbHi + 1)..($LbHi + 8)))) {
-  $l5 = Bind-Listener $side
-  $l5ports += $l5.LocalEndpoint.Port
-  try { Assert-SbRefused 'L5' '127.0.0.1' $l5.LocalEndpoint.Port $lb } finally { $l5.Stop() }
-}
-$l5v6 = Bind-Listener (($LbHi + 9)..($LbHi + 16)) ([System.Net.IPAddress]::IPv6Loopback)
-$l5v6port = $l5v6.LocalEndpoint.Port
-try { Assert-SbRefused 'L5' '::1' $l5v6port $lb } finally { $l5v6.Stop() }
-Write-Host "L5 ok: loopback just outside the range ($($l5ports -join ', '), [::1]:$l5v6port) still refused"
-
-# L6: an in-range port on a NON-loopback address of this machine is
-# still refused — the PERMIT is for loopback addresses only.
-if (-not $lanIp) {
-  Write-Host 'L6 SKIPPED: runner has no off-loopback IPv4 address'
-} else {
-  $l6 = Bind-Listener (($LbLo + 16)..($LbLo + 23)) ([System.Net.IPAddress]::Parse($lanIp))
+# L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1. The
+# 127.0.0.1 ports are taken from four stretches between the ports that
+# stay blocked, so more than one of the PERMIT's port conditions is
+# exercised.
+foreach ($slice in @((1100..1107), (8100..8107), ($LbLo..($LbLo + 7)), (48100..48107))) {
+  $l3 = Bind-Listener $slice
   try {
-    Assert-SbRefused 'L6' $lanIp $l6.LocalEndpoint.Port $lb
-    Write-Host "L6 ok: in-range port on non-loopback ${lanIp}:$($l6.LocalEndpoint.Port) refused"
+    Assert-SbConnected 'L3' '127.0.0.1' $l3.LocalEndpoint.Port $lb
+    Write-Host "L3 ok: loopback 127.0.0.1:$($l3.LocalEndpoint.Port) reachable"
   } finally {
-    $l6.Stop()
+    $l3.Stop()
   }
 }
+$l4 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
+try {
+  Assert-SbConnected 'L4' '::1' $l4.LocalEndpoint.Port $lb
+  Write-Host "L4 ok: loopback [::1]:$($l4.LocalEndpoint.Port) reachable"
+} finally {
+  $l4.Stop()
+}
 
-# L7: a server started by one sandboxed command on an in-range port
-# is reachable from a second sandboxed command.
-$rt = SbServerRoundTrip 'L7' (Free-LbPort (($LbLo + 24)..($LbLo + 31))) $lb
+# L5: UDP on loopback works: a datagram reaches a local echo server
+# and its answer comes back.
+$l5port = $LbLo + 32
+$l5 = Start-UdpEcho 'L5' $l5port
+try {
+  $r = SbUdpEcho $l5port $lb
+  if ($r.out -notmatch 'ECHO=udp-ping') {
+    throw "L5: UDP echo through 127.0.0.1:$l5port did not come back. raw: $($r.raw)"
+  }
+} finally {
+  try { $l5.Kill($true) } catch { }
+}
+Write-Host "L5 ok: UDP echo on 127.0.0.1:$l5port works"
+
+# L6: the ports that stay blocked are still refused, listener or not
+# (the filter answers before the destination does).
+foreach ($port in $LbFloor) {
+  $l6 = $null
+  try { $l6 = Bind-Listener @($port) } catch { Write-Host "L6 note: port $port is taken on this runner; probing it as it is" }
+  try { Assert-SbRefused 'L6' '127.0.0.1' $port $lb } finally { if ($l6) { $l6.Stop() } }
+}
+Write-Host "L6 ok: loopback ports $($LbFloor -join ', ') still refused with loopback open"
+
+# L7: a port that is open on loopback is still refused on a
+# NON-loopback address of this machine — the PERMIT is for loopback
+# addresses only — and so is a connect off the machine.
+if (-not $lanIp) {
+  Write-Host 'L7 SKIPPED (non-loopback half): runner has no off-loopback IPv4 address'
+} else {
+  $l7 = Bind-Listener (($LbLo + 16)..($LbLo + 23)) ([System.Net.IPAddress]::Parse($lanIp))
+  $l7port = $l7.LocalEndpoint.Port
+  try {
+    # The same port, listening on loopback as well.
+    $l7lo = Bind-Listener @($l7port)
+    try { Assert-SbConnected 'L7' '127.0.0.1' $l7port $lb } finally { $l7lo.Stop() }
+    Assert-SbRefused 'L7' $lanIp $l7port $lb
+    Write-Host "L7 ok: port $l7port reachable on 127.0.0.1, refused on non-loopback $lanIp"
+  } finally {
+    $l7.Stop()
+  }
+}
+$r = RExec ($lb + @('--', $cmd, '/c', 'curl -sS -m 5 https://example.com'))
+if ($r.exit -eq 0) {
+  throw "L7: outbound curl succeeded under the sandbox with loopback open. out: $($r.out)"
+}
+Write-Host "L7 ok: off-machine egress still blocked with loopback open (curl exit=$($r.exit))"
+
+# L8: a server started by one sandboxed command is reachable from a
+# second sandboxed command.
+$rt = SbServerRoundTrip 'L8' (Free-LbPort (($LbLo + 24)..($LbLo + 31))) $lb
 if ($rt.client.out -notmatch 'CONNECTED' -or -not $rt.served) {
-  throw "L7: sandbox-started in-range server not reached from a second sandboxed command (served=$($rt.served)). raw: $($rt.client.raw)"
+  throw "L8: sandbox-started server not reached from a second sandboxed command (served=$($rt.served)). raw: $($rt.client.raw)"
 }
-Write-Host 'L7 ok: a sandbox-started server on an in-range port is reachable from a second sandboxed command'
+Write-Host 'L8 ok: a sandbox-started server is reachable from a second sandboxed command'
 
-# L8: a session whose range differs from the installed one — none, or
-# another — is refused with the reinstall message and launches nothing.
-foreach ($case in @(@('none', @()), @($LbOther, @('--loopback-port-range', $LbOther)))) {
-  $r = RExec ($case[1] + @('--', $cmd, '/c', 'echo L8-RAN'))
-  if ($r.exit -ne 19) { throw "L8: exec configured '$($case[0])' expected exit 19, got $($r.exit). raw: $($r.raw)" }
-  if ($r.raw -match 'L8-RAN') { throw "L8: child RAN with a mismatched range ('$($case[0])'). raw: $($r.raw)" }
-  if ($r.raw -notmatch '(?i)loopback port range' -or $r.raw -notmatch '(?i)srt-win install') {
-    throw "L8: exec message lacks the range / reinstall hint ('$($case[0])'). raw: $($r.raw)"
-  }
-  $l8Lsn = Bind-Listener (49950..49959)
-  $l8args = @('wfp','verify','--target',"127.0.0.1:$($l8Lsn.LocalEndpoint.Port)") + $case[1]
-  $l8out = & $Exe @l8args
-  $l8exit = $LASTEXITCODE
-  $l8Lsn.Stop()
-  if ($l8exit -ne 19) { throw "L8: wfp verify configured '$($case[0])' expected exit 19, got $l8exit. out: $l8out" }
-  $l8doc = $l8out | ConvertFrom-Json
-  if (-not $l8doc.outdated -or $l8doc.hint -notmatch '(?i)srt-win install') {
-    throw "L8: wfp verify output lacks outdated=true / the reinstall hint: $l8out"
-  }
+# L9: a session that expects loopback CLOSED on this install, which
+# has it open, is refused with the reinstall message and launches
+# nothing.
+$r = RExec @('--', $cmd, '/c', 'echo L9-RAN')
+if ($r.exit -ne 19) { throw "L9: exec expecting closed loopback expected exit 19, got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'L9-RAN') { throw "L9: child RAN expecting closed loopback on an open install. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)loopback mode' -or $r.raw -notmatch '(?i)srt-win install') {
+  throw "L9: exec message lacks the loopback mode / reinstall hint. raw: $($r.raw)"
 }
-Write-Host 'L8 ok: a session configured with a different range (or none) is refused with the reinstall message'
+$l9Lsn = Bind-Listener (49950..49959)
+$l9out = & $Exe wfp verify --target "127.0.0.1:$($l9Lsn.LocalEndpoint.Port)"
+$l9exit = $LASTEXITCODE
+$l9Lsn.Stop()
+if ($l9exit -ne 19) { throw "L9: wfp verify expecting closed loopback expected exit 19, got $l9exit. out: $l9out" }
+$l9doc = $l9out | ConvertFrom-Json
+if (-not $l9doc.outdated -or -not $l9doc.allow_loopback_mismatch -or $l9doc.hint -notmatch '(?i)srt-win install') {
+  throw "L9: wfp verify output lacks outdated / allow_loopback_mismatch / the reinstall hint: $l9out"
+}
+Write-Host 'L9 ok: a session expecting closed loopback on an open install is refused (exec 19, wfp verify 19)'
 
-# L9: removing the range is the install step again. The PERMIT goes,
-# the record goes, and the in-range listener is refused once more.
+# L10: closing loopback is the install step again. The PERMIT goes
+# (the elevated status enumerates the sublayer's filters: the count is
+# back and none of them opens loopback), the record goes, and a
+# loopback listener is refused once more.
 Run @('install',
       '--sublayer-guid',$Sublayer,
       '--proxy-port-range',$PortRange,
       '--force')
-$l9 = J @('wfp','status','--sublayer-guid',$Sublayer)
-if ($l9.state -ne 'installed' -or $l9.filters -ne $st0.filters -or $null -ne $l9.loopback_port_range) {
-  throw "L9: after removing the range expected installed/$($st0.filters) filters/no range, got $($l9 | ConvertTo-Json -Compress)"
+$l10 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($l10.state -ne 'installed' -or $l10.filters -ne $st0.filters -or $l10.allow_loopback -ne $false -or
+    $null -ne $l10.PSObject.Properties['loopback_notice']) {
+  throw "L10: after closing loopback expected installed/$($st0.filters) filters/allow_loopback=false, got $($l10 | ConvertTo-Json -Compress)"
 }
-if ($null -ne (Get-ItemProperty $regBase -ea Stop).PSObject.Properties['LoopbackPortRange']) {
-  throw 'L9: LoopbackPortRange still recorded after the range was removed'
+if ($null -ne (Get-ItemProperty $regBase -ea Stop).PSObject.Properties['AllowLoopback']) {
+  throw 'L10: AllowLoopback still recorded after loopback was closed'
 }
-$l9Lsn = Bind-Listener ($LbLo..($LbLo + 7))
-try { Assert-SbRefused 'L9' '127.0.0.1' $l9Lsn.LocalEndpoint.Port } finally { $l9Lsn.Stop() }
-Write-Host 'L9 ok: reinstalling without the range closes it again'
+$l10Lsn = Bind-Listener ($LbLo..($LbLo + 7))
+try { Assert-SbRefused 'L10' '127.0.0.1' $l10Lsn.LocalEndpoint.Port } finally { $l10Lsn.Stop() }
+$r = RExec @('--', $cmd, '/c', 'echo L10-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'L10-RAN') {
+  throw "L10: exec after closing loopback failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'L10 ok: reinstalling without --allow-loopback closes it again and leaves no permit behind'
 
 # ── S-rows: Secondary Logon (seclogon) preflight + typed failure ─
 # Every launch is CreateProcessWithLogonW, which needs the seclogon
@@ -2247,4 +2324,4 @@ if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
 $slRows = if ($slSkipped) { 'S4; S1-S3 SKIPPED' } else { 'S1-S4' }
-Write-Host "smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b/R9c/R9d, T1-T6, R11, R12, R13, R14, G1-G6/G3b, U0-U4, L0-L9, $slRows)"
+Write-Host "smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b/R9c/R9d, T1-T6, R11, R12, R13, R14, G1-G6/G3b, U0-U4, L0-L10, $slRows)"

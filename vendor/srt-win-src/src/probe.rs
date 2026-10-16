@@ -6,9 +6,10 @@
 //! destination:
 //!
 //!   - **plain** — its own token, to the loopback probe target: a
-//!     loopback port outside the proxy port range and outside the
-//!     configured loopback port range. The sandbox-user BLOCK must
-//!     refuse it.
+//!     loopback port outside the proxy port range and, when loopback
+//!     is open, one of the ports that stay blocked
+//!     ([`crate::wfp::LOOPBACK_FLOOR_PORTS`]). The sandbox-user BLOCK
+//!     must refuse it.
 //!   - **anonymous** — while impersonating the anonymous token, to an
 //!     off-loopback target. The anonymous BLOCK must refuse it.
 //!   - **anonymous, loopback** — while impersonating the anonymous
@@ -29,29 +30,34 @@
 //!     cannot be made to refuse it; a connect here is reported as the
 //!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
 //!
-//! With a loopback port range configured (`wfp verify
-//! --loopback-port-range`) it makes two more, both under its own
-//! token, which show that the range's PERMIT opens what it says and
-//! no more:
+//! With loopback open (`wfp verify --allow-loopback`) it makes two
+//! more, both under its own token, which show that the open-loopback
+//! PERMIT opens what it says and no more:
 //!
-//!   - **range, off-loopback** — to a NON-loopback address of this
-//!     machine on a port inside the range. The PERMIT is for loopback
-//!     addresses only, so the sandbox-user BLOCK must refuse it.
-//!   - **range, loopback** — to a loopback listener the broker itself
-//!     bound on a port inside the range for the duration of the probe.
-//!     It must connect; a block here means the filters in place do not
-//!     carry the configured range.
+//!   - **open, off-loopback** — to a NON-loopback address of this
+//!     machine, on the port of the listener below. The PERMIT is for
+//!     loopback addresses only, so the sandbox-user BLOCK must refuse
+//!     it.
+//!   - **open, loopback** — to a loopback listener the broker itself
+//!     bound on an arbitrary port for the duration of the probe. It
+//!     must connect; a block here means the filters in place do not
+//!     open loopback.
 //!
 //! It also moves the off-loopback half of the lowered-integrity
-//! attempts onto that in-range port ([`lowered_off_loopback`]): the
-//! address is the same, so nothing is lost, and the attempts then
-//! also show that the range's PERMIT stays closed off loopback for a
-//! lowered token, in both socket orderings described below. (The
-//! report is the runner's exit code, and ten three-bit results fill
-//! it; aiming the existing attempts at the stricter destination adds
-//! the check without another result.) The two range attempts
-//! themselves run under the runner's own token, where there is no
-//! ordering to vary: one connect each.
+//! attempts onto that port ([`lowered_off_loopback`]): the address is
+//! the same, so nothing is lost, and the attempts then also show that
+//! the PERMIT stays closed off loopback for a lowered token, in both
+//! socket orderings described below. (The report is the runner's exit
+//! code, and ten three-bit results fill it; aiming the existing
+//! attempts at the stricter destination adds the check without another
+//! result.) The two open-loopback attempts themselves run under the
+//! runner's own token, where there is no ordering to vary: one connect
+//! each.
+//!
+//! A pass with loopback open says that DIRECT connections off the
+//! machine are blocked. It does not say that nothing on localhost
+//! forwards traffic off it: `wfp verify` prints
+//! [`crate::wfp::open_loopback_notice`] with every such result.
 //!
 //! ## Two orderings per assumed identity
 //!
@@ -239,8 +245,8 @@ impl Outcome {
     }
 }
 
-/// Every attempt's result. The two `range_*` attempts are
-/// [`Outcome::Skipped`] when no loopback port range is configured.
+/// Every attempt's result. The two `open_*` attempts are
+/// [`Outcome::Skipped`] when loopback is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub plain: Outcome,
@@ -255,12 +261,12 @@ pub struct Report {
     pub untrusted_integrity: Outcome,
     /// Untrusted integrity, to the loopback target.
     pub untrusted_integrity_loopback: Outcome,
-    /// Own token, to a non-loopback address on a port inside the
-    /// configured loopback port range.
-    pub range_off_loopback: Outcome,
-    /// Own token, to the broker's loopback listener inside the
-    /// configured loopback port range.
-    pub range_loopback: Outcome,
+    /// Own token, to a non-loopback address on a port that is open on
+    /// loopback.
+    pub open_off_loopback: Outcome,
+    /// Own token, to the broker's loopback listener on an arbitrary
+    /// port.
+    pub open_loopback: Outcome,
 }
 
 const BITS: u32 = 3;
@@ -287,8 +293,8 @@ impl Report {
             self.low_integrity_loopback,
             self.untrusted_integrity,
             self.untrusted_integrity_loopback,
-            self.range_off_loopback,
-            self.range_loopback,
+            self.open_off_loopback,
+            self.open_loopback,
         ]
     }
 
@@ -315,16 +321,15 @@ impl Report {
             low_integrity_loopback: field(5)?,
             untrusted_integrity: field(6)?,
             untrusted_integrity_loopback: field(7)?,
-            range_off_loopback: field(8)?,
-            range_loopback: field(9)?,
+            open_off_loopback: field(8)?,
+            open_loopback: field(9)?,
         })
     }
 
     /// The attempts the filters are built to refuse, each with
     /// whether it may have been skipped (the ones aimed at the
     /// off-loopback target, which a machine can lack, and the one
-    /// aimed at a port of the loopback range, which need not be
-    /// configured).
+    /// made only with loopback open).
     fn must_be_blocked(&self) -> [(Outcome, bool); 7] {
         [
             (self.plain, false),
@@ -333,7 +338,7 @@ impl Report {
             (self.low_integrity_loopback, false),
             (self.untrusted_integrity, true),
             (self.untrusted_integrity_loopback, false),
-            (self.range_off_loopback, true),
+            (self.open_off_loopback, true),
         ]
     }
 }
@@ -349,9 +354,10 @@ pub const EXIT_NOT_FENCED: i32 = 3;
 /// `wfp verify` / `exec` exit code: the installed filter set is not
 /// the one this session requires — the install record says it was
 /// written by an earlier build, or (for `exec`) removed by an
-/// uninstall, or opens a different loopback port range than the one
-/// the session is configured with; or the probe found the configured
-/// range closed. The repair is always to re-run the install.
+/// uninstall, or has a different loopback mode than the one the
+/// session is configured with; or the probe found loopback closed
+/// where it is recorded open. The repair is always to re-run the
+/// install.
 pub const EXIT_FENCE_OUTDATED: i32 = 19;
 
 /// What `wfp verify` concludes from a [`Report`].
@@ -365,20 +371,19 @@ pub struct Verdict {
 }
 
 /// The plain, the off-loopback anonymous, the four lowered-integrity
-/// attempts and the off-loopback one at a port of the configured
-/// loopback range decide whether the fence is there: any one getting
+/// attempts and the off-loopback one at a port open on loopback
+/// decide whether the fence is there: any one getting
 /// past the filters is a missing fence ([`EXIT_NOT_FENCED`]), and any
 /// one that neither got past nor was blocked — the token could not be
 /// assumed, the connect timed out — leaves the probe inconclusive. An
 /// attempt at an off-loopback target that was skipped (the machine
-/// has no such address to aim at, or no range is configured) does not
+/// has no such address to aim at, or loopback is closed) does not
 /// fail the probe.
 ///
-/// With those settled, the attempt at the broker's own listener inside
-/// the configured range must connect. Blocked means the filters do not
-/// carry the range ([`EXIT_FENCE_OUTDATED`]); skipped (no range
-/// configured, or no port of it was free to listen on) does not fail
-/// the probe.
+/// With those settled, the attempt at the broker's own loopback
+/// listener must connect. Blocked means the filters do not open
+/// loopback ([`EXIT_FENCE_OUTDATED`]); skipped (loopback is closed, or
+/// no listener could be bound) does not fail the probe.
 ///
 /// The two remaining attempts never fail it — the filters cannot
 /// refuse them — and are reported as residuals instead of passing
@@ -404,7 +409,7 @@ pub fn verdict(r: &Report, child_token: bool) -> Verdict {
     } else if must.iter().any(|(o, may_skip)| !closed(*o, *may_skip)) {
         EXIT_INCONCLUSIVE
     } else {
-        match r.range_loopback {
+        match r.open_loopback {
             Outcome::Connected | Outcome::Skipped => EXIT_FENCED,
             Outcome::Blocked => EXIT_FENCE_OUTDATED,
             _ => EXIT_INCONCLUSIVE,
@@ -423,8 +428,8 @@ pub fn verdict(r: &Report, child_token: bool) -> Verdict {
 }
 
 /// An off-loopback destination on this machine for the anonymous
-/// attempt, the lowered-integrity attempts and the off-loopback range
-/// attempt: the address the machine would use as the source of an
+/// attempt, the lowered-integrity attempts and the off-loopback
+/// open-port attempt: the address the machine would use as the source of an
 /// outbound connection, at `port`. Nothing needs to listen there —
 /// refused is as good an answer as connected.
 ///
@@ -450,22 +455,31 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     None
 }
 
-/// A loopback listener on the first port of `range` that is free,
-/// for the in-range reachability attempt. Held by the caller (the
-/// broker) until the runner has reported, then dropped. A pending
-/// connection completes against the listen backlog, so nothing needs
-/// to accept. `None` when every port of the range is taken: the probe
-/// never aims that attempt at a listener it does not own.
-pub fn bind_in_range((lo, hi): (u16, u16)) -> Option<std::net::TcpListener> {
-    (lo..=hi).find_map(|p| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)).ok())
+/// A loopback listener on a port the open-loopback PERMIT covers, for
+/// the reachability attempt: whatever port the system hands out, tried
+/// again (with the earlier ones held) if that is one of the floor.
+/// Held by the caller (the broker) until the runner has reported, then
+/// dropped. A pending connection completes against the listen backlog,
+/// so nothing needs to accept. `None` when none could be bound: the
+/// probe never aims that attempt at a listener it does not own.
+pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
+    let mut on_floor = Vec::new();
+    for _ in 0..4 {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+        if !crate::wfp::is_loopback_floor_port(l.local_addr().ok()?.port()) {
+            return Some(l);
+        }
+        on_floor.push(l);
+    }
+    None
 }
 
-/// Why `target` cannot serve as the probe's must-be-blocked loopback
-/// target with `range` configured, if it cannot: a loopback port
-/// inside the range is PERMITted by an intact fence, so a connect
-/// there would read as a missing one.
-pub fn target_conflicts_with_range(target: &SocketAddr, (lo, hi): (u16, u16)) -> bool {
-    target.ip().is_loopback() && (lo..=hi).contains(&target.port())
+/// Whether `target` cannot serve as the probe's must-be-blocked
+/// loopback target with loopback open: a loopback port outside the
+/// floor is PERMITted by an intact fence, so a connect there would
+/// read as a missing one.
+pub fn target_is_open_loopback(target: &SocketAddr) -> bool {
+    target.ip().is_loopback() && !crate::wfp::is_loopback_floor_port(target.port())
 }
 
 // ────────────────────── the attempts ──────────────────────
@@ -1011,30 +1025,29 @@ pub fn connect_once(target: &str) -> Result<u32> {
 }
 
 /// The off-loopback target of the lowered-integrity attempts: the
-/// one at a port inside the configured loopback range when there is
-/// one, else the anonymous attempt's. Both are the same address; the
-/// in-range port is the stricter destination, since it is the one a
-/// PERMIT names. Shared by the runner, which aims the attempts, and
+/// one at a port open on loopback when there is one, else the
+/// anonymous attempt's. Both are the same address; the open port is
+/// the stricter destination, since it is one a PERMIT names. Shared by the runner, which aims the attempts, and
 /// the broker, which reports where they went.
-pub fn lowered_off_loopback<T>(range_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
-    range_off_loopback.or(anonymous)
+pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
+    open_off_loopback.or(anonymous)
 }
 
 /// Where each attempt is aimed. `None` skips that attempt.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Targets<'a> {
-    /// The loopback probe target: outside every permitted port range.
+    /// The loopback probe target: a port no PERMIT covers.
     pub target: &'a str,
     /// Off-loopback, for the attempt made while impersonating the
     /// anonymous token — and for the lowered-integrity attempts when
-    /// `range_off_loopback` is `None`.
+    /// `open_off_loopback` is `None`.
     pub anonymous: Option<&'a str>,
-    /// Off-loopback, at a port inside the configured loopback range.
-    /// Also where the lowered-integrity attempts' off-loopback half
-    /// goes ([`lowered_off_loopback`]).
-    pub range_off_loopback: Option<&'a str>,
-    /// The broker's loopback listener inside the configured range.
-    pub range_loopback: Option<&'a str>,
+    /// Off-loopback, at a port that is open on loopback. Also where
+    /// the lowered-integrity attempts' off-loopback half goes
+    /// ([`lowered_off_loopback`]).
+    pub open_off_loopback: Option<&'a str>,
+    /// The broker's loopback listener on an arbitrary port.
+    pub open_loopback: Option<&'a str>,
 }
 
 /// Run every attempt.
@@ -1045,14 +1058,14 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
     };
     let target = parse(targets.target)?;
     let anonymous_target = targets.anonymous.map(parse).transpose()?;
-    let range_off_loopback = targets.range_off_loopback.map(parse).transpose()?;
-    let range_loopback = targets.range_loopback.map(parse).transpose()?;
+    let open_off_loopback = targets.open_off_loopback.map(parse).transpose()?;
+    let open_loopback = targets.open_loopback.map(parse).transpose()?;
     let optional = |name: &str, t: &Option<SocketAddr>| match t {
         Some(t) => attempt(name, Identity::Own, t),
         None => Outcome::Skipped,
     };
     winsock_startup()?;
-    let lowered_target = lowered_off_loopback(range_off_loopback, anonymous_target);
+    let lowered_target = lowered_off_loopback(open_off_loopback, anonymous_target);
     let off_loopback_at = |name: &str, id: Identity, t: &Option<SocketAddr>| match t {
         Some(t) => attempt(name, id, t),
         None => {
@@ -1074,8 +1087,8 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
         low_integrity_loopback: attempt("low integrity, loopback", low, &target),
         untrusted_integrity: off_loopback_at("untrusted integrity", untrusted, &lowered_target),
         untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target),
-        range_off_loopback: optional("loopback range, off-loopback", &range_off_loopback),
-        range_loopback: optional("loopback range, loopback", &range_loopback),
+        open_off_loopback: optional("open loopback, off-loopback", &open_off_loopback),
+        open_loopback: optional("open loopback, loopback", &open_loopback),
     })
 }
 
@@ -1083,9 +1096,9 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
 mod tests {
     use super::*;
 
-    /// A report with no loopback port range configured: the four
-    /// lowered-integrity attempts blocked, the two range attempts
-    /// skipped, the rest as given.
+    /// A report with loopback closed: the four lowered-integrity
+    /// attempts blocked, the two open-loopback attempts skipped, the
+    /// rest as given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
         lowered(
             Report {
@@ -1097,8 +1110,8 @@ mod tests {
                 low_integrity_loopback: Outcome::Blocked,
                 untrusted_integrity: Outcome::Blocked,
                 untrusted_integrity_loopback: Outcome::Blocked,
-                range_off_loopback: Outcome::Skipped,
-                range_loopback: Outcome::Skipped,
+                open_off_loopback: Outcome::Skipped,
+                open_loopback: Outcome::Skipped,
             },
             [Outcome::Blocked; 4],
         )
@@ -1116,11 +1129,12 @@ mod tests {
         }
     }
 
-    /// An otherwise clean report with the two range attempts set.
-    fn ranged(off_loopback: Outcome, loopback: Outcome) -> Report {
+    /// An otherwise clean report with the two open-loopback attempts
+    /// set.
+    fn opened(off_loopback: Outcome, loopback: Outcome) -> Report {
         Report {
-            range_off_loopback: off_loopback,
-            range_loopback: loopback,
+            open_off_loopback: off_loopback,
+            open_loopback: loopback,
             ..report(
                 Outcome::Blocked,
                 Outcome::Blocked,
@@ -1139,13 +1153,13 @@ mod tests {
                         // The four lowered-integrity fields take the
                         // same values in a different order, so every
                         // field sees every outcome beside differing
-                        // neighbours; the two range fields take every
-                        // pair.
+                        // neighbours; the two open-loopback fields take
+                        // every pair.
                         for ro in Outcome::ALL {
                             for rl in Outcome::ALL {
                                 let r = Report {
-                                    range_off_loopback: ro,
-                                    range_loopback: rl,
+                                    open_off_loopback: ro,
+                                    open_loopback: rl,
                                     ..lowered(report(p, a, al, d), [d, al, a, p])
                                 };
                                 assert_eq!(Report::decode(r.encode()), Some(r));
@@ -1158,53 +1172,54 @@ mod tests {
     }
 
     #[test]
-    fn verdict_with_a_loopback_range() {
-        // The range opens loopback and nothing else.
-        let v = verdict(&ranged(Blocked, Connected), false);
+    fn verdict_with_loopback_open() {
+        // Loopback is open and nothing else is.
+        let v = verdict(&opened(Blocked, Connected), false);
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
-        // No off-loopback address to aim at, or no free port to
-        // listen on: neither fails the probe.
+        // No off-loopback address to aim at, or no listener: neither
+        // fails the probe.
         assert_eq!(
-            verdict(&ranged(Skipped, Connected), false).exit,
+            verdict(&opened(Skipped, Connected), false).exit,
             EXIT_FENCED
         );
-        assert_eq!(verdict(&ranged(Blocked, Skipped), false).exit, EXIT_FENCED);
-        // An in-range port reached off loopback is a missing fence,
-        // whatever the listener attempt says.
+        assert_eq!(verdict(&opened(Blocked, Skipped), false).exit, EXIT_FENCED);
+        // A port that is open on loopback reached off loopback is a
+        // missing fence, whatever the listener attempt says.
         for through in [Connected, Refused] {
             for listener in [Connected, Blocked, Skipped, Unreachable] {
                 assert_eq!(
-                    verdict(&ranged(through, listener), false).exit,
+                    verdict(&opened(through, listener), false).exit,
                     EXIT_NOT_FENCED
                 );
             }
         }
-        // The broker's own in-range listener blocked: the filters do
-        // not carry the configured range.
+        // The broker's own loopback listener blocked: the filters do
+        // not open loopback.
         assert_eq!(
-            verdict(&ranged(Blocked, Blocked), false).exit,
+            verdict(&opened(Blocked, Blocked), false).exit,
             EXIT_FENCE_OUTDATED
         );
         // A must-be-blocked attempt getting out outranks that.
-        let mut r = ranged(Blocked, Blocked);
+        let mut r = opened(Blocked, Blocked);
         r.plain = Connected;
         assert_eq!(verdict(&r, false).exit, EXIT_NOT_FENCED);
         // Anything else says nothing either way.
         for odd in [Unreachable, Error] {
             assert_eq!(
-                verdict(&ranged(odd, Connected), false).exit,
+                verdict(&opened(odd, Connected), false).exit,
                 EXIT_INCONCLUSIVE
             );
         }
         for odd in [Refused, Unreachable, Error] {
             assert_eq!(
-                verdict(&ranged(Blocked, odd), false).exit,
+                verdict(&opened(Blocked, odd), false).exit,
                 EXIT_INCONCLUSIVE
             );
         }
-        // Residuals qualify a pass with a range as without one.
-        let mut r = ranged(Blocked, Connected);
+        // Residuals qualify a pass with loopback open as with it
+        // closed.
+        let mut r = opened(Blocked, Connected);
         r.deny_only = Connected;
         assert_eq!(
             verdict(&r, false).residuals,
@@ -1213,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn lowered_attempts_go_to_the_in_range_port_when_there_is_one() {
+    fn lowered_attempts_go_to_the_open_port_when_there_is_one() {
         assert_eq!(
             lowered_off_loopback(Some("10.0.0.5:3000"), Some("10.0.0.5:49999")),
             Some("10.0.0.5:3000")
@@ -1231,8 +1246,8 @@ mod tests {
         assert_eq!(REPORT_BASE, 0x4000_0000);
         // The widest report still has bit 31 clear.
         let all_error = Report {
-            range_off_loopback: Error,
-            range_loopback: Error,
+            open_off_loopback: Error,
+            open_loopback: Error,
             ..lowered(report(Error, Error, Error, Error), [Error; 4])
         };
         assert_eq!(all_error.encode() >> 31, 0);
@@ -1240,26 +1255,29 @@ mod tests {
     }
 
     #[test]
-    fn probe_target_inside_the_range_is_a_conflict() {
+    fn only_a_floor_port_is_a_blocked_loopback_target_with_loopback_open() {
         let t = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let range = (3000, 3099);
-        for inside in [
+        for open in [
             "127.0.0.1:3000",
-            "127.0.0.1:3099",
-            "127.9.9.9:3050",
+            "127.0.0.1:49152",
+            "127.9.9.9:8080",
             "[::1]:3050",
+            "127.0.0.1:1",
+            "127.0.0.1:65535",
         ] {
-            assert!(target_conflicts_with_range(&t(inside), range), "{inside}");
+            assert!(target_is_open_loopback(&t(open)), "{open}");
         }
-        for outside in ["127.0.0.1:2999", "127.0.0.1:3100", "[::1]:49152"] {
-            assert!(
-                !target_conflicts_with_range(&t(outside), range),
-                "{outside}"
-            );
+        for (port, _) in crate::wfp::LOOPBACK_FLOOR_PORTS {
+            for host in ["127.0.0.1", "[::1]"] {
+                let floor = format!("{host}:{port}");
+                assert!(!target_is_open_loopback(&t(&floor)), "{floor}");
+            }
         }
-        // The PERMIT is for loopback addresses: an in-range port
-        // elsewhere is still a must-be-blocked destination.
-        assert!(!target_conflicts_with_range(&t("192.0.2.7:3050"), range));
+        // The PERMIT is for loopback addresses: any port elsewhere is
+        // still a must-be-blocked destination.
+        assert!(!target_is_open_loopback(&t("192.0.2.7:3050")));
+        assert!(!target_is_open_loopback(&t("[fe80::1]:3050")));
+        assert!(!target_is_open_loopback(&t("[::ffff:192.0.2.7]:3050")));
     }
 
     #[test]
@@ -1302,8 +1320,8 @@ mod tests {
         // still below the bit that marks one.
         let all = [Denied; FIELDS as usize];
         let r = Report {
-            range_off_loopback: all[8],
-            range_loopback: all[9],
+            open_off_loopback: all[8],
+            open_loopback: all[9],
             ..lowered(
                 report(all[0], all[1], all[2], all[3]),
                 [all[4], all[5], all[6], all[7]],
