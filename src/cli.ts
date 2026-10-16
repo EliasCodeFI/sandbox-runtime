@@ -202,6 +202,12 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
+      '--loopback-port-range <lo-hi>',
+      'second loopback PERMIT port range, for local servers the sandbox ' +
+        'may connect to directly (default: none); must match ' +
+        'windows.loopbackPortRange',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
@@ -231,10 +237,15 @@ async function main(): Promise<void> {
           typeof o.proxyPortRange === 'string'
             ? (o.proxyPortRange.split('-').map(Number) as [number, number])
             : undefined
+        const loopbackRange =
+          typeof o.loopbackPortRange === 'string'
+            ? (o.loopbackPortRange.split('-').map(Number) as [number, number])
+            : undefined
         try {
           const r = await installWindowsSandboxAsync({
             sublayerGuid: o.sublayerGuid as string | undefined,
             proxyPortRange: range,
+            loopbackPortRange: loopbackRange,
             sandboxUser: o.sandboxUser as string | undefined,
             force: Boolean(o.force),
             skipProfileGrant: Boolean(o.skipProfileGrant),
@@ -261,6 +272,10 @@ async function main(): Promise<void> {
               `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
               (r.wfp.portRange
                 ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
+                : '') +
+              (r.wfp.loopbackPortRange
+                ? `, loopback port range ${r.wfp.loopbackPortRange[0]}-` +
+                  `${r.wfp.loopbackPortRange[1]}`
                 : '') +
               `\n` +
               `  profile read grant: ` +

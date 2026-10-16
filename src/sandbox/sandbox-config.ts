@@ -1057,6 +1057,90 @@ export const SrtWinConfigSchema = z.object({
  * `.transform()` so this stays a plain `ZodObject` for consumers that
  * `.extend()`/`.shape` it.
  */
+/**
+ * Default `[low, high]` of `windows.proxyPortRange` — what `srt-win
+ * install` uses when no `--proxy-port-range` is given.
+ */
+export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
+  60080, 60089,
+]
+
+/** Most ports `windows.loopbackPortRange` may hold. */
+export const WINDOWS_LOOPBACK_PORT_RANGE_MAX_PORTS = 512
+
+/** Lowest port `windows.loopbackPortRange` may start at. */
+export const WINDOWS_LOOPBACK_PORT_RANGE_MIN_PORT = 1024
+
+/**
+ * Ports `windows.loopbackPortRange` may not include: local services
+ * that hand whoever connects to them control of the machine, of
+ * another account, or of another process. `srt-win` carries the same
+ * list (`SENSITIVE_LOOPBACK_PORTS` in `vendor/srt-win-src/src/wfp.rs`)
+ * and enforces it at install time.
+ */
+export const WINDOWS_LOOPBACK_SENSITIVE_PORTS: readonly (readonly [
+  number,
+  string,
+])[] = [
+  [2375, 'container engine API'],
+  [2376, 'container engine API (TLS)'],
+  [3389, 'remote desktop'],
+  [5985, 'remote management (HTTP)'],
+  [5986, 'remote management (HTTPS)'],
+  [9222, 'browser remote debugging'],
+  [9229, 'JavaScript runtime inspector'],
+  [47001, 'remote management (compatibility listener)'],
+]
+
+/**
+ * Why `range` is not acceptable as `windows.loopbackPortRange`, or
+ * `undefined` when it is. The same rules `srt-win install
+ * --loopback-port-range` applies:
+ *
+ * - `low <= high`;
+ * - at most {@link WINDOWS_LOOPBACK_PORT_RANGE_MAX_PORTS} ports;
+ * - `low >=` {@link WINDOWS_LOOPBACK_PORT_RANGE_MIN_PORT};
+ * - no port in common with `proxyPortRange` (skipped when it is not
+ *   given);
+ * - no port of {@link WINDOWS_LOOPBACK_SENSITIVE_PORTS}.
+ */
+export function windowsLoopbackPortRangeIssue(
+  range: readonly [number, number],
+  proxyPortRange?: readonly [number, number],
+): string | undefined {
+  const [lo, hi] = range
+  if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < 1 || hi > 65535) {
+    return 'ports must be integers between 1 and 65535'
+  }
+  if (lo > hi) return `low (${lo}) must be ≤ high (${hi})`
+  const ports = hi - lo + 1
+  if (ports > WINDOWS_LOOPBACK_PORT_RANGE_MAX_PORTS) {
+    return (
+      `range too wide (${ports} ports); at most ` +
+      `${WINDOWS_LOOPBACK_PORT_RANGE_MAX_PORTS}`
+    )
+  }
+  if (lo < WINDOWS_LOOPBACK_PORT_RANGE_MIN_PORT) {
+    return `low port must be ≥ ${WINDOWS_LOOPBACK_PORT_RANGE_MIN_PORT}`
+  }
+  if (proxyPortRange && lo <= proxyPortRange[1] && proxyPortRange[0] <= hi) {
+    return (
+      `range overlaps the proxy port range ` +
+      `${proxyPortRange[0]}-${proxyPortRange[1]}`
+    )
+  }
+  const sensitive = WINDOWS_LOOPBACK_SENSITIVE_PORTS.find(
+    ([port]) => lo <= port && port <= hi,
+  )
+  if (sensitive) {
+    return (
+      `range includes port ${sensitive[0]} (${sensitive[1]}), which must ` +
+      `not be reachable from the sandbox`
+    )
+  }
+  return undefined
+}
+
 export const WindowsConfigSchema = z.object({
   sandboxUser: z
     .string()
@@ -1096,6 +1180,29 @@ export const WindowsConfigSchema = z.object({
         'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
+    ),
+  loopbackPortRange: z
+    .tuple([z.number().int().min(1), z.number().int().max(65535)])
+    .superRefine((range, ctx) => {
+      // The overlap with the proxy range needs `proxyPortRange`, which
+      // a field cannot see: SandboxRuntimeConfigSchema checks it.
+      const issue = windowsLoopbackPortRangeIssue(range)
+      if (issue) ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue })
+    })
+    .optional()
+    .describe(
+      'Inclusive [low, high] range of loopback ports that sandboxed ' +
+        'commands may connect to directly, for local servers (a dev ' +
+        'server, a database, a server another sandboxed command started) ' +
+        'that listen inside it. Unset by default: loopback is then ' +
+        'reachable only through the proxy. Any listener of any user on ' +
+        'these ports becomes reachable from the sandbox. MUST match the ' +
+        'range passed to `srt-win install --loopback-port-range`; a ' +
+        'session whose range differs from the installed one (or that has ' +
+        'none when one is installed) is refused until the install is ' +
+        're-run. At most 512 ports, starting at 1024 or above, sharing no ' +
+        'port with proxyPortRange and including none of 2375, 2376, 3389, ' +
+        '5985, 5986, 9222, 9229, 47001.',
     ),
   srtWin: SrtWinConfigSchema.optional().describe(
     'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
@@ -1289,6 +1396,26 @@ export const SandboxRuntimeConfigSchema = z
     ),
   })
   .superRefine((cfg, ctx) => {
+    // windows.loopbackPortRange against the proxy range in use. The
+    // field's own rules are checked on the field.
+    const loopbackRange = cfg.windows?.loopbackPortRange
+    if (loopbackRange) {
+      const proxyRange =
+        cfg.windows?.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+      if (
+        loopbackRange[0] <= proxyRange[1] &&
+        proxyRange[0] <= loopbackRange[1]
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['windows', 'loopbackPortRange'],
+          message:
+            `range overlaps the proxy port range ` +
+            `${proxyRange[0]}-${proxyRange[1]}`,
+        })
+      }
+    }
+
     // filesystem.disabled drops every filesystem rule, the credential file
     // denies included (getFsReadConfig, getFsWriteConfig and
     // computeWindowsFsAccessSet all short-circuit on it), so an inert deny

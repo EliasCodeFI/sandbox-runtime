@@ -222,7 +222,13 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // So under the write-restricted token (the default) every
 // initialize() probes, with that session's token, and nothing is
 // remembered.
-const windowsWfpVerified = { defaultToken: false }
+// What IS config-scoped, under the ordinary token too, is the loopback
+// port range the probe was run with: `defaultToken` is that range
+// (`none` without one) once verified, and a session configured with
+// another verifies again.
+const windowsWfpVerified: { defaultToken: string | undefined } = {
+  defaultToken: undefined,
+}
 // The child-token shape initialize() verified the fence for, captured
 // like `srtWinSpawn` so the wrap path uses it rather than `config`:
 // updateConfig() swaps `config` live without re-verifying, and a
@@ -1234,10 +1240,16 @@ async function initializeSteps(
           throw e
         }
       }
-      if (!windowsWfpVerified.defaultToken) {
+      // A session whose `windows.loopbackPortRange` is not the range
+      // the install recorded is refused here too, with the install
+      // command that repairs it.
+      const loopbackPortRange = runtimeConfig.windows?.loopbackPortRange
+      const verifyKey = loopbackPortRange ? loopbackPortRange.join('-') : 'none'
+      if (windowsWfpVerified.defaultToken !== verifyKey) {
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+            loopbackPortRange,
             writeRestrictedToken: false,
             srtWin,
           })
@@ -1245,7 +1257,7 @@ async function initializeSteps(
           config = undefined
           throw e
         }
-        windowsWfpVerified.defaultToken = true
+        windowsWfpVerified.defaultToken = verifyKey
       }
     }
     windowsWriteRestrictedToken = writeRestricted
@@ -1447,6 +1459,10 @@ async function initializeSteps(
         // never starts with that token unfenced.
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          // A session whose `windows.loopbackPortRange` is not the
+          // range the install recorded is refused here, with the
+          // install command that repairs it.
+          loopbackPortRange: runtimeConfig.windows?.loopbackPortRange,
           writeRestrictedToken: true,
           writeRoots: acc.grantWrite,
           srtWin,
@@ -1618,11 +1634,15 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(
-  ripgrepConfig?: RipgrepConfig,
-):
+function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   | { done: SandboxDependencyCheck }
-  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
+  | {
+      windows: {
+        sublayerGuid?: string
+        srtWin: SrtWinSpawn
+        loopbackPortRange?: readonly [number, number] | null
+      }
+    } {
   if (!isSupportedPlatform()) {
     return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
@@ -1660,6 +1680,11 @@ function checkDependenciesCommon(
         sublayerGuid:
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
         srtWin,
+        // With a config to go by, an install whose loopback port
+        // range is not the configured one (`null`: none) is an error.
+        ...(config && {
+          loopbackPortRange: config.windows?.loopbackPortRange ?? null,
+        }),
       },
     }
   }
@@ -2900,6 +2925,12 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      // `srt-win exec` launches nothing unless this is the range the
+      // install recorded, so a range that differs — the session's or
+      // one command's — is refused, never silently ignored.
+      loopbackPortRange:
+        customConfig?.windows?.loopbackPortRange ??
+        config?.windows?.loopbackPortRange,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
