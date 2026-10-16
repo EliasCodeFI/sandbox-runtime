@@ -401,6 +401,35 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     // The proxy vars themselves survive — only the bypass list is dropped.
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
   })
+
+  it('NODE_USE_ENV_PROXY=1 rides the --env overlay with the HTTP proxy, over a masked value', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const envArgsOf = (
+      p: Parameters<typeof wrapCommandWithSandboxWindows>[0],
+    ) => {
+      const { argv } = wrapCommandWithSandboxWindows(p)
+      return argv.filter((_, i) => argv[i - 1] === '--env')
+    }
+    const named = (envArgs: string[]) =>
+      envArgs.filter(e => e.startsWith('NODE_USE_ENV_PROXY='))
+    // Node's built-in clients read HTTP_PROXY / HTTPS_PROXY only when
+    // asked to; the generated value follows setEnvVars, as the proxy
+    // variables do.
+    expect(
+      named(
+        envArgsOf({
+          command: 'node app.js',
+          httpProxyPort: 60080,
+          socksProxyPort: 60080,
+          proxyAuthToken: 'tok',
+          setEnvVars: { NODE_USE_ENV_PROXY: '0' },
+          srtWin,
+        }),
+      ),
+    ).toEqual(['NODE_USE_ENV_PROXY=1'])
+    // No proxy: nothing to point Node at.
+    expect(named(envArgsOf({ command: 'node app.js', srtWin }))).toEqual([])
+  })
 })
 
 describe('parseWindowsBinShell (pure, all platforms)', () => {
@@ -1862,13 +1891,14 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it.skipIf(!hasTool('node'))(
     'B5: node https.get direct egress is BLOCKED (proxy env not honoured)',
     async () => {
-      // KEY: Node's built-in https does NOT read HTTPS_PROXY, so it
-      // attempts a DIRECT connect. The user-SID WFP filter must
-      // refuse it. This is the load-bearing proof that WFP — not the
-      // proxy env vars — is the real network boundary.
+      // KEY: with NODE_USE_ENV_PROXY cleared, Node's built-in https
+      // does NOT read HTTPS_PROXY, so it attempts a DIRECT connect.
+      // The user-SID WFP filter must refuse it. This is the
+      // load-bearing proof that WFP — not the proxy env vars — is
+      // the real network boundary.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
-        `node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
+        `set "NODE_USE_ENV_PROXY=" & node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
       )
       expect(r.stdout.startsWith('OK:')).toBe(false)
     },
@@ -3071,10 +3101,11 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     'G5: node trusts the MITM CA via NODE_EXTRA_CA_CERTS (extends)',
     async () => {
       SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
-      // Node's built-in `fetch` (undici) does NOT honor proxy env
-      // vars, so a bare fetch goes direct and the WFP fence blocks
-      // it (the B5 row pins exactly this). To prove
-      // NODE_EXTRA_CA_CERTS is honored we tunnel explicitly:
+      // Node's built-in clients honor the proxy env vars only from
+      // the releases that read NODE_USE_ENV_PROXY; on an older one a
+      // bare fetch goes direct and the WFP fence blocks it (the B5
+      // row pins the direct case). To prove NODE_EXTRA_CA_CERTS is
+      // honored on any release we tunnel explicitly:
       // http CONNECT to the proxy (read from `HTTPS_PROXY`,
       // including the auth token), then `https.get` over the
       // resulting socket. `https.get` validates the proxy-minted
