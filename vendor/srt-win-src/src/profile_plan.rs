@@ -881,8 +881,10 @@ pub fn parse_reparse(buf: &[u8]) -> Result<LinkData, String> {
         .get(names_at + off..names_at + off + len)
         .ok_or("truncated reparse data")?;
     let wide: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let target = String::from_utf16(&wide).map_err(|_| "a link target that is not valid UTF-16")?;
     Ok(if tag == TAG_MOUNT_POINT {
