@@ -920,6 +920,63 @@ try {
   if ($h.exit -eq 0 -and -not (Has-Group $workDir)) { Ok 'H: with the session ended, the kept root is forgotten' }
   else { Fail "H: acl forget --all after the session: exit=$($h.exit) root still granted=$(Has-Group $workDir) raw: $($h.raw)" }
 
+  # ── S: a sandboxed command does not outlive its session ──────────
+  # A helper process stands for a session host: it is registered as a
+  # session, and a long sandboxed command is started for it
+  # (`--held-by`). While both run the profile grant is refused. The
+  # helper is then killed — only the helper: the command and
+  # everything it started must be gone within seconds, `srt-win exec`
+  # must say so with its own exit code, and only then does the grant
+  # go ahead. "No session" has to mean "no sandboxed process".
+  function Sb-Pings {
+    @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object {
+        try { (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $sbSid } catch { $false }
+      })
+  }
+  function Wait-Until { param([scriptblock] $cond, [int] $sec)
+    $until = (Get-Date).AddSeconds($sec)
+    while ((Get-Date) -lt $until) { if (& $cond) { return $true }; Start-Sleep -Milliseconds 250 }
+    return [bool](& $cond)
+  }
+  $helper = Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden -ArgumentList @('/c', 'ping', '-n', '600', '127.0.0.1')
+  $held = $null
+  try {
+    $json = @{ read = @(); write = @(); denyRead = @(); denyWrite = @() } | ConvertTo-Json -Compress
+    $reg = $json | & $Exe acl grant --holder-pid $helper.Id --sandbox-user-sid $sbSid --persistent 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { Fail "S: setup — the helper could not be registered as a session: $reg" }
+    else {
+      $psi = [System.Diagnostics.ProcessStartInfo]::new()
+      $psi.FileName              = $ExeAbs
+      $psi.UseShellExecute       = $false
+      $psi.RedirectStandardError = $true
+      foreach ($a in @('exec', '--held-by', "$($helper.Id)", '--write-restricted-token',
+                       '--env', "PATH=$($env:PATH)", '--env', "PATHEXT=$($env:PATHEXT)",
+                       '--', $cmd, '/d', '/s', '/c', 'ping -n 600 127.0.0.1 >nul')) { $null = $psi.ArgumentList.Add($a) }
+      $held = [System.Diagnostics.Process]::Start($psi)
+      $heldErr = $held.StandardError.ReadToEndAsync()
+      if (-not (Wait-Until { (Sb-Pings).Count -ge 1 } 60)) { Fail "S: setup — the sandboxed command did not start (exec exited=$($held.HasExited))" }
+      else {
+        $sg = Grant
+        if ($sg.exit -eq 24 -and @($sg.json.held_by | Where-Object { $_.pid -eq $helper.Id }).Count -ge 1) { Ok 'S: with the session and its command running, profile grant is refused (exit 24)' }
+        else { Fail "S: profile grant beside a running command: exit=$($sg.exit) raw: $($sg.raw)" }
+        # Only the session's process (and its own child), not the exec.
+        & taskkill /PID $helper.Id /T /F 2>&1 | Out-Null
+        $exited = $held.WaitForExit(10000)
+        $none = Wait-Until { (Sb-Pings).Count -eq 0 } 5
+        if ($exited -and $none) { Ok 'S: the session killed, its sandboxed command and everything it started are gone within seconds' }
+        else { Fail "S: after the session was killed: exec exited=$exited sandboxed ping(s) left=$((Sb-Pings).Count)" }
+        if ($exited -and $held.ExitCode -eq 26 -and $heldErr.Result -match '"code":"session_ended"') { Ok 'S: srt-win exec says the session ended (exit 26)' }
+        else { Fail "S: exec exit=$(if ($exited) { $held.ExitCode } else { 'still running' }) stderr: $(if ($exited) { $heldErr.Result })" }
+        $sg = Grant
+        if ($sg.exit -eq 0 -and $none) { Ok 'S: with the tree gone, profile grant goes ahead' }
+        else { Fail "S: profile grant after the session ended: exit=$($sg.exit) sandboxed ping(s) left=$((Sb-Pings).Count) raw: $($sg.raw)" }
+      }
+    }
+  } finally {
+    & taskkill /PID $helper.Id /T /F 2>&1 | Out-Null
+    if ($held -and -not $held.HasExited) { try { $held.Kill($true) } catch { } }
+  }
+
   # ── U: uninstall ─────────────────────────────────────────────────
   # (Already elevated, so there is no prompt to decline; this is the
   # path where the account is removed first and the grants are then
@@ -969,4 +1026,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, B, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, U)'
+Write-Host 'smoke-profile-read: PASS (T, B, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, S, U)'
