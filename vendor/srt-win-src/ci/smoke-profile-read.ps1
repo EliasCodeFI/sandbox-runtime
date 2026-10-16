@@ -888,6 +888,11 @@ try {
     $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--all', '--unless-held-by-others', '4')
     if ($h.exit -eq 22 -and (Has-Group $workDir)) { Ok 'H: acl forget --all is refused (exit 22) while another live session writes through a kept root, which stays' }
     else { Fail "H: acl forget --all with a live holder: exit=$($h.exit) root still granted=$(Has-Group $workDir) raw: $($h.raw)" }
+    # Nor is the grant written or refreshed under a live session: it
+    # changes only on a quiet machine.
+    $hg = Grant
+    if ($hg.exit -eq 24 -and @($hg.json.held_by | Where-Object { $_.pid -eq $PID }).Count -ge 1) { Ok 'H: profile grant is refused (exit 24) while a session is live' }
+    else { Fail "H: profile grant with a live holder: exit=$($hg.exit) raw: $($hg.raw)" }
     Expect-Read 'H (the held grant still reads)' $note 'NOTE-CONTENT'
     # The session's own process is not "another".
     $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--all', '--unless-held-by-others', "$PID")
@@ -918,12 +923,14 @@ try {
   }
 }
 finally {
-  & $Exe profile forget 2>&1 | Out-Null
-  & $Exe acl forget --all 2>&1 | Out-Null
+  # This script's own session first: nothing is forgotten, and nothing
+  # uninstalled, from under a live holder.
   if ($sbSid) {
     & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
     & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   }
+  & $Exe profile forget 2>&1 | Out-Null
+  & $Exe acl forget --all 2>&1 | Out-Null
   if ($lockedDir -and (Test-Path -LiteralPath $lockedDir)) {
     & icacls $lockedDir /remove:d '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' 2>&1 | Out-Null
   }

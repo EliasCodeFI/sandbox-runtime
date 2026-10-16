@@ -28,7 +28,10 @@ import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import {
+  SandboxManager,
+  windowsProfileReadWarningsOf,
+} from '../../src/sandbox/sandbox-manager.js'
 import type {
   CredentialFileConfig,
   SandboxRuntimeConfig,
@@ -1428,6 +1431,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
+        staleAllow: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
@@ -6280,9 +6284,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         | 'handed-read'
         | 'handed-write'
         | 'handed-deny'
+        | 'except'
         | 'expect',
         string[]
-      > & { name: string }
+      > & { name: string; reduced: boolean }
       const blank = (name: string): Case => ({
         name,
         read: [],
@@ -6292,7 +6297,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         'handed-read': [],
         'handed-write': [],
         'handed-deny': [],
+        except: [],
         expect: [],
+        reduced: false,
       })
       const recorded: { path: string; kind: string }[] = []
       const cases: Case[] = []
@@ -6312,7 +6319,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         } else {
           const c = cases[cases.length - 1]!
           expect(Object.keys(c)).toContain(key)
-          c[key as Exclude<keyof Case, 'name'>] = list(value)
+          c[key as Exclude<keyof Case, 'name' | 'reduced'>] = list(value)
+          if (key === 'except') c.reduced = true
         }
       }
       expect(cases.length).toBeGreaterThanOrEqual(12)
@@ -6361,17 +6369,42 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           name: c.name,
           denied: [...c.expect].sort(),
         })
-        // And what a per-command deny is sent with: the grants that
-        // outrank it.
-        expect(
-          winUtils.windowsGrantsBeneathDenies(allows, ranked.denyRead).sort(),
-        ).toEqual(
-          allows
-            .filter(a =>
-              ranked.denyRead.some(d => covers(d, a) && key(d) !== key(a)),
-            )
-            .sort(),
+        // What a per-command deny is sent with: for each deny the
+        // topmost grants strictly beneath it. Whatever the reduction
+        // leaves out, srt-win — which spares, per deny, what lies at
+        // or beneath a grant strictly beneath THAT deny — must reach
+        // the same outcome from it as from the full list.
+        const sent = winUtils.windowsGrantsBeneathDenies(
+          allows,
+          ranked.denyRead,
         )
+        if (c.reduced) {
+          expect({ name: c.name, sent: [...sent].sort() }).toEqual({
+            name: c.name,
+            sent: [...c.except].sort(),
+          })
+        }
+        const asSrtWinDenies = (grants: readonly string[]) =>
+          recorded
+            .filter(r => ['container', 'granted', 'file'].includes(r.kind))
+            .filter(r =>
+              ranked.denyRead.some(
+                d =>
+                  key(d) === key(r.path) ||
+                  (covers(d, r.path) &&
+                    !grants.some(
+                      g =>
+                        covers(d, g) && key(g) !== key(d) && covers(g, r.path),
+                    )),
+              ),
+            )
+            .map(r => r.path)
+            .sort()
+        expect({ name: c.name, denied: asSrtWinDenies(sent) }).toEqual({
+          name: c.name,
+          denied: [...c.expect].sort(),
+        })
+        expect(asSrtWinDenies(allows)).toEqual([...c.expect].sort())
       }
     })
 
@@ -7591,6 +7624,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
+        staleAllow: [],
         failed: [],
         elapsedMs: 1234,
       })
@@ -7604,7 +7638,13 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       const classes = () => ({
         not_granted: [item('AppData/Roaming/Microsoft/Installer', 'no right')],
         self_closed: [item('.ssh', 'closed by its own access list')],
-        unverifiable: [item('.kube', 'cannot be read')],
+        unverifiable: [
+          {
+            ...item('.kube', 'cannot be read'),
+            caller_reads: false,
+            cause: 'acl_unreadable',
+          },
+        ],
         unprotected: [item('.docker', 'readable by its own access list')],
       })
 
@@ -7615,8 +7655,15 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         const r = await winUtils.grantWindowsProfileRead({ srtWin })
         expect(r.notGranted).toEqual(classes().not_granted)
         expect(r.selfClosed).toEqual(classes().self_closed)
-        expect(r.unverifiable).toEqual(classes().unverifiable)
+        expect(r.unverifiable).toEqual([
+          {
+            ...item('.kube', 'cannot be read'),
+            callerReads: false,
+            cause: 'acl_unreadable',
+          },
+        ])
         expect(r.unprotected).toEqual(classes().unprotected)
+        expect(r.staleAllow).toEqual([])
         expect(r.failed).toEqual([])
       })
 
@@ -7626,7 +7673,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(st.state).toBe('current')
         expect(st.notGranted).toEqual(classes().not_granted)
         expect(st.selfClosed).toEqual(classes().self_closed)
-        expect(st.unverifiable).toEqual(classes().unverifiable)
+        expect(
+          st.unverifiable.map(i => [i.path, i.callerReads, i.cause]),
+        ).toEqual([[join(home, '.kube'), false, 'acl_unreadable']])
         expect(st.unprotected).toEqual(classes().unprotected)
         // A status that says nothing of them has none; one that says
         // nonsense has none either.
@@ -7637,34 +7686,84 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(plain.notGranted).toEqual([])
       })
 
-      it('a session starts on such a grant; an excluded path that is readable all the same is a typed warning', async () => {
-        profileStatus = { ...current(), ...classes() }
+      it('a session starts on such a grant; what was found is surfaced as typed warnings that claim no more than that', async () => {
+        const unverifiable = (
+          rel: string,
+          caller_reads: boolean | 'unknown',
+          cause: string,
+        ) => ({ ...item(rel, `reason of ${rel}`), caller_reads, cause })
+        profileStatus = {
+          ...current(),
+          ...classes(),
+          unverifiable: [
+            unverifiable('.kube', false, 'acl_unreadable'),
+            // The access list cannot be read, the content can: what
+            // admits the user there admits the sandbox account too.
+            unverifiable('.oci', true, 'acl_unreadable'),
+            unverifiable('.snowsql', 'unknown', 'account_unknown'),
+            unverifiable('.kaggle', 'unknown', 'not_local'),
+          ],
+          stale_allow: [item('Old', 'could not be removed')],
+        }
         await SandboxManager.initialize(config())
+        // None of it is a rejection.
         expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
         const warnings = SandboxManager.getWindowsProfileReadWarnings()
-        // Two: what is known to be readable, and what could not be
-        // shown to be closed. Each with its paths and their reasons.
         expect(warnings.map(w => w.code)).toEqual([
           'profile_exclusion_unprotected',
           'profile_exclusion_unverifiable',
+          'profile_stale_allow',
         ])
-        expect(warnings[0]!.paths).toEqual(classes().unprotected)
-        expect(warnings[0]!.message).toContain(join(home, '.docker'))
-        expect(warnings[1]!.paths).toEqual(classes().unverifiable)
-        expect(warnings[1]!.paths[0]!.reason).toBe('cannot be read')
-        expect(warnings[1]!.message).toContain(join(home, '.kube'))
-        // Neither is a rejection: the session is running.
-        expect(SandboxManager.getConfig()).toBeDefined()
+        const [open, unknown, stale] = warnings
+        // Known readable, and readable to the user without anyone
+        // being able to see why: one warning, each with its own words.
+        expect(open!.paths.map(p => p.path)).toEqual([
+          join(home, '.docker'),
+          join(home, '.oci'),
+        ])
+        expect(open!.message).toContain('by their own access lists')
+        expect(open!.message).toContain('you can read all the same')
+        expect(open!.message).toContain(join(home, '.oci'))
+        // The rest: what is known is said, and nothing is promised.
+        expect(unknown!.paths.map(p => p.path)).toEqual([
+          join(home, '.kube'),
+          join(home, '.snowsql'),
+          join(home, '.kaggle'),
+        ])
+        expect(unknown!.paths[0]).toEqual({
+          path: join(home, '.kube'),
+          reason: 'reason of .kube',
+          callerReads: false,
+          cause: 'acl_unreadable',
+        })
+        expect(unknown!.message).toContain(
+          'you cannot read their content either',
+        )
+        expect(unknown!.message).toContain('the sandbox account is not known')
+        expect(unknown!.message).toContain('were not examined')
+        expect(unknown!.message).not.toContain(join(home, '.oci'))
+        for (const w of warnings) {
+          expect(w.message).not.toMatch(/probabl|unlikely/i)
+        }
+        expect(stale!.paths).toEqual([item('Old', 'could not be removed')])
         await SandboxManager.reset()
         expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
-        // An unverifiable exclusion alone is still surfaced …
-        profileStatus = { ...current(), ...classes(), unprotected: [] }
-        await SandboxManager.initialize(config())
+        // Only the parts that have something to say are said.
         expect(
-          SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
-        ).toEqual(['profile_exclusion_unverifiable'])
-        await SandboxManager.reset()
-        // … and the two classes where nothing is open, or nothing was
+          windowsProfileReadWarningsOf({
+            unprotected: [],
+            unverifiable: [
+              {
+                path: 'p',
+                reason: 'r',
+                callerReads: false,
+                cause: 'acl_unreadable',
+              },
+            ],
+            staleAllow: [],
+          }).map(w => [w.code, w.message.includes('not known')]),
+        ).toEqual([['profile_exclusion_unverifiable', false]])
+        // The two classes where nothing is open, or nothing was
         // granted, are not warnings.
         profileStatus = {
           ...current(),
@@ -7676,11 +7775,30 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
       })
 
+      it('a command that runs into a profile grant in progress is told so', () => {
+        syncResult['profile status'] = exit(25, '', 'srt-win: error: …')
+        let thrown: unknown
+        try {
+          winUtils.getWindowsProfileReadStatus({ srtWin })
+        } catch (e) {
+          thrown = e
+        }
+        expect((thrown as WindowsSandboxError).code).toBe(
+          'profile_operation_in_progress',
+        )
+        // … and so is a wrapped command, from what srt-win exec prints.
+        const parsed = winUtils.parseWindowsSandboxError(
+          'srt-win: error: busy\n' +
+            '{"code":"profile_operation_in_progress","message":"in progress"}',
+        )
+        expect(parsed?.code).toBe('profile_operation_in_progress')
+      })
+
       it('a grant that live sessions block is its own typed error', async () => {
         grantRun = {
           code: 24,
           stderr: [
-            'srt-win: profile grant: a running session (process 7) denies reading',
+            'srt-win: error: profile grant: 1 sandbox session(s) or command(s) are running (process 7).',
           ],
           stdout: '',
         }
@@ -7889,6 +8007,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
+        staleAllow: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],

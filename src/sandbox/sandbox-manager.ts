@@ -93,6 +93,8 @@ import {
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
+  type WindowsProfileGrantItem,
+  type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -294,24 +296,115 @@ let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
 
 /** Something about the profile read grant that the user should be shown. */
 export interface WindowsProfileReadWarning {
-  /**
-   * `profile_exclusion_unprotected`: paths on the exclusion list that
-   * sandboxed commands can read all the same — by the paths' own
-   * access lists, which the user who made the grant may not change.
-   * The grant did not open them and cannot close them; their owner or
-   * an administrator can.
-   *
-   * `profile_exclusion_unverifiable`: paths on the exclusion list
-   * whose deny could not be written and whose access list the user
-   * who made the grant may not even read, so that nobody established
-   * that sandboxed commands are kept out. It is unlikely that they get
-   * in — what admits the sandbox account would as a rule admit that
-   * user too — but it is not known; each path's `reason` says whether
-   * the user can read its content.
-   */
-  code: 'profile_exclusion_unprotected' | 'profile_exclusion_unverifiable'
+  /** See {@link windowsProfileReadWarningsOf}. */
+  code:
+    | 'profile_exclusion_unprotected'
+    | 'profile_exclusion_unverifiable'
+    | 'profile_stale_allow'
   message: string
-  paths: { path: string; reason: string }[]
+  paths: WindowsProfileGrantItem[]
+}
+
+/**
+ * What a session on this grant has to tell its user, from what
+ * `srt-win` found — each message says what was established about its
+ * paths and nothing more.
+ *
+ * - `profile_exclusion_unprotected`: exclusions that could not be
+ *   denied and are readable to sandboxed commands — by their own
+ *   access list, or, where that list could not be read, because YOU
+ *   can read them without being able to see why (what admits you
+ *   there is as a rule a group the sandbox account is in too).
+ * - `profile_exclusion_unverifiable`: exclusions that could not be
+ *   denied and could not be examined. No claim is made about them;
+ *   the message says what is known: that you cannot read them either,
+ *   or that the sandbox account's identity is not known, or that they
+ *   were not looked at.
+ * - `profile_stale_allow`: paths that are no longer to be readable and
+ *   still carry an allow of an earlier run that could not be removed.
+ */
+export function windowsProfileReadWarningsOf(
+  grant: Pick<
+    WindowsProfileGrantStatus,
+    'unprotected' | 'unverifiable' | 'staleAllow'
+  >,
+): WindowsProfileReadWarning[] {
+  const list = (items: readonly WindowsProfileGrantItem[]) =>
+    items.map(i => i.path).join(', ')
+  const out: WindowsProfileReadWarning[] = []
+  const byList = grant.unprotected
+  const callerReads = grant.unverifiable.filter(i => i.callerReads === true)
+  const rest = grant.unverifiable.filter(i => i.callerReads !== true)
+  if (byList.length + callerReads.length > 0) {
+    const parts: string[] = []
+    if (byList.length > 0) {
+      parts.push(
+        `${byList.length} by their own access lists, which you may not ` +
+          `change (${list(byList)})`,
+      )
+    }
+    if (callerReads.length > 0) {
+      parts.push(
+        `${callerReads.length} whose access lists could not be read but ` +
+          `which you can read all the same, so sandboxed commands may ` +
+          `too (${list(callerReads)})`,
+      )
+    }
+    out.push({
+      code: 'profile_exclusion_unprotected',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied and are, or may be, readable to sandboxed commands: ` +
+        parts.join('; ') +
+        `. Only their owner or an administrator can close them.`,
+      paths: [...byList, ...callerReads],
+    })
+  }
+  if (rest.length > 0) {
+    const unreadable = rest.filter(i => i.callerReads === false)
+    const noAccount = rest.filter(i => i.cause === 'account_unknown')
+    const other = rest.filter(
+      i => i.callerReads !== false && i.cause !== 'account_unknown',
+    )
+    const parts: string[] = []
+    if (unreadable.length > 0) {
+      parts.push(
+        `${unreadable.length} whose access lists could not be read; you ` +
+          `cannot read their content either (${list(unreadable)})`,
+      )
+    }
+    if (noAccount.length > 0) {
+      parts.push(
+        `${noAccount.length} that could not be examined because the ` +
+          `sandbox account is not known (${list(noAccount)})`,
+      )
+    }
+    if (other.length > 0) {
+      parts.push(`${other.length} that were not examined (${list(other)})`)
+    }
+    out.push({
+      code: 'profile_exclusion_unverifiable',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied, and whether sandboxed commands can read them was not ` +
+        `established: ` +
+        parts.join('; ') +
+        `.`,
+      paths: rest,
+    })
+  }
+  if (grant.staleAllow.length > 0) {
+    out.push({
+      code: 'profile_stale_allow',
+      message:
+        `${grant.staleAllow.length} path(s) that are no longer to be ` +
+        `readable still carry an entry of the profile read grant that ` +
+        `could not be removed, and are readable to sandboxed commands ` +
+        `through it: ${list(grant.staleAllow)}.`,
+      paths: grant.staleAllow,
+    })
+  }
+  return out
 }
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -1318,44 +1411,9 @@ async function initializeSteps(
         if (grant.state === 'current') {
           profileExclusions = grant
           windowsProfileRead = 'granted'
-          if (grant.unprotected.length > 0) {
-            const warning: WindowsProfileReadWarning = {
-              code: 'profile_exclusion_unprotected',
-              message:
-                `${grant.unprotected.length} path(s) on the exclusion list of ` +
-                `the profile read grant are readable to sandboxed commands ` +
-                `by their own access lists, which you may not change: ` +
-                grant.unprotected.map(u => u.path).join(', ') +
-                `. Their owner or an administrator can close them ` +
-                `(\`srt-win profile status\` lists them with the reason).`,
-              paths: grant.unprotected,
-            }
-            windowsProfileReadWarnings.push(warning)
-            logForDebugging(`[Sandbox Windows] ${warning.message}`, {
-              level: 'warn',
-            })
-          }
-          // Not proven closed either, and weaker than the above: the
-          // access list could not even be read. Not a rejection — an
-          // object the user may not look at must not be what stops
-          // the sandbox — but not passed over in silence.
-          if (grant.unverifiable.length > 0) {
-            const warning: WindowsProfileReadWarning = {
-              code: 'profile_exclusion_unverifiable',
-              message:
-                `${grant.unverifiable.length} path(s) on the exclusion list of ` +
-                `the profile read grant could not be denied to sandboxed ` +
-                `commands, and their access lists could not be read to see ` +
-                `whether they are closed anyway: ` +
-                grant.unverifiable.map(u => u.path).join(', ') +
-                `. They are probably not readable to sandboxed commands; ` +
-                `\`srt-win profile status\` gives the reason for each.`,
-              paths: grant.unverifiable,
-            }
-            windowsProfileReadWarnings.push(warning)
-            logForDebugging(`[Sandbox Windows] ${warning.message}`, {
-              level: 'warn',
-            })
+          windowsProfileReadWarnings = windowsProfileReadWarningsOf(grant)
+          for (const w of windowsProfileReadWarnings) {
+            logForDebugging(`[Sandbox Windows] ${w.message}`, { level: 'warn' })
           }
         }
       }

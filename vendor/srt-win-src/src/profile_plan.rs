@@ -3243,6 +3243,9 @@ mod tests {
             name: String,
             /// Handed read and write grants.
             allows: Vec<String>,
+            /// What a per-command deny is sent with, where the case
+            /// says: the reduced list of grants.
+            except: Option<Vec<String>>,
             denies: Vec<String>,
             expect: Vec<String>,
         }
@@ -3268,6 +3271,7 @@ mod tests {
                     cases.last_mut().unwrap().allows.extend(list(value))
                 }
                 "handed-deny" => cases.last_mut().unwrap().denies = list(value),
+                "except" => cases.last_mut().unwrap().except = Some(list(value)),
                 "expect" => cases.last_mut().unwrap().expect = list(value),
                 // What the session configured: the library's side.
                 "read" | "write" | "deny" | "credential" => {}
@@ -3276,13 +3280,17 @@ mod tests {
         }
         assert!(cases.len() >= 12 && recorded.len() >= 10);
         let index = RecordedAllows::new(recorded.iter().map(|(p, k)| (p.as_str(), *k)));
-        for Case {
-            name,
-            allows,
-            denies,
-            expect,
-        } in &cases
-        {
+        assert!(cases.iter().any(|c| c.except.is_some()));
+        // Each case from the full list of grants and, where it names
+        // one, from the reduced list a command is sent with.
+        let runs = cases.iter().flat_map(|c| {
+            std::iter::once((&c.name, &c.allows, &c.denies, &c.expect)).chain(
+                c.except
+                    .as_ref()
+                    .map(|reduced| (&c.name, reduced, &c.denies, &c.expect)),
+            )
+        });
+        for (name, allows, denies, expect) in runs {
             // srt-win writes each handed deny on itself and on what
             // `covered` returns for it.
             let mut got: Vec<String> = Vec::new();

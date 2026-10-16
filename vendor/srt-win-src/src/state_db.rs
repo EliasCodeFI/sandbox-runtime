@@ -222,15 +222,69 @@ impl Drop for InitMutex {
     }
 }
 
+/// What the holder of the init lock is doing, written into the lock
+/// file behind the locked byte so that a waiter can tell a short
+/// operation from a long one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockFor {
+    /// A session start, an exec, an `acl` command: sub-second, at
+    /// most one DACL write.
+    Session,
+    /// `profile grant`, `profile forget`, the forget of an uninstall:
+    /// the walk of a profile, from half a minute to many minutes.
+    Profile,
+}
+
+impl LockFor {
+    const AT: u64 = 8;
+    const LEN: usize = 8;
+
+    fn word(self) -> &'static [u8; Self::LEN] {
+        match self {
+            LockFor::Session => b"session\n",
+            LockFor::Profile => b"profile\n",
+        }
+    }
+}
+
+/// The init lock is held for a profile grant or forget, which takes
+/// long: the caller was not made to wait it out. Exit code
+/// [`EXIT_PROFILE_BUSY`] at the top level.
+#[derive(Debug)]
+pub struct ProfileBusy;
+
+impl std::fmt::Display for ProfileBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the read grant on the user profile is being written or removed \
+             (`srt-win profile grant` / `profile forget`); nothing can start until it is done",
+        )
+    }
+}
+
+impl std::error::Error for ProfileBusy {}
+
+/// Exit code of any command that needed the init lock while a profile
+/// grant or forget held it.
+pub const EXIT_PROFILE_BUSY: i32 = 25;
+
+/// How long a caller waits for the init lock before it asks what the
+/// holder is doing: long enough for any session operation to finish,
+/// short enough that a session start during a profile grant fails at
+/// once, with the reason, instead of after a minute without one.
+const PROFILE_BUSY_AFTER_MS: u64 = 3_000;
+
 impl InitMutex {
-    fn acquire() -> Result<Self> {
-        Self::acquire_file(".acl-init.lock")
+    fn acquire(purpose: LockFor) -> Result<Self> {
+        // Bounded, not infinite: crash-recovery under this lock is
+        // sub-second and real contention is a handful of concurrent
+        // acl ops for ONE user, so a minute means a wedged holder —
+        // fail the op loudly rather than hang.
+        Self::acquire_within(purpose, PROFILE_BUSY_AFTER_MS, 60_000)
     }
 
-    /// The same kind of lock on another file of the session
-    /// directory: for a long operation that must not run twice at
-    /// once and must not keep the init lock while it runs.
-    fn acquire_file(name: &str) -> Result<Self> {
+    fn acquire_within(purpose: LockFor, ask_after_ms: u64, timeout_ms: u64) -> Result<Self> {
+        use std::os::windows::fs::FileExt;
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::{
             LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
@@ -239,24 +293,20 @@ impl InitMutex {
         let dir = session_store_dir()?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create_dir_all {}", dir.display()))?;
-        let path = dir.join(name);
+        let path = dir.join(".acl-init.lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            // Never truncate: the file's only role is carrying the
-            // kernel byte-range lock; its content is irrelevant.
+            // Never truncate: the first byte carries the kernel
+            // byte-range lock, and the bytes at `LockFor::AT` say what
+            // the holder is doing.
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open init-lock file {}", path.display()))?;
-        // Bounded, not infinite: crash-recovery under this lock is
-        // sub-second and real contention is a handful of concurrent
-        // acl ops for ONE user, so a minute means a wedged holder —
-        // fail the op loudly rather than hang.
-        const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
         const POLL_MS: u64 = 100;
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
+        let started = std::time::Instant::now();
+        let waited = || started.elapsed().as_millis() as u64;
         loop {
             let mut ov = OVERLAPPED::default();
             let r = unsafe {
@@ -270,11 +320,27 @@ impl InitMutex {
                 )
             };
             if r.is_ok() {
+                // Every holder says what it holds the lock for, so the
+                // word is never a previous holder's.
+                file.seek_write(purpose.word(), LockFor::AT)
+                    .context("mark the init lock")?;
                 return Ok(Self { file });
             }
-            if std::time::Instant::now() >= deadline {
+            // Held. After the short wait: if it is held for the walk
+            // of a profile, say so now.
+            if waited() >= ask_after_ms {
+                let mut word = [0u8; LockFor::LEN];
+                if file
+                    .seek_read(&mut word, LockFor::AT)
+                    .is_ok_and(|n| n == LockFor::LEN)
+                    && &word == LockFor::Profile.word()
+                {
+                    return Err(anyhow::Error::new(ProfileBusy));
+                }
+            }
+            if waited() >= timeout_ms {
                 bail!(
-                    "init lock {} not acquired within {ACQUIRE_TIMEOUT_MS}ms — \
+                    "init lock {} not acquired within {timeout_ms}ms — \
                      another srt-win/broker is holding it (wedged?)",
                     path.display(),
                 );
@@ -288,16 +354,51 @@ impl InitMutex {
 /// stamping/clearing) serialize against this user's brokers —
 /// acquire the session init lock without opening the session DB.
 pub fn acquire_session_lock() -> Result<impl Drop> {
-    InitMutex::acquire()
+    InitMutex::acquire(LockFor::Session)
 }
 
-/// The lock a `profile grant` or `profile forget` holds for its whole
-/// run, so that two of them do not interleave. It is NOT the init
-/// lock: that one they take per object written, so that sessions and
-/// commands that need it wait for one DACL write at most, not for the
-/// walk of a profile.
-pub fn acquire_profile_lock() -> Result<impl Drop> {
-    InitMutex::acquire_file(".profile-grant.lock")
+/// Whether the system refused `e` for lack of access — as opposed to
+/// any refusal this code makes itself.
+fn is_access_denied(e: &anyhow::Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|we| we.code() == windows::Win32::Foundation::ERROR_ACCESS_DENIED.into())
+}
+
+/// Every live holder of anything: `(process, kind, path)` of each
+/// holder row whose process is alive, except those of `except`. Call
+/// under the init lock, after crash recovery has dropped the rows of
+/// holders that are gone.
+///
+/// This is what a profile grant, a profile forget and an uninstall
+/// look at before they change anything: they run only on a quiet
+/// machine, where no session and no sandboxed command exists.
+pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
+    live_holders_with(db.conn(), except, DISK.alive)
+}
+
+fn live_holders_with(
+    conn: &Connection,
+    except: Option<u32>,
+    alive: fn(u32, i64) -> bool,
+) -> Result<Vec<KeptHolder>> {
+    let rows: Vec<(i64, i64, String, String)> = query_vec(
+        conn,
+        "SELECT h.pid, b.process_create_time, h.kind, h.canonical_path \
+         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         ORDER BY h.pid, h.kind, h.canonical_path",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|&(pid, ct, _, _)| Some(pid as u32) != except && alive(pid as u32, ct))
+        .map(|(pid, _, kind, path)| KeptHolder {
+            pid: pid as u32,
+            kind,
+            path,
+        })
+        .collect())
 }
 
 /// Whether the live process `pid` is recorded as a holder of the
@@ -320,28 +421,6 @@ pub fn holds_profile(pid: u32) -> bool {
     .ok()
     .flatten()
     .is_some_and(|created| (DISK.alive)(pid, created))
-}
-
-/// The read denies live sessions hold, as `(holder process, path)`:
-/// what a profile grant must not write a new allow beneath. Call under
-/// the init lock, after crash recovery has dropped the rows of holders
-/// that are gone.
-pub fn live_read_denies(db: &Locked) -> Result<Vec<(u32, String)>> {
-    let read_deny = SbAce::Deny(acl::DenyMask::ReadDeny);
-    let rows: Vec<(i64, i64, String)> = query_vec(
-        db.conn(),
-        "SELECT h.pid, b.process_create_time, h.canonical_path \
-         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
-         WHERE h.kind = ?1 AND h.want_mask = ?2 \
-         ORDER BY h.pid, h.canonical_path",
-        params![read_deny.kind(), read_deny.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    Ok(rows
-        .into_iter()
-        .filter(|&(pid, ct, _)| (DISK.alive)(pid as u32, ct))
-        .map(|(pid, _, path)| (pid as u32, path))
-        .collect())
 }
 
 /// Open (creating if needed) the per-user SESSION DB. Stamps the
@@ -420,7 +499,14 @@ pub fn open_db() -> Result<Connection> {
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", KIND_DENY_SATISFIED];
+/// A read deny the holder asked for that could not be written because
+/// the object's access list may not be changed, on an object whose
+/// own access list gave the sandbox account no read at the time. No
+/// ACE stands behind the row and no `working_aces` row: it is there so
+/// the deny is not invisible — it shows among the holder's holds, is
+/// released with them, and names the path to look at again.
+pub const KIND_DENY_SATISFIED: &str = "deny_satisfied";
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 /// Holder rows that record no ACE of the holder's own: that a session
@@ -731,18 +817,39 @@ pub fn with_init_lock<R>(
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
-    let (_mutex, conn, report) = locked_recovered(force_recover)?;
+    let (_mutex, conn, report) = locked_recovered(force_recover, LockFor::Session)?;
     let mut locked = Locked { conn, holder_pid };
     let out = f(&mut locked)?;
     Ok((out, report))
+}
+
+/// [`with_init_lock`] for a profile grant or forget: the same lock,
+/// held for the whole run and marked as such, so that a session start
+/// or a command that needs it meanwhile is told at once what it is
+/// waiting for ([`ProfileBusy`]) instead of waiting it out.
+///
+/// The profile's entries change only inside this: no session start,
+/// no stamp and no strip runs beside it, and `f` is expected to refuse
+/// if [`live_holders`] finds anyone. A session's view of the profile
+/// grant is therefore fixed from its start to its end.
+pub fn with_profile_lock<R>(f: impl FnOnce(&mut Locked) -> Result<R>) -> Result<R> {
+    let (_mutex, conn, _report) = locked_recovered(false, LockFor::Profile)?;
+    let mut locked = Locked {
+        conn,
+        holder_pid: HolderPid(std::process::id()),
+    };
+    f(&mut locked)
 }
 
 /// The shared critical-section preamble of [`with_init_lock`] and
 /// [`with_install_lock`]: acquire the init mutex, open the DB, run
 /// crash recovery. Keep the mutex guard alive for the whole
 /// critical section.
-fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, RecoveryReport)> {
-    let mutex = InitMutex::acquire()?;
+fn locked_recovered(
+    force_recover: bool,
+    purpose: LockFor,
+) -> Result<(InitMutex, Connection, RecoveryReport)> {
+    let mutex = InitMutex::acquire(purpose)?;
     let conn = open_db()?;
     let report = crash_recovery(&conn, force_recover)?;
     Ok((mutex, conn, report))
@@ -822,6 +929,19 @@ impl Locked {
                 .execute(params![profile, KIND_KEPT_PROFILE, pid])
                 .context("INSERT profile hold")?;
         }
+        Ok(())
+    }
+
+    /// Record a read deny of the holder that the object's own access
+    /// list stands in for ([`KIND_DENY_SATISFIED`]).
+    fn note_satisfied_deny(&self, canon: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO ace_holders (canonical_path, kind, pid, want_mask) \
+                 VALUES (?1, ?2, ?3, 'denyRead')",
+                params![canon, KIND_DENY_SATISFIED, self.holder_pid.0 as i64],
+            )
+            .context("INSERT satisfied deny")?;
         Ok(())
     }
 
@@ -943,14 +1063,23 @@ impl Locked {
                     // account no read is what the deny asks for. One
                     // that cannot be written where the account CAN
                     // read fails the batch, as before.
-                    Err(_)
+                    // Only where the access list may not be CHANGED
+                    // (access denied): every other refusal — a file
+                    // with other hard links, an object that is not the
+                    // recorded one — fails the batch as it always did.
+                    Err(e)
                         if ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
+                            && is_access_denied(&e)
                             && crate::profile::closed_to_sandbox(canon) =>
                     {
                         eprintln!(
                             "srt-win: '{canon}' cannot be given a read deny and is closed to \
                              the sandbox account by its own access list"
                         );
+                        if let Err(e) = db.note_satisfied_deny(canon) {
+                            eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
+                            failed += 1;
+                        }
                         false
                     }
                     Err(e) => {
@@ -980,8 +1109,14 @@ impl Locked {
                     Ok(w) => witnesses.push(w),
                     Err(e) if path_id::is_not_found(&e) => {}
                     // Cannot be written, and its own access list
-                    // already gives the sandbox account no read.
-                    Err(_) if crate::profile::closed_to_sandbox(canon) => {}
+                    // already gives the sandbox account no read:
+                    // recorded as such, not passed over.
+                    Err(e) if is_access_denied(&e) && crate::profile::closed_to_sandbox(canon) => {
+                        if let Err(e) = db.note_satisfied_deny(canon) {
+                            eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
+                            failed += 1;
+                        }
+                    }
                     Err(e) => {
                         eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
                         failed += 1;
@@ -1929,6 +2064,36 @@ mod tests {
         (n("brokers"), n("ace_holders"), n("working_aces"))
     }
 
+    /// One lock for everything, and a profile operation holding it is
+    /// told apart: a second profile operation, a session start or a
+    /// command gets `ProfileBusy` after the short wait instead of
+    /// running beside it or waiting it out.
+    #[test]
+    fn a_profile_operation_holds_the_one_lock_and_is_named_to_those_it_keeps_out() {
+        let busy = |r: Result<InitMutex>| r.err().is_some_and(|e| e.is::<ProfileBusy>());
+        let held = InitMutex::acquire(LockFor::Profile).unwrap();
+        for purpose in [LockFor::Session, LockFor::Profile] {
+            let started = std::time::Instant::now();
+            assert!(
+                busy(InitMutex::acquire_within(purpose, 200, 5_000)),
+                "{purpose:?}"
+            );
+            assert!(started.elapsed().as_millis() < 2_000, "told promptly");
+        }
+        drop(held);
+        // Held for a session operation it is an ordinary wait: no
+        // such answer, and the lock is had once it is free.
+        let held = InitMutex::acquire(LockFor::Session).unwrap();
+        let r = InitMutex::acquire_within(LockFor::Profile, 100, 400);
+        assert!(r.is_err() && !busy(r));
+        drop(held);
+        // The word is the current holder's, never a previous one's.
+        let held = InitMutex::acquire_within(LockFor::Session, 100, 400).unwrap();
+        let r = InitMutex::acquire_within(LockFor::Session, 100, 400);
+        assert!(r.is_err() && !busy(r));
+        drop(held);
+    }
+
     /// Who runs on a kept grant: live holders other than the caller,
     /// and never one whose process is gone.
     #[test]
@@ -1994,6 +2159,19 @@ mod tests {
                     },
                 ]
             );
+            // Everything live counts for an operation that needs a
+            // quiet machine: kept holds and an ordinary session grant
+            // alike, of every live holder — or of every one but the
+            // asker.
+            let all = live_holders_with(&db.conn, None, alive).unwrap();
+            assert_eq!(all.len(), 5, "{all:?}");
+            assert!(all.iter().all(|h| i64::from(h.pid) != dead));
+            assert!(
+                all.iter()
+                    .any(|h| h.kind == "grant" && i64::from(h.pid) == other)
+            );
+            let but_me = live_holders_with(&db.conn, Some(me as u32), alive).unwrap();
+            assert_eq!(but_me.len(), 3);
             // Asked by the other session, it is this one that holds.
             let held = kept_holders_with(&db.conn, other, alive).unwrap();
             assert!(held.iter().all(|h| i64::from(h.pid) == me) && held.len() == 2);

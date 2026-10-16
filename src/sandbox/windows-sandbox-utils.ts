@@ -138,6 +138,7 @@ export type WindowsSandboxErrorCode =
   | 'kept_grants_in_use'
   | 'srt_win_outdated'
   | 'profile_grant_blocked_by_session'
+  | 'profile_operation_in_progress'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -780,12 +781,37 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
       args[0],
     )
   }
+  throwIfProfileBusy(args, r.status)
   return {
     status: r.status,
     signal: r.signal,
     stdout: (r.stdout ?? '').trim(),
     stderr: (r.stderr ?? '').trim(),
   }
+}
+
+/**
+ * `srt-win`'s exit code when the one lock is held by a `profile
+ * grant` or `profile forget`: those run for as long as a walk of the
+ * profile takes, with nothing else beside them, and whatever needs
+ * the lock meanwhile is told so after about three seconds instead of
+ * waiting it out.
+ */
+export const SRT_WIN_EXIT_PROFILE_BUSY = 25
+
+function throwIfProfileBusy(
+  args: readonly string[],
+  status: number | null,
+): void {
+  if (status !== SRT_WIN_EXIT_PROFILE_BUSY) return
+  throw new WindowsSandboxError(
+    'profile_operation_in_progress',
+    `The read grant on your user profile is being written or removed ` +
+      `right now (srt-win profile grant / profile forget). Nothing in the ` +
+      `sandbox can start until that is done; try again when it has ` +
+      `finished.`,
+    args[0],
+  )
 }
 
 /**
@@ -842,6 +868,12 @@ function runSrtWinAsync(
             args[0],
           ),
         )
+        return
+      }
+      try {
+        throwIfProfileBusy(args, status)
+      } catch (e) {
+        reject(e as Error)
         return
       }
       resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
@@ -2346,23 +2378,26 @@ export function windowsGrantsBeneathDenies(
 ): string[] {
   if (grants.length === 0 || denies.length === 0) return []
   const denyKeys = denies.map(windowsPathKey)
-  const beneath = grants
-    .map(g => ({ path: g, key: windowsPathKey(g) }))
-    .filter(g => denyKeys.some(d => g.key !== d && isAtOrUnder(g.key, d)))
-  // Only the topmost: `srt-win` spares everything at or beneath a path
-  // it is given, so a grant beneath another one in the list adds
-  // nothing — and the list rides on a command line. (If it is still
-  // too long for one, the command is refused with `argv_too_long`;
-  // neither an exception nor the deny is dropped to make it fit.)
-  return beneath
-    .filter(
-      g =>
-        !beneath.some(
-          other => other.key !== g.key && isAtOrUnder(g.key, other.key),
-        ),
-    )
-    .filter((g, i, all) => all.findIndex(o => o.key === g.key) === i)
-    .map(g => g.path)
+  const keyed = grants.map(g => ({ path: g, key: windowsPathKey(g) }))
+  // Per deny, the topmost grants strictly beneath THAT deny: `srt-win`
+  // spares, for each deny, what lies at or beneath an allow that is
+  // strictly beneath it. A grant beneath another grant adds nothing
+  // for the same deny — but it may be the only one beneath a second,
+  // deeper deny that the upper grant lies above, so the reduction is
+  // made deny by deny and the results joined. (If the list is still
+  // too long for a command line, the command is refused with
+  // `argv_too_long`; neither an exception nor the deny is dropped.)
+  const out = new Map<string, string>()
+  for (const d of denyKeys) {
+    const beneath = keyed.filter(g => g.key !== d && isAtOrUnder(g.key, d))
+    for (const g of beneath) {
+      const covered = beneath.some(
+        other => other.key !== g.key && isAtOrUnder(g.key, other.key),
+      )
+      if (!covered && !out.has(g.key)) out.set(g.key, g.path)
+    }
+  }
+  return [...out.values()]
 }
 
 /** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
@@ -2475,7 +2510,10 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  */
 export function parseWindowsSandboxError(
   stderr: string,
-): MappedDriveCwdError | undefined {
+):
+  | MappedDriveCwdError
+  | (WindowsSandboxError & { drive?: undefined })
+  | undefined {
   for (const line of stderr.split(/\r?\n/)) {
     const t = line.trim()
     if (!t.startsWith('{') || !t.includes('"code"')) continue
@@ -2484,6 +2522,15 @@ export function parseWindowsSandboxError(
         code?: string
         message?: string
         drive?: string
+      }
+      // Exit 25: the command needed the lock a profile grant or forget
+      // is holding.
+      if (j.code === 'profile_operation_in_progress') {
+        return new WindowsSandboxError(
+          'profile_operation_in_progress',
+          j.message ?? 'a profile grant or forget is in progress',
+          'exec',
+        )
       }
       if (j.code === 'mapped_drive_cwd') {
         // The canonical class carries `code`/`subcommand`; `drive`
@@ -3103,6 +3150,7 @@ export interface WindowsProfileGrantStatus {
   selfClosed: WindowsProfileGrantItem[]
   unverifiable: WindowsProfileGrantItem[]
   unprotected: WindowsProfileGrantItem[]
+  staleAllow: WindowsProfileGrantItem[]
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
@@ -3139,6 +3187,7 @@ type RawProfileStatus = {
   self_closed?: unknown
   unverifiable?: unknown
   unprotected?: unknown
+  stale_allow?: unknown
   state?: string
   reason?: string
   profile?: string | null
@@ -3247,6 +3296,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     selfClosed: grantItems(raw.self_closed),
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
+    staleAllow: grantItems(raw.stale_allow),
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],
@@ -3323,6 +3373,19 @@ export interface WindowsProfileGrantOptions {
 export interface WindowsProfileGrantItem {
   path: string
   reason: string
+  /**
+   * On an `unverifiable` item: whether YOU can open the object for
+   * reading — `true`, `false`, or `'unknown'` where that was not
+   * tried. One you can read without being able to see its access list
+   * is to be taken as readable to sandboxed commands as well.
+   */
+  callerReads?: boolean | 'unknown'
+  /**
+   * On an `unverifiable` item: why it could not be examined —
+   * `acl_unreadable`, `account_unknown` (the sandbox account's
+   * identity is not known), `not_local`, `probe_failed`.
+   */
+  cause?: string
 }
 
 export interface WindowsProfileGrantResult {
@@ -3367,9 +3430,13 @@ export interface WindowsProfileGrantResult {
    */
   unprotected: WindowsProfileGrantItem[]
   /**
-   * Entries of an earlier run that are no longer wanted and could not
-   * be removed.
+   * Paths that are no longer to be readable — excluded now, or no
+   * longer part of the grant — and still carry the allow of an
+   * earlier run, which could not be removed: readable through the
+   * grant's own entry. Show these to the user as well.
    */
+  staleAllow: WindowsProfileGrantItem[]
+  /** Always empty; kept for readers of earlier results. */
   failed: WindowsProfileGrantItem[]
   elapsedMs: number
 }
@@ -3387,9 +3454,21 @@ function grantItems(v: unknown): WindowsProfileGrantItem[] {
           path?: unknown
           reason?: unknown
         }
-        return typeof p === 'string'
-          ? [{ path: p, reason: typeof reason === 'string' ? reason : '' }]
-          : []
+        if (typeof p !== 'string') return []
+        const { caller_reads: reads, cause } = i as {
+          caller_reads?: unknown
+          cause?: unknown
+        }
+        return [
+          {
+            path: p,
+            reason: typeof reason === 'string' ? reason : '',
+            ...((typeof reads === 'boolean' || reads === 'unknown') && {
+              callerReads: reads,
+            }),
+            ...(typeof cause === 'string' && { cause }),
+          },
+        ]
       })
     : []
 }
@@ -3411,9 +3490,15 @@ function grantItems(v: unknown): WindowsProfileGrantItem[] {
  * it: see `notGranted`, `selfClosed`, `unverifiable` and `unprotected`
  * in the result.
  *
- * @throws `profile_grant_blocked_by_session` when a running session
- *   denies reading of paths the run would newly make readable (nothing
- *   is written; run it again when that session has ended),
+ * It runs only on a quiet machine: while any sandbox session or
+ * command of this user is running it writes nothing, and while it
+ * runs none can start (they fail with `profile_operation_in_progress`
+ * after about three seconds). A refresh therefore needs running
+ * sessions closed.
+ *
+ * @throws `profile_grant_blocked_by_session` when a session or
+ *   command is running (nothing is written; run it again when they
+ *   have ended),
  *   `profile_grant_failed` on any other non-zero exit (the grant is
  *   then recorded as incomplete, or not at all), `srt_win_timeout`
  *   when `timeoutMs` passes.
@@ -3473,6 +3558,12 @@ export async function grantWindowsProfileRead(
         )
         return
       }
+      try {
+        throwIfProfileBusy(args, status)
+      } catch (e) {
+        reject(e as Error)
+        return
+      }
       resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
     })
   })
@@ -3496,10 +3587,10 @@ function profileGrantResult(
   if (r.status === SRT_WIN_EXIT_GRANT_BLOCKED) {
     throw new WindowsSandboxError(
       'profile_grant_blocked_by_session',
-      `The read grant on your user profile was not changed: a sandbox ` +
-        `session that is running denies reading of paths this run would ` +
-        `make readable, and would read them from now on. Run it again ` +
-        `when no such session is running. ` +
+      `The read grant on your user profile was not changed: sandbox ` +
+        `sessions or commands are running, and the grant is written only ` +
+        `while none is, so that no session sees it change. End them and ` +
+        `run it again. ` +
         `${r.stderr.slice(-2000) || r.stdout}`,
       'profile',
     )
@@ -3528,6 +3619,7 @@ function profileGrantResult(
     self_closed?: unknown
     unverifiable?: unknown
     unprotected?: unknown
+    stale_allow?: unknown
     failed?: WindowsProfileGrantItem[]
     elapsed_ms: number
   }>(args, r)
@@ -3546,6 +3638,7 @@ function profileGrantResult(
     selfClosed: grantItems(raw.self_closed),
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
+    staleAllow: grantItems(raw.stale_allow),
     failed: raw.failed ?? [],
     elapsedMs: raw.elapsed_ms,
   }
