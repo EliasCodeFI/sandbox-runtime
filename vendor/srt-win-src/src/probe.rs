@@ -1386,10 +1386,9 @@ mod tests {
         // Each attempt the fence must refuse, refused by the kernel
         // instead: closed when the child's own token was probed,
         // inconclusive when the runner stood in for it.
-        let mut cases = vec![
-            report(Denied, Blocked, Blocked, Blocked),
-            report(Blocked, Denied, Blocked, Blocked),
-        ];
+        // (The anonymous attempts are not among them: refused or
+        // not, they never decide the exit.)
+        let mut cases = vec![report(Denied, Blocked, Blocked, Blocked)];
         for field in 0..4 {
             let mut l = [Blocked; 4];
             l[field] = Denied;
@@ -1419,7 +1418,10 @@ mod tests {
                 [Connected, Blocked, Blocked, Blocked],
             );
             assert_eq!(verdict(&leak, child_token).exit, EXIT_NOT_FENCED);
-            let odd = report(Blocked, Error, Denied, Denied);
+            let odd = lowered(
+                report(Blocked, Denied, Denied, Denied),
+                [Error, Blocked, Blocked, Blocked],
+            );
             assert_eq!(verdict(&odd, child_token).exit, EXIT_INCONCLUSIVE);
             // A residual is still named beside a refusal.
             let v = verdict(&report(Blocked, Blocked, Denied, Connected), child_token);
@@ -1530,15 +1532,18 @@ mod tests {
     /// to get through. Whatever it does, it is never a probe failure.
     #[test]
     fn verdict_anonymous_egress_is_a_residual_never_a_failure() {
-        for through in [Connected, Refused] {
-            let v = verdict_runner(&report(Blocked, through, Blocked, Blocked));
-            assert_eq!(v.exit, EXIT_FENCED);
-            assert_eq!(v.residuals, [RESIDUAL_ANONYMOUS_EGRESS]);
-        }
-        for other in [Blocked, Unreachable, Error, Skipped] {
-            let v = verdict_runner(&report(Blocked, other, Blocked, Blocked));
-            assert_eq!(v.exit, EXIT_FENCED, "{other:?}");
-            assert!(v.residuals.is_empty(), "{other:?}");
+        // Under both child tokens alike.
+        for child_token in [false, true] {
+            for through in [Connected, Refused] {
+                let v = verdict(&report(Blocked, through, Blocked, Blocked), child_token);
+                assert_eq!(v.exit, EXIT_FENCED);
+                assert_eq!(v.residuals, [RESIDUAL_ANONYMOUS_EGRESS]);
+            }
+            for other in [Blocked, Unreachable, Error, Skipped, Denied] {
+                let v = verdict(&report(Blocked, other, Blocked, Blocked), child_token);
+                assert_eq!(v.exit, EXIT_FENCED, "{other:?}");
+                assert!(v.residuals.is_empty(), "{other:?}");
+            }
         }
     }
 
