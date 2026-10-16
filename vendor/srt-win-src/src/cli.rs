@@ -260,6 +260,12 @@ enum Cmd {
         /// and as the holder of each `--write-root`: the profile read
         /// grant is not made or removed beside the command, and no
         /// root is removed from under it.
+        ///
+        /// A command started for a recorded session ends with it: if
+        /// that process exits while the command runs, the command and
+        /// everything it started are terminated and this exits **26**.
+        /// A recorded, live session that cannot be watched fails the
+        /// command before anything is started.
         #[arg(long = "held-by", value_name = "PID")]
         held_by: Option<u32>,
         /// Per-exec write-deny — see `--deny-read`.
@@ -1586,7 +1592,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     target: target.clone(),
                 }
             };
-            let code = logon::spawn_runner(&cred.user, &cred.pw, &sb_sid, None, &cmd, false)
+            let code = logon::spawn_runner(&cred.user, &cred.pw, &sb_sid, None, &cmd, false, None)
                 .context("spawn runner for egress probe")?;
             let probe = match code {
                 0 => "blocked",
@@ -2460,14 +2466,26 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // session behind it is a sandboxed process like any
             // other, and the profile grant must not be made beside
             // it.
-            let self_hold: Option<Vec<String>> =
-                (!held_by.is_some_and(srt_win::state_db::holds_profile)).then(|| {
-                    write_root
-                        .iter()
-                        .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
-                        .map(|(canon, _)| canon)
-                        .collect()
-                });
+            //
+            // The named session is also WATCHED: the command does not
+            // outlive it (`logon::spawn_runner`). A session that is
+            // not recorded, or already gone, is no session — this
+            // process then holds for itself, and since it lives
+            // exactly as long as the command's job, that hold never
+            // ends before the command does. One that is recorded and
+            // cannot be watched fails the command before anything is
+            // started.
+            let session = match held_by {
+                Some(pid) => srt_win::state_db::watch_session(pid)?,
+                None => None,
+            };
+            let self_hold: Option<Vec<String>> = session.is_none().then(|| {
+                write_root
+                    .iter()
+                    .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+                    .map(|(canon, _)| canon)
+                    .collect()
+            });
             let hold_for_self = |db: &srt_win::state_db::Locked| -> anyhow::Result<()> {
                 match &self_hold {
                     Some(roots) => db.hold_kept(roots, Some(srt_win::state_db::KEPT_PROFILE_PATH)),
@@ -2584,8 +2602,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     capability_sids,
                 }),
                 quiet,
+                session.as_ref().map(|h| h.raw()),
             ) {
                 Ok(c) => c,
+                // The session ended first: the tree is gone. What this
+                // command held is released, and the caller is told.
+                Err(e) if e.is::<logon::HolderGone>() => {
+                    drop(per_exec_guard);
+                    eprintln!("srt-win: error: {e}");
+                    eprintln!(
+                        "{}",
+                        json!({ "code": "session_ended", "message": e.to_string() })
+                    );
+                    std::process::exit(EXIT_SESSION_ENDED);
+                }
                 Err(e) => {
                     // Mapped/network-drive cwd (see
                     // `logon::MappedDriveCwd`): emit a one-line
@@ -2690,6 +2720,11 @@ fn require_elevated() -> anyhow::Result<()> {
 /// holds anything: nothing was written. The grant changes the
 /// profile's entries only on a quiet machine.
 const EXIT_GRANT_BLOCKED_BY_SESSION: i32 = 24;
+
+/// Exit code of `exec` when the session named with `--held-by` ended
+/// while the command ran: the command and everything it started were
+/// terminated. (25 is `state_db::EXIT_PROFILE_BUSY`.)
+const EXIT_SESSION_ENDED: i32 = 26;
 
 /// Exit code of `acl forget` / `profile forget` with
 /// `--unless-held-by-others` when another live session runs on a kept

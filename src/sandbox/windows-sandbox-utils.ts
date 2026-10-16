@@ -139,6 +139,7 @@ export type WindowsSandboxErrorCode =
   | 'srt_win_outdated'
   | 'profile_grant_blocked_by_session'
   | 'profile_operation_in_progress'
+  | 'session_ended'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -799,6 +800,14 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
  * waiting it out.
  */
 export const SRT_WIN_EXIT_PROFILE_BUSY = 25
+/**
+ * `srt-win exec`'s exit code when the session a command was started
+ * for (`heldBy`) ended while the command ran: the command and
+ * everything it started were terminated. A sandboxed command does not
+ * outlive its session. {@link parseWindowsSandboxError} gives the
+ * typed error (`session_ended`) from what it printed.
+ */
+export const SRT_WIN_EXIT_SESSION_ENDED = 26
 /** `srt-win`'s exit code for "nothing was removed: sandbox sessions or commands are running". */
 export const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
 /** `srt-win profile grant`'s exit code for "nothing was changed: sandbox sessions or commands are running". */
@@ -2622,6 +2631,16 @@ export function parseWindowsSandboxError(
         return new WindowsSandboxError(
           'profile_operation_in_progress',
           j.message ?? 'a profile grant or forget is in progress',
+          'exec',
+        )
+      }
+      // Exit 26: the process named with `heldBy` ended while the
+      // command ran, and the command was terminated with it.
+      if (j.code === 'session_ended') {
+        return new WindowsSandboxError(
+          'session_ended',
+          j.message ??
+            'the session that started this command ended; the command was terminated',
           'exec',
         )
       }

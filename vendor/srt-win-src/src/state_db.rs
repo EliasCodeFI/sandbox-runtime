@@ -475,26 +475,67 @@ fn live_holders_with(
         .collect())
 }
 
-/// Whether the live process `pid` is recorded as a holder of the
-/// profile read grant — a session that registered at its start
-/// (`acl grant --persistent`) and has not released since. Read from
-/// the database without the init lock: it decides only whether a
-/// command takes a hold of its own, and a wrong "no" costs one hold
-/// too many.
-pub fn holds_profile(pid: u32) -> bool {
+/// The live process `pid`, if it is recorded as a session (a holder
+/// of the profile read grant: it registered at its start and has not
+/// released since) — as a handle that can be waited on, so that a
+/// command started for it ends with it.
+///
+/// `None` when it is not recorded, or is gone (its pid nobody's, or
+/// another process's now): the command then holds for itself, as one
+/// with no session behind it does. An error when it is recorded and
+/// alive and cannot be watched: nothing is started for a session
+/// whose end would go unnoticed.
+///
+/// Read from the database without the init lock: it decides only
+/// whether a command takes a hold of its own, and a wrong "no" costs
+/// one hold too many.
+pub fn watch_session(pid: u32) -> Result<Option<crate::util::OwnedHandle>> {
     let Ok(Some(conn)) = open_db_ro() else {
-        return false;
+        return Ok(None);
     };
-    conn.query_row(
-        "SELECT b.process_create_time FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
-         WHERE h.pid = ?1 AND h.kind = ?2",
-        params![pid as i64, KIND_KEPT_PROFILE],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .is_some_and(|created| (DISK.alive)(pid, created))
+    let recorded = conn
+        .query_row(
+            "SELECT b.process_create_time FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+             WHERE h.pid = ?1 AND h.kind = ?2",
+            params![pid as i64, KIND_KEPT_PROFILE],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    if !(DISK.alive)(pid, recorded) {
+        return Ok(None);
+    }
+    let opened = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    };
+    let h = match opened {
+        Ok(h) if !h.is_invalid() => crate::util::OwnedHandle(h),
+        // Gone between the look and the open.
+        _ if !(DISK.alive)(pid, recorded) => return Ok(None),
+        Ok(_) => bail!("the session this command belongs to (process {pid}) cannot be watched"),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("the session this command belongs to (process {pid}) cannot be watched")
+            });
+        }
+    };
+    // The handle is the holder's, not that of a process that has its
+    // pid since: by the creation time read THROUGH it.
+    let created = process_create_time(h.raw())
+        .with_context(|| format!("the session's process {pid} cannot be identified"))?;
+    if created != recorded || unsafe { WaitForSingleObject(h.raw(), 0) } == WAIT_OBJECT_0 {
+        return Ok(None);
+    }
+    Ok(Some(h))
 }
 
 /// Open (creating if needed) the per-user SESSION DB. Stamps the

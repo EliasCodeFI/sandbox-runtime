@@ -7870,6 +7870,13 @@ describe('Windows profile read grant (pure, all platforms)', () => {
             '{"code":"profile_operation_in_progress","message":"in progress"}',
         )
         expect(parsed?.code).toBe('profile_operation_in_progress')
+        // … and a command ended with its session (exit 26).
+        const ended = winUtils.parseWindowsSandboxError(
+          'srt-win: error: the session that started this command ended\n' +
+            '{"code":"session_ended","message":"the session ended"}',
+        )
+        expect(ended?.code).toBe('session_ended')
+        expect(winUtils.SRT_WIN_EXIT_SESSION_ENDED).toBe(26)
       })
 
       it('a grant that live sessions block is its own typed error', async () => {
