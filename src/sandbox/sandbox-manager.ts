@@ -95,6 +95,8 @@ import {
   revokeWindowsAclChecked,
   windowsAclIncompleteRevoke,
   type WindowsAclRevokeResult,
+  stageWindowsJavaAgentJar,
+  removeStagedWindowsJavaAgentJar,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -192,6 +194,13 @@ let mitmCA: MitmCA | undefined
  * shipped/found (JVMs then just aren't proxy-aware, as before).
  */
 let javaAgentJarPath: string | undefined
+/**
+ * Windows: this session's staged copy of the agent jar, in a directory of
+ * its own that the sandbox user is granted read on (the child runs as a
+ * different account and cannot read {@link javaAgentJarPath} where it
+ * sits). This is what the Windows wrap advertises.
+ */
+let windowsJavaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
@@ -1416,7 +1425,58 @@ async function initializeSteps(
       // against the config's lists, nor one of the config's grants.
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
-        : acc.grantRead
+        : [...acc.grantRead]
+      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
+      // It sits wherever the package was installed — unreadable to
+      // the sandbox user, and not a directory to grant wholesale —
+      // so a copy is staged in a directory of its own and that
+      // directory rides the read-set, exactly as the trust bundle's
+      // does. Read+execute only; released by the same revoke.
+      //
+      // The sandbox must never be able to WRITE there: every JVM it
+      // starts loads this jar, and the sandbox account is shared
+      // across sessions. A temp path does not guarantee that — an
+      // allowWrite root may cover it, or %TEMP% may be Users-writable
+      // — so the directory is also stamped with the session's write
+      // denies, as a protected path would be. The broker composes one
+      // DENY and one ALLOW per path, deny first, so the write-deny
+      // holds over any inherited modify grant while the read grant
+      // still works; reset()'s restore releases it with the other
+      // stamps. Like the grant, it is the library's own and not one
+      // of the config's, so it stays out of `acc`.
+      // Resolved here rather than with the proxies below (the lookup
+      // is cached, so that one is free) because the grant has to
+      // precede the first exec.
+      const denyWrite = [...acc.denyWrite]
+      const jar = await getJavaProxyAgentJarPathAsync(
+        runtimeConfig.javaAgentJarPath,
+      )
+      windowsJavaAgentJarPath = jar ? stageWindowsJavaAgentJar(jar) : undefined
+      // The staged directory is one more path the library grants on
+      // its own account, so it is held to the profile exclusions like
+      // the trust bundle's above. One that reaches an exclusion is not
+      // granted: the session then runs as if no jar was found.
+      if (
+        windowsJavaAgentJarPath &&
+        windowsProfileExclusionConflicts(
+          [dirname(windowsJavaAgentJarPath)],
+          profileExclusions,
+        ).length > 0
+      ) {
+        logForDebugging(
+          `[Sandbox Windows] the staged JVM proxy agent jar ` +
+            `'${windowsJavaAgentJarPath}' reaches a path excluded from ` +
+            `reads of the user profile; JVMs in the sandbox will not be ` +
+            `pointed at the proxy`,
+          { level: 'warn' },
+        )
+        removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+        windowsJavaAgentJarPath = undefined
+      }
+      if (windowsJavaAgentJarPath) {
+        grantRead.push(dirname(windowsJavaAgentJarPath))
+        denyWrite.push(dirname(windowsJavaAgentJarPath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -1435,7 +1495,7 @@ async function initializeSteps(
         grantRead.length > 0 ||
         acc.grantWrite.length > 0 ||
         acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
+        denyWrite.length > 0
       if (writeRestricted) {
         // One call: the write roots are granted persistently (kept at
         // reset(); a root granted before costs one DACL read), the
@@ -1448,7 +1508,7 @@ async function initializeSteps(
             read: grantRead,
             write: acc.grantWrite,
             denyRead: acc.denyRead,
-            denyWrite: acc.denyWrite,
+            denyWrite: denyWrite,
             allowProfileExclusions: override,
             srtWin,
           })
@@ -1479,11 +1539,11 @@ async function initializeSteps(
             srtWin,
           })
         }
-        if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
+        if (acc.denyRead.length > 0 || denyWrite.length > 0) {
           stampWindowsAcl({
             sandboxUserSid: sb,
             denyRead: acc.denyRead,
-            denyWrite: acc.denyWrite,
+            denyWrite: denyWrite,
             srtWin,
           })
         }
@@ -1500,7 +1560,7 @@ async function initializeSteps(
             `${acc.grantWrite.length} grantWrite, ` +
             `${grantRead.length} grantRead, ` +
             `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
+            `${denyWrite.length} denyWrite`,
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
@@ -1518,6 +1578,10 @@ async function initializeSteps(
       }
       windowsFsSbUserSid = undefined
       windowsProfileRead = undefined
+      if (windowsJavaAgentJarPath) {
+        removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+        windowsJavaAgentJarPath = undefined
+      }
       config = undefined
       throw e
     }
@@ -2773,17 +2837,23 @@ async function wrapWithSandboxOnce(
 
 /**
  * Wrap `command` for the sandbox and return a spawn descriptor:
- * `{ argv, env }`, suitable for
+ * `{ argv, env, stdinPayload? }`, suitable for
  * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
  *
  * On Windows this is the ONLY supported wrap method (see
  * {@link wrapWithSandbox}); `env` is the broker process's spawn env
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
- * {@link wrapCommandWithSandboxWindows}). On
+ * {@link wrapCommandWithSandboxWindows}). When `stdinPayload` is set
+ * (network config with proxy auth or a JVM proxy agent), the caller MUST spawn with
+ * stdin piped and write the payload immediately — it carries the
+ * proxy env entries embedding the per-session auth token, which
+ * must never appear on a command line (same-user siblings can
+ * enumerate those freely). On
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
- * (proxy env is baked into that command) and `env` is the unchanged
- * `process.env`, so callers can spawn uniformly across platforms.
+ * (proxy env is baked into that command), `env` is the unchanged
+ * `process.env`, and `stdinPayload` is never set, so callers can
+ * spawn uniformly across platforms.
  *
  * @param cwd the working directory the caller will spawn the result
  *   with. On Windows the child's cwd is whatever the caller passes
@@ -2799,7 +2869,11 @@ async function wrapWithSandboxArgv(
   abortSignal?: AbortSignal,
   cwd?: string,
   options?: WrapWithSandboxOptions,
-): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+): Promise<{
+  argv: string[]
+  env: NodeJS.ProcessEnv
+  stdinPayload?: Buffer
+}> {
   const platform = getPlatform()
 
   if (platform === 'windows') {
@@ -2893,10 +2967,12 @@ async function wrapWithSandboxArgv(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
     }
-    // Per-exec deny rides on argv (`acl stamp` reads stdin, but
-    // exec's stdin belongs to the child). The CreateProcessW
-    // length check lives in `wrapCommandWithSandboxWindows`
-    // where the full argv (incl. shell + user command) is known.
+    // Per-exec deny rides on argv (`acl stamp` reads stdin;
+    // exec's own stdin is reserved for the `--env-stdin` secret
+    // frame and is never forwarded to the sandboxed child). The
+    // CreateProcessW length check lives in
+    // `wrapCommandWithSandboxWindows` where the full argv (incl.
+    // shell + user command) is known.
     //
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
@@ -2936,6 +3012,12 @@ async function wrapWithSandboxArgv(
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
+      // Only when a proxy is advertised, as on macOS/Linux. The deny
+      // list rides along solely so a denied JAVA_TOOL_OPTIONS is not
+      // composed back in from the broker's env. The composed value
+      // travels in the --env-stdin frame, not on argv.
+      javaAgentJarPath: hasNetworkConfig ? windowsJavaAgentJarPath : undefined,
+      unsetEnvVars: credentialRestrictions.unsetEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
@@ -3203,6 +3285,12 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  // After the revoke and restore above, so both ACEs are released
+  // while the path still resolves.
+  if (windowsJavaAgentJarPath) {
+    removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+    windowsJavaAgentJarPath = undefined
+  }
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
   windowsProfileGrantPaths = undefined
@@ -3453,7 +3541,11 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
     cwd?: string,
     options?: WrapWithSandboxOptions,
-  ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  ): Promise<{
+    argv: string[]
+    env: NodeJS.ProcessEnv
+    stdinPayload?: Buffer
+  }>
   /**
    * Register the network allow list of one invocation, under the `commandId`
    * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched

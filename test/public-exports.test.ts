@@ -17,6 +17,7 @@ import * as srt from '../src/index.js'
 const PUBLIC_VALUE_EXPORTS = [
   'CredentialsConfigSchema',
   'DEFAULT_WINDOWS_PROXY_PORT_RANGE',
+  'ENV_STDIN_FRAME_CAP',
   'FilesystemConfigSchema',
   'GitConfigSchema',
   'IgnoreViolationsConfigSchema',
@@ -37,6 +38,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'checkWindowsDependenciesAsync',
   'checkWindowsSandboxStatus',
   'checkWindowsSandboxStatusAsync',
+  'encodeEnvStdinFrame',
   'ensurePersistentWindowsCa',
   'expandWindowsFsPaths',
   'forgetWindowsProfileRead',
@@ -62,6 +64,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'restoreWindowsAcl',
   'revokeWindowsAcl',
   'revokeWindowsAclChecked',
+  'spawnWrappedCommandWindows',
   'stampWindowsAcl',
   'uninstallWindowsSandbox',
   'validateCaPair',
@@ -76,6 +79,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'windowsTrustCa',
   'windowsTrustCaAsync',
   'writeRootsOf',
+  'writeStdinPayload',
 ]
 
 describe('package entry point', () => {

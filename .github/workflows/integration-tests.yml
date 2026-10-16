@@ -161,6 +161,11 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-residual-egress.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      - name: Smoke-test srt-win --env-stdin secret channel (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-env-stdin.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -181,6 +186,16 @@ jobs:
           $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
+          # The JVM proxy agent jar, so the J rows in winsrt.test.ts can
+          # drive a real JVM through the proxy from inside the sandbox.
+          # Built only where the runner image carries a JDK; without the
+          # jar (or without a java the sandbox user can launch) those
+          # rows skip and the rest of the suite is unaffected.
+          if ($env:JAVA_HOME -or (Get-Command javac -ErrorAction SilentlyContinue)) {
+            npm run build:java-agent
+          } else {
+            Write-Host '::notice::no JDK on this runner; winsrt J4 (JVM through the proxy) will skip'
+          }
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw

@@ -13,10 +13,13 @@ import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -43,6 +46,11 @@ import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
 import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
+import * as javaAgent from '../../src/sandbox/java-proxy-agent.js'
+import {
+  getJavaProxyAgentJarPathAsync,
+  JAVA_PROXY_AGENT_JAR_NAME,
+} from '../../src/sandbox/java-proxy-agent.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -63,6 +71,10 @@ import {
   ensurePersistentWindowsCa,
   windowsStateDir,
   wrapCommandWithSandboxWindows,
+  stageWindowsJavaAgentJar,
+  removeStagedWindowsJavaAgentJar,
+  isUnswappedDirectory,
+  encodeEnvStdinFrame,
   parseWindowsBinShell,
   rankWindowsFsAccess,
   resolveSrtWin,
@@ -352,13 +364,15 @@ async function runSandboxed(
   stderr: string
   status: number | null
 }> {
-  const { argv, env } = await SandboxManager.wrapWithSandboxArgv(command)
+  const { argv, env, stdinPayload } =
+    await SandboxManager.wrapWithSandboxArgv(command)
   // The child reaches the proxy via the runner's --env overlay; the
   // returned `env` is the BROKER's spawn env (proxy vars also there
   // for diagnostics, but the runner's overlay is what the child sees).
   return spawnAsync(argv[0], argv.slice(1), {
     timeout: timeoutMs,
     env: extraEnv ? { ...env, ...extraEnv } : env,
+    input: stdinPayload,
   })
 }
 
@@ -739,6 +753,125 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs.some(e => e.startsWith('no_proxy='))).toBe(false)
     // The proxy vars themselves survive — only the bypass list is dropped.
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
+  })
+
+  it('proxyAuthToken: token absent from argv and spawn env; rides the --env-stdin frame', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const TOKEN = 'tok-secret-not-for-argv'
+    const { argv, env, stdinPayload } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      socksProxyPort: 60081,
+      proxyAuthToken: TOKEN,
+      srtWin,
+    })
+    // The whole point: no argv element may carry the token — a
+    // process's command line is freely readable by same-user
+    // sibling processes.
+    for (const a of argv) {
+      expect(a).not.toContain(TOKEN)
+    }
+    expect(argv).toContain('--env-stdin')
+    expect(argv.indexOf('--env-stdin')).toBeLessThan(argv.indexOf('--'))
+    // Tokenless entries still ride --env for debuggability.
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+    // The broker spawn env carries no token either.
+    for (const v of Object.values(env)) {
+      expect(v ?? '').not.toContain(TOKEN)
+    }
+    // The stdin frame is `<u32 LE length><JSON [[KEY,VALUE],…]>` and
+    // holds exactly the token-bearing entries (matched by srt-win's
+    // `runner::decode_env_frame`).
+    expect(stdinPayload).toBeDefined()
+    expect(stdinPayload!.readUInt32LE(0)).toBe(stdinPayload!.length - 4)
+    const entries: [string, string][] = JSON.parse(
+      stdinPayload!.subarray(4).toString('utf8'),
+    )
+    const keys = entries.map(([k]) => k)
+    expect(keys).toContain('HTTPS_PROXY')
+    expect(keys).toContain('ALL_PROXY')
+    for (const [, v] of entries) {
+      expect(v).toContain(TOKEN)
+    }
+    // No key rides both channels.
+    for (const k of keys) {
+      expect(envArgs.some(e => e.startsWith(`${k}=`))).toBe(false)
+    }
+  })
+
+  it('broker env: ambient secret-NAMED vars are deleted, any case, any value', () => {
+    // Nested-session / stale-export case: an OUTER session's
+    // token-bearing var (a different token than ours) sits in
+    // process.env under a secret-tagged NAME. Scrubbing must go by
+    // KEY name, not by this-session-token value matching, or the
+    // foreign secret rides the broker's spawn env.
+    //
+    // HAZARD — do NOT plant HTTP(S)_PROXY/http(s)_proxy here: Bun
+    // LATCHES those env vars into its HTTP client the moment they
+    // are set, even if deleted before any request, and every later
+    // in-process request (including other test files' TLS-terminate
+    // upstream legs) then dials the dead proxy and 502s. Use
+    // CLOUDSDK_PROXY_PASSWORD — secret-tagged by
+    // generateProxyEnvEntries but meaningless to Bun's networking —
+    // to exercise the same delete-by-key scrub path.
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const saved = process.env.CLOUDSDK_PROXY_PASSWORD
+    process.env.CLOUDSDK_PROXY_PASSWORD = 'outer-session-token'
+    process.env['ClOuDsDk_PrOxY_pAsSwOrD'] = 'outer-session-token'
+    try {
+      const { env } = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        httpProxyPort: 60080,
+        socksProxyPort: 60081,
+        proxyAuthToken: 'tok-this-session',
+        srtWin,
+      })
+      expect(env.CLOUDSDK_PROXY_PASSWORD).toBeUndefined()
+      expect(env['ClOuDsDk_PrOxY_pAsSwOrD']).toBeUndefined()
+      for (const v of Object.values(env)) {
+        expect(v ?? '').not.toContain('outer-session-token')
+        expect(v ?? '').not.toContain('tok-this-session')
+      }
+    } finally {
+      delete process.env.CLOUDSDK_PROXY_PASSWORD
+      delete process.env['ClOuDsDk_PrOxY_pAsSwOrD']
+      if (saved !== undefined) {
+        process.env.CLOUDSDK_PROXY_PASSWORD = saved
+      }
+    }
+  })
+
+  it('encodeEnvStdinFrame: <u32 LE byte length><JSON>; rejects frames over the 4 MiB cap', () => {
+    const frame = encodeEnvStdinFrame([['K', 'V']])
+    expect(frame.readUInt32LE(0)).toBe(frame.length - 4)
+    expect(JSON.parse(frame.subarray(4).toString('utf8'))).toEqual([['K', 'V']])
+    // Byte length, not char length: multi-byte values still frame
+    // correctly for Rust's read_exact.
+    const multi = encodeEnvStdinFrame([['K', 'ünïcode']])
+    expect(multi.readUInt32LE(0)).toBe(multi.length - 4)
+
+    let thrown: unknown
+    try {
+      encodeEnvStdinFrame([['BIG', 'x'.repeat(4 * 1024 * 1024)]])
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(WindowsSandboxError)
+    expect((thrown as WindowsSandboxError).code).toBe('env_frame_too_large')
+  })
+
+  it('no proxyAuthToken → no --env-stdin, no stdinPayload; proxy URLs stay on --env', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv, stdinPayload } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      srtWin,
+    })
+    expect(argv).not.toContain('--env-stdin')
+    expect(stdinPayload).toBeUndefined()
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
   })
 
   it('loopbackPortRange: passed to exec before --, and absent without one', () => {
@@ -1477,6 +1610,13 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     writeFileSync(token, 'token-content')
     spies.push(
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      // The JVM agent jar is the one a test's config names, or none. The
+      // default lookup finds a jar wherever one has been built (`npm run
+      // build:java-agent`), and initialize() stages what it finds: the
+      // session's grants would then depend on the machine.
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
+        explicitPath => Promise.resolve(explicitPath ?? null),
+      ),
       spyOn(winUtils, 'checkWindowsDependenciesAsync').mockResolvedValue({
         errors: [],
         warnings: [],
@@ -1704,6 +1844,25 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     )
     expect(granted).toBeUndefined()
     expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
+  })
+
+  it('the session: the JVM agent jar is staged, read-granted and write-denied beneath an allowWrite', async () => {
+    const jar = join(root, JAVA_PROXY_AGENT_JAR_NAME)
+    writeFileSync(jar, 'JAR-BYTES')
+    // The staged copy lands in the temp root, which this session may write.
+    const temp = dirname(root)
+    await SandboxManager.initialize({
+      ...configOf({ allowWrite: [temp] }),
+      javaAgentJarPath: jar,
+    })
+    const staged = stamped?.denyWrite[0] ?? ''
+    expect(dirname(staged)).toBe(temp)
+    expect(staged).not.toBe(root)
+    expect(readdirSync(staged)).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
+    expect(granted).toMatchObject({ read: [staged], write: [temp] })
+    expect(stamped).toMatchObject({ denyRead: [], denyWrite: [staged] })
+    await SandboxManager.reset()
+    expect(existsSync(staged)).toBe(false)
   })
 
   it('onExtractNoMatch "error": initialize() resolves and the wrap throws', async () => {
@@ -3342,6 +3501,13 @@ describe('Windows write-restricted token, the default: write roots are granted o
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      // The JVM agent jar is the one a test's config names, or none. The
+      // default lookup finds a jar wherever one has been built (`npm run
+      // build:java-agent`), and initialize() stages what it finds: the
+      // session's grants would then depend on the machine.
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
+        explicitPath => Promise.resolve(explicitPath ?? null),
+      ),
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockImplementation(((
         o: Parameters<typeof winUtils.verifyWindowsWfpEgress>[0],
       ) => {
@@ -3840,6 +4006,13 @@ function restoreGatedOnACompletedRevoke(
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      // The JVM agent jar is the one a test's config names, or none. The
+      // default lookup finds a jar wherever one has been built (`npm run
+      // build:java-agent`), and initialize() stages what it finds: the
+      // session's grants would then depend on the machine.
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
+        explicitPath => Promise.resolve(explicitPath ?? null),
+      ),
       // The WFP probe binds a listener and is once-per-process; it is
       // not what these tests are about.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
@@ -4361,7 +4534,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     // refused by the fence, or this throws.
     await SandboxManager.initialize(createTestConfig())
     try {
-      const { argv, env } =
+      const { argv, env, stdinPayload } =
         await SandboxManager.wrapWithSandboxArgv('echo WR-TOKEN-OK')
       expect(argv).toContain('--write-restricted-token')
       expect(argv.indexOf('--write-restricted-token')).toBeLessThan(
@@ -4376,6 +4549,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 60_000,
         env,
+        input: stdinPayload,
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
@@ -4433,10 +4607,13 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       return cfg
     }
     const write = async (file: string): Promise<boolean> => {
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        `echo X> "${file}"`,
-      )
-      await spawnAsync(argv[0], argv.slice(1), { timeout: 60_000, env })
+      const { argv, env, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv(`echo X> "${file}"`)
+      await spawnAsync(argv[0], argv.slice(1), {
+        timeout: 60_000,
+        env,
+        input: stdinPayload,
+      })
       return existsSync(file)
     }
     const read = async (file: string): Promise<string> =>
@@ -4555,7 +4732,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(grant.stderr).toMatch(/re-run `srt-win install`/)
       expect(status().persistentGrants).toBeUndefined()
       for (const writeRestrictedToken of [undefined, false]) {
-        const { argv, env } = wrapCommandWithSandboxWindows({
+        const { argv, env, stdinPayload } = wrapCommandWithSandboxWindows({
           command: 'echo V2-RAN',
           writeRestrictedToken,
           quiet: false,
@@ -4564,6 +4741,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         const r = await spawnAsync(argv[0], argv.slice(1), {
           timeout: 60_000,
           env,
+          input: stdinPayload,
         })
         expect(r.status).toBe(15)
         expect(r.stdout).not.toContain('V2-RAN')
@@ -4642,21 +4820,36 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     )
   })
 
-  it('wrapWithSandboxArgv returns argv carrying the --env overlay', async () => {
-    const { argv } = await SandboxManager.wrapWithSandboxArgv('echo hi')
+  it('wrapWithSandboxArgv splits the overlay: tokenless on --env, token-bearing in stdinPayload', async () => {
+    const { argv, stdinPayload } =
+      await SandboxManager.wrapWithSandboxArgv('echo hi')
     expect(argv[0]).toMatch(/srt-win\.exe$/i)
     expect(argv).toContain('exec')
-    // Proxy ports ride as --env KEY=VALUE pairs to the runner.
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    const httpProxy = envArgs.find(e => e.startsWith('HTTP_PROXY='))
-    const allProxy = envArgs.find(e => e.startsWith('ALL_PROXY='))
-    expect(httpProxy).toMatch(/^HTTP_PROXY=http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^ALL_PROXY=http:\/\/.+:\d+$/)
-    const httpPort = Number(httpProxy!.split(':').pop())
+    // The session proxy has an auth token, so the token-bearing proxy
+    // URLs must NOT ride argv — they travel in the --env-stdin frame.
+    expect(argv).toContain('--env-stdin')
+    for (const key of ['HTTP_PROXY=', 'ALL_PROXY=', 'DOCKER_HTTP_PROXY=']) {
+      expect(envArgs.some(e => e.startsWith(key))).toBe(false)
+    }
+    // Tokenless entries still ride --env: RSYNC_PROXY is host:port
+    // only (no userinfo), so it carries the port-range proof.
+    const rsync = envArgs.find(e => e.startsWith('RSYNC_PROXY='))
+    expect(rsync).toMatch(/^RSYNC_PROXY=localhost:\d+$/)
+    // The frame carries the full token-bearing set, ports in range.
+    expect(stdinPayload).toBeDefined()
+    const frame: [string, string][] = JSON.parse(
+      stdinPayload!.subarray(4).toString('utf8'),
+    )
+    const frameKeys = frame.map(([k]) => k)
+    expect(frameKeys).toContain('HTTP_PROXY')
+    expect(frameKeys).toContain('ALL_PROXY')
+    expect(frameKeys).toContain('DOCKER_HTTP_PROXY')
+    const httpProxy = frame.find(([k]) => k === 'HTTP_PROXY')![1]
+    expect(httpProxy).toMatch(/^http:\/\/.+:.+@localhost:\d+$/)
+    const httpPort = Number(httpProxy.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    // The FULL set rides along, not just the standard trio.
-    expect(envArgs.some(e => e.startsWith('DOCKER_HTTP_PROXY='))).toBe(true)
     // Last element is the user's command, passed verbatim to cmd /c.
     expect(argv.slice(-4)).toEqual(['/d', '/s', '/c', 'echo hi'])
   })
@@ -4938,14 +5131,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const cmd = `curl --noproxy '*' -sS -m 5 https://example.com`
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        cmd,
-        GIT_BASH,
-      )
+      const { argv, env, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv(cmd, GIT_BASH)
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 60_000,
         env,
+        input: stdinPayload,
       })
       expectEgressBlocked('E4', r)
     },
@@ -4956,14 +5148,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     'E5: binShell=bash.exe — &&, single-quote, pipe survive argv round-trip',
     async () => {
       const cmd = `printf '%s ' one && printf '%s' two | tr a-z A-Z`
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        cmd,
-        GIT_BASH,
-      )
+      const { argv, env, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv(cmd, GIT_BASH)
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 60_000,
         env,
+        input: stdinPayload,
       })
       expectStatus('E5', r, [0])
       expect(r.stdout.trim()).toBe('one TWO')
@@ -5026,15 +5217,14 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
           `this row says nothing about the child token · ${raw('unsandboxed', host)}`,
       )
     }
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-      command,
-      shell,
-    )
+    const { argv, env, stdinPayload } =
+      await SandboxManager.wrapWithSandboxArgv(command, shell)
     expect(argv).toContain('--write-restricted-token')
     expect(argv).not.toContain('--write-root')
     const r = await spawnAsync(argv[0], argv.slice(1), {
       timeout: 60_000,
       env,
+      input: stdinPayload,
     })
     console.error(`[winsrt ${id}] ${raw('sandboxed', r)}`)
     if (r.status !== 0 || r.stdout.trim() !== want) {
@@ -5219,13 +5409,14 @@ describe.if(isWindows)(
     }, 60_000)
 
     async function rexec(tail: string) {
-      const { argv, env } = wrapCommandWithSandboxWindows({
+      const { argv, env, stdinPayload } = wrapCommandWithSandboxWindows({
         command: tail,
         srtWin: TEST_SRT_WIN,
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
         timeout: 60_000,
+        input: stdinPayload,
       })
     }
 
@@ -5378,6 +5569,7 @@ describe.if(isWindows)(
               return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
                 env: wrapped.env,
                 timeout: 60_000,
+                input: wrapped.stdinPayload,
               })
             } finally {
               await SandboxManager.reset()
@@ -5474,17 +5666,18 @@ describe.if(isWindows)(
               createFsTestConfig({ allowWrite: [dir] }),
             )
             try {
-              const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-                `type "${a}" & echo --SEP-- & type "${b}"`,
-                undefined,
-                {
-                  filesystem: {
-                    denyRead: [join(dir, 'glob-*.secret')],
-                    allowWrite: [],
-                    denyWrite: [],
+              const { argv, env, stdinPayload } =
+                await SandboxManager.wrapWithSandboxArgv(
+                  `type "${a}" & echo --SEP-- & type "${b}"`,
+                  undefined,
+                  {
+                    filesystem: {
+                      denyRead: [join(dir, 'glob-*.secret')],
+                      allowWrite: [],
+                      denyWrite: [],
+                    },
                   },
-                },
-              )
+                )
               // Glob expanded TS-side: exactly two --deny-read flags;
               // no glob char survives onto the argv (Rust would
               // hard-fail otherwise).
@@ -5508,6 +5701,7 @@ describe.if(isWindows)(
               const r = await spawnAsync(argv[0], argv.slice(1), {
                 env,
                 timeout: 60_000,
+                input: stdinPayload,
               })
               if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
                 throw new Error(
@@ -5524,6 +5718,7 @@ describe.if(isWindows)(
               const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
                 env: wf.env,
                 timeout: 60_000,
+                input: wf.stdinPayload,
               })
               if (
                 !rR.stdout.includes('GLOB-A') ||
@@ -5619,21 +5814,23 @@ describe.if(isWindows)(
             ): Promise<void> {
               const reads = Object.entries(expected.reads ?? {})
               const writes = Object.entries(expected.writes ?? {})
-              const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-                [
-                  'echo RAN',
-                  // `type` lists the folder first; `<` opens the file alone.
-                  ...reads.map(
-                    ([rel]) => `type "${at(rel)}" & more < "${at(rel)}"`,
-                  ),
-                  ...writes.map(([rel]) => `echo WROTE>"${at(rel)}"`),
-                ].join(' & '),
-                undefined,
-                customConfig,
-              )
+              const { argv, env, stdinPayload } =
+                await SandboxManager.wrapWithSandboxArgv(
+                  [
+                    'echo RAN',
+                    // `type` lists the folder first; `<` opens the file alone.
+                    ...reads.map(
+                      ([rel]) => `type "${at(rel)}" & more < "${at(rel)}"`,
+                    ),
+                    ...writes.map(([rel]) => `echo WROTE>"${at(rel)}"`),
+                  ].join(' & '),
+                  undefined,
+                  customConfig,
+                )
               const r = await spawnAsync(argv[0], argv.slice(1), {
                 env,
                 timeout: 60_000,
+                input: stdinPayload,
               })
               const found = {
                 reads: Object.fromEntries(
@@ -6349,6 +6546,468 @@ describe.if(isWindows)(
 )
 
 // ────────────────────────────────────────────────────────────────────
+// Group J — JVM proxy agent (JAVA_TOOL_OPTIONS=-javaagent:…)
+// ────────────────────────────────────────────────────────────────────
+//
+// JVMs ignore HTTPS_PROXY, so without the agent Maven/Gradle dial
+// their feed directly and hit the WFP fence. The env-composition
+// layer is covered on every platform by the "Windows wrapper" block in
+// java-proxy-agent.test.ts; here: the staging step (pure), then on
+// Windows the session plumbing — the sandbox user can read the staged
+// jar and nothing beside the original — and, where the runner has a
+// JDK and the jar was built, a real JVM through the real proxy.
+
+describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
+  it('copies the jar into a fresh directory holding nothing else', () => {
+    const src = mkdtempSync(join(tmpdir(), 'srt-jsrc-'))
+    const jar = join(src, JAVA_PROXY_AGENT_JAR_NAME)
+    writeFileSync(jar, 'JAR-BYTES')
+    writeFileSync(join(src, 'neighbour.txt'), 'NEIGHBOUR')
+    let staged: string | undefined
+    try {
+      staged = stageWindowsJavaAgentJar(jar)
+      expect(staged).toBeDefined()
+      // The directory that gets granted is NOT the one the jar came
+      // from: whatever shares the original's directory stays out of
+      // the sandbox user's reach.
+      expect(dirname(staged!)).not.toBe(src)
+      expect(readdirSync(dirname(staged!))).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
+      expect(readFileSync(staged!, 'utf8')).toBe('JAR-BYTES')
+      // Each session stages its own copy.
+      const again = stageWindowsJavaAgentJar(jar)!
+      expect(dirname(again)).not.toBe(dirname(staged!))
+      removeStagedWindowsJavaAgentJar(again)
+      expect(existsSync(dirname(again))).toBe(false)
+
+      removeStagedWindowsJavaAgentJar(staged!)
+      expect(existsSync(dirname(staged!))).toBe(false)
+      // The source is left exactly as it was.
+      expect(readdirSync(src).sort()).toEqual([
+        'neighbour.txt',
+        JAVA_PROXY_AGENT_JAR_NAME,
+      ])
+    } finally {
+      if (staged) rmSync(dirname(staged), { recursive: true, force: true })
+      rmSync(src, { recursive: true, force: true })
+    }
+  })
+
+  it('stages under the resolved temp root, so the granted path has no link in it', () => {
+    const src = mkdtempSync(join(tmpdir(), 'srt-jsrc-'))
+    const jar = join(src, JAVA_PROXY_AGENT_JAR_NAME)
+    writeFileSync(jar, 'JAR-BYTES')
+    const staged = stageWindowsJavaAgentJar(jar)!
+    try {
+      const dir = dirname(staged)
+      expect(realpathSync.native(dir)).toBe(dir)
+      expect(dirname(dir)).toBe(realpathSync.native(tmpdir()))
+      expect(lstatSync(dir).isSymbolicLink()).toBe(false)
+      expect(lstatSync(staged).isFile()).toBe(true)
+    } finally {
+      removeStagedWindowsJavaAgentJar(staged)
+      rmSync(src, { recursive: true, force: true })
+    }
+  })
+
+  it('isUnswappedDirectory: rejects a link, a replacement directory, and a swapped parent', () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-jswap-')))
+    try {
+      const parent = join(root, 'parent')
+      const dir = join(parent, 'staged')
+      mkdirSync(dir, { recursive: true })
+      const created = lstatSync(dir, { bigint: true })
+      expect(isUnswappedDirectory(dir, created)).toBe(true)
+
+      // A link (symlink here; a junction reads the same under lstat on
+      // Windows) planted where the directory was.
+      const elsewhere = join(root, 'elsewhere')
+      mkdirSync(elsewhere)
+      renameSync(dir, join(root, 'moved-aside'))
+      symlinkSync(elsewhere, dir, 'junction')
+      expect(isUnswappedDirectory(dir, created)).toBe(false)
+
+      // A different real directory at the same path.
+      rmSync(dir, { force: true })
+      mkdirSync(dir)
+      expect(isUnswappedDirectory(dir, created)).toBe(false)
+
+      // The original put back: accepted again.
+      rmSync(dir, { recursive: true, force: true })
+      renameSync(join(root, 'moved-aside'), dir)
+      expect(isUnswappedDirectory(dir, created)).toBe(true)
+
+      // The PARENT swapped for a link to a look-alike tree: the leaf is
+      // a real directory, but not ours, and not reached link-free.
+      const fakeParent = join(root, 'fake-parent')
+      mkdirSync(join(fakeParent, 'staged'), { recursive: true })
+      renameSync(parent, join(root, 'parent-aside'))
+      symlinkSync(fakeParent, parent, 'junction')
+      expect(isUnswappedDirectory(dir, created)).toBe(false)
+
+      // Gone entirely.
+      expect(isUnswappedDirectory(join(root, 'nope'), created)).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('returns undefined (no throw, nothing left behind) when the jar cannot be copied', () => {
+    const before = readdirSync(tmpdir()).filter(n =>
+      n.startsWith('srt-java-agent-'),
+    )
+    expect(
+      stageWindowsJavaAgentJar(join(tmpdir(), 'srt-no-such-dir', 'a.jar')),
+    ).toBeUndefined()
+    const after = readdirSync(tmpdir()).filter(n =>
+      n.startsWith('srt-java-agent-'),
+    )
+    expect(after).toEqual(before)
+  })
+})
+
+/** Major version of `java`, or 0 if it cannot be run. */
+function javaMajor(java: string): number {
+  const r = spawnSync(java, ['-version'], { encoding: 'utf8', timeout: 30_000 })
+  if (r.status !== 0) return 0
+  // `openjdk version "21.0.1"` / `java version "1.8.0_392"`
+  const m = /version "(\d+)(?:\.(\d+))?/.exec(r.stderr + r.stdout)
+  if (!m) return 0
+  return m[1] === '1' ? Number(m[2]) : Number(m[1])
+}
+// The single-file source launcher (`java Probe.java`) needs JDK >= 11.
+const JAVA_CANDIDATE = sandboxReachable('java')
+const JAVA =
+  JAVA_CANDIDATE !== undefined && javaMajor(JAVA_CANDIDATE) >= 11
+    ? JAVA_CANDIDATE
+    : undefined
+// The jar is a build artifact (`npm run build:java-agent`); CI builds it
+// on the Windows legs when the runner has a JDK.
+const BUILT_AGENT_JAR = isWindows ? await getJavaProxyAgentJarPathAsync() : null
+const JAVA_FIXTURE_DIR = join(
+  import.meta.dir,
+  '..',
+  'fixtures',
+  'java-proxy-agent',
+)
+
+describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
+  let scratch: string
+  let fakeJar: string
+  let neighbour: string
+
+  beforeAll(() => {
+    console.error('[winsrt J beforeAll] start')
+    // G's afterAll uninstalled — re-provision (own sublayer).
+    const wfp = getWindowsWfpStatus({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
+    }
+    // A stand-in jar beside a file the sandbox must NOT gain access
+    // to, both under the broker's %TEMP% — which the sandbox user has
+    // no rights on, so any read that succeeds came from the grant.
+    scratch = mkdtempSync(join(tmpdir(), 'srt-j-'))
+    fakeJar = join(scratch, JAVA_PROXY_AGENT_JAR_NAME)
+    neighbour = join(scratch, 'neighbour.txt')
+    writeFileSync(fakeJar, 'JAR-BYTES')
+    writeFileSync(neighbour, 'NEIGHBOUR')
+    console.error('[winsrt J beforeAll] done')
+  }, 120_000)
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(scratch, { recursive: true, force: true })
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+  }, 60_000)
+
+  function createJavaTestConfig(
+    javaAgentJarPath: string,
+    allowedDomains: string[],
+    allowRead: string[] = [],
+  ): SandboxRuntimeConfig {
+    const base = createTestConfig(allowedDomains)
+    return {
+      ...base,
+      javaAgentJarPath,
+      filesystem: { ...base.filesystem, allowRead },
+    }
+  }
+
+  function frameOf(stdinPayload: Buffer | undefined): [string, string][] {
+    return stdinPayload
+      ? JSON.parse(stdinPayload.subarray(4).toString('utf8'))
+      : []
+  }
+
+  /**
+   * The JAVA_TOOL_OPTIONS value the child will receive and the jar it
+   * names. It must come from the `--env-stdin` frame: the value can
+   * carry the broker's own JAVA_TOOL_OPTIONS, so it never rides argv.
+   */
+  function agentFromWrap(w: { argv: string[]; stdinPayload?: Buffer }): {
+    jto: string
+    staged: string
+  } {
+    for (const a of w.argv) {
+      if (/JAVA_TOOL_OPTIONS=|-javaagent:/i.test(a)) {
+        throw new Error(`JAVA_TOOL_OPTIONS on argv: ${JSON.stringify(a)}`)
+      }
+    }
+    const entry = frameOf(w.stdinPayload).find(
+      ([k]) => k === 'JAVA_TOOL_OPTIONS',
+    )
+    if (entry === undefined) {
+      throw new Error('no JAVA_TOOL_OPTIONS in the --env-stdin frame')
+    }
+    const jto = entry[1]
+    // Quoted when %TEMP% contains whitespace; the agent flag comes first.
+    const m = /^"?-javaagent:(.+?[\\/]srt-proxy-agent\.jar)/.exec(jto)
+    if (!m) throw new Error(`unexpected JAVA_TOOL_OPTIONS: ${jto}`)
+    return { jto, staged: m[1] }
+  }
+
+  it('J1: child sees the agent option; staged jar readable, not writable, original directory not exposed; reset() cleans up', async () => {
+    await SandboxManager.initialize(
+      createJavaTestConfig(fakeJar, ['example.com']),
+    )
+    let stagedDir: string | undefined
+    try {
+      const wrapped = await SandboxManager.wrapWithSandboxArgv('echo hi')
+      const { jto, staged } = agentFromWrap(wrapped)
+      stagedDir = dirname(staged)
+      // A copy in a directory of its own — not the configured path.
+      expect(stagedDir).not.toBe(scratch)
+      expect(readdirSync(stagedDir)).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
+      // The credential is not in it, and not on argv at all.
+      expect(jto).not.toContain('@')
+      const token = /:([^:@]+)@localhost:\d+$/.exec(
+        frameOf(wrapped.stdinPayload).find(([k]) => k === 'HTTPS_PROXY')![1],
+      )![1]
+      for (const a of wrapped.argv) expect(a).not.toContain(token)
+
+      const env = await runSandboxed('echo JTO=%JAVA_TOOL_OPTIONS%')
+      expectStatus('J1 env', env, [0])
+      expect(env.stdout).toContain(`JTO=${jto}`)
+
+      const probe = join(stagedDir, 'written-by-sandbox.txt')
+      const r = await runSandboxed(
+        `type "${staged}" & echo --SEP-- & type "${neighbour}" & ` +
+          `echo --SEP-- & echo POISON>"${probe}"`,
+      )
+      if (!r.stdout.includes('JAR-BYTES')) {
+        throw new Error(
+          `J1: sandbox user cannot read the staged jar (the write-deny ` +
+            `must leave read+execute open) — ` +
+            `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+        )
+      }
+      if (r.stdout.includes('NEIGHBOUR')) {
+        throw new Error(
+          `J1: the jar's ORIGINAL directory was exposed to the sandbox — ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+      if (existsSync(probe)) {
+        throw new Error(`J1: sandbox user could WRITE into '${stagedDir}'`)
+      }
+    } finally {
+      await SandboxManager.reset()
+    }
+    // The session's revoke + restore ran against the still-existing
+    // directory, then the directory itself went.
+    expect(existsSync(stagedDir)).toBe(false)
+  }, 180_000)
+
+  it('J1b: the staged jar stays read-only when an allowWrite root covers the temp directory', async () => {
+    // The hostile layout: %TEMP% sits inside a tree the session grants
+    // the sandbox MODIFY on. Point this process's temp root at such a
+    // tree for the duration, so the staged directory lands under it.
+    const root = mkdtempSync(join(tmpdir(), 'srt-jw-'))
+    const temp = join(root, 'tmp')
+    mkdirSync(temp)
+    const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP }
+    process.env.TEMP = temp
+    process.env.TMP = temp
+    let stagedDir: string | undefined
+    try {
+      const base = createJavaTestConfig(fakeJar, ['example.com'])
+      await SandboxManager.initialize({
+        ...base,
+        filesystem: { ...base.filesystem, allowWrite: [root] },
+      })
+      const wrapped = await SandboxManager.wrapWithSandboxArgv('echo hi')
+      const { staged } = agentFromWrap(wrapped)
+      stagedDir = dirname(staged)
+      // Premise: the staged directory really is under the write grant.
+      expect(stagedDir.toLowerCase()).toContain(
+        realpathSync.native(root).toLowerCase(),
+      )
+
+      const ctl = join(temp, 'control.txt')
+      const planted = join(stagedDir, 'planted.jar')
+      const r = await runSandboxed(
+        // Control first: the allowWrite grant is live right next door.
+        `echo CTL>"${ctl}" & ` +
+          // Then every way to swap what the JVM would load.
+          `echo POISON>"${staged}" & ` +
+          `echo POISON>"${planted}" & ` +
+          `del /f /q "${staged}" & ` +
+          `ren "${stagedDir}" swapped & ` +
+          `echo --SEP-- & type "${staged}"`,
+      )
+      const diag = `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`
+      if (!existsSync(ctl)) {
+        throw new Error(`J1b: control write under allowWrite failed — ${diag}`)
+      }
+      if (!existsSync(staged) || readFileSync(staged, 'utf8') !== 'JAR-BYTES') {
+        throw new Error(`J1b: staged jar was replaced or removed — ${diag}`)
+      }
+      if (existsSync(planted)) {
+        throw new Error(`J1b: sandbox planted a file beside the jar — ${diag}`)
+      }
+      expect(readdirSync(stagedDir)).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
+      // Still readable through the deny: read+execute survives it.
+      expect(r.stdout.split('--SEP--').pop()).toContain('JAR-BYTES')
+    } finally {
+      await SandboxManager.reset()
+      if (saved.TEMP === undefined) delete process.env.TEMP
+      else process.env.TEMP = saved.TEMP
+      if (saved.TMP === undefined) delete process.env.TMP
+      else process.env.TMP = saved.TMP
+    }
+    try {
+      // Grant, write-deny and the parent's delete-child deny all
+      // released; staged directory gone.
+      expect(existsSync(stagedDir)).toBe(false)
+      const out = spawnSync('icacls', [temp], {
+        encoding: 'utf8',
+        timeout: 5_000,
+      })
+      if (out.stdout.includes('srt-sandbox')) {
+        throw new Error(`J1b: sandbox ACE left on '${temp}': ${out.stdout}`)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }, 180_000)
+
+  it('J2: no agent, no error, when the configured jar does not exist and none is built', async () => {
+    // Falls back past the missing explicit path to the normal lookup:
+    // either the built vendor jar, or nothing — never the bogus path.
+    await SandboxManager.initialize(
+      createJavaTestConfig(join(scratch, 'missing.jar'), ['example.com']),
+    )
+    try {
+      const { argv, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv('echo hi')
+      const jto = frameOf(stdinPayload)
+        .filter(([k]) => k === 'JAVA_TOOL_OPTIONS')
+        .map(([, v]) => v)
+      if (BUILT_AGENT_JAR === null) expect(jto).toEqual([])
+      else expect(jto.length).toBe(1)
+      expect(jto.join(' ')).not.toContain('missing.jar')
+      for (const a of argv) expect(a).not.toContain('JAVA_TOOL_OPTIONS')
+      const r = await runSandboxed('echo J2-RAN')
+      expectStatus('J2', r, [0])
+      expect(r.stdout).toContain('J2-RAN')
+    } finally {
+      await SandboxManager.reset()
+    }
+  }, 120_000)
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'J3: the option survives the msys2 → native hop (git-bash → cmd.exe)',
+    async () => {
+      // Maven/Gradle wrappers are commonly run from git-bash. msys2
+      // rewrites env values that look like POSIX paths when it spawns
+      // a native program; the value is a native Windows path, so it
+      // must come out the other side byte-for-byte.
+      await SandboxManager.initialize(
+        createJavaTestConfig(fakeJar, ['example.com']),
+      )
+      try {
+        const cmd = `cmd.exe //d //c "echo JTO=%JAVA_TOOL_OPTIONS%"`
+        const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd, GIT_BASH)
+        const { jto } = agentFromWrap(wrapped)
+        const r = await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
+          timeout: 60_000,
+          env: wrapped.env,
+          input: wrapped.stdinPayload,
+        })
+        expectStatus('J3', r, [0])
+        expect(r.stdout).toContain(`JTO=${jto}`)
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+    120_000,
+  )
+
+  // The proof that matters: a JVM, which ignores HTTPS_PROXY and whose
+  // direct connects the WFP fence drops, reaches an allow-listed host —
+  // so it went through the proxy, with the session credential — and is
+  // refused BY THE PROXY for a host that is not on the list. Also the
+  // runtime check on leaving -Djava.net.preferIPv4Stack off: the JDK's
+  // default dual-stack socket has to match the loopback PERMIT.
+  it.skipIf(JAVA === undefined || BUILT_AGENT_JAR === null)(
+    'J4: a real JVM reaches an allowed host through the proxy and is refused for another',
+    async () => {
+      const probe = join(JAVA_FIXTURE_DIR, 'ProxyProbe.java')
+      await SandboxManager.initialize(
+        createJavaTestConfig(
+          BUILT_AGENT_JAR!,
+          ['example.com'],
+          // The probe source lives in the checkout, which the sandbox
+          // user cannot read without a grant.
+          [JAVA_FIXTURE_DIR],
+        ),
+      )
+      try {
+        const ok = await runSandboxedUntil(
+          `"${JAVA}" "${probe}" connect https://example.com/`,
+          x => x.stdout.includes('code=200'),
+          2,
+          120_000,
+        )
+        if (!ok.stdout.includes('code=200')) {
+          throw new Error(
+            `J4 allow: JVM did not reach example.com via the proxy · ` +
+              `status=${ok.status} · stdout=${JSON.stringify(ok.stdout)} · ` +
+              `stderr=${JSON.stringify(ok.stderr.slice(-2000))}`,
+          )
+        }
+        expect(ok.stderr).toContain('Picked up JAVA_TOOL_OPTIONS')
+
+        // Single-shot: a BLOCK row is never retried.
+        const no = await runSandboxed(
+          `"${JAVA}" "${probe}" connect https://www.google.com/`,
+          120_000,
+        )
+        if (/code=\d/.test(no.stdout) || !/error=.*proxy/i.test(no.stdout)) {
+          throw new Error(
+            `J4 block: expected the proxy to refuse the tunnel · ` +
+              `status=${no.status} · stdout=${JSON.stringify(no.stdout)} · ` +
+              `stderr=${JSON.stringify(no.stderr.slice(-2000))}`,
+          )
+        }
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+    300_000,
+  )
+})
+
+// ────────────────────────────────────────────────────────────────────
 // Group P — persistent CA (`ensurePersistentWindowsCa` +
 // `initialize()` auto-load with `tlsTerminate: {}`).
 //
@@ -6741,6 +7400,13 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     }
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      // The JVM agent jar is the one a test's config names, or none. The
+      // default lookup finds a jar wherever one has been built (`npm run
+      // build:java-agent`), and initialize() stages what it finds: the
+      // session's grants would then depend on the machine.
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
+        explicitPath => Promise.resolve(explicitPath ?? null),
+      ),
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockImplementation((() =>
         Promise.resolve({ outcome: 'blocked' })) as never),
       spyOn(child_process, 'spawn').mockImplementation(((

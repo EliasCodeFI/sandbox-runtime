@@ -31,7 +31,9 @@ param(
   # Must match smoke-profile-read.ps1.
   [string]$ProfileReadSublayer = 'e1a47c93-5d28-4b6f-a3c1-7f0e9d2b4a58',
   # Must match smoke-residual-egress.ps1.
-  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc'
+  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc',
+  # Must match smoke-env-stdin.ps1.
+  [string]$EnvStdinSublayer = 'a7f3c9d1-5e28-4b06-8f4a-9c1d2e6b0a35'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -51,6 +53,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $WriteRestrictedSublayer
 & $Exe wfp uninstall --sublayer-guid $ProfileReadSublayer
 & $Exe wfp uninstall --sublayer-guid $ResidualSublayer
+& $Exe wfp uninstall --sublayer-guid $EnvStdinSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
