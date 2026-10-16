@@ -1,5 +1,5 @@
-//! Proof that the security descriptors on the WFP BLOCK filters
-//! match the token shapes `wfp::install_filters` relies on them to
+//! Proof that the security descriptor on the WFP BLOCK filters
+//! matches the token shapes `wfp::install_filters` relies on it to
 //! match — and only those.
 //!
 //! WFP's `ALE_USER_ID` `FWP_MATCH_EQUAL` condition runs `AccessCheck`
@@ -14,15 +14,21 @@
 //! is about "a token of the sandbox account", and on a SID the
 //! caller does not carry wherever a row is about "some other user".
 //!
-//! | token                                   | sandbox-user SD | anonymous SD |
-//! |-----------------------------------------|-----------------|--------------|
-//! | sandbox account, plain                  | match           | no match     |
-//! | another real user                       | no match        | no match     |
-//! | anonymous                               | no match        | match        |
-//! | AppContainer of the sandbox account     | match           | —            |
-//! | AppContainer of another real user       | no match        | —            |
-//! | sandbox account, user SID deny-only     | no match        | no match     |
-//! | sandbox account, integrity lowered      | recorded        | no match     |
+//! | token                                   | sandbox-user SD |
+//! |-----------------------------------------|-----------------|
+//! | sandbox account, plain                  | match           |
+//! | another real user                       | no match        |
+//! | anonymous                               | no match        |
+//! | AppContainer of the sandbox account     | match           |
+//! | AppContainer of another real user       | no match        |
+//! | sandbox account, user SID deny-only     | no match        |
+//! | sandbox account, integrity lowered      | recorded        |
+//!
+//! The anonymous row is a gap the filter set leaves open: a thread of
+//! the sandbox account that impersonates the anonymous token is not
+//! matched, and no filter is keyed on the anonymous SID, which would
+//! apply to every process on the machine. The row is asserted so the
+//! gap stays visible.
 //!
 //! The deny-only row is not what the fence wants — it is what an
 //! ALLOW ACE can do. A deny-only SID satisfies no ALLOW ACE, so no
@@ -38,9 +44,7 @@
 //! mapping the filtering engine passes is not something this crate
 //! controls, so every row is evaluated under [`STRICT`], which files
 //! the requested right under nothing: a grant under it holds under
-//! any mapping. The anonymous token is the row this decides — its
-//! integrity level is untrusted — and it is why the anonymous SD
-//! carries an untrusted-level label.
+//! any mapping.
 //!
 //! Each check prints one line to stderr (written past the test
 //! harness's capture, so it shows for passing tests too): the token's
@@ -77,7 +81,7 @@ use windows::core::BOOL;
 
 use srt_win::sid::{LocalPsid, psid_to_string};
 use srt_win::util::wstr;
-use srt_win::wfp::{sddl_anonymous, sddl_sandbox_user};
+use srt_win::wfp::sddl_sandbox_user;
 
 /// `CC` in SDDL is `ADS_RIGHT_DS_CREATE_CHILD` = bit 0. The filters
 /// only need a single bit; `AccessCheck` is asked for that bit.
@@ -103,10 +107,6 @@ const LENIENT: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericExecute: DESIRED_ACCESS,
     GenericAll: DESIRED_ACCESS,
 };
-
-/// The anonymous SD without its mandatory label. Logged next to the
-/// real one, never asserted: it shows what the label changes.
-const ANONYMOUS_LABELLED: &str = "O:LSG:LSD:(A;;CC;;;S-1-5-7)S:(ML;;NW;;;S-1-16-0)";
 
 /// The low mandatory level.
 const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
@@ -466,37 +466,16 @@ fn plain_tokens() {
         ),
         "sandbox-user SD keyed on a foreign SID must NOT match own token"
     );
-    // A real user's own token is not the anonymous token. The label
-    // on the anonymous SD lets every token past the mandatory check,
-    // so this is the DACL's answer.
-    assert!(
-        !check("plain / anonymous SD", tok, &sddl_anonymous()),
-        "anonymous SD must NOT match a real user's token"
-    );
     close(tok);
 }
 
 #[test]
-fn anonymous_token_matches_only_the_anonymous_sd() {
+fn anonymous_token_is_not_matched() {
     let tok = anonymous_token();
     let me = srt_win::sid::current_user_sid().unwrap();
 
-    // Logged, not asserted. The anonymous token's integrity level is
-    // untrusted, so against the filter's unlabelled descriptor the
-    // result depends on the generic mapping the checker passes: the
-    // strict mapping here refuses it, the lenient one grants it. The
-    // filtering engine's own mapping is not visible from here; the
-    // smoke rows that connect under the anonymous token are the
-    // measurement. The labelled row shows the DACL itself is right.
-    let _ = check("anonymous / anonymous SD", tok, &sddl_anonymous());
-    let _ = check(
-        "anonymous / anonymous SD with an untrusted label",
-        tok,
-        ANONYMOUS_LABELLED,
-    );
-    // Why the anonymous BLOCK exists: the sandbox-user SD does not
-    // reach a thread of the sandbox account once it impersonates
-    // anonymous.
+    // The gap, pinned: the sandbox-user SD does not reach a thread of
+    // the sandbox account once it impersonates anonymous.
     assert!(
         !check("anonymous / sandbox-user SD", tok, &sddl_sandbox_user(&me)),
         "sandbox-user SD does not match the anonymous token"
@@ -546,14 +525,10 @@ fn deny_only_user_sid_is_not_matched() {
     let tok = deny_only_user_token(&me);
 
     // The gap, pinned: a deny-only SID satisfies no ALLOW ACE, and
-    // the token carries neither package SID nor ANONYMOUS LOGON.
+    // the token carries neither package SID.
     assert!(
         !check("deny-only / sandbox-user SD", tok, &sddl_sandbox_user(&me)),
         "an ALLOW ACE does not match a deny-only user SID"
-    );
-    assert!(
-        !check("deny-only / anonymous SD", tok, &sddl_anonymous()),
-        "anonymous SD must NOT match a deny-only token of a real user"
     );
     close(tok);
 }
@@ -575,7 +550,8 @@ fn lowered_integrity_token_of_the_sandbox_account() {
         &sddl_sandbox_user(&me),
     );
 
-    // These hold under any mapping: neither DACL names this token.
+    // This holds under any mapping: the DACL does not name this
+    // token.
     assert!(
         !check(
             "low integrity / sandbox-user SD of another user",
@@ -583,10 +559,6 @@ fn lowered_integrity_token_of_the_sandbox_account() {
             &sddl_sandbox_user(FOREIGN_SID)
         ),
         "sandbox-user SD keyed on a foreign SID must NOT match a low-integrity token"
-    );
-    assert!(
-        !check("low integrity / anonymous SD", tok, &sddl_anonymous()),
-        "anonymous SD must NOT match a low-integrity token of a real user"
     );
     close(tok);
 }

@@ -258,7 +258,7 @@ export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
  * check is {@link verifyWindowsWfpEgress}, not this enum.
  *
  * `outdated` means a filter set is installed but was written by an
- * earlier `srt-win` and lacks filters the current one requires; the
+ * earlier `srt-win` and is not the set the current one installs; the
  * sandbox refuses to run until the install is re-run. It is reported
  * to elevated and non-elevated callers alike. An elevated caller also
  * gets it when the loopback mode of the filters is not the one the
@@ -321,6 +321,11 @@ export type WindowsWfpProbeOutcome =
  * A gap {@link verifyWindowsWfpEgress} observed that the filter set
  * does not close. The fence is active; these are what it leaves open.
  *
+ * - `anonymous-egress` — a connect to an off-loopback destination
+ *   made while impersonating the anonymous token is not blocked. This
+ *   is expected on every machine that has such an address: no filter
+ *   is keyed on the anonymous token, because one would apply to every
+ *   process on the machine and not only to sandboxed ones.
  * - `anonymous-loopback` — a connect to a loopback destination made
  *   while impersonating the anonymous token is not blocked, so local
  *   listeners outside the proxy port range are reachable that way.
@@ -330,18 +335,24 @@ export type WindowsWfpProbeOutcome =
  * Each is probed on a socket created before the token is assumed and
  * on one created after; the residual is named when either connects.
  */
-export type WindowsWfpResidual = 'anonymous-loopback' | 'deny-only-user-sid'
+export type WindowsWfpResidual =
+  | 'anonymous-egress'
+  | 'anonymous-loopback'
+  | 'deny-only-user-sid'
 
 /**
  * Result of `srt-win wfp verify` on success (exit 0) — see
  * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
  * return path `probes.plain` and the two lowered-integrity loopback
- * attempts are always `blocked`, `probes.anonymous` and the two
- * lowered-integrity off-loopback attempts are `blocked` or `skipped`,
- * and — with loopback open — `probes.openOffLoopback` is `blocked` or
- * `skipped` and `probes.openLoopback` is `connected` or `skipped` —
- * except that under the write-restricted token any of them but
- * `probes.plain` may instead be `denied`.
+ * attempts are always `blocked`, the two lowered-integrity
+ * off-loopback attempts are `blocked` or `skipped`, and — with
+ * loopback open — `probes.openOffLoopback` is `blocked` or `skipped`
+ * and `probes.openLoopback` is `connected` or `skipped`. The remaining
+ * three (`anonymous`, `anonymousLoopback`, `denyOnly`) can be anything:
+ * the filters do not cover them, and one that got through is named in
+ * `residuals`.
+ * Under the write-restricted token any of them but `probes.plain`
+ * may instead be `denied`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -1636,6 +1647,11 @@ function srtWinTooOld(stderr: string): WindowsSandboxError {
 }
 
 const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
+  'anonymous-egress':
+    'a connect to an off-loopback destination made while impersonating ' +
+    'the anonymous token is not blocked (no filter is keyed on that ' +
+    'token; a sandboxed process that puts it on a thread before ' +
+    'creating a socket is not fenced)',
   'anonymous-loopback':
     'a connect to a loopback destination made while impersonating the ' +
     'anonymous token is not blocked (local listeners outside the proxy ' +
@@ -1661,13 +1677,13 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
  *   with).
  * - exit 3, or any attempt the fence must refuse reported as having
  *   got past the filters → `wfp_fence_inactive`. Those attempts are
- *   the plain one, the off-loopback anonymous one, the four made
- *   under a copy of the sandbox token with its integrity level
- *   lowered, and — with loopback open — the off-loopback one at the
- *   port of a loopback listener.
+ *   the plain one, the four made under a copy of the sandbox token
+ *   with its integrity level lowered, and — with loopback open — the
+ *   off-loopback one at the port of a loopback listener. The attempts
+ *   made while impersonating the anonymous token are not among them.
  * - any other non-zero exit → `wfp_verify_inconclusive`.
  * - exit 0 → the result, with any residuals and their warnings. A
- *   residual never throws: the filters cannot close it, so refusing
+ *   residual never throws: the filters do not close it, so refusing
  *   to start would refuse every machine.
  */
 export function interpretWindowsWfpVerify(r: {
@@ -1767,11 +1783,6 @@ export function interpretWindowsWfpVerify(r: {
   const which = (
     [
       [probes.plain, 'the sandbox user', raw.target],
-      [
-        probes.anonymous,
-        'the sandbox user impersonating the anonymous token',
-        raw.anonymous_target,
-      ],
       [probes.lowIntegrity, lowIl, loweredTarget],
       [probes.lowIntegrityLoopback, lowIl, raw.target],
       [probes.untrustedIntegrity, untrustedIl, loweredTarget],
@@ -1807,13 +1818,6 @@ export function interpretWindowsWfpVerify(r: {
   const warnings = residuals.map(
     x => `WFP egress fence residual '${x}': ${WFP_RESIDUAL_TEXT[x]}`,
   )
-  if (probes.anonymous === 'skipped') {
-    warnings.push(
-      `WFP egress fence: the anonymous-token attempt was skipped (no ` +
-        `off-loopback address on this machine to aim it at), so the ` +
-        `anonymous block is unverified this run`,
-    )
-  }
   if (
     probes.lowIntegrity === 'skipped' ||
     probes.untrustedIntegrity === 'skipped'
@@ -1892,11 +1896,12 @@ export function interpretWindowsWfpVerify(r: {
  * 7. to a loopback listener `srt-win` itself binds on an arbitrary
  *    port for the probe — loopback must actually be open.
  *
- * Attempts 1, 2, 5 and 6 are what the fence must refuse: any of them
+ * Attempts 1, 5 and 6 are what the fence must refuse: any of them
  * getting through throws. So does attempt 7 being blocked, and a
  * loopback mode that is not the one the install recorded
- * (`wfp_fence_outdated`, before anything is probed). Attempts 3 and 4
- * are shapes the filter set cannot refuse; when they get through, the
+ * (`wfp_fence_outdated`, before anything is probed). Attempts 2, 3 and
+ * 4 are shapes the filter set does not refuse — attempt 2 is expected
+ * to get through; when they do, the
  * result names them in `residuals` (with `warnings`) rather than
  * passing silently — see {@link WindowsWfpResidual}.
  *
@@ -5299,9 +5304,7 @@ export function windowsSetupVersionMismatch(
  */
 export const WINDOWS_INSTALL_NETWORK_EFFECT =
   `The WFP filters key on the dedicated \`srt-sandbox\` account's SID, ` +
-  `so your own connections are unaffected, with one machine-wide ` +
-  `exception: a connect to a non-loopback address made while ` +
-  `impersonating the anonymous token is blocked for every process.`
+  `so your own network is unaffected.`
 
 /**
  * Install instructions, surfaced verbatim in error messages.

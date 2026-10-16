@@ -3151,28 +3151,47 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     const r = await runVerify(
       0,
       verifyOut({
+        anonymous_probe: 'refused',
         anonymous_loopback_probe: 'connected',
         deny_only_probe: 'connected',
-        residuals: ['anonymous-loopback', 'deny-only-user-sid'],
+        residuals: [
+          'anonymous-egress',
+          'anonymous-loopback',
+          'deny-only-user-sid',
+        ],
       }),
     )
+    expect(r.probes.anonymous).toBe('refused')
     expect(r.probes.anonymousLoopback).toBe('connected')
     expect(r.probes.denyOnly).toBe('connected')
-    expect(r.residuals).toEqual(['anonymous-loopback', 'deny-only-user-sid'])
-    expect(r.warnings.length).toBe(2)
-    expect(r.warnings[0]).toMatch(/anonymous-loopback/)
-    expect(r.warnings[1]).toMatch(/deny-only-user-sid/)
+    expect(r.residuals).toEqual([
+      'anonymous-egress',
+      'anonymous-loopback',
+      'deny-only-user-sid',
+    ])
+    expect(r.warnings.length).toBe(3)
+    expect(r.warnings[0]).toMatch(/anonymous-egress/)
+    expect(r.warnings[1]).toMatch(/anonymous-loopback/)
+    expect(r.warnings[2]).toMatch(/deny-only-user-sid/)
   })
 
-  it('verifyWindowsWfpEgress: a skipped anonymous attempt resolves with a warning', async () => {
+  it('verifyWindowsWfpEgress: a residual name this version does not know is dropped', async () => {
+    const r = await runVerify(
+      0,
+      verifyOut({ residuals: ['anonymous-egress', 'something-newer'] }),
+    )
+    expect(r.residuals).toEqual(['anonymous-egress'])
+    expect(r.warnings.length).toBe(1)
+  })
+
+  it('verifyWindowsWfpEgress: a skipped anonymous attempt resolves with nothing to report', async () => {
     const r = await runVerify(
       0,
       verifyOut({ anonymous_probe: 'skipped', anonymous_target: null }),
     )
     expect(r.probes.anonymous).toBe('skipped')
     expect(r.residuals).toEqual([])
-    expect(r.warnings.length).toBe(1)
-    expect(r.warnings[0]).toMatch(/skipped/)
+    expect(r.warnings).toEqual([])
   })
 
   it('verifyWindowsWfpEgress: the plain attempt connecting rejects (wfp_fence_inactive)', async () => {
@@ -3181,16 +3200,28 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
   })
 
-  it('verifyWindowsWfpEgress: the anonymous attempt getting out rejects and says which', async () => {
-    for (const through of ['connected', 'refused']) {
-      const err = await runVerify(
-        3,
-        verifyOut({ anonymous_probe: through }),
-      ).catch(e => e as WindowsSandboxError)
-      expect(err).toBeInstanceOf(WindowsSandboxError)
-      expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
-      expect((err as WindowsSandboxError).message).toMatch(
-        /impersonating the anonymous token to 10\.0\.0\.5:49999/,
+  it('verifyWindowsWfpEgress: the anonymous attempt getting out is a residual, never a failure', async () => {
+    for (const through of ['connected', 'refused'] as const) {
+      const r = await runVerify(
+        0,
+        verifyOut({
+          anonymous_probe: through,
+          residuals: ['anonymous-egress'],
+        }),
+      )
+      expect(r.probes.anonymous).toBe(through)
+      expect(r.probes.plain).toBe('blocked')
+      expect(r.residuals).toEqual(['anonymous-egress'])
+      expect(r.warnings.length).toBe(1)
+      expect(r.warnings[0]).toMatch(/anonymous-egress/)
+      expect(r.warnings[0]).toMatch(/not fenced/)
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+    }
+    // Whatever else it reports, it does not decide the result.
+    for (const other of ['blocked', 'unreachable', 'error']) {
+      expect(await verifyCode(0, verifyOut({ anonymous_probe: other }))).toBe(
+        'resolved',
       )
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
@@ -3253,8 +3284,8 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     expect(r.probes.lowIntegrity).toBe('skipped')
     expect(r.probes.lowIntegrityLoopback).toBe('blocked')
-    expect(r.warnings.length).toBe(2)
-    expect(r.warnings[1]).toMatch(/lowered-integrity/)
+    expect(r.warnings.length).toBe(1)
+    expect(r.warnings[0]).toMatch(/lowered-integrity/)
   })
 
   it('verifyWindowsWfpEgress: an out-of-date fence rejects (wfp_fence_outdated) with the reinstall hint', async () => {
@@ -3612,7 +3643,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 
   it('verifyWindowsWfpEgress: inconclusive and unparseable runs reject', async () => {
     expect(
-      await verifyCode(2, verifyOut({ anonymous_probe: 'unreachable' })),
+      await verifyCode(2, verifyOut({ egress_probe: 'unreachable' })),
     ).toBe('wfp_verify_inconclusive')
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
