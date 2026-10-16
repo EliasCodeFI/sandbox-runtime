@@ -6117,6 +6117,44 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(stdinOf('acl grant')?.read).toEqual([join(app, 'data')])
     })
 
+    it('a wildcard entry refuses a directory above it only while something beneath it matches', async () => {
+      // A tool's own directory under Local, with no EBWebView in it:
+      // grantable for reading and as a write root.
+      const tool = join(home, 'AppData', 'Local', 'npm-cache')
+      mkdirSync(join(tool, 'bin'), { recursive: true })
+      await SandboxManager.initialize(
+        config({}, { allowRead: [tool], allowWrite: [join(tool, 'bin')] }),
+      )
+      expect(stdinOf('acl grant')).toMatchObject({
+        read: [tool],
+        write: [join(tool, 'bin')],
+      })
+      await SandboxManager.reset()
+      // The same directory once such a child exists in it: refused.
+      mkdirSync(join(tool, 'EBWebView'))
+      calls = []
+      await refused(allowRead(tool))
+      await SandboxManager.reset()
+      calls = []
+      await refused(config({}, { allowWrite: [tool] }))
+      // The lookup is as deep as the rule and no deeper, and does not
+      // go through a link.
+      const deep = join(home, 'AppData', 'Local', 'deep')
+      mkdirSync(join(deep, 'x', 'EBWebView'), { recursive: true })
+      const linked = join(home, 'AppData', 'Local', 'linked')
+      mkdirSync(linked)
+      symlinkSync(
+        join(tool, 'EBWebView'),
+        join(linked, 'elsewhere'),
+        'junction',
+      )
+      await explained([deep, linked], () => {
+        expect(
+          winUtils.windowsProfileExclusionConflicts([deep, linked], lists()),
+        ).toEqual([])
+      })
+    })
+
     it('a link that resolves into an excluded store → refused (a junction, and a name spelled like an 8.3 short name: both are resolved by the final-path lookup)', async () => {
       for (const name of ['to-ssh', 'SSH~1']) {
         calls = []

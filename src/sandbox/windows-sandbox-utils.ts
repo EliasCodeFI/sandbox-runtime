@@ -3316,6 +3316,31 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
 }
 
 /**
+ * Whether something that exists beneath the directory `dir` matches
+ * `rest`, the components of an exclusion that `dir` lies above. No
+ * link is followed out of `dir`, and the lookup goes exactly as deep
+ * as the exclusion has components left.
+ */
+function exclusionMatchedBeneath(
+  dir: string,
+  rest: readonly string[],
+): boolean {
+  if (rest.length === 0) return true
+  let entries: fs.Dirent[]
+  try {
+    if (fs.lstatSync(dir).isSymbolicLink()) return false
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return false
+  }
+  return entries.some(
+    e =>
+      exclusionComponentMatches(rest[0]!, normalizeCaseForComparison(e.name)) &&
+      exclusionMatchedBeneath(path.join(dir, e.name), rest.slice(1)),
+  )
+}
+
+/**
  * The paths among `paths` that a session must not grant read access
  * to while the profile read grant exists, with the exclusion each
  * collides with (`grant` is the recorded
@@ -3329,7 +3354,12 @@ function exclusionComponentMatches(pattern: string, name: string): boolean {
  *   path, lies inside it, or lies above it. Above counts because a
  *   session grant inherits: an excluded store that is deleted and
  *   created again beneath it would be readable, which is what the
- *   grant's own layout never allows.
+ *   grant's own layout never allows. An exclusion with a wildcard
+ *   (`…\Local\*\EBWebView`) names no path until something matches
+ *   it, and would otherwise make every directory under `Local`
+ *   ungrantable: a path counts as above one only while something that
+ *   exists beneath the path matches it. `srt-win` applies the same
+ *   rule.
  * - Against an UNGRANTED-ONLY directory (the temporary directory) it
  *   collides when it is that directory or lies above it: the grant
  *   would cover everything in it. A path INSIDE one does not collide:
@@ -3387,6 +3417,14 @@ export function windowsProfileExclusionConflicts(
   for (const p of paths) {
     const key = windowsPathKey(p)
     const parts = key.split('/')
+    // The object itself, for the lookups beneath it.
+    let onDisk = p
+    try {
+      // eslint-disable-next-line no-restricted-properties
+      onDisk = fs.realpathSync.native(p)
+    } catch {
+      // Not there: nothing lies beneath it.
+    }
     for (const r of rules) {
       const shared = Math.min(parts.length, r.parts.length)
       let related = true
@@ -3401,6 +3439,13 @@ export function windowsProfileExclusionConflicts(
             ? 'inside'
             : 'above'
       if (r.onlyEqual && relation !== 'equal') continue
+      if (
+        relation === 'above' &&
+        r.exclusion.includes('*') &&
+        !exclusionMatchedBeneath(onDisk, r.parts.slice(parts.length))
+      ) {
+        continue
+      }
       if (r.kind === 'ungranted-only') {
         if (relation === 'inside') continue
       } else if (relation !== 'above' && admitted.has(key)) {

@@ -60,7 +60,7 @@
 
 /// Version of the exclusion list and of the walk rule. A recorded
 /// grant made with another version is reported as outdated.
-pub const LIST_VERSION: u32 = 2;
+pub const LIST_VERSION: u32 = 3;
 
 /// What a built-in exclusion's path is relative to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,12 @@ pub struct Excl {
     /// Ungranted-only (see the module doc): kept out of the grant,
     /// not denied. Every other entry is protected.
     pub ungranted_only: bool,
+    /// Create the directory, empty, when it is missing, so the deny
+    /// has an object to sit on. Not set for the stores of tools most
+    /// profiles do not have: a missing one is covered without it —
+    /// nothing above it carries an inheriting allow, and a session
+    /// may not grant a path above it.
+    pub create: bool,
 }
 
 /// A protected directory.
@@ -99,6 +105,19 @@ const fn dir(base: Base, path: &'static str) -> Excl {
         dir: true,
         stamp: true,
         ungranted_only: false,
+        create: true,
+    }
+}
+
+/// A protected directory that is not created when missing.
+const fn store(base: Base, path: &'static str) -> Excl {
+    Excl {
+        base,
+        path,
+        dir: true,
+        stamp: true,
+        ungranted_only: false,
+        create: false,
     }
 }
 
@@ -110,6 +129,7 @@ const fn file(base: Base, path: &'static str) -> Excl {
         dir: false,
         stamp: true,
         ungranted_only: false,
+        create: false,
     }
 }
 
@@ -121,6 +141,7 @@ const fn ungranted(base: Base, path: &'static str) -> Excl {
         dir: true,
         stamp: false,
         ungranted_only: true,
+        create: false,
     }
 }
 
@@ -159,6 +180,33 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Roaming, "terraform.d"),
     file(Roaming, "terraform.rc"),
     dir(Local, "heroku"),
+    // Plaintext token files and directories of further command-line
+    // tools, at the locations each uses on Windows and, where the tool
+    // also follows the XDG convention, under `.config`.
+    store(Local, "github-copilot"),
+    store(Profile, r".config\github-copilot"),
+    store(Profile, r".config\doctl"),
+    store(Roaming, "doctl"),
+    store(Profile, r".config\op"),
+    file(Profile, r".config\hub"),
+    file(Profile, r".gem\credentials"),
+    file(Profile, r".pulumi\credentials.json"),
+    file(Roaming, r"postgresql\pgpass.conf"),
+    file(Profile, ".pgpass"),
+    file(Roaming, r"Composer\auth.json"),
+    file(Profile, r".composer\auth.json"),
+    file(Profile, r".fly\config.yml"),
+    file(Profile, ".databrickscfg"),
+    file(Profile, ".boto"),
+    file(Profile, ".s3cfg"),
+    file(Roaming, "s3cmd.ini"),
+    store(Profile, ".kaggle"),
+    store(Profile, ".snowsql"),
+    store(Profile, ".oci"),
+    store(Profile, ".bluemix"),
+    store(Profile, ".ibmcloud"),
+    store(Profile, ".railway"),
+    store(Profile, ".supabase"),
     // Package-feed sign-in caches: the token stores of the credential
     // providers, as opposed to the configuration files that name a
     // feed (those are readable — see `READABLE_CONFIG`).
@@ -186,6 +234,25 @@ pub const BUILT_IN: &[Excl] = &[
     dir(Local, r"BraveSoftware\Brave-Browser\User Data"),
     dir(Roaming, r"Mozilla\Firefox"),
     dir(Local, r"Mozilla\Firefox"),
+    // The other channels of those browsers, the other browsers built
+    // on the same engines, and the mail client that shares Firefox's
+    // profile layout.
+    store(Local, r"Google\Chrome Beta\User Data"),
+    store(Local, r"Google\Chrome Dev\User Data"),
+    store(Local, r"Google\Chrome SxS\User Data"),
+    store(Local, r"Chromium\User Data"),
+    store(Local, r"Microsoft\Edge Beta\User Data"),
+    store(Local, r"Microsoft\Edge Dev\User Data"),
+    store(Local, r"Microsoft\Edge SxS\User Data"),
+    store(Local, r"BraveSoftware\Brave-Browser-Beta\User Data"),
+    store(Local, r"BraveSoftware\Brave-Browser-Nightly\User Data"),
+    store(Local, r"Vivaldi\User Data"),
+    store(Local, r"Yandex\YandexBrowser\User Data"),
+    store(Roaming, "Opera Software"),
+    store(Local, "Opera Software"),
+    store(Roaming, r"Mozilla\SeaMonkey"),
+    store(Roaming, "Thunderbird"),
+    store(Local, "Thunderbird"),
     // Embedded browser profiles of desktop applications.
     dir(Local, r"*\EBWebView"),
     dir(Local, r"Microsoft\*\EBWebView"),
@@ -235,6 +302,7 @@ pub const BUILT_IN: &[Excl] = &[
         dir: true,
         stamp: false,
         ungranted_only: false,
+        create: false,
     },
     // UNGRANTED-ONLY. The user's temporary directory: every program
     // of the user drops files there, so none of it is readable by
@@ -454,7 +522,7 @@ impl Rules {
                     spelled,
                     stamp: e.stamp,
                     ungranted: e.ungranted_only,
-                    placeholder: e.dir && e.stamp && !wild && !e.ungranted_only,
+                    placeholder: e.dir && e.stamp && e.create && !wild && !e.ungranted_only,
                 });
             }
         }
@@ -560,6 +628,30 @@ pub fn relation(path: &str, rule: &str) -> Option<Relation> {
     })
 }
 
+/// Whether something that exists beneath the directory `path` matches
+/// the rest of `rule`, which `path` lies above. `list` gives the entry
+/// names of a directory (nothing for a file, a link, or a directory
+/// that cannot be read), so the lookup never leaves `path` through a
+/// link, and it goes exactly as deep as the rule has components left.
+fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Vec<String>) -> bool {
+    fn go(dir: &str, rest: &[Pat], list: &dyn Fn(&str) -> Vec<String>) -> bool {
+        let Some((first, rest)) = rest.split_first() else {
+            return true;
+        };
+        list(dir).iter().any(|name| {
+            first.matches(&norm_component(name))
+                && go(
+                    &format!("{}\\{name}", dir.trim_end_matches('\\')),
+                    rest,
+                    list,
+                )
+        })
+    }
+    let depth = split_path(path).len();
+    let pats: Vec<Pat> = split_path(rule).iter().map(|c| Pat::parse(c)).collect();
+    pats.len() > depth && go(path, &pats[depth..], list)
+}
+
 /// Why a session must not be granted `path` (canonical) while a
 /// profile read grant with these recorded exclusions exists; `None`
 /// when it may.
@@ -572,7 +664,14 @@ pub fn relation(path: &str, rule: &str) -> Option<Relation> {
 ///
 /// A grant above an exclusion inherits: a store that is deleted and
 /// created again beneath it would carry the grant, which the profile
-/// grant's own layout never allows. `admitted` are the paths the
+/// grant's own layout never allows. That holds for a rule that names
+/// its path outright. A rule with a wildcard (`Local\*\EBWebView`)
+/// names no path until something matches it, and read the same way it
+/// would make every directory beneath `Local` ungrantable; so `path`
+/// counts as above such a rule only while something that exists
+/// beneath it matches ([`matched_beneath`], through `list`). The
+/// grant's own walk does not make that concession: it treats every
+/// such level as a container. `admitted` are the paths the
 /// caller explicitly asked to open (`acl grant
 /// --allow-profile-exclusion`); they count for a READ grant that is a
 /// protected path or lies inside one, and for nothing else — a write
@@ -583,6 +682,7 @@ pub fn session_grant_refusal(
     protected: &[String],
     ungranted: &[String],
     admitted: &[String],
+    list: &dyn Fn(&str) -> Vec<String>,
 ) -> Option<String> {
     let what = if write { "write" } else { "read" };
     for u in ungranted {
@@ -600,6 +700,7 @@ pub fn session_grant_refusal(
     for r in protected {
         match relation(path, r) {
             None => {}
+            Some(Relation::Above) if r.contains('*') && !matched_beneath(path, r, list) => {}
             Some(Relation::Above) => {
                 return Some(format!(
                     "a {what} grant on '{path}' would be inherited by the excluded '{r}' \
@@ -1125,6 +1226,10 @@ mod tests {
             k.get(r"AppData\Local\Google\Chrome\User Data"),
             Some(&(Kind::Denied, true))
         );
+        // Nor is a store most profiles do not have created.
+        absent(".kaggle");
+        absent(r"AppData\Local\Vivaldi");
+        absent(r"AppData\Roaming\Thunderbird");
         // A missing excluded FILE gets no placeholder, nor does a
         // wildcard entry.
         absent(".git-credentials");
@@ -1393,6 +1498,30 @@ mod tests {
             (Local, r"Microsoft\Windows\UsrClass.dat"),
             (Profile, r".config\gcloud"),
             (Profile, r".config\gh"),
+            (Local, r"github-copilot\hosts.json"),
+            (Profile, r".config\github-copilot\apps.json"),
+            (Profile, r".gem\credentials"),
+            (Profile, r".pulumi\credentials.json"),
+            (Roaming, r"postgresql\pgpass.conf"),
+            (Profile, ".pgpass"),
+            (Roaming, r"Composer\auth.json"),
+            (Profile, r".composer\auth.json"),
+            (Profile, r".config\doctl\config.yaml"),
+            (Profile, r".config\hub"),
+            (Profile, r".config\op\config"),
+            (Profile, r".kaggle\kaggle.json"),
+            (Profile, ".databrickscfg"),
+            (Profile, r".snowsql\config"),
+            (Profile, ".boto"),
+            (Profile, ".s3cfg"),
+            (Profile, r".oci\config"),
+            (Profile, r".fly\config.yml"),
+            (Local, r"Google\Chrome Beta\User Data\Default\Cookies"),
+            (Local, r"Chromium\User Data"),
+            (Local, r"Vivaldi\User Data"),
+            (Local, r"Yandex\YandexBrowser\User Data"),
+            (Roaming, r"Opera Software\Opera GX Stable"),
+            (Roaming, r"Thunderbird\Profiles"),
         ] {
             let prefix = match base {
                 Roaming => r"AppData\Roaming\",
@@ -1406,6 +1535,16 @@ mod tests {
             && !e.path.starts_with('\\')
             && !e.path.contains('/')
             && !e.path.contains(':')));
+        // The tools those stores belong to stay runnable: only the
+        // token file is excluded where the tool installs itself
+        // beside it.
+        for tool in [
+            r".pulumi\bin\pulumi.exe",
+            r".fly\bin\flyctl.exe",
+            r".gem\specs",
+        ] {
+            assert!(!r.excludes(&names(&split_path(tool))), "{tool}");
+        }
         // The readable configuration files are not excluded.
         for (base, path, _) in READABLE_CONFIG {
             let prefix = match base {
@@ -1727,8 +1866,27 @@ mod tests {
             p(r"AppData\Local\Temp\keys"),
         ];
         let ungranted = vec![p(r"AppData\Local\Temp")];
+        // What is on disk, for the wildcard rules: `App` has an
+        // EBWebView directory, `Tool` and `npm-cache` do not.
+        let on_disk = |dir: &str| -> Vec<String> {
+            let d = dir.to_lowercase();
+            let names: &[&str] = if d.ends_with(r"\appdata\local") {
+                &["App", "Tool", "npm-cache", "Temp"]
+            } else if d.ends_with(r"\appdata\local\app") {
+                &["EBWebView", "data"]
+            } else if d.ends_with(r"\appdata\local\tool") {
+                &["bin"]
+            } else if d.ends_with(r"\appdata") {
+                &["Local", "Roaming"]
+            } else if d.ends_with(r"\users\me") {
+                &["AppData", "Documents"]
+            } else {
+                &[]
+            };
+            names.iter().map(|n| (*n).to_owned()).collect()
+        };
         let check = |rel: &str, write: bool, admitted: &[String]| {
-            session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted)
+            session_grant_refusal(&p(rel), write, &protected, &ungranted, admitted, &on_disk)
         };
         let refused = |rel: &str, write: bool| check(rel, write, &[]).is_some();
         for write in [false, true] {
@@ -1739,6 +1897,12 @@ mod tests {
             assert!(refused("ntuser.dat.LOG1", write));
             assert!(refused(r"AppData\Local\App", write));
             assert!(refused("AppData", write));
+            // A wildcard rule refuses a directory above it only while
+            // something beneath that directory matches: a tool's own
+            // directory under Local with no such child is grantable.
+            assert!(!refused(r"AppData\Local\Tool", write));
+            assert!(!refused(r"AppData\Local\npm-cache", write));
+            assert!(!refused(r"AppData\Local\Tool\bin", write));
             // Ungranted-only: the directory and above it, not inside.
             assert!(refused(r"AppData\Local\Temp", write));
             assert!(refused(r"AppData\Local", write));
@@ -1756,7 +1920,8 @@ mod tests {
         for root in [r"\\?\C:\Users\me", r"\\?\C:\Users", r"\\?\C:\"] {
             for write in [false, true] {
                 assert!(
-                    session_grant_refusal(root, write, &protected, &ungranted, &[]).is_some(),
+                    session_grant_refusal(root, write, &protected, &ungranted, &[], &on_disk)
+                        .is_some(),
                     "{root}"
                 );
             }
@@ -1764,7 +1929,7 @@ mod tests {
         // Another drive, another user.
         for other in [r"\\?\D:\work", r"\\?\C:\Users\other\.ssh"] {
             assert_eq!(
-                session_grant_refusal(other, true, &protected, &ungranted, &[]),
+                session_grant_refusal(other, true, &protected, &ungranted, &[], &on_disk),
                 None
             );
         }
@@ -1779,6 +1944,39 @@ mod tests {
         assert!(check("AppData", false, &[p("AppData")]).is_some());
         let temp = [p(r"AppData\Local\Temp")];
         assert!(check(r"AppData\Local\Temp", false, &temp).is_some());
+        // With nothing on disk only the rules that name their path
+        // refuse a directory above them; the wildcard ones do not.
+        let empty = |_: &str| Vec::new();
+        let bare = |rel: &str| {
+            session_grant_refusal(&p(rel), true, &protected, &ungranted, &[], &empty).is_some()
+        };
+        assert!(!bare(r"AppData\Local\App"));
+        assert!(bare(r"AppData\Local\App\EBWebView"));
+        assert!(bare(r"AppData\Local"));
+        assert!(bare(""));
+        // The lookup goes no deeper than the rule: `x\y\EBWebView`
+        // beneath Local does not make Local's child `x` refused.
+        let deep = |dir: &str| -> Vec<String> {
+            let d = dir.to_lowercase();
+            if d.ends_with(r"\local\x") {
+                vec!["y".to_owned()]
+            } else if d.ends_with(r"\local\x\y") {
+                vec!["EBWebView".to_owned()]
+            } else {
+                Vec::new()
+            }
+        };
+        assert_eq!(
+            session_grant_refusal(
+                &p(r"AppData\Local\x"),
+                true,
+                &protected,
+                &ungranted,
+                &[],
+                &deep
+            ),
+            None
+        );
         // The message for a write root above an exclusion says what
         // to do about it.
         let why = check("AppData", true, &[]).unwrap();

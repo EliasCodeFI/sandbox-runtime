@@ -747,13 +747,34 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
                 .unwrap_or_else(|_| a.clone())
         })
         .collect();
-    check_grants_against(read_marker_at(persist::MARKER_KEY), grants, &admitted)
+    check_grants_against(
+        read_marker_at(persist::MARKER_KEY),
+        grants,
+        &admitted,
+        &entry_names,
+    )
+}
+
+/// The entry names of the directory `dir`, read through a handle
+/// opened without following a link; nothing for a link, a file, or a
+/// directory that cannot be opened.
+fn entry_names(dir: &str) -> Vec<String> {
+    let Ok(o) = open_no_follow(dir, ACCESS_LIST) else {
+        return Vec::new();
+    };
+    if !o.is_dir || skip_reason(o.attrs, true).is_some() {
+        return Vec::new();
+    }
+    list_dir(o.h.raw())
+        .map(|entries| entries.into_iter().map(|e| e.name.long).collect())
+        .unwrap_or_default()
 }
 
 fn check_grants_against(
     marker: Result<Marker>,
     grants: &[(String, bool)],
     admitted: &[String],
+    list: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<()> {
     let m = marker.map_err(|e| {
         anyhow!(
@@ -772,9 +793,14 @@ fn check_grants_against(
         );
     }
     for (path, write) in grants {
-        if let Some(why) =
-            plan::session_grant_refusal(path, *write, &m.exclusions, &m.ungranted_only, admitted)
-        {
+        if let Some(why) = plan::session_grant_refusal(
+            path,
+            *write,
+            &m.exclusions,
+            &m.ungranted_only,
+            admitted,
+            list,
+        ) {
             bail!("refused, and nothing was granted: {why}");
         }
     }
@@ -1676,7 +1702,7 @@ mod tests {
             paths: Vec::new(),
         };
         let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
-            check_grants_against(m, g, admitted)
+            check_grants_against(m, g, admitted, &|_| Vec::new())
         };
         // No grant recorded: nothing in the profile is readable by
         // default, and there is no list to check against.
