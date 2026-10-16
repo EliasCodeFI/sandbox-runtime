@@ -757,7 +757,7 @@ The sandboxed command runs **as the `srt-sandbox` account**, not as the calling 
 
 Running under a distinct user SID structurally closes the surrogate-spawn class of escape (Task Scheduler, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` onto a broker-owned process, BITS, out-of-process COM with `RunAs="Interactive User"`): any process the child manages to spawn out-of-band still carries the `srt-sandbox` SID, so it remains subject to the WFP egress fence and has no rights on the calling user's files.
 
-**Network isolation** is a two-filter WFP set at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`, installed machine-wide:
+**Network isolation** is a two-filter WFP set at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`, installed machine-wide, with an optional third:
 
 - a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`);
 - optionally, a second PERMIT for loopback destinations on every port but a short fixed list — absent unless installed with `--allow-loopback` (see [Local servers on Windows](#local-servers-on-windows));
