@@ -8,11 +8,14 @@
 //!   - **plain** — its own token, to the loopback probe target. The
 //!     sandbox-user BLOCK must refuse it.
 //!   - **anonymous** — while impersonating the anonymous token, to an
-//!     off-loopback target. The anonymous BLOCK must refuse it.
+//!     off-loopback target. No filter covers a socket created under
+//!     that token (see the `wfp` module doc), so a connect here is
+//!     expected and is reported as the [`RESIDUAL_ANONYMOUS_EGRESS`]
+//!     residual.
 //!   - **anonymous, loopback** — while impersonating the anonymous
-//!     token, to the loopback probe target. No filter covers this
-//!     (see the `wfp` module doc), so a connect here is reported as
-//!     the [`RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
+//!     token, to the loopback probe target. Not covered either; a
+//!     connect here is reported as the
+//!     [`RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
 //!   - **low integrity** and **untrusted integrity** — under a copy
 //!     of its own token whose integrity level has been lowered, to the
 //!     off-loopback target and to the loopback probe target. The copy
@@ -77,6 +80,12 @@ use windows::Win32::Security::{
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
+
+/// Name of the residual reported when a connect to an off-loopback
+/// destination made while impersonating the anonymous token is not
+/// blocked. Expected on every machine with such a destination: the
+/// filter set has no filter for the anonymous token.
+pub const RESIDUAL_ANONYMOUS_EGRESS: &str = "anonymous-egress";
 
 /// Name of the residual reported when a connect to a loopback
 /// destination made while impersonating the anonymous token is not
@@ -254,10 +263,9 @@ impl Report {
     /// The attempts the filters are built to refuse, each with
     /// whether it may have been skipped (the ones aimed at the
     /// off-loopback target, which a machine can lack).
-    fn must_be_blocked(&self) -> [(Outcome, bool); 6] {
+    fn must_be_blocked(&self) -> [(Outcome, bool); 5] {
         [
             (self.plain, false),
-            (self.anonymous, true),
             (self.low_integrity, true),
             (self.low_integrity_loopback, false),
             (self.untrusted_integrity, true),
@@ -289,15 +297,18 @@ pub struct Verdict {
     pub residuals: Vec<&'static str>,
 }
 
-/// The plain, the off-loopback anonymous and the four
-/// lowered-integrity attempts decide the exit code: any one getting
+/// The plain and the four lowered-integrity attempts — the ones made
+/// under a token that still carries the sandbox account's SID —
+/// decide the exit code: any one getting
 /// past the filters is a missing fence, and any one that neither got
 /// past nor was blocked — the token could not be assumed, the connect
 /// timed out — leaves the probe inconclusive. An attempt at the
 /// off-loopback target that was skipped (the machine has no such
-/// address to aim at) does not fail the probe. The two remaining
-/// attempts never fail it — the filters cannot refuse them — and are
-/// reported as residuals instead of passing silently.
+/// address to aim at) does not fail the probe. The three remaining
+/// attempts — both anonymous ones and the deny-only one — never fail
+/// it, whatever their outcome: the filters do not refuse them. One
+/// that got through is reported as a residual instead of passing
+/// silently.
 pub fn verdict(r: &Report) -> Verdict {
     let must = r.must_be_blocked();
     let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
@@ -312,6 +323,9 @@ pub fn verdict(r: &Report) -> Verdict {
     };
     let mut residuals = Vec::new();
     if exit == EXIT_FENCED {
+        if r.anonymous.passed_fence() {
+            residuals.push(RESIDUAL_ANONYMOUS_EGRESS);
+        }
         if r.anonymous_loopback.passed_fence() {
             residuals.push(RESIDUAL_ANONYMOUS_LOOPBACK);
         }
@@ -1009,6 +1023,16 @@ mod tests {
             v.residuals,
             [RESIDUAL_ANONYMOUS_LOOPBACK, crate::wfp::RESIDUAL_DENY_ONLY]
         );
+        let v = verdict(&report(Blocked, Connected, Connected, Connected));
+        assert_eq!(v.exit, EXIT_FENCED);
+        assert_eq!(
+            v.residuals,
+            [
+                RESIDUAL_ANONYMOUS_EGRESS,
+                RESIDUAL_ANONYMOUS_LOOPBACK,
+                crate::wfp::RESIDUAL_DENY_ONLY
+            ]
+        );
         let v = verdict(&report(Blocked, Blocked, Blocked, Refused));
         assert_eq!(v.residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
         // An attempt that could not be made is not a residual.
@@ -1018,16 +1042,30 @@ mod tests {
     }
 
     #[test]
-    fn verdict_plain_or_anonymous_getting_out_is_not_fenced() {
+    fn verdict_plain_getting_out_is_not_fenced() {
         for through in [Connected, Refused] {
-            assert_eq!(
-                verdict(&report(through, Blocked, Blocked, Blocked)).exit,
-                EXIT_NOT_FENCED
-            );
-            let v = verdict(&report(Blocked, through, Connected, Connected));
+            let v = verdict(&report(through, Blocked, Blocked, Blocked));
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             // Residuals qualify a pass; a failure reports none.
+            let v = verdict(&report(through, Connected, Connected, Connected));
+            assert_eq!(v.exit, EXIT_NOT_FENCED);
             assert!(v.residuals.is_empty());
+        }
+    }
+
+    /// The off-loopback connect under the anonymous token is expected
+    /// to get through. Whatever it does, it is never a probe failure.
+    #[test]
+    fn verdict_anonymous_egress_is_a_residual_never_a_failure() {
+        for through in [Connected, Refused] {
+            let v = verdict(&report(Blocked, through, Blocked, Blocked));
+            assert_eq!(v.exit, EXIT_FENCED);
+            assert_eq!(v.residuals, [RESIDUAL_ANONYMOUS_EGRESS]);
+        }
+        for other in [Blocked, Unreachable, Error, Skipped] {
+            let v = verdict(&report(Blocked, other, Blocked, Blocked));
+            assert_eq!(v.exit, EXIT_FENCED, "{other:?}");
+            assert!(v.residuals.is_empty(), "{other:?}");
         }
     }
 
@@ -1078,15 +1116,5 @@ mod tests {
                 EXIT_INCONCLUSIVE
             );
         }
-        for odd in [Unreachable, Error] {
-            assert_eq!(
-                verdict(&report(Blocked, odd, Blocked, Blocked)).exit,
-                EXIT_INCONCLUSIVE
-            );
-        }
-        assert_eq!(
-            verdict(&report(Blocked, Skipped, Blocked, Blocked)).exit,
-            EXIT_FENCED
-        );
     }
 }
