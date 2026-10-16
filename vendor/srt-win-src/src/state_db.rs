@@ -1158,7 +1158,13 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
+    // The sandbox group, for the one place where a session's allow
+    // goes ahead of another entry of ours (`apply_sandbox_aces_over`).
+    let group = crate::install::read_setup()
+        .ok()
+        .flatten()
+        .map(|s| s.sandbox_group_sid);
+    acl::apply_sandbox_aces_over(canon, sandbox_sid, set, group.as_deref())
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 

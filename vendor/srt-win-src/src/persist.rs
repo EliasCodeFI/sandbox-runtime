@@ -550,6 +550,7 @@ impl Ids {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
             previous_group_sids: &self.previous_group_sids,
+            sandbox_user_sid: self.sandbox_user_sid.as_deref(),
         }
     }
 }
