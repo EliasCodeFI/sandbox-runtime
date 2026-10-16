@@ -1468,6 +1468,8 @@ pub struct AceFact<'a> {
     /// Objects beneath inherit the entry (to files, to directories,
     /// or both).
     pub inherited_beneath: bool,
+    /// The entry is itself a copy inherited from a directory above.
+    pub inherited: bool,
 }
 
 /// Groups every token of the sandbox account carries, besides its own
@@ -1521,9 +1523,22 @@ pub fn may_read(dacl: Option<&[AceFact<'_>]>, certain: &[&str], maybe: &[&str]) 
     let Some(dacl) = dacl else {
         return true;
     };
+    reading_entry(dacl, certain, maybe).is_some()
+}
+
+/// The entry of `dacl` that lets the sandbox account read — on the
+/// object, or failing that in what it hands down ([`may_read`]).
+/// `None` if nothing does. Which entry it is tells whose it is: one
+/// that names the sandbox group is an entry this product wrote.
+pub fn reading_entry<'a>(
+    dacl: &'a [AceFact<'a>],
+    certain: &[&str],
+    maybe: &[&str],
+) -> Option<&'a AceFact<'a>> {
     let here = dacl.iter().filter(|a| !a.inherit_only);
     let beneath = dacl.iter().filter(|a| a.inherited_beneath);
-    first_word_on_reading(here, certain, maybe) || first_word_on_reading(beneath, certain, maybe)
+    first_word_on_reading(here, certain, maybe)
+        .or_else(|| first_word_on_reading(beneath, certain, maybe))
 }
 
 /// The first entry among `aces` that speaks of reading and names the
@@ -1532,17 +1547,17 @@ fn first_word_on_reading<'a>(
     aces: impl Iterator<Item = &'a AceFact<'a>>,
     certain: &[&str],
     maybe: &[&str],
-) -> bool {
+) -> Option<&'a AceFact<'a>> {
     for ace in aces.filter(|a| a.mask & READS != 0) {
         let is_certain = certain.contains(&ace.sid);
         if ace.deny && is_certain {
-            return false;
+            return None;
         }
         if !ace.deny && (is_certain || maybe.contains(&ace.sid)) {
-            return true;
+            return Some(ace);
         }
     }
-    false
+    None
 }
 
 /// What an excluded path is, when the deny that marks it could not be
@@ -3334,6 +3349,7 @@ mod tests {
             mask,
             inherit_only: false,
             inherited_beneath: true,
+            inherited: false,
         };
         let deny = |sid, mask| AceFact {
             deny: true,
@@ -3341,6 +3357,7 @@ mod tests {
             mask,
             inherit_only: false,
             inherited_beneath: true,
+            inherited: false,
         };
         let class =
             |dacl: &[AceFact<'_>]| unstamped_exclusion(Ok(Some(dacl)), &certain, &SANDBOX_MAYBE);
@@ -3463,6 +3480,30 @@ mod tests {
             class(&[allow("S-1-5-11", 0x1000_0000)]),
             Unstamped::Unprotected
         );
+        // Which entry lets the account in says whose it is: the
+        // sandbox group's is one this product wrote — set on the
+        // object, or a copy inherited from a directory above.
+        let copy = |a: AceFact<'static>| AceFact {
+            inherited: true,
+            ..a
+        };
+        let list = [
+            allow(OWNER, FULL),
+            copy(allow(GROUP, RX)),
+            allow("S-1-1-0", RX),
+        ];
+        let by = reading_entry(&list, &certain, &SANDBOX_MAYBE).unwrap();
+        assert!(by.sid == GROUP && by.inherited);
+        let list = [deny("S-1-1-0", 0x10000), allow(GROUP, RX)];
+        let by = reading_entry(&list, &certain, &SANDBOX_MAYBE).unwrap();
+        assert!(by.sid == GROUP && !by.inherited);
+        // Someone else's entry that comes first is the one that counts.
+        let list = [allow("S-1-5-32-545", RX), allow(GROUP, RX)];
+        assert_eq!(
+            reading_entry(&list, &certain, &SANDBOX_MAYBE).unwrap().sid,
+            "S-1-5-32-545"
+        );
+        assert!(reading_entry(&[allow(OWNER, FULL)], &certain, &SANDBOX_MAYBE).is_none());
         // An empty access list admits nobody; none at all, everybody.
         assert_eq!(class(&[]), Unstamped::SelfClosed);
         assert_eq!(

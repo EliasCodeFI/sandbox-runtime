@@ -319,7 +319,9 @@ fn open_bare(path: &str, access: u32) -> Result<OwnedHandle> {
     Ok(OwnedHandle(handle))
 }
 
-fn is_access_denied(e: &anyhow::Error) -> bool {
+/// Whether the system refused `e` for lack of access — as opposed to
+/// any refusal this code makes itself.
+pub(crate) fn is_access_denied(e: &anyhow::Error) -> bool {
     e.root_cause()
         .downcast_ref::<windows::core::Error>()
         .is_some_and(|we| we.code() == windows::Win32::Foundation::ERROR_ACCESS_DENIED.into())
@@ -699,8 +701,20 @@ pub enum NoteClass {
     /// access list lets the sandbox account read it.
     Unprotected,
     /// Carries the allow of an earlier run though it is no longer to
-    /// be readable, and the allow could not be removed.
+    /// be readable, and the allow could not be removed. Not on the
+    /// exclusion list: it has merely left the grant.
     StaleAllow,
+    /// The same on a path that IS on the exclusion list now: a
+    /// protected store readable through an entry this product wrote.
+    /// Recorded apart, reported with the unprotected ones — as the
+    /// strongest of them.
+    OurAllow,
+    /// A directory an earlier run granted whole, that must now be
+    /// granted child by child because something beneath it became an
+    /// exclusion, and could not be rewritten: the exclusion beneath
+    /// is readable through the directory's entry. Reported as the
+    /// one before.
+    OurAllowAbove,
 }
 
 impl NoteClass {
@@ -719,8 +733,22 @@ impl NoteClass {
             NoteClass::Unverifiable => "unverifiable",
             NoteClass::Unprotected => "unprotected",
             NoteClass::StaleAllow => "stale_allow",
+            NoteClass::OurAllow => "our_allow",
+            NoteClass::OurAllowAbove => "our_allow_above",
         }
     }
+
+    /// Every class a record can carry: those reported, and the two
+    /// that are reported as `unprotected`.
+    const RECORDED: [NoteClass; 7] = [
+        NoteClass::NotGranted,
+        NoteClass::SelfClosed,
+        NoteClass::Unverifiable,
+        NoteClass::Unprotected,
+        NoteClass::StaleAllow,
+        NoteClass::OurAllow,
+        NoteClass::OurAllowAbove,
+    ];
 }
 
 /// One such object, as recorded with the grant.
@@ -741,7 +769,9 @@ impl Note {
         let mut it = s.splitn(3, '|');
         let class = it.next()?;
         Some(Note {
-            class: NoteClass::ALL.into_iter().find(|c| c.as_str() == class)?,
+            class: NoteClass::RECORDED
+                .into_iter()
+                .find(|c| c.as_str() == class)?,
             path: it.next()?.to_owned(),
             reason: it.next().unwrap_or_default().to_owned(),
         })
@@ -1323,6 +1353,21 @@ pub struct Item {
     /// failed otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<&'static str>,
+    /// Where an entry THIS PRODUCT wrote is what makes the path
+    /// readable to sandboxed commands: whether the path is on the
+    /// exclusion list now — a credential store open through our own
+    /// entry — or merely no longer part of the grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_exclusion: Option<bool>,
+    /// For the same: `explicit` (the entry is on the object, which
+    /// cannot be written) or `inherited` (a copy handed down from a
+    /// directory above, which could not be taken off the object).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<&'static str>,
+    /// The path is a directory whose entry exposes an exclusion
+    /// BENEATH it, not an exclusion itself.
+    #[serde(skip)]
+    above: bool,
 }
 
 /// What an exclusion without a deny of ours is, with what was found
@@ -1333,6 +1378,8 @@ struct Probe {
     /// `Some` for [`NoteClass::Unverifiable`] only.
     caller_reads: Option<Option<bool>>,
     cause: Option<&'static str>,
+    /// `Some` where our own entry is what lets the sandbox account in.
+    entry: Option<&'static str>,
 }
 
 impl Probe {
@@ -1342,6 +1389,7 @@ impl Probe {
             reason,
             caller_reads: None,
             cause: None,
+            entry: None,
         }
     }
 
@@ -1351,6 +1399,7 @@ impl Probe {
             reason,
             caller_reads: Some(caller_reads),
             cause: Some(cause),
+            entry: None,
         }
     }
 
@@ -1363,6 +1412,10 @@ impl Probe {
                 None => serde_json::Value::String("unknown".to_owned()),
             }),
             cause: self.cause,
+            // Every exclusion judged here is on the exclusion list.
+            protected_exclusion: self.entry.map(|_| true),
+            entry: self.entry,
+            above: false,
         }
     }
 }
@@ -1399,15 +1452,12 @@ pub struct Report {
     pub self_closed: Vec<Item>,
     pub unverifiable: Vec<Item>,
     pub unprotected: Vec<Item>,
-    /// Paths that are no longer to be readable — excluded now, or no
-    /// longer part of the grant — and still carry the allow of an
-    /// earlier run, which could not be removed. They are readable
-    /// through the grant and it could not take that back: the one
-    /// outcome here that leaves something open by our own entry.
+    /// Paths that have left the grant and still carry the allow of an
+    /// earlier run, which could not be removed: readable through an
+    /// entry of ours on an object that cannot be written. One that is
+    /// on the exclusion list now is not here but in `unprotected`,
+    /// with `protected_exclusion` set.
     pub stale_allow: Vec<Item>,
-    /// Always empty: no outcome of a run that ends is a failure of
-    /// the run. Kept for readers of the output.
-    pub failed: Vec<Item>,
     pub elapsed_ms: u64,
 }
 
@@ -1428,7 +1478,9 @@ impl Report {
             NoteClass::NotGranted => self.not_granted.push(item),
             NoteClass::SelfClosed => self.self_closed.push(item),
             NoteClass::Unverifiable => self.unverifiable.push(item),
-            NoteClass::Unprotected => self.unprotected.push(item),
+            NoteClass::Unprotected | NoteClass::OurAllow | NoteClass::OurAllowAbove => {
+                self.unprotected.push(item)
+            }
             NoteClass::StaleAllow => self.stale_allow.push(item),
         }
     }
@@ -1438,7 +1490,13 @@ impl Report {
             items
                 .iter()
                 .map(|i| Note {
-                    class,
+                    // Open through an entry of ours: recorded as
+                    // that, on the object or on a directory above.
+                    class: match (class, i.entry, i.above) {
+                        (NoteClass::Unprotected, Some(_), false) => NoteClass::OurAllow,
+                        (NoteClass::Unprotected, Some(_), true) => NoteClass::OurAllowAbove,
+                        _ => class,
+                    },
                     path: i.path.clone(),
                     reason: i.reason.clone(),
                 })
@@ -1472,7 +1530,10 @@ fn sandbox_sids(ids: &Ids) -> Vec<&str> {
 ///
 /// The error says which it was: `acl_unreadable` when the system
 /// refused the caller the access list, `probe_failed` otherwise.
-fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, (&'static str, String)> {
+fn own_access(
+    path: &str,
+    ids: &Ids,
+) -> std::result::Result<Option<Access>, (&'static str, String)> {
     let failed = |e: &anyhow::Error| {
         let cause = if is_access_denied(e) {
             "acl_unreadable"
@@ -1488,23 +1549,79 @@ fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, (&'sta
     };
     let dacl =
         acl::read_dacl_views(acl::DaclTarget::Handle(h.raw(), path)).map_err(|e| failed(&e))?;
-    let facts: Option<Vec<plan::AceFact<'_>>> = dacl.as_ref().map(|aces| {
-        aces.iter()
-            .map(|a| plan::AceFact {
-                deny: a.deny,
-                sid: &a.sid,
-                mask: a.mask,
-                inherit_only: a.flags & 0x8 != 0,
-                // Object-inherit or container-inherit.
-                inherited_beneath: a.flags & 0x3 != 0,
-            })
-            .collect()
-    });
-    Ok(Some(plan::may_read(
-        facts.as_deref(),
-        &sandbox_sids(ids),
-        &plan::SANDBOX_MAYBE,
-    )))
+    let Some(aces) = dacl else {
+        // No access list at all: everyone reads.
+        return Ok(Some(Access {
+            reads: true,
+            ours: None,
+        }));
+    };
+    let facts: Vec<plan::AceFact<'_>> = aces
+        .iter()
+        .map(|a| plan::AceFact {
+            deny: a.deny,
+            sid: &a.sid,
+            mask: a.mask,
+            inherit_only: a.flags & 0x8 != 0,
+            // Object-inherit or container-inherit.
+            inherited_beneath: a.flags & 0x3 != 0,
+            inherited: a.inherited,
+        })
+        .collect();
+    let by = plan::reading_entry(&facts, &sandbox_sids(ids), &plan::SANDBOX_MAYBE);
+    // An entry for the sandbox group — this install's, or an earlier
+    // one's — is an entry this product wrote.
+    let is_ours = |sid: &str| {
+        ids.group_sid.as_deref() == Some(sid) || ids.previous_group_sids.iter().any(|g| g == sid)
+    };
+    Ok(Some(Access {
+        reads: by.is_some(),
+        ours: by.filter(|a| is_ours(a.sid)).map(
+            |a| {
+                if a.inherited { "inherited" } else { "explicit" }
+            },
+        ),
+    }))
+}
+
+/// What an object's own access list says about the sandbox account.
+struct Access {
+    reads: bool,
+    /// The entry that lets it read is one this product wrote: set on
+    /// the object (`explicit`) or a copy from above (`inherited`).
+    ours: Option<&'static str>,
+}
+
+/// The line for a path that sandboxed commands can read through an
+/// entry this product wrote and could not take back, with what its
+/// user can do about it.
+///
+/// An explicit entry on an object that cannot be written cannot be
+/// neutralised from above: nothing a parent's list says removes an
+/// entry set on the object itself, and a deny added there would have
+/// to be written to the same list. An INHERITED copy has its source
+/// in a directory above, and that source is rewritten by the grant
+/// whenever it can be (the directory becomes one whose children are
+/// granted one by one) — what is left is a copy the system could not
+/// take off this object for the same lack of access, and only
+/// re-deriving the object's inherited entries removes it.
+fn our_entry_line(path: &str, ids: &Ids, entry: &str) -> String {
+    let shown = path_id::strip_extended_prefix(path);
+    let group = ids.group_sid.as_deref().unwrap_or("<sandbox group SID>");
+    if entry == "inherited" {
+        format!(
+            "it is readable to sandboxed commands through a copy of an entry this product \
+             wrote on a directory above it; the copy could not be taken off this object. \
+             As its owner, or from an elevated prompt: icacls \"{shown}\" /inheritance:e — \
+             that re-derives its inherited entries — then run the grant again"
+        )
+    } else {
+        format!(
+            "it is readable to sandboxed commands through an entry this product wrote on \
+             it and could not remove. As its owner, or from an elevated prompt: icacls \
+             \"{shown}\" /remove:g \"*{group}\" — then run the grant again"
+        )
+    }
 }
 
 /// An excluded path whose deny could not be written (`why`): which of
@@ -1538,14 +1655,27 @@ fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
         // Said of the object and of what it hands down to objects
         // beneath — not of every object already inside it, which is
         // not looked at: an excluded store is not walked.
-        Ok(Some(false)) => Probe::settled(
+        Ok(Some(Access { reads: false, .. })) => Probe::settled(
             NoteClass::SelfClosed,
             format!(
                 "its deny {why}; its own access list gives the sandbox account no read, \
                  on it or handed down beneath it"
             ),
         ),
-        Ok(Some(true)) => Probe::settled(
+        // Open through an entry of OURS: the strongest case there is —
+        // a store on the exclusion list, readable through what this
+        // product wrote.
+        Ok(Some(Access {
+            reads: true,
+            ours: Some(entry),
+        })) => Probe {
+            entry: Some(entry),
+            ..Probe::settled(
+                NoteClass::Unprotected,
+                format!("its deny {why}, and {}", our_entry_line(path, ids, entry)),
+            )
+        },
+        Ok(Some(Access { reads: true, .. })) => Probe::settled(
             NoteClass::Unprotected,
             format!(
                 "its deny {why}, and its own access list lets the sandbox account read it \
@@ -1595,7 +1725,12 @@ fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
 /// deny is then already what the access list says. `false` whenever
 /// that cannot be established.
 pub fn closed_to_sandbox(path: &str) -> bool {
-    Ids::load().is_ok_and(|ids| matches!(own_access(path, &ids), Ok(Some(false))))
+    Ids::load().is_ok_and(|ids| {
+        matches!(
+            own_access(path, &ids),
+            Ok(Some(Access { reads: false, .. }))
+        )
+    })
 }
 
 /// Whether the object at `path` carries no entry of ours, read with
@@ -1797,10 +1932,10 @@ fn resolve_extra(profile: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
 ///
 /// Order within a run: the record (marked incomplete), then every
 /// exclusion's deny, then the removal of entries that are no longer
-/// part of the grant, then the allows, parents first. A failure on
-/// one path is reported and the run goes on; the run is complete
-/// unless an excluded directory could not be denied or a stale entry
-/// could not be removed.
+/// part of the grant, then the allows, parents first. A path that
+/// cannot be written is reported by what that leaves ([`NoteClass`])
+/// and the run goes on to its end: a run that ends is complete, and
+/// "incomplete" is only a run that was cut short.
 ///
 /// `extra_raw` adds exclusions to the built-in list. The ones an
 /// earlier run recorded stay in force as well — a refresh that names
@@ -2017,14 +2152,85 @@ pub fn grant(
         // The stamp may have got as far as recording the new kind.
         upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created)?;
         match (is_allow(r.kind), wanted.map(|n| is_allow(n.kind))) {
-            (true, Some(false)) | (true, None) => report.note(
-                NoteClass::StaleAllow,
-                path,
-                format!(
-                    "it is no longer to be readable, and the entry of an earlier run that \
-                         makes it readable could not be removed ({why:#})"
-                ),
-            ),
+            // An allow of ours is on it and it is no longer to be
+            // readable. Two cases, not equally serious. If the path is
+            // on the exclusion list NOW — it became an exclusion, or
+            // lies inside one — a credential store is open through our
+            // own entry: reported with the unprotected ones, as the
+            // strongest of them. Otherwise it has merely left the
+            // grant. Either way it is an explicit entry on an object
+            // that cannot be written, and stays a warning: refusing
+            // every session over an object its user cannot change
+            // would cost the sandbox and close nothing.
+            (true, Some(false)) | (true, None) => {
+                let excluded_now = wanted.is_some()
+                    || plan::rel_components(profile, path).is_ok_and(|rel| {
+                        let names: Vec<Name> = rel.iter().map(|c| Name::long(c)).collect();
+                        rules.excludes(&names)
+                    });
+                let line = our_entry_line(path, ids, "explicit");
+                let item = Item {
+                    path: path.to_owned(),
+                    reason: if excluded_now {
+                        format!("it is excluded now, and {line} ({why:#})")
+                    } else {
+                        format!("it is no longer part of the grant, and {line} ({why:#})")
+                    },
+                    protected_exclusion: Some(excluded_now),
+                    entry: Some("explicit"),
+                    ..Default::default()
+                };
+                report.note_item(
+                    if excluded_now {
+                        NoteClass::OurAllow
+                    } else {
+                        NoteClass::StaleAllow
+                    },
+                    item,
+                );
+            }
+            // Granted WHOLE by an earlier run, and now to be granted
+            // child by child because something beneath it is excluded
+            // or left ungranted: the entry that hands reading down to
+            // everything beneath is still there. That is a stale allow
+            // too — and where an exclusion lies beneath, the strongest
+            // case: a protected store readable through our entry on
+            // the directory above it.
+            (true, Some(true))
+                if r.kind == Kind::Granted && wanted.is_some_and(|n| n.kind == Kind::Container) =>
+            {
+                let excludes_beneath = plan::rel_components(profile, path).is_ok_and(|rel| {
+                    let names: Vec<Name> = rel.iter().map(|c| Name::long(c)).collect();
+                    rules.could_exclude_beneath(&names)
+                });
+                let line = our_entry_line(path, ids, "explicit");
+                let item = Item {
+                    path: path.to_owned(),
+                    reason: if excludes_beneath {
+                        format!(
+                            "an exclusion lies beneath it, and whatever beneath it carries no \
+                             deny of its own is still readable: {line} ({why:#})"
+                        )
+                    } else {
+                        format!(
+                            "it is to be granted child by child now and everything beneath \
+                             it is still readable: {line} ({why:#})"
+                        )
+                    },
+                    protected_exclusion: Some(excludes_beneath),
+                    entry: Some("explicit"),
+                    above: true,
+                    ..Default::default()
+                };
+                report.note_item(
+                    if excludes_beneath {
+                        NoteClass::OurAllowAbove
+                    } else {
+                        NoteClass::StaleAllow
+                    },
+                    item,
+                );
+            }
             (false, Some(true)) => report.note(
                 NoteClass::NotGranted,
                 path,
@@ -2337,7 +2543,11 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
     // Under the one lock for the whole run, like every change to the
     // profile's entries. (No look at live holders here: the account
     // they would run as is already gone.)
-    crate::state_db::with_profile_lock(|db| forget(&Store::of(db.conn()), ids)).map(Some)
+    crate::state_db::with_profile_lock(|db| {
+        crate::state_db::mark_profile_operation()?;
+        forget(&Store::of(db.conn()), ids)
+    })
+    .map(Some)
 }
 
 // ─── Status ─────────────────────────────────────────────────────────
@@ -2415,7 +2625,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         .collect();
     for n in &m.notes {
         let (class, item) = match (n.class, &ids) {
-            (NoteClass::NotGranted | NoteClass::StaleAllow, _) => (
+            (NoteClass::NotGranted, _) => (
                 n.class,
                 Item {
                     path: n.path.clone(),
@@ -2423,6 +2633,71 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
                     ..Default::default()
                 },
             ),
+            // Looked at again like the exclusions: gone from the
+            // object since (its owner removed it), it is no longer
+            // reported; still there, the item says how it is there.
+            (NoteClass::StaleAllow, Some(ids)) => match own_access(&n.path, ids) {
+                Ok(Some(Access { ours: None, .. })) | Ok(None) => continue,
+                found => (
+                    n.class,
+                    Item {
+                        path: n.path.clone(),
+                        reason: n.reason.clone(),
+                        protected_exclusion: Some(false),
+                        entry: match found {
+                            Ok(Some(Access { ours, .. })) => ours,
+                            _ => None,
+                        },
+                        ..Default::default()
+                    },
+                ),
+            },
+            (NoteClass::StaleAllow, None) => (
+                n.class,
+                Item {
+                    path: n.path.clone(),
+                    reason: n.reason.clone(),
+                    protected_exclusion: Some(false),
+                    ..Default::default()
+                },
+            ),
+            // A directory above an exclusion, still granted whole:
+            // as the run found it, until the next run.
+            (NoteClass::OurAllowAbove, _) => (
+                NoteClass::Unprotected,
+                Item {
+                    path: n.path.clone(),
+                    reason: n.reason.clone(),
+                    protected_exclusion: Some(true),
+                    entry: Some("explicit"),
+                    ..Default::default()
+                },
+            ),
+            // An exclusion open through our entry: still so unless
+            // the entry is seen to be gone — then it is judged like
+            // any exclusion without a deny. An access list that
+            // cannot be read does not take back what the run found.
+            (NoteClass::OurAllow, Some(ids))
+                if !matches!(
+                    own_access(&n.path, ids),
+                    Ok(Some(Access { ours: None, .. })) | Ok(None)
+                ) =>
+            {
+                let entry = match own_access(&n.path, ids) {
+                    Ok(Some(Access { ours: Some(e), .. })) => e,
+                    _ => "explicit",
+                };
+                (
+                    NoteClass::Unprotected,
+                    Item {
+                        path: n.path.clone(),
+                        reason: n.reason.clone(),
+                        protected_exclusion: Some(true),
+                        entry: Some(entry),
+                        ..Default::default()
+                    },
+                )
+            }
             (_, Some(ids)) => {
                 let probe =
                     exclusion_as_it_is(&n.path, ids, "could not be written when the grant ran");
@@ -2885,7 +3160,7 @@ mod tests {
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
         let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
-        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        assert!(report.complete, "{report:?}");
         let deny_dir = vec![(true, true, 0x3u8, ALL)];
         // The keys and the sign-in are denied where they really are …
         assert_eq!(group_aces(&prof.join(r"dotfiles\.ssh")), deny_dir);
@@ -3004,10 +3279,7 @@ mod tests {
             // Whole: nothing of it is a failure, and nothing is left
             // open.
             assert!(report.complete, "{run}: {report:?}");
-            assert!(
-                report.failed.is_empty() && report.unprotected.is_empty(),
-                "{run}"
-            );
+            assert!(report.unprotected.is_empty(), "{run}");
             assert!(report.unverifiable.is_empty(), "{run}: {report:?}");
             // Either its deny was written through the owner's right
             // to the access list, or — where the system would not
@@ -3094,14 +3366,36 @@ mod tests {
             // the sandbox account nothing.
             (".azure", format!("(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)")),
         ];
+        // Back into the caller's hands, with the access list `sddl`:
+        // ownership taken (which an elevated caller may always do),
+        // and with it the right to write the list.
+        let own_back = |p: &str, sddl: &str| {
+            let took = std::process::Command::new("takeown")
+                .args(["/F", p])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            took && acl::set_path_dacl_from_sddl(p, &format!("D:P{sddl}"), "test").is_ok()
+        };
+        // Out of the caller's hands: owned by SYSTEM, with an access
+        // list that gives the caller no right to change it. In that
+        // order — the owner is changed while the caller's own entry
+        // still lets it, the list is written through that entry, and
+        // only the list written last takes the entry away. (The other
+        // way round the change of owner is refused: an owner's implied
+        // rights do not include giving the object away.)
+        let disown = |p: &str, sddl: &str| {
+            own_back(p, &format!("(A;;FA;;;{me})"))
+                && icacls(&[p, "/setowner", "*S-1-5-18"])
+                && acl::set_path_dacl_from_sddl(p, &format!("D:P{sddl}"), "test").is_ok()
+        };
         let mut disowned = Vec::new();
         for (rel, sddl) in &cases {
             let p = prof.join(rel);
             let p = p.to_str().unwrap().to_owned();
-            acl::set_path_dacl_from_sddl(&p, &format!("D:P{sddl}"), "test").unwrap();
-            if !icacls(&[&p, "/setowner", "*S-1-5-18"]) {
+            if !disown(&p, sddl) {
                 // Not elevated: nothing here can be given away.
                 for p in disowned.iter().chain([&p]) {
+                    let _ = own_back(p, &format!("(A;;FA;;;{me})"));
                     let _ = icacls(&[p, "/reset", "/T", "/C", "/Q"]);
                 }
                 std::fs::remove_dir_all(&base).ok();
@@ -3124,10 +3418,7 @@ mod tests {
             let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
             let paths = |items: &[Item]| items.iter().map(|i| i.path.clone()).collect::<Vec<_>>();
             // Nothing of this makes the grant incomplete or failed.
-            assert!(
-                report.complete && report.failed.is_empty(),
-                "{run}: {report:?}"
-            );
+            assert!(report.complete, "{run}: {report:?}");
             // Was to be granted, cannot be written: not granted, and
             // said so. Nothing of ours is on it, and it is not in the
             // record.
@@ -3184,11 +3475,7 @@ mod tests {
         // between …
         let azure = prof.join(".azure");
         let azure = azure.to_str().unwrap();
-        let reown = |sddl: &str| {
-            assert!(icacls(&[azure, "/setowner", &format!("*{me}")]));
-            acl::set_path_dacl_from_sddl(azure, &format!("D:P{sddl}"), "test").unwrap();
-            assert!(icacls(&[azure, "/setowner", "*S-1-5-18"]));
-        };
+        let reown = |sddl: &str| assert!(disown(azure, sddl), "{sddl}");
         let class_of = |rel: &str| -> String {
             let st = status_json(&key, Ok(layout.clone()), false);
             ["not_granted", "self_closed", "unverifiable", "unprotected"]
@@ -3229,16 +3516,13 @@ mod tests {
         // it and the grant stays complete …
         let docs = prof.join("Documents");
         let docs = docs.to_str().unwrap().to_owned();
-        acl::set_path_dacl_from_sddl(
+        assert!(disown(
             &docs,
-            &format!("D:P(A;OICI;0x1200a9;;;{GROUP})(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
-            "test",
-        )
-        .unwrap();
-        assert!(icacls(&[&docs, "/setowner", "*S-1-5-18"]));
+            &format!("(A;OICI;0x1200a9;;;{GROUP})(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
+        ));
         disowned.push(docs.clone());
         let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
-        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        assert!(report.complete, "{report:?}");
         // … still wanted as it is: it keeps its entry, stays recorded,
         // and is reported as not looked at again.
         assert!(report.stale_allow.is_empty(), "{report:?}");
@@ -3259,37 +3543,118 @@ mod tests {
                 .iter()
                 .any(|p| p["path"] == at("Documents").as_str())
         );
-        // Now it is to be EXCLUDED, and the allow cannot be taken
-        // back: that is said, as its own class, and nothing else
-        // changes — not incomplete, the entry untouched.
+        // Something BENEATH it becomes an exclusion: it is to be
+        // granted child by child now, cannot be rewritten, and still
+        // hands reading down. Reported with the unprotected ones, as
+        // open through an entry of ours.
+        let ours = |report: &Report, path: &str| {
+            report
+                .unprotected
+                .iter()
+                .find(|i| i.path == path)
+                .map(|i| (i.protected_exclusion, i.entry, i.reason.clone()))
+        };
+        let report = grant(
+            &store,
+            &ids,
+            &layout,
+            &[r"Documents\secret".to_owned()],
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            report.complete && report.stale_allow.is_empty(),
+            "{report:?}"
+        );
+        let (protected, entry, reason) = ours(&report, &at("Documents")).unwrap();
+        assert_eq!((protected, entry), (Some(true), Some("explicit")));
+        assert!(reason.contains("an exclusion lies beneath it"), "{reason}");
+        // Now it is ITSELF excluded, and the allow cannot be taken
+        // back: a protected path readable through our own entry. Said
+        // with the unprotected ones, with what its user can do; not
+        // incomplete, the entry untouched.
         let report = grant(
             &store,
             &ids,
             &layout,
             &["Documents".to_owned()],
-            false,
+            true,
             false,
         )
         .unwrap();
-        assert!(report.complete && report.failed.is_empty(), "{report:?}");
-        assert_eq!(
-            report
-                .stale_allow
-                .iter()
-                .map(|i| i.path.clone())
-                .collect::<Vec<_>>(),
-            [at("Documents")]
+        assert!(
+            report.complete && report.stale_allow.is_empty(),
+            "{report:?}"
+        );
+        let (protected, entry, reason) = ours(&report, &at("Documents")).unwrap();
+        assert_eq!((protected, entry), (Some(true), Some("explicit")));
+        assert!(
+            reason.contains(&format!("/remove:g \"*{GROUP}\"")) && reason.contains("icacls"),
+            "{reason}"
         );
         assert_eq!(
             group_aces(&prof.join("Documents")),
             [(true, false, 0x3, RX)]
         );
-        let st = status_json(&key, Ok(layout.clone()), false);
-        assert_eq!(st["state"], "current", "{st}");
-        assert_eq!(st["stale_allow"].as_array().unwrap().len(), 1);
+        // Recorded as that, and read back.
+        let recorded = read_marker_at(&key).unwrap();
+        assert!(
+            recorded
+                .notes
+                .iter()
+                .any(|n| n.class == NoteClass::OurAllow && n.path == at("Documents"))
+        );
+        assert_eq!(
+            status_json(&key, Ok(layout.clone()), false)["state"],
+            "current"
+        );
         // An exclusion whose deny is in place and cannot be looked at
         // again is left alone, deny and all (the stamp is not undone).
         // (`Documents` wanted as an allow again: back to "kept".)
+        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        assert!(
+            report.complete && report.stale_allow.is_empty(),
+            "{report:?}"
+        );
+        assert!(ours(&report, &at("Documents")).is_none(), "{report:?}");
+
+        // The lesser case: a path that has merely LEFT the grant — it
+        // was granted on its own while its directory was granted
+        // child by child, the directory is granted whole again — and
+        // cannot be written. A stale allow, not an exclusion.
+        let shelf = prof.join("Shelf");
+        std::fs::create_dir_all(shelf.join("box")).unwrap();
+        let note = shelf.join("box").join("note.txt");
+        std::fs::write(&note, b"x").unwrap();
+        let note = note.to_str().unwrap().to_owned();
+        let by_child = [r"Shelf\box\secret".to_owned()];
+        let report = grant(&store, &ids, &layout, &by_child, true, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(group_aces(std::path::Path::new(&note)).len(), 1);
+        assert!(disown(
+            &note,
+            &format!("(A;;0x1200a9;;;{GROUP})(A;;0x1200a9;;;BU)(A;;FA;;;SY)"),
+        ));
+        disowned.push(note.clone());
+        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(ours(&report, &at(r"Shelf\box\note.txt")).is_none());
+        let stale: Vec<_> = report
+            .stale_allow
+            .iter()
+            .map(|i| (i.path.clone(), i.protected_exclusion, i.entry))
+            .collect();
+        assert_eq!(
+            stale,
+            [(at(r"Shelf\box\note.txt"), Some(false), Some("explicit"))],
+            "{report:?}"
+        );
+        // Handed back, the next run takes the entry off.
+        assert!(own_back(
+            &note,
+            &format!("(A;;0x1200a9;;;{GROUP})(A;;FA;;;{me})")
+        ));
         let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
         assert!(
             report.complete && report.stale_allow.is_empty(),
@@ -3305,19 +3670,16 @@ mod tests {
             "{f:?}"
         );
         // Handed back, it comes off as well.
-        assert!(icacls(&[&docs, "/setowner", &format!("*{me}")]));
-        acl::set_path_dacl_from_sddl(
+        assert!(own_back(
             &docs,
-            &format!("D:P(A;OICI;0x1200a9;;;{GROUP})(A;OICI;FA;;;{me})"),
-            "test",
-        )
-        .unwrap();
+            &format!("(A;OICI;0x1200a9;;;{GROUP})(A;OICI;FA;;;{me})")
+        ));
         // Removing the grant does not stumble over the others either.
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");
         assert_eq!(status_json(&key, Ok(layout), false)["state"], "none");
         for p in &disowned {
-            let _ = icacls(&[p, "/setowner", &format!("*{me}")]);
+            let _ = own_back(p, &format!("(A;;FA;;;{me})"));
             let _ = icacls(&[p, "/reset", "/T", "/C", "/Q"]);
         }
         std::fs::remove_dir_all(&base).ok();
@@ -3346,7 +3708,7 @@ mod tests {
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
         let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
-        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        assert!(report.complete, "{report:?}");
         // `dotfiles` is a container, not granted whole, and the place
         // the link leads to exists again, denied.
         assert_eq!(group_aces(&prof.join("dotfiles")), [(true, false, 0, LIST)]);
@@ -3429,7 +3791,7 @@ mod tests {
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
         let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
         assert!(report.complete, "{report:?}");
-        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(report.complete, "{report:?}");
 
         let allow = |inherit: u8, mask: u32| vec![(true, false, inherit, mask)];
         let deny_dir = vec![(true, true, 0x3, ALL)];
@@ -3558,7 +3920,7 @@ mod tests {
         write(&prof, r"NewTop\n.txt");
         assert!(group_aces(&prof.join("NewTop")).is_empty());
         let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
-        assert!(again.complete && again.failed.is_empty(), "{again:?}");
+        assert!(again.complete, "{again:?}");
         assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
         assert!(group_aces(&prof.join(".netrc")).iter().all(|a| a.1));

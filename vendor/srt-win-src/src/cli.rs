@@ -253,14 +253,13 @@ enum Cmd {
         #[arg(long = "deny-read-except", value_name = "PATH")]
         deny_read_except: Vec<String>,
         /// The process whose session this command belongs to and
-        /// which is recorded as a holder of the kept grants the
-        /// command runs on (`acl grant --persistent --holder-pid`).
-        /// Checked: if that process is not alive or holds nothing —
-        /// or without the flag — this process, under
-        /// `--write-restricted-token`, records itself as the holder of
-        /// the profile read grant and of each `--write-root`, so that
-        /// neither is removed from under the command
-        /// (`--unless-held-by-others`).
+        /// which is recorded as one (`acl grant --holder-pid`, with
+        /// or without `--persistent`). Checked: if that process is not
+        /// alive or is not recorded — or without the flag — this
+        /// process records itself, under either token, as a session
+        /// and as the holder of each `--write-root`: the profile read
+        /// grant is not made or removed beside the command, and no
+        /// root is removed from under it.
         #[arg(long = "held-by", value_name = "PID")]
         held_by: Option<u32>,
         /// Per-exec write-deny — see `--deny-read`.
@@ -396,9 +395,10 @@ enum ProfileCmd {
     ///
     /// Exits **15** unless the install's setup marker is this
     /// build's, **21** when run as a service account (LocalSystem,
-    /// LocalService, NetworkService), and non-zero when an excluded
-    /// directory could not be denied (the grant is then recorded as
-    /// incomplete).
+    /// LocalService, NetworkService), **24** — nothing changed — while
+    /// a sandbox session or command is running, and **25** while
+    /// another profile operation is. A path that cannot be written is
+    /// reported by what that leaves and does not fail the run.
     Grant {
         /// A path inside the profile to exclude in addition to the
         /// built-in list (absolute, or relative to the profile).
@@ -453,7 +453,9 @@ enum ProfileCmd {
     /// `ungranted_only` the directories it leaves ungranted without
     /// denying them. `state` is
     /// `none`, `current`, `outdated`, `incomplete` or `unknown`; only
-    /// `current` is a grant a session may rely on. `env` lists the
+    /// `current` is a grant a session may rely on. Asked while a
+    /// grant or forget is running it is `in_progress`, with nothing
+    /// else but `capabilities`. `env` lists the
     /// configuration-file variables an embedder may set for a
     /// sandboxed command. Reads the registry and opens the profile
     /// directory; nothing below it. Exit 0.
@@ -1356,7 +1358,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             };
             // Not from under a live session: its account, and with it
             // every grant it runs on, would go while its commands run.
-            // (With --keep-user neither goes.)
+            // (With --keep-user neither goes.) Checked once, here: a
+            // session that starts between this and the elevated step
+            // is not kept out, and loses its account under it.
             if !keep_user && !elevated_step {
                 let holder = srt_win::state_db::HolderPid(std::process::id());
                 srt_win::state_db::with_init_lock(holder, false, |db| {
@@ -1768,6 +1772,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             eprintln!("srt-win: skipped: '{p}': {e}");
                         }
                         let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                        // A session exists from here, whatever it was
+                        // given: said in the holder table, so that the
+                        // profile grant is not made or removed beside
+                        // it.
+                        db.hold_kept(&[], Some(state_db::KEPT_PROFILE_PATH))?;
                         return Ok((at, w, f, None));
                     }
                     let ids = persist::Ids::load()?;
@@ -1810,10 +1819,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     // kept roots and on the profile read grant: said
                     // in the holder table, so that nothing removes
                     // either from under it
-                    // (`--unless-held-by-others`). The profile grant
-                    // is held whether or not one is recorded now — one
-                    // made while the session runs is read through by
-                    // its commands from then on.
+                    // (`--unless-held-by-others`), and nothing makes
+                    // or changes the profile grant beside it: that
+                    // row is taken whether or not a grant is recorded.
                     db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))?;
                     // Per session, for the sandbox user SID as without
                     // the flag: the read grants, and the denies under
@@ -2183,6 +2191,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // or command holds anything (`profile` module doc).
             let report = state_db::with_profile_lock(|db| {
                 exit_unless_quiet(db, None, EXIT_GRANT_BLOCKED_BY_SESSION, "profile grant")?;
+                state_db::mark_profile_operation()?;
                 profile::grant(
                     &profile::Store::of(db.conn()),
                     &ids,
@@ -2255,6 +2264,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     EXIT_HELD_BY_OTHERS,
                     "profile forget",
                 )?;
+                state_db::mark_profile_operation()?;
                 profile::forget(&profile::Store::of(db.conn()), &ids)
             })?;
             eprintln!(
@@ -2292,11 +2302,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let test_profile: Option<String> = None;
             #[cfg(feature = "test-hooks")]
             let test_profile = test_profile.or_else(test_profile_from_env);
-            let mut status = profile::status_json(
-                persist::MARKER_KEY,
-                profile::Layout::resolve(test_profile.as_deref()),
-                paths,
-            );
+            // Asked while a grant or forget is running, the record is
+            // half-written by design: that is said as what it is, not
+            // read as a run that was killed.
+            let mut status = if srt_win::state_db::profile_operation_running() {
+                json!({ "state": "in_progress" })
+            } else {
+                profile::status_json(
+                    persist::MARKER_KEY,
+                    profile::Layout::resolve(test_profile.as_deref()),
+                    paths,
+                )
+            };
             // Whatever the state: what this build does, by name.
             if let Some(o) = status.as_object_mut() {
                 o.insert("capabilities".to_owned(), json!(profile::CAPABILITIES));
@@ -2439,15 +2456,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // dead holder's, the next time the records are looked at,
             // so it costs one acquisition of the init lock and none
             // when a session holds.
-            let self_hold: Option<Vec<String>> = (write_restricted_token
-                && !held_by.is_some_and(srt_win::state_db::holds_profile))
-            .then(|| {
-                write_root
-                    .iter()
-                    .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
-                    .map(|(canon, _)| canon)
-                    .collect()
-            });
+            // Under either token: an ordinary-token command with no
+            // session behind it is a sandboxed process like any
+            // other, and the profile grant must not be made beside
+            // it.
+            let self_hold: Option<Vec<String>> =
+                (!held_by.is_some_and(srt_win::state_db::holds_profile)).then(|| {
+                    write_root
+                        .iter()
+                        .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+                        .map(|(canon, _)| canon)
+                        .collect()
+                });
             let hold_for_self = |db: &srt_win::state_db::Locked| -> anyhow::Result<()> {
                 match &self_hold {
                     Some(roots) => db.hold_kept(roots, Some(srt_win::state_db::KEPT_PROFILE_PATH)),
@@ -2727,14 +2747,8 @@ fn exit_if_roots_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Resul
     }
     for h in &held {
         eprintln!(
-            "srt-win: a live session (pid {}) is running on the kept {} '{}'",
-            h.pid,
-            if h.kind == srt_win::state_db::KIND_KEPT_PROFILE {
-                "profile read grant for"
-            } else {
-                "write grant on"
-            },
-            h.path
+            "srt-win: a live session (pid {}) is running on the kept write grant on '{}'",
+            h.pid, h.path
         );
     }
     eprintln!("srt-win: nothing was removed");
@@ -2814,10 +2828,27 @@ fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: b
             eprintln!("srt-win: WARNING: persistent write grants not removed: {e:#}");
         }
     }
+    // The quiet check was made before the elevated step and nothing
+    // kept a session from starting since. One that did has lost its
+    // account: said, so that what follows is not a puzzle.
+    let holder = srt_win::state_db::HolderPid(std::process::id());
+    if let Ok((held, _)) = srt_win::state_db::with_init_lock(holder, false, |db| {
+        srt_win::state_db::live_holders(db, None)
+    }) && !held.is_empty()
+    {
+        let mut pids: Vec<String> = held.iter().map(|h| h.pid.to_string()).collect();
+        pids.dedup();
+        eprintln!(
+            "srt-win: NOTE: a sandbox session started while the uninstall ran (process {}). \
+             The sandbox account is gone: its commands will fail. End it.",
+            pids.join(", ")
+        );
+    }
     if incomplete {
         eprintln!(
             "srt-win: the sandbox account and filters are removed, but not every grant kept \
-             for this user was (see above)"
+             for this user was (see above). What is left stays recorded; once nothing else \
+             is running, `srt-win profile forget` and `srt-win acl forget --all` remove it."
         );
         EXIT_GRANTS_NOT_FORGOTTEN
     } else {
