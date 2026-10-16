@@ -1409,6 +1409,8 @@ fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, String
                 sid: &a.sid,
                 mask: a.mask,
                 inherit_only: a.flags & 0x8 != 0,
+                // Object-inherit or container-inherit.
+                inherited_beneath: a.flags & 0x3 != 0,
             })
             .collect()
     });
@@ -1423,33 +1425,84 @@ fn own_access(path: &str, ids: &Ids) -> std::result::Result<Option<bool>, String
 /// the three it is ([`plan::Unstamped`]), with the line for the
 /// report.
 fn exclusion_without_deny(path: &str, ids: &Ids, why: &anyhow::Error) -> (NoteClass, String) {
+    exclusion_as_it_is(path, ids, &format!("could not be written ({why:#})"))
+}
+
+/// [`exclusion_without_deny`] at any later time: what an exclusion
+/// that carries no deny of ours is NOW. Its class is a fact about
+/// access lists, and those change; the record of what it was when the
+/// grant ran is not replayed (see [`status_json`]). `why` completes
+/// "its deny …".
+///
+/// Only a path on a local drive is looked at; anything else is
+/// unverifiable without being touched, as is one the look fails on.
+fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> (NoteClass, String) {
+    if !path_id::is_drive_path(path) || path_id::on_network_drive(path) {
+        return (
+            NoteClass::Unverifiable,
+            format!("its deny {why}, and it is not on a local drive, so it is not examined"),
+        );
+    }
     match own_access(path, ids) {
         Ok(None) => (
             NoteClass::SelfClosed,
-            format!("nothing is there to deny ({why:#})"),
+            format!("nothing is there to deny (its deny {why})"),
         ),
+        // Said of the object and of what it hands down to objects
+        // beneath — not of every object already inside it, which is
+        // not looked at: an excluded store is not walked.
         Ok(Some(false)) => (
             NoteClass::SelfClosed,
             format!(
-                "its deny could not be written ({why:#}); its own access list gives the \
-                 sandbox account no read"
+                "its deny {why}; its own access list gives the sandbox account no read, \
+                 on it or handed down beneath it"
             ),
         ),
         Ok(Some(true)) => (
             NoteClass::Unprotected,
             format!(
-                "its deny could not be written ({why:#}), and its own access list lets the \
-                 sandbox account read it — as it did before the grant. Only its owner or an \
-                 administrator can close it"
+                "its deny {why}, and its own access list lets the sandbox account read it \
+                 or what is put into it — the grant did not open it and cannot close it. \
+                 Only its owner or an administrator can"
             ),
         ),
-        Err(e) => (
-            NoteClass::Unverifiable,
-            format!(
-                "its deny could not be written ({why:#}) and its access list could not be \
-                 read ({e}); the calling user cannot use it either"
-            ),
-        ),
+        // Unverifiable. What is true of such an object: the calling
+        // user is not its owner (an owner always reads the access
+        // list) and nothing on it gives the calling user that right.
+        // Why the sandbox account is then unlikely to read it: the
+        // groups its token carries — Everyone, Authenticated Users,
+        // Users — are groups the calling user is in as well, so an
+        // entry that admits the sandbox account through one of them
+        // admits the caller too, and an entry naming the sandbox
+        // account or its group on an object of someone else's is not
+        // something this product writes.
+        //
+        // That is plausibility, not proof, and it has a hole: an
+        // access list can give Users READ DATA without READ_CONTROL,
+        // or deny the calling user by name. Then the caller cannot see
+        // the list while the sandbox account can read the object. One
+        // half of that is checked here, by trying: whether the CALLER
+        // can open it for reading. If so the line says it, and the
+        // object is to be treated as possibly readable. It stays a
+        // warning either way — an object whose access list the user
+        // may not even read must not be what stops the sandbox.
+        Err(e) => {
+            const FILE_READ_DATA: u32 = 0x1;
+            let caller_reads = open_bare(path, FILE_READ_DATA).is_ok();
+            (
+                NoteClass::Unverifiable,
+                format!(
+                    "its deny {why} and its access list could not be read ({e}); {}",
+                    if caller_reads {
+                        "you can read its content all the same, so the sandbox account may be \
+                         able to as well"
+                    } else {
+                        "you cannot read it either, and what lets the sandbox account in \
+                         would as a rule let you in too"
+                    }
+                ),
+            )
+        }
     }
 }
 
@@ -2263,9 +2316,39 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
     // What the last run left as it found it, by class and with the
     // reason: nothing of it makes the grant unusable, and all of it is
     // for the user to see.
+    //
+    // An exclusion without a deny is NOT reported as the run classed
+    // it. Whether its own access list keeps the sandbox account out is
+    // a fact about access lists, and those change: each is looked at
+    // again now — a handful of paths, one open each — so that a store
+    // that was closed when the grant ran and has since been opened up
+    // reads as unprotected at the next session start. (One that can
+    // now be denied is denied by the next run of the grant.) A look
+    // that fails says "unverifiable", never "closed".
+    let ids = Ids::load().ok();
+    let notes: Vec<Note> = m
+        .notes
+        .iter()
+        .map(|n| match (n.class, &ids) {
+            (NoteClass::NotGranted, _) => n.clone(),
+            (_, Some(ids)) => {
+                let (class, reason) =
+                    exclusion_as_it_is(&n.path, ids, "could not be written when the grant ran");
+                Note {
+                    class,
+                    path: n.path.clone(),
+                    reason,
+                }
+            }
+            (_, None) => Note {
+                class: NoteClass::Unverifiable,
+                path: n.path.clone(),
+                reason: "it could not be examined: the sandbox account is not known".to_owned(),
+            },
+        })
+        .collect();
     for class in NoteClass::ALL {
-        out[class.as_str()] = m
-            .notes
+        out[class.as_str()] = notes
             .iter()
             .filter(|n| n.class == class)
             .map(|n| json!({ "path": n.path, "reason": n.reason }))
@@ -3075,6 +3158,52 @@ mod tests {
                 assert_eq!(report.writes, 0, "a refresh writes nothing: {report:?}");
             }
         }
+        // The class is what the access list says NOW, not what the
+        // grant found: opened up since, `.azure` is unprotected at the
+        // next reading of the status, with no run of the grant in
+        // between …
+        let azure = prof.join(".azure");
+        let azure = azure.to_str().unwrap();
+        let reown = |sddl: &str| {
+            assert!(icacls(&[azure, "/setowner", &format!("*{me}")]));
+            acl::set_path_dacl_from_sddl(azure, &format!("D:P{sddl}"), "test").unwrap();
+            assert!(icacls(&[azure, "/setowner", "*S-1-5-18"]));
+        };
+        let class_of = |rel: &str| -> String {
+            let st = status_json(&key, Ok(layout.clone()), false);
+            ["not_granted", "self_closed", "unverifiable", "unprotected"]
+                .into_iter()
+                .find(|c| {
+                    st[*c]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|i| i["path"] == at(rel).as_str())
+                })
+                .unwrap_or("none")
+                .to_owned()
+        };
+        assert_eq!(class_of(".azure"), "self_closed");
+        reown(&format!(
+            "(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+        ));
+        assert_eq!(class_of(".azure"), "unprotected");
+        // … also when only what it hands down is open: the directory
+        // itself closed, everything put into it readable to Users.
+        reown(&format!(
+            "(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)(A;OICIIO;0x1200a9;;;BU)"
+        ));
+        assert_eq!(class_of(".azure"), "unprotected");
+        // Closed to the caller as well: no longer known.
+        reown("(A;OICI;FA;;;SY)");
+        assert_eq!(class_of(".azure"), "unverifiable");
+        // And back.
+        reown(&format!("(A;OICI;0x20000;;;{me})(A;OICI;FA;;;SY)"));
+        assert_eq!(class_of(".azure"), "self_closed");
+        // The others read as they did.
+        assert_eq!(class_of(".docker"), "unprotected");
+        assert_eq!(class_of(".kube"), "unverifiable");
+
         // Removing the grant does not stumble over them either.
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");

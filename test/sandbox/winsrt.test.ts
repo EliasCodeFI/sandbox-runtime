@@ -7642,14 +7642,36 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         await SandboxManager.initialize(config())
         expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
         const warnings = SandboxManager.getWindowsProfileReadWarnings()
-        expect(warnings).toHaveLength(1)
-        expect(warnings[0]!.code).toBe('profile_exclusion_unprotected')
+        // Two: what is known to be readable, and what could not be
+        // shown to be closed. Each with its paths and their reasons.
+        expect(warnings.map(w => w.code)).toEqual([
+          'profile_exclusion_unprotected',
+          'profile_exclusion_unverifiable',
+        ])
         expect(warnings[0]!.paths).toEqual(classes().unprotected)
         expect(warnings[0]!.message).toContain(join(home, '.docker'))
-        // The other classes are not warnings: nothing is open.
+        expect(warnings[1]!.paths).toEqual(classes().unverifiable)
+        expect(warnings[1]!.paths[0]!.reason).toBe('cannot be read')
+        expect(warnings[1]!.message).toContain(join(home, '.kube'))
+        // Neither is a rejection: the session is running.
+        expect(SandboxManager.getConfig()).toBeDefined()
         await SandboxManager.reset()
         expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
+        // An unverifiable exclusion alone is still surfaced …
         profileStatus = { ...current(), ...classes(), unprotected: [] }
+        await SandboxManager.initialize(config())
+        expect(
+          SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
+        ).toEqual(['profile_exclusion_unverifiable'])
+        await SandboxManager.reset()
+        // … and the two classes where nothing is open, or nothing was
+        // granted, are not warnings.
+        profileStatus = {
+          ...current(),
+          ...classes(),
+          unprotected: [],
+          unverifiable: [],
+        }
         await SandboxManager.initialize(config())
         expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
       })

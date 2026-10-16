@@ -300,8 +300,16 @@ export interface WindowsProfileReadWarning {
    * access lists, which the user who made the grant may not change.
    * The grant did not open them and cannot close them; their owner or
    * an administrator can.
+   *
+   * `profile_exclusion_unverifiable`: paths on the exclusion list
+   * whose deny could not be written and whose access list the user
+   * who made the grant may not even read, so that nobody established
+   * that sandboxed commands are kept out. It is unlikely that they get
+   * in — what admits the sandbox account would as a rule admit that
+   * user too — but it is not known; each path's `reason` says whether
+   * the user can read its content.
    */
-  code: 'profile_exclusion_unprotected'
+  code: 'profile_exclusion_unprotected' | 'profile_exclusion_unverifiable'
   message: string
   paths: { path: string; reason: string }[]
 }
@@ -1322,7 +1330,29 @@ async function initializeSteps(
                 `(\`srt-win profile status\` lists them with the reason).`,
               paths: grant.unprotected,
             }
-            windowsProfileReadWarnings = [warning]
+            windowsProfileReadWarnings.push(warning)
+            logForDebugging(`[Sandbox Windows] ${warning.message}`, {
+              level: 'warn',
+            })
+          }
+          // Not proven closed either, and weaker than the above: the
+          // access list could not even be read. Not a rejection — an
+          // object the user may not look at must not be what stops
+          // the sandbox — but not passed over in silence.
+          if (grant.unverifiable.length > 0) {
+            const warning: WindowsProfileReadWarning = {
+              code: 'profile_exclusion_unverifiable',
+              message:
+                `${grant.unverifiable.length} path(s) on the exclusion list of ` +
+                `the profile read grant could not be denied to sandboxed ` +
+                `commands, and their access lists could not be read to see ` +
+                `whether they are closed anyway: ` +
+                grant.unverifiable.map(u => u.path).join(', ') +
+                `. They are probably not readable to sandboxed commands; ` +
+                `\`srt-win profile status\` gives the reason for each.`,
+              paths: grant.unverifiable,
+            }
+            windowsProfileReadWarnings.push(warning)
             logForDebugging(`[Sandbox Windows] ${warning.message}`, {
               level: 'warn',
             })

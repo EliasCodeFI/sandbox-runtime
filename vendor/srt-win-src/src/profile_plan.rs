@@ -1465,6 +1465,9 @@ pub struct AceFact<'a> {
     /// The entry is a template for objects beneath and does not apply
     /// to this object.
     pub inherit_only: bool,
+    /// Objects beneath inherit the entry (to files, to directories,
+    /// or both).
+    pub inherited_beneath: bool,
 }
 
 /// Groups every token of the sandbox account carries, besides its own
@@ -1503,14 +1506,34 @@ const READS: u32 = 0x1 | 0x8000_0000 | 0x1000_0000;
 /// kinds this does not model (object, callback, conditional) are not
 /// passed in at all; an access list that relies on them is read as
 /// what its plain entries say.
+///
+/// Two questions are asked of a directory, and either "may" counts:
+/// what the list gives on the directory itself, and what it hands
+/// down — the entries objects beneath inherit, among them those that
+/// apply ONLY beneath. A directory can be closed while everything put
+/// into it is open. (On a file no entry is handed down, and the
+/// second question answers "no".)
+///
+/// What this does NOT see is an object already inside the directory
+/// that carries an allow of its own: an excluded store is not walked.
+/// "Closed" is said of the directory and of what it hands down.
 pub fn may_read(dacl: Option<&[AceFact<'_>]>, certain: &[&str], maybe: &[&str]) -> bool {
     let Some(dacl) = dacl else {
         return true;
     };
-    for ace in dacl
-        .iter()
-        .filter(|a| !a.inherit_only && a.mask & READS != 0)
-    {
+    let here = dacl.iter().filter(|a| !a.inherit_only);
+    let beneath = dacl.iter().filter(|a| a.inherited_beneath);
+    first_word_on_reading(here, certain, maybe) || first_word_on_reading(beneath, certain, maybe)
+}
+
+/// The first entry among `aces` that speaks of reading and names the
+/// account decides, as an access check does.
+fn first_word_on_reading<'a>(
+    aces: impl Iterator<Item = &'a AceFact<'a>>,
+    certain: &[&str],
+    maybe: &[&str],
+) -> bool {
+    for ace in aces.filter(|a| a.mask & READS != 0) {
         let is_certain = certain.contains(&ace.sid);
         if ace.deny && is_certain {
             return false;
@@ -1534,15 +1557,24 @@ pub fn may_read(dacl: Option<&[AceFact<'_>]>, certain: &[&str], maybe: &[&str]) 
 /// cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unstamped {
-    /// Its own access list gives the sandbox account no read: closed
-    /// without the deny.
+    /// Its own access list gives the sandbox account no read — neither
+    /// on the object nor, for a directory, in what it hands down to
+    /// the objects beneath: closed without the deny. This is said of
+    /// the object and of what it hands down, NOT of every object
+    /// already inside it, which may carry an allow of its own; an
+    /// excluded store is not walked.
     SelfClosed,
     /// Its own access list lets the sandbox account read it, and that
     /// cannot be changed from here. Reported, loudly; the grant is not
     /// what opened it and cannot close it.
     Unprotected,
-    /// The access list cannot even be read by the calling user, who
-    /// can therefore not use the object either. Unknown, and said so.
+    /// The access list cannot even be read by the calling user: not
+    /// its owner, and given no right to. Nobody established that the
+    /// sandbox account is kept out. It is unlikely to get in — the
+    /// groups it is in are the calling user's too — but not proven
+    /// (see where the executor reports it), so it is surfaced as a
+    /// warning of its own, weaker than "closed" and distinct from
+    /// "known to be readable".
     Unverifiable,
 }
 
@@ -3293,12 +3325,14 @@ mod tests {
             sid,
             mask,
             inherit_only: false,
+            inherited_beneath: true,
         };
         let deny = |sid, mask| AceFact {
             deny: true,
             sid,
             mask,
             inherit_only: false,
+            inherited_beneath: true,
         };
         let class =
             |dacl: &[AceFact<'_>]| unstamped_exclusion(Ok(Some(dacl)), &certain, &SANDBOX_MAYBE);
@@ -3353,16 +3387,62 @@ mod tests {
             class(&[deny("S-1-5-4", RX), allow("S-1-1-0", RX)]),
             Unstamped::Unprotected
         );
-        // Entries that say nothing of reading, or apply only beneath,
-        // decide nothing.
+        // Entries that say nothing of reading decide nothing.
+        assert_eq!(
+            class(&[deny("S-1-1-0", 0x10000), allow("S-1-1-0", 0x100080)]),
+            Unstamped::SelfClosed
+        );
+        // What the directory hands down counts as much as what it
+        // gives itself. An allow that applies ONLY beneath — the
+        // directory closed, everything put into it open — is open.
+        let only_beneath = |a: AceFact<'static>| AceFact {
+            inherit_only: true,
+            inherited_beneath: true,
+            ..a
+        };
+        let only_here = |a: AceFact<'static>| AceFact {
+            inherited_beneath: false,
+            ..a
+        };
+        for sid in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", GROUP, "S-1-5-4"] {
+            assert_eq!(
+                class(&[allow(OWNER, FULL), only_beneath(allow(sid, RX))]),
+                Unstamped::Unprotected,
+                "{sid}"
+            );
+        }
+        // Each of the two is decided by its own first word: a deny
+        // that holds on the directory only does not close what is
+        // handed down behind it …
         assert_eq!(
             class(&[
-                deny("S-1-1-0", 0x10000),
-                allow("S-1-1-0", 0x100080),
-                AceFact {
-                    inherit_only: true,
-                    ..allow("S-1-1-0", FULL)
-                },
+                only_here(deny("S-1-1-0", RX)),
+                only_beneath(allow("S-1-5-32-545", RX)),
+            ]),
+            Unstamped::Unprotected
+        );
+        // … and one that is handed down ahead of the allow does.
+        assert_eq!(
+            class(&[
+                only_beneath(deny("S-1-1-0", RX)),
+                only_beneath(allow("S-1-5-32-545", RX)),
+                only_here(allow(OWNER, FULL)),
+            ]),
+            Unstamped::SelfClosed
+        );
+        // Open here and closed beneath is open, too.
+        assert_eq!(
+            class(&[
+                only_beneath(deny("S-1-1-0", RX)),
+                only_here(allow("S-1-5-32-545", RX)),
+            ]),
+            Unstamped::Unprotected
+        );
+        // Handed down to nobody the account is: closed.
+        assert_eq!(
+            class(&[
+                only_beneath(allow(OWNER, FULL)),
+                only_here(allow(SYSTEM, FULL))
             ]),
             Unstamped::SelfClosed
         );
