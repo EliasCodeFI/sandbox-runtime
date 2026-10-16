@@ -135,6 +135,7 @@ export type WindowsSandboxErrorCode =
   | 'profile_grant_failed'
   /** `srt-win profile forget` could not remove the whole grant. */
   | 'profile_forget_failed'
+  | 'kept_grants_in_use'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -2654,15 +2655,18 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
  * Pass `write` to {@link wrapCommandWithSandboxWindows} as
  * `writeRoots`.
  *
+ * Asynchronous: a root's first grant walks its whole tree, and the
+ * event loop of the embedding program stays live meanwhile.
+ *
  * @throws on exit ≠ 0, including exit 2 (an input was skipped).
  *   Nothing falls back to a per-session grant.
  */
-export function grantWindowsAclPersistent(
+export async function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
     denyRead: readonly string[]
     denyWrite: readonly string[]
   },
-): void {
+): Promise<void> {
   const holder = opts.holderPid ?? process.pid
   const stdin = JSON.stringify({
     read: opts.read,
@@ -2670,7 +2674,7 @@ export function grantWindowsAclPersistent(
     denyRead: opts.denyRead,
     denyWrite: opts.denyWrite,
   })
-  const r = runSrtWin(
+  const r = await runSrtWinAsync(
     [
       'acl',
       'grant',
@@ -2708,19 +2712,26 @@ export function grantWindowsAclPersistent(
  * grant lets the sandbox account write its tree under the ordinary
  * token.
  *
- * @throws if any grant could not be removed.
+ * Asynchronous: it walks each root's tree.
+ *
+ * `unlessHeldByOthers` (the calling session's process id) makes it
+ * remove nothing if another live session is running on a kept grant.
+ *
+ * @throws `kept_grants_in_use` in that case, naming the sessions;
+ *   `acl_forget_failed` if any grant could not be removed.
  */
-export function forgetWindowsPersistentGrants(
-  opts: { srtWin?: SrtWinSpawn } = {},
-): void {
-  const r = runSrtWin(['acl', 'forget', '--all'], {
-    timeoutMs: 600_000,
-    srtWin: opts.srtWin,
-  })
+export async function forgetWindowsPersistentGrants(
+  opts: { unlessHeldByOthers?: number; srtWin?: SrtWinSpawn } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(
+    ['acl', 'forget', '--all', ...unlessHeldArgs(opts.unlessHeldByOthers)],
+    { timeoutMs: 600_000, srtWin: opts.srtWin },
+  )
   logForDebugging(
     `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
   )
+  throwIfKeptGrantsInUse(r, 'acl')
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'acl_forget_failed',
@@ -2729,6 +2740,48 @@ export function forgetWindowsPersistentGrants(
         `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
     )
   }
+}
+
+/** `srt-win`'s exit code for "another live session runs on a kept grant". */
+const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
+
+function unlessHeldArgs(holderPid: number | undefined): string[] {
+  return holderPid === undefined
+    ? []
+    : ['--unless-held-by-others', `${holderPid}`]
+}
+
+/**
+ * Turn `srt-win`'s refusal to remove a kept grant from under another
+ * live session into the typed error, naming those sessions.
+ */
+function throwIfKeptGrantsInUse(r: RunResult, command: string): void {
+  if (r.status !== SRT_WIN_EXIT_HELD_BY_OTHERS) return
+  let held: { pid?: unknown; kind?: unknown; path?: unknown }[] = []
+  try {
+    const parsed = JSON.parse(r.stdout) as { held_by?: unknown }
+    if (Array.isArray(parsed.held_by)) held = parsed.held_by as typeof held
+  } catch {
+    // The exit code says it; the list is for the message only.
+  }
+  const what = held
+    .map(
+      h =>
+        `process ${String(h.pid)} ` +
+        (h.kind === 'profile'
+          ? `reads the profile through the profile read grant`
+          : `writes ${String(h.path)} through a kept grant`),
+    )
+    .join('; ')
+  throw new WindowsSandboxError(
+    'kept_grants_in_use',
+    `Another sandbox session is running on grants this one would have to ` +
+      `remove to use windows.writeRestrictedToken: false` +
+      (what ? ` (${what})` : '') +
+      `. Nothing was removed and nothing was granted. End that session ` +
+      `first, or start this one with the write-restricted token.`,
+    command,
+  )
 }
 
 /**
@@ -3274,6 +3327,12 @@ function grantWindowsProfileReadSync(
  * grant and `windows.writeRestrictedToken` is `false`; uninstall
  * removes the grant too.
  *
+ * This is the synchronous form, for callers that are synchronous by
+ * contract (a command-line tool, an exit path). It blocks for as long
+ * as the removal takes, which on a large profile is minutes:
+ * anything with an event loop to keep alive uses
+ * {@link forgetWindowsProfileReadAsync}, as `initialize()` does.
+ *
  * @throws `profile_forget_failed` if any path could not be completed;
  *   the grant then still counts as existing.
  */
@@ -3284,6 +3343,37 @@ export function forgetWindowsProfileRead(
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
+  profileForgetResult(r)
+}
+
+/**
+ * {@link forgetWindowsProfileRead} without blocking the event loop.
+ *
+ * `unlessHeldByOthers` (the calling session's process id) makes it
+ * remove nothing if another live session is running on a kept grant.
+ *
+ * @throws `kept_grants_in_use` in that case; `profile_forget_failed`
+ *   if any path could not be completed.
+ */
+export async function forgetWindowsProfileReadAsync(
+  opts: {
+    timeoutMs?: number
+    unlessHeldByOthers?: number
+    srtWin?: SrtWinSpawn
+  } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(
+    ['profile', 'forget', '--json', ...unlessHeldArgs(opts.unlessHeldByOthers)],
+    {
+      timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+      srtWin: opts.srtWin,
+    },
+  )
+  throwIfKeptGrantsInUse(r, 'profile')
+  profileForgetResult(r)
+}
+
+function profileForgetResult(r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] profile forget exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,

@@ -847,6 +847,22 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
     )
 }
 
+/// The profile a read grant is recorded for, if one is: what a
+/// default session runs on, and so holds for as long as it lives
+/// (`state_db::Locked::hold_kept`). A record that cannot be read
+/// counts as a grant — the session may well be reading through it.
+pub fn held_profile() -> Option<String> {
+    match read_marker_at(persist::MARKER_KEY) {
+        Ok(m) if m.is_empty() => None,
+        Ok(m) => Some(
+            m.header
+                .map(|h| h.profile)
+                .unwrap_or_else(|| "(profile)".to_owned()),
+        ),
+        Err(_) => Some("(profile)".to_owned()),
+    }
+}
+
 /// The recorded paths a session's read deny on `deny` (canonical) is
 /// written on as well ([`plan::covered_by_read_deny`]), among those
 /// that still exist. Nothing when no grant is recorded. A record that

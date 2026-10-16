@@ -84,6 +84,7 @@ export {
   revokeWindowsAclChecked,
   grantWindowsProfileRead,
   forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
   getWindowsProfileReadStatus,
   windowsProfileReadEnv,
   windowsProfileExclusionConflicts,

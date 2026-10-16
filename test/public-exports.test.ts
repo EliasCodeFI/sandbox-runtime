@@ -40,6 +40,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'ensurePersistentWindowsCa',
   'expandWindowsFsPaths',
   'forgetWindowsProfileRead',
+  'forgetWindowsProfileReadAsync',
   'generateCa',
   'getDefaultWritePaths',
   'getSrtWinPath',

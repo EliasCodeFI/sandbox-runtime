@@ -483,6 +483,60 @@ async function bindOutOfRange(): Promise<BoundListener> {
 // Pure-JS object test — runs on all platforms. `srtWin.path` is
 // pointed at the test runner's own executable so binary resolution
 // passes its existence check on non-Windows hosts.
+/**
+ * Whether `argv` is one of the `srt-win` calls that can walk a tree,
+ * which the library makes without blocking: `acl grant --persistent`,
+ * `acl forget`, `profile forget`.
+ */
+function walksATree(argv: readonly string[]): boolean {
+  const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
+  return (
+    (own[0] === 'acl' &&
+      (own[1] === 'forget' ||
+        (own[1] === 'grant' && own.includes('--persistent')))) ||
+    (own[0] === 'profile' && own[1] === 'forget')
+  )
+}
+
+/**
+ * A fake child for an asynchronous `srt-win` call, answered by the
+ * test's `spawnSync` mock once its stdin has been written: the call
+ * is recorded and answered by the same code as a synchronous one, in
+ * the order the calls are made.
+ */
+function asyncChildAnsweredBySync(exe: string, argv: readonly string[]) {
+  const mkStream = () => {
+    const s = new EventEmitter() as EventEmitter & {
+      setEncoding(e: string): typeof s
+      end(d?: string): void
+    }
+    s.setEncoding = () => s
+    s.end = () => {}
+    return s
+  }
+  const child = Object.assign(new EventEmitter(), {
+    stdout: mkStream(),
+    stderr: mkStream(),
+    stdin: mkStream(),
+    kill: () => true,
+  })
+  child.stdin.end = (input?: string) => {
+    setImmediate(() => {
+      const r = child_process.spawnSync(exe, [...argv], {
+        input,
+      }) as unknown as {
+        status: number | null
+        stdout?: string
+        stderr?: string
+      }
+      if (r.stdout) child.stdout.emit('data', r.stdout)
+      if (r.stderr) child.stderr.emit('data', r.stderr)
+      child.emit('close', r.status, null)
+    })
+  }
+  return child
+}
+
 describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
   it('argv shape: srtWin.path → [path, --srt-win, exec, …]; --env overlay before --', () => {
     // Mirrors real usage: SandboxManager.initialize() resolves once
@@ -1377,15 +1431,17 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
       // The default: one call with all four lists. Recorded as the
       // grant and the stamp it stands for, each only when it has
       // something in it, as the two separate calls are made.
-      spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(o => {
-        expect(writeRestrictedToken).toBeUndefined()
-        if (o.read.length > 0 || o.write.length > 0) {
-          granted = { read: o.read, write: o.write }
-        }
-        if (o.denyRead.length > 0 || o.denyWrite.length > 0) {
-          stamped = { denyRead: o.denyRead, denyWrite: o.denyWrite }
-        }
-      }),
+      spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(
+        async o => {
+          expect(writeRestrictedToken).toBeUndefined()
+          if (o.read.length > 0 || o.write.length > 0) {
+            granted = { read: o.read, write: o.write }
+          }
+          if (o.denyRead.length > 0 || o.denyWrite.length > 0) {
+            stamped = { denyRead: o.denyRead, denyWrite: o.denyWrite }
+          }
+        },
+      ),
       spyOn(winUtils, 'revokeWindowsAclChecked').mockReturnValue({
         complete: true,
         outcomes: [],
@@ -1736,7 +1792,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ])
   })
 
-  it('grantWindowsAclPersistent: one acl grant --persistent with grants and denies on stdin; any non-zero exit throws', () => {
+  // These two walk a tree, so they are asynchronous; the fake child
+  // is answered by the same stub as a synchronous call.
+  const answerAsyncBySync = () =>
+    spawnSpy.mockImplementation(((exe: string, argv: readonly string[]) =>
+      asyncChildAnsweredBySync(exe, argv)) as never)
+
+  it('grantWindowsAclPersistent: one acl grant --persistent with grants and denies on stdin; any non-zero exit throws', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const opts = {
       sandboxUserSid: 'S-1-5-21-1',
@@ -1748,7 +1810,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       srtWin,
     }
     stubSpawn(() => ({ status: 0, stdout: '' }))
-    winUtils.grantWindowsAclPersistent(opts)
+    answerAsyncBySync()
+    const pending = winUtils.grantWindowsAclPersistent(opts)
+    // Not a blocking call: nothing has been spawned synchronously by
+    // the time it returns its promise.
+    expect(pending).toBeInstanceOf(Promise)
+    expect(spawnSyncSpy.mock.calls).toHaveLength(0)
+    await pending
     expect(spawnSyncSpy.mock.calls).toHaveLength(1)
     const [, argv, spawnOpts] = spawnSyncSpy.mock.calls[0] as [
       string,
@@ -1777,9 +1845,10 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       spawnSyncSpy.mockRestore()
       spawnSpy.mockRestore()
       stubSpawn(() => ({ status, stdout: '' }))
+      answerAsyncBySync()
       let thrown: unknown
       try {
-        winUtils.grantWindowsAclPersistent(opts)
+        await winUtils.grantWindowsAclPersistent(opts)
       } catch (e) {
         thrown = e
       }
@@ -1788,24 +1857,60 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('forgetWindowsPersistentGrants: acl forget --all; a non-zero exit throws acl_forget_failed', () => {
+  it('forgetWindowsPersistentGrants: acl forget --all, asynchronously; a non-zero exit throws acl_forget_failed, a held grant kept_grants_in_use', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     stubSpawn(() => ({ status: 0, stdout: '' }))
-    winUtils.forgetWindowsPersistentGrants({ srtWin })
+    answerAsyncBySync()
+    await winUtils.forgetWindowsPersistentGrants({ srtWin })
+    await winUtils.forgetWindowsPersistentGrants({
+      srtWin,
+      unlessHeldByOthers: 4242,
+    })
     expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [SRT_WIN_DISPATCH_ARG1, 'acl', 'forget', '--all'],
+      [
+        SRT_WIN_DISPATCH_ARG1,
+        'acl',
+        'forget',
+        '--all',
+        '--unless-held-by-others',
+        '4242',
+      ],
     ])
-    spawnSyncSpy.mockRestore()
-    spawnSpy.mockRestore()
-    stubSpawn(() => ({ status: 1, stdout: '' }))
-    let thrown: unknown
-    try {
-      winUtils.forgetWindowsPersistentGrants({ srtWin })
-    } catch (e) {
-      thrown = e
+    const failing = async (status: number, stdout: string) => {
+      spawnSyncSpy.mockRestore()
+      spawnSpy.mockRestore()
+      stubSpawn(() => ({ status, stdout }))
+      answerAsyncBySync()
+      try {
+        await winUtils.forgetWindowsPersistentGrants({
+          srtWin,
+          unlessHeldByOthers: 4242,
+        })
+      } catch (e) {
+        return e as WindowsSandboxError
+      }
+      throw new Error('expected a throw')
     }
-    expect(thrown).toBeInstanceOf(WindowsSandboxError)
-    expect((thrown as WindowsSandboxError).code).toBe('acl_forget_failed')
+    const failed = await failing(1, '')
+    expect(failed).toBeInstanceOf(WindowsSandboxError)
+    expect(failed.code).toBe('acl_forget_failed')
+    // Exit 22: another live session runs on a kept grant. Named in
+    // the message; a list that cannot be read changes nothing about
+    // the refusal.
+    const held = await failing(
+      22,
+      JSON.stringify({
+        held_by: [
+          { pid: 77, kind: 'kept_root', path: 'C:\\work\\repo' },
+          { pid: 78, kind: 'profile', path: 'C:\\Users\\me' },
+        ],
+      }),
+    )
+    expect(held.code).toBe('kept_grants_in_use')
+    expect(held.message).toContain('process 77 writes C:\\work\\repo')
+    expect(held.message).toContain('process 78 reads the profile')
+    expect((await failing(22, 'not json')).code).toBe('kept_grants_in_use')
   })
 
   it('user status: persistent_grants is surfaced unless it says "none"; an unknown state is not "none"', () => {
@@ -2277,11 +2382,13 @@ describe('Windows write-restricted token, the default: write roots are granted o
         return verifyResult()
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Async spawns: `user status` / `status` at initialize().
+      // Async spawns: `user status` / `status` at initialize(), and
+      // the calls that can walk a tree, answered as the sync ones.
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
       ) => {
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -2573,7 +2680,30 @@ describe('Windows write-restricted token, the default: write roots are granted o
       persistentGrants = reported
       await SandboxManager.initialize(config(false))
       expect(subs()).toEqual(['forget', 'grant', 'stamp'])
-      expect(acl[0].argv).toEqual(['--all'])
+      // Not from under another live session: srt-win is told whose
+      // session asks, and checks its holder records itself.
+      expect(acl[0].argv).toEqual([
+        '--all',
+        '--unless-held-by-others',
+        `${process.pid}`,
+      ])
+    })
+
+    it(`option false, kept grants ${reported.state}: another live session runs on one → kept_grants_in_use, nothing removed or granted`, async () => {
+      persistentGrants = reported
+      aclResult.forget = exit(
+        22,
+        JSON.stringify({
+          held_by: [{ pid: 4711, kind: 'kept_root', path: 'C:\\work' }],
+        }),
+      )
+      const e = await rejection(config(false))
+      expect(e.code).toBe('kept_grants_in_use')
+      expect(e.message).toContain('process 4711 writes C:\\work')
+      // The refused forget is the only thing that ran.
+      expect(subs()).toEqual(['forget'])
+      expect(verifyCalls).toHaveLength(0)
+      expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
     it(`option false, kept grants ${reported.state}: forget fails → initialize() rejects with nothing granted, and does not fall back to the write-restricted token`, async () => {
@@ -2774,11 +2904,13 @@ function restoreGatedOnACompletedRevoke(
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize().
+      // Async spawns: `user status` / `status` at initialize(), and
+      // the calls that can walk a tree, answered as the sync ones.
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
       ) => {
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -5677,6 +5809,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         _exe: string,
         argv: readonly string[],
       ) => {
+        // The calls that can walk a tree are asynchronous too; they
+        // are recorded and answered with the synchronous ones.
+        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         asyncCalls.push([...own])
         const mkStream = () => {
@@ -6620,10 +6755,55 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         briefGrant = brief
         await SandboxManager.initialize(config(ORDINARY))
         expect(names()).toEqual(['profile forget', 'acl grant'])
-        expect(calls[0].argv).toEqual(['--json'])
+        expect(calls[0].argv).toEqual([
+          '--json',
+          '--unless-held-by-others',
+          `${process.pid}`,
+        ])
         expect(calls[1].argv).not.toContain('--persistent')
       })
     }
+
+    it('another live session reads the profile through the grant → kept_grants_in_use; the grant stays, no session', async () => {
+      briefGrant = { state: 'present' }
+      syncResult['profile forget'] = exit(
+        22,
+        JSON.stringify({
+          held_by: [{ pid: 4711, kind: 'profile', path: home }],
+        }),
+      )
+      const e = await rejection(config(ORDINARY))
+      expect(e.code).toBe('kept_grants_in_use')
+      expect(e.message).toContain('process 4711 reads the profile')
+      expect(names()).toEqual(['profile forget'])
+      expect(SandboxManager.getConfig()).toBeUndefined()
+    })
+
+    it('a default session registers as a holder of the grant even with nothing to grant, and releases it at reset', async () => {
+      const cfg = config({}, { allowWrite: [] })
+      await SandboxManager.initialize(cfg)
+      expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+      // The one `acl grant --persistent`, with empty lists: what
+      // records this process as running on the profile read grant.
+      expect(names()).toEqual(['profile status', 'acl grant'])
+      expect(calls[1].argv).toContain('--persistent')
+      expect(calls[1].argv).toContain(`${process.pid}`)
+      expect(stdinOf('acl grant')).toEqual({
+        read: [],
+        write: [],
+        denyRead: [],
+        denyWrite: [],
+      })
+      await SandboxManager.reset()
+      expect(names().slice(2)).toEqual(['acl revoke', 'acl restore'])
+      // Without a grant to hold, a session with nothing to grant
+      // makes no call at all.
+      calls = []
+      profileStatus = { state: 'none' }
+      briefGrant = { state: 'none' }
+      await SandboxManager.initialize(cfg)
+      expect(names()).toEqual([])
+    })
 
     it('profile forget fails → profile_forget_failed; nothing granted, no session', async () => {
       briefGrant = { state: 'present' }

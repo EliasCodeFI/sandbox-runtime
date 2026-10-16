@@ -88,7 +88,7 @@ import {
   windowsSetupVersionMismatch,
   windowsWriteRestrictedTokenEnabled,
   forgetWindowsPersistentGrants,
-  forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -1167,7 +1167,16 @@ async function initializeSteps(
     >[1] = { exclusions: [], ungrantedOnly: [] }
     try {
       if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
-        if (u.profileGrant) forgetWindowsProfileRead({ srtWin })
+        // Not from under another live session that reads the profile
+        // through it, or writes through a kept grant: srt-win checks
+        // its holder records under its lock and removes nothing then
+        // (`kept_grants_in_use`).
+        if (u.profileGrant) {
+          await forgetWindowsProfileReadAsync({
+            srtWin,
+            unlessHeldByOthers: process.pid,
+          })
+        }
       } else if (u.profileGrant) {
         const grant = getWindowsProfileReadStatus({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
@@ -1220,10 +1229,14 @@ async function initializeSteps(
       // sessions that ran with the default let the sandbox account
       // write those trees under the ordinary token this session uses.
       // Remove them before anything is granted or run; if that fails,
-      // no session.
+      // no session. Nor if another live session is running on one:
+      // its working directory is not taken away from under it.
       if (u.persistentGrants) {
         try {
-          forgetWindowsPersistentGrants({ srtWin })
+          await forgetWindowsPersistentGrants({
+            srtWin,
+            unlessHeldByOthers: process.pid,
+          })
         } catch (e) {
           config = undefined
           throw e
@@ -1421,8 +1434,14 @@ async function initializeSteps(
         // denies under them are converged with them, and the rest is
         // per-session as below. A failure throws — there is no
         // fallback to per-session grants.
-        if (anyApplied) {
-          grantWindowsAclPersistent({
+        //
+        // The same call records this process as a holder of its kept
+        // roots and of the profile read grant, so that another
+        // session switching the token off cannot remove them from
+        // under this one. That is wanted even with nothing to grant,
+        // whenever this session reads the profile through the grant.
+        if (anyApplied || windowsProfileRead === 'granted') {
+          await grantWindowsAclPersistent({
             sandboxUserSid: sb,
             read: grantRead,
             write: acc.grantWrite,
@@ -1467,8 +1486,9 @@ async function initializeSteps(
       // running revoke/restore at reset(). Recorded AFTER success —
       // the catch below clears `config`, and a non-undefined
       // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed.
-      if (anyApplied) {
+      // that never landed. A session that only registered as a holder
+      // of the profile read grant releases that the same way.
+      if (anyApplied || (writeRestricted && windowsProfileRead === 'granted')) {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
