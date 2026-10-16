@@ -67,7 +67,7 @@ use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
 use crate::path_id::{self, FileId, Located};
 use crate::persist::{self, Ids, OpenObject};
-use crate::profile_plan::{self as plan, Entry, Kind, Name, Node, Rules, Tree};
+use crate::profile_plan::{self as plan, Entry, Kind, LinkTarget, Name, Node, Rules, Tree};
 use crate::reg;
 use crate::util::{OwnedHandle, pcwstr, wstr};
 
@@ -322,6 +322,7 @@ fn list_dir(h: HANDLE) -> Result<Vec<Entry>> {
                         short: String::from_utf16(short).ok().filter(|s| !s.is_empty()),
                     },
                     is_dir,
+                    link: info.FileAttributes & ATTR_REPARSE_POINT != 0,
                 });
             }
             if info.NextEntryOffset == 0 {
@@ -341,6 +342,20 @@ struct DiskTree<'a> {
 }
 
 impl Tree for DiskTree<'_> {
+    /// Where the link at `rel` leads: the final path of an open that
+    /// follows it and every link after it, placed against the
+    /// profile. Only read; nothing is written at either end here.
+    fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
+        let path = join(self.profile, rel);
+        match path_id::canonicalize_path(&path) {
+            Ok((target, _)) => match plan::rel_components(self.profile, &target) {
+                Ok(inside) => LinkTarget::Inside(inside),
+                Err(_) => LinkTarget::Elsewhere(format!("leads to '{target}'")),
+            },
+            Err(e) => LinkTarget::Elsewhere(format!("cannot be resolved: {e}")),
+        }
+    }
+
     fn list(&mut self, rel: &[String]) -> std::result::Result<Vec<Entry>, String> {
         let path = join(self.profile, rel);
         (|| -> Result<Vec<Entry>> {
@@ -1066,8 +1081,10 @@ pub fn grant(
         layout.rel(&layout.local).as_deref(),
         &extra,
     );
-    let nodes = plan::plan(&mut DiskTree { profile }, &rules)
-        .map_err(|e| anyhow!("list the profile directory '{profile}': {e}"))?;
+    // The rules the plan ends with include those carried over to the
+    // targets of links; they are what is recorded.
+    let (nodes, rules) = plan::plan_resolved(&mut DiskTree { profile }, &rules)
+        .map_err(|e| anyhow!("plan the grant on '{profile}': {e}"))?;
 
     let mut report = Report {
         profile: profile.to_owned(),
@@ -1884,6 +1901,99 @@ mod tests {
         unchanged("after the removal");
         drop(o);
         std::fs::remove_dir(granted.join("j")).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An excluded name that is a link into the profile: the link is
+    /// left alone, and its target carries what the name would have.
+    #[test]
+    fn an_excluded_name_that_is_a_link_protects_its_target() {
+        let base = scratch("links");
+        let prof = base.join("profile");
+        for f in [
+            r"dotfiles\.ssh\id_ed25519",
+            r"dotfiles\.config\gh\hosts.yml",
+            r"dotfiles\.config\nvim\init.lua",
+            r"dotfiles\README",
+            r"Documents\a.txt",
+        ] {
+            write(&prof, f);
+        }
+        junction(&prof.join(".ssh"), &prof.join(r"dotfiles\.ssh"));
+        junction(&prof.join(".config"), &prof.join(r"dotfiles\.config"));
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let key = format!("{TEST_KEY}Links");
+        let store = Store {
+            conn: &conn,
+            key: &key,
+        };
+        clear_marker(&key).unwrap();
+        let ids = ids();
+        let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        let deny_dir = vec![(true, true, 0x3u8, ALL)];
+        // The keys and the sign-in are denied where they really are …
+        assert_eq!(group_aces(&prof.join(r"dotfiles\.ssh")), deny_dir);
+        assert_eq!(group_aces(&prof.join(r"dotfiles\.config\gh")), deny_dir);
+        assert!(
+            !group_aces(&prof.join(r"dotfiles\.ssh\id_ed25519"))
+                .iter()
+                .any(|a| !a.1)
+        );
+        // … the directories above them are containers, not granted
+        // whole, and what else is in them is readable.
+        assert_eq!(group_aces(&prof.join("dotfiles")), [(true, false, 0, LIST)]);
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\.config")),
+            [(true, false, 0, LIST)]
+        );
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\README")),
+            [(true, false, 0, RX)]
+        );
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\.config\nvim")),
+            [(true, false, 0x3, RX)]
+        );
+        // Both links are reported as skipped.
+        for link in [r"\.ssh", r"\.config"] {
+            assert!(
+                report.skipped.iter().any(|s| s.path.ends_with(link)),
+                "{link}: {:?}",
+                report.skipped
+            );
+        }
+        // The record lists the exclusions where they really are, which
+        // is where a session's path resolves to.
+        let st = status_json(&key, Ok(layout.clone()), false);
+        let listed: Vec<String> = st["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+        for want in [r"\dotfiles\.ssh", r"\dotfiles\.config\gh"] {
+            let full = format!("{}{want}", layout.profile.to_lowercase());
+            assert!(listed.contains(&full), "{full} not in {listed:?}");
+        }
+        let through_link =
+            path_id::canonicalize_path(prof.join(r".ssh\id_ed25519").to_str().unwrap())
+                .unwrap()
+                .0;
+        let refused =
+            check_grants_against(read_marker_at(&key), &[(through_link, false)], &[], &|_| {
+                Vec::new()
+            });
+        assert!(
+            refused.is_err(),
+            "a session read grant on the keys through the link"
+        );
+        let f = forget(&store, &ids).unwrap();
+        assert!(f.failed.is_empty(), "{f:?}");
+        assert!(group_aces(&prof.join(r"dotfiles\.ssh")).is_empty());
+        std::fs::remove_dir(prof.join(".ssh")).ok();
+        std::fs::remove_dir(prof.join(".config")).ok();
         std::fs::remove_dir_all(&base).ok();
     }
 

@@ -47,6 +47,22 @@
 //! grant of the directory itself, or of one above it, would cover
 //! everything in it and is refused like one above a protected path.
 //!
+//! ## Links
+//!
+//! A junction, a symbolic link or a cloud placeholder is never written
+//! on or through. But a link can stand where a rule points: with
+//! `.ssh` a link to `dotfiles\.ssh`, skipping the link alone would
+//! leave the keys in a `dotfiles` directory that no rule names and
+//! that would be granted whole. So a link at or above a path some rule
+//! covers is resolved, and if its target lies inside the profile the
+//! rules that would have applied beneath the link are applied beneath
+//! the target as well ([`plan_resolved`]): the target is denied, or
+//! becomes a container with the right children denied. The added
+//! rules are recorded with the grant like any other exclusion, in
+//! their resolved form — which is the form a session's path is
+//! compared in. A target outside the profile gets nothing: nothing
+//! there is granted either.
+//!
 //! A file directly inside a container is readable only if it is
 //! granted itself. In the profile root that is the short list in
 //! [`READABLE_ROOT_FILES`]: the root is where the registry hives and
@@ -739,13 +755,29 @@ pub struct Entry {
     /// Set for an entry nothing may be written on or through: a
     /// reparse point or a cloud placeholder.
     pub skip: Option<String>,
+    /// The entry is a reparse point: something that may redirect to
+    /// another place ([`Tree::resolve_link`]).
+    pub link: bool,
+}
+
+/// Where a link leads, with every link on the way resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// Inside the profile: the target's components beneath it (empty
+    /// for the profile directory itself).
+    Inside(Vec<String>),
+    /// Outside the profile, or nowhere that can be resolved (a
+    /// dangling link, a cycle), with a word about it.
+    Elsewhere(String),
 }
 
 /// What the walk reads the tree through. `list` is called for the
 /// root and for every directory about to be treated as a container;
 /// an `Err` makes that directory skipped, with the error as reason.
+/// `resolve_link` is called for a link that sits where a rule points.
 pub trait Tree {
     fn list(&mut self, rel: &[String]) -> Result<Vec<Entry>, String>;
+    fn resolve_link(&mut self, rel: &[String]) -> LinkTarget;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,20 +838,97 @@ pub struct Node {
     pub note: Option<String>,
 }
 
+/// A link the walk met where a rule points: its path, and the rules
+/// that matched down to and including its name.
+struct LinkHit {
+    rel: Vec<String>,
+    rules: Vec<usize>,
+}
+
+/// What a walk produces.
+struct Found {
+    nodes: Vec<Node>,
+    hits: Vec<LinkHit>,
+}
+
+/// How many times the rules may grow by resolving links before the
+/// plan gives up: each round resolves the links the previous round's
+/// added rules led to, so this bounds the length of a chain of links
+/// that each sit beneath the previous one's target.
+const MAX_LINK_ROUNDS: usize = 8;
+
 /// The plan for a profile: every node the grant touches or reports,
 /// parents before children, in the order the tree listed them.
 pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
-    let entries = tree.list(&[])?;
-    let mut out = vec![Node {
-        rel: Vec::new(),
-        is_dir: true,
-        kind: Kind::Container,
-        missing: false,
-        stamp: true,
-        note: None,
-    }];
-    walk(tree, rules, &[], entries, &rules.all(), false, &mut out);
-    Ok(out)
+    plan_resolved(tree, rules).map(|(nodes, _)| nodes)
+}
+
+/// [`plan`], with the rules it ended up with: `rules` plus, for every
+/// link that sits at or above a path a rule covers and leads into the
+/// profile, that rule carried over to the link's target (see the
+/// module doc). The returned rules are what the grant records.
+///
+/// A link that leads to the profile directory itself from a place a
+/// rule covers would exclude the whole profile; that is an error, as
+/// is a chain of links longer than [`MAX_LINK_ROUNDS`].
+pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, Rules), String> {
+    let mut rules = rules.clone();
+    for _ in 0..=MAX_LINK_ROUNDS {
+        let entries = tree.list(&[])?;
+        let mut found = Found {
+            nodes: vec![Node {
+                rel: Vec::new(),
+                is_dir: true,
+                kind: Kind::Container,
+                missing: false,
+                stamp: true,
+                note: None,
+            }],
+            hits: Vec::new(),
+        };
+        let all = rules.all();
+        walk(tree, &rules, &[], entries, &all, false, &mut found);
+        let Found { nodes: out, hits } = found;
+        let mut grew = false;
+        for hit in hits {
+            let LinkTarget::Inside(target) = tree.resolve_link(&hit.rel) else {
+                continue;
+            };
+            if target.is_empty() {
+                return Err(format!(
+                    "'{}' is a link to the profile directory itself and stands where an \
+                     exclusion applies; the profile cannot be granted around it",
+                    hit.rel.join("\\")
+                ));
+            }
+            let depth = hit.rel.len();
+            for i in hit.rules {
+                let from = rules.rules[i].clone();
+                let mut pats: Vec<Pat> =
+                    target.iter().map(|c| Pat::Lit(norm_component(c))).collect();
+                pats.extend(from.pats[depth..].iter().cloned());
+                let mut spelled = target.clone();
+                spelled.extend(from.spelled[depth..].iter().cloned());
+                let same = |r: &Rule| r.pats == pats && r.ungranted == from.ungranted;
+                if !rules.rules.iter().any(same) {
+                    rules.rules.push(Rule {
+                        pats,
+                        spelled,
+                        stamp: true,
+                        ungranted: from.ungranted,
+                        placeholder: false,
+                    });
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return Ok((out, rules));
+        }
+    }
+    Err(format!(
+        "links beneath the profile lead on to further links more than {MAX_LINK_ROUNDS} times"
+    ))
 }
 
 /// Walk one container. `alive` are the rules whose first `rel.len()`
@@ -833,7 +942,7 @@ fn walk(
     entries: Vec<Entry>,
     alive: &[usize],
     bare: bool,
-    out: &mut Vec<Node>,
+    found: &mut Found,
 ) {
     let depth = rel.len();
     let node = |name: &str, is_dir: bool, kind: Kind| Node {
@@ -846,18 +955,26 @@ fn walk(
     };
     for e in &entries {
         let name = e.name.long.as_str();
-        if let Some(why) = &e.skip {
-            out.push(Node {
-                note: Some(why.clone()),
-                ..node(name, e.is_dir, Kind::Skipped)
-            });
-            continue;
-        }
         let next: Vec<usize> = alive
             .iter()
             .copied()
             .filter(|&i| e.name.matched_by(&rules.rules[i].pats[depth]))
             .collect();
+        if let Some(why) = &e.skip {
+            found.nodes.push(Node {
+                note: Some(why.clone()),
+                ..node(name, e.is_dir, Kind::Skipped)
+            });
+            // Nothing is written on it. If rules point at or through
+            // it and it leads somewhere, they follow it there.
+            if e.link && !next.is_empty() {
+                found.hits.push(LinkHit {
+                    rel: rel.iter().cloned().chain([name.to_owned()]).collect(),
+                    rules: next,
+                });
+            }
+            continue;
+        }
         let ending: Vec<&Rule> = next
             .iter()
             .map(|&i| &rules.rules[i])
@@ -866,7 +983,7 @@ fn walk(
         // A protected rule ending here wins over an ungranted-only one.
         let protected: Vec<&&Rule> = ending.iter().filter(|r| !r.ungranted).collect();
         if !protected.is_empty() {
-            out.push(Node {
+            found.nodes.push(Node {
                 stamp: protected.iter().all(|r| r.stamp),
                 ..node(name, e.is_dir, Kind::Denied)
             });
@@ -888,16 +1005,16 @@ fn walk(
                 let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
                 match tree.list(&child) {
                     Ok(children) => {
-                        out.push(node(name, true, Kind::Ungranted));
-                        walk(tree, rules, &child, children, &deeper, true, out);
+                        found.nodes.push(node(name, true, Kind::Ungranted));
+                        walk(tree, rules, &child, children, &deeper, true, found);
                     }
-                    Err(why) => out.push(Node {
+                    Err(why) => found.nodes.push(Node {
                         note: Some(why),
                         ..node(name, true, Kind::Skipped)
                     }),
                 }
             } else if !ending.is_empty() {
-                out.push(node(name, true, Kind::Ungranted));
+                found.nodes.push(node(name, true, Kind::Ungranted));
             }
             continue;
         }
@@ -909,21 +1026,21 @@ fn walk(
                 true
             };
             if readable {
-                out.push(node(name, false, Kind::File));
+                found.nodes.push(node(name, false, Kind::File));
             }
             continue;
         }
         if next.is_empty() {
-            out.push(node(name, true, Kind::Granted));
+            found.nodes.push(node(name, true, Kind::Granted));
             continue;
         }
         let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
         match tree.list(&child) {
             Ok(children) => {
-                out.push(node(name, true, Kind::Container));
-                walk(tree, rules, &child, children, &next, false, out);
+                found.nodes.push(node(name, true, Kind::Container));
+                walk(tree, rules, &child, children, &next, false, found);
             }
-            Err(why) => out.push(Node {
+            Err(why) => found.nodes.push(Node {
                 note: Some(why),
                 ..node(name, true, Kind::Skipped)
             }),
@@ -970,7 +1087,7 @@ fn walk(
                 break;
             }
             let excluded_here = rules.excludes(&names);
-            out.push(Node {
+            found.nodes.push(Node {
                 rel: chain,
                 is_dir: true,
                 kind: if last || excluded_here {
@@ -1065,6 +1182,9 @@ mod tests {
     struct Mem {
         dirs: BTreeMap<String, Vec<Entry>>,
         unreadable: Vec<String>,
+        /// Link path → where it points: a path beneath the profile
+        /// (`""` for the profile itself), or `None` for outside it.
+        links: BTreeMap<String, Option<String>>,
     }
 
     fn entry(name: &str, is_dir: bool) -> Entry {
@@ -1072,6 +1192,7 @@ mod tests {
             name: Name::long(name),
             is_dir,
             skip: None,
+            link: false,
         }
     }
 
@@ -1107,7 +1228,51 @@ mod tests {
         }
     }
 
+    impl Mem {
+        /// Make the directory `path` a link to `target`.
+        fn link(&mut self, path: &str, target: Option<&str>) -> &mut Self {
+            if !self.dirs.contains_key(path) {
+                self.add(&format!("{path}\\"));
+            }
+            let e = self.entry_mut(path);
+            e.skip = Some("reparse point".into());
+            e.link = true;
+            self.links
+                .insert(path.to_owned(), target.map(str::to_owned));
+            self
+        }
+
+        /// `path` with every link on the way resolved, as the final
+        /// path of a real open is; `None` for outside the profile or
+        /// a cycle.
+        fn real(&self, path: &str) -> Option<String> {
+            let mut cur = path.to_owned();
+            for _ in 0..32 {
+                let comps = split_path(&cur);
+                let hit = (1..=comps.len())
+                    .map(|n| comps[..n].join("\\"))
+                    .find(|prefix| self.links.contains_key(prefix));
+                let Some(prefix) = hit else {
+                    return Some(cur);
+                };
+                let target = self.links[&prefix].clone()?;
+                let rest = &cur[prefix.len()..];
+                cur = format!("{target}{rest}")
+                    .trim_start_matches('\\')
+                    .to_owned();
+            }
+            None
+        }
+    }
+
     impl Tree for Mem {
+        fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
+            match self.real(&rel.join("\\")) {
+                Some(real) => LinkTarget::Inside(split_path(&real)),
+                None => LinkTarget::Elsewhere("outside the profile".to_owned()),
+            }
+        }
+
         fn list(&mut self, rel: &[String]) -> Result<Vec<Entry>, String> {
             let key = rel.join("\\");
             if self.unreadable.contains(&key) {
@@ -1297,6 +1462,148 @@ mod tests {
         t.add(r"AppData\Local\x");
         let k = kinds(&plan(&mut t, &rules).unwrap());
         assert!(!k.keys().any(|p| p.starts_with(r"AppData\Local\Temp")));
+    }
+
+    /// A link where a rule points: the rule follows it to its target.
+    #[test]
+    fn a_rule_follows_a_link_to_its_target_inside_the_profile() {
+        let mut t = Mem::default();
+        t.add(r"dotfiles\.ssh\id_ed25519")
+            .add(r"dotfiles\.config\gh\hosts.yml")
+            .add(r"dotfiles\.config\git\config")
+            .add(r"dotfiles\.config\git\credentials")
+            .add(r"dotfiles\.config\nvim\init.lua")
+            .add(r"dotfiles\README")
+            .add(r"Documents\a.txt");
+        t.link(".ssh", Some(r"dotfiles\.ssh"))
+            .link(".config", Some(r"dotfiles\.config"));
+        let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        let is = |p: &str, kind: Kind| assert_eq!(k.get(p).map(|v| v.0), Some(kind), "{p}");
+        // The links themselves: nothing written, nothing beneath.
+        is(".ssh", Kind::Skipped);
+        is(".config", Kind::Skipped);
+        // Their targets: what the rules say for the names they have
+        // through the links.
+        is("dotfiles", Kind::Container);
+        is(r"dotfiles\.ssh", Kind::Denied);
+        is(r"dotfiles\.config", Kind::Container);
+        is(r"dotfiles\.config\gh", Kind::Denied);
+        is(r"dotfiles\.config\git", Kind::Container);
+        is(r"dotfiles\.config\git\credentials", Kind::Denied);
+        is(r"dotfiles\.config\git\config", Kind::File);
+        is(r"dotfiles\.config\nvim", Kind::Granted);
+        is(r"dotfiles\README", Kind::File);
+        is("Documents", Kind::Granted);
+        assert!(!k.contains_key(r"dotfiles\.ssh\id_ed25519"));
+        // The carried-over rules are part of what is recorded, in
+        // their resolved form, and cover paths not there yet.
+        let spelled = rules.spelled();
+        for want in [
+            r"dotfiles\.ssh",
+            r"dotfiles\.config\gh",
+            r"dotfiles\.config\gcloud",
+        ] {
+            assert!(
+                spelled.iter().any(|s| s == want),
+                "{want} not in {spelled:?}"
+            );
+        }
+        assert!(rules.excludes(&names(&split_path(r"dotfiles\.ssh\new-key"))));
+        assert!(rules.could_exclude_beneath(&names(&split_path("dotfiles"))));
+        // Without the links none of that holds: `dotfiles` is an
+        // ordinary directory, granted whole.
+        let mut plain = Mem::default();
+        plain
+            .add(r"dotfiles\.ssh\id_ed25519")
+            .add(r"dotfiles\README");
+        let k = kinds(&plan(&mut plain, &super::tests::rules()).unwrap());
+        assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Granted));
+    }
+
+    #[test]
+    fn links_in_chains_upwards_outwards_and_in_circles() {
+        // A chain: `.config` → `a\cfg`, and in there `gh` → `b\gh`.
+        let mut t = Mem::default();
+        t.add(r"a\cfg\other\x")
+            .add(r"b\gh\hosts.yml")
+            .add(r"b\keep.txt");
+        t.link(".config", Some(r"a\cfg"))
+            .link(r"a\cfg\gh", Some(r"b\gh"));
+        let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get(r"b\gh").map(|v| v.0), Some(Kind::Denied));
+        assert_eq!(k.get("b").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"b\keep.txt").map(|v| v.0), Some(Kind::File));
+        assert_eq!(k.get(r"a\cfg").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"a\cfg\gh").map(|v| v.0), Some(Kind::Skipped));
+        assert!(rules.spelled().iter().any(|s| s == r"b\gh"));
+
+        // A link whose target is above it: `.config\gh` → `.config`.
+        // The rule for `.config\gh` lands on `.config`, all of it.
+        let mut t = Mem::default();
+        t.add(r".config\git\config");
+        t.link(r".config\gh", Some(".config"));
+        let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
+        assert_eq!(k.get(".config").map(|v| v.0), Some(Kind::Denied));
+        assert!(!k.contains_key(r".config\git"));
+
+        // A link out of the profile: skipped, and nothing follows it.
+        let mut t = Mem::default();
+        t.add(r"Documents\a.txt");
+        t.link(".ssh", None);
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get("Documents").map(|v| v.0), Some(Kind::Granted));
+        assert_eq!(rules.spelled(), super::tests::rules().spelled());
+
+        // A circle of links resolves nowhere: both skipped.
+        let mut t = Mem::default();
+        t.link(".ssh", Some(".aws")).link(".aws", Some(".ssh"));
+        let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
+        assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get(".aws").map(|v| v.0), Some(Kind::Skipped));
+
+        // A link no rule points at or through is only skipped.
+        let mut t = Mem::default();
+        t.add(r"work\x");
+        t.link("shortcut", Some("work"));
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        assert_eq!(kinds(&nodes).get("work").map(|v| v.0), Some(Kind::Granted));
+        assert_eq!(rules.spelled(), super::tests::rules().spelled());
+
+        // An excluded name that leads to the profile directory itself
+        // cannot be granted around.
+        let mut t = Mem::default();
+        t.link(".ssh", Some(""));
+        assert!(plan(&mut t, &super::tests::rules()).is_err());
+
+        // A chain longer than the bound is an error, not a partial
+        // plan. Each link carries the rest of a long added rule one
+        // directory on: `x1` → `h1`, `h1\x2` → `h2`, …
+        let hops = MAX_LINK_ROUNDS + 3;
+        let long: Vec<String> = (1..=hops + 1).map(|i| format!("x{i}")).collect();
+        let chain = |links: usize| {
+            let mut t = Mem::default();
+            for i in 1..=links {
+                let at = if i == 1 {
+                    "x1".to_owned()
+                } else {
+                    format!(r"h{}\x{i}", i - 1)
+                };
+                t.add(&format!(r"h{i}\keep.txt"));
+                t.link(&at, Some(&format!("h{i}")));
+            }
+            t
+        };
+        let with_long = Rules::new(None, None, std::slice::from_ref(&long));
+        assert!(plan(&mut chain(hops), &with_long).is_err());
+        // Within the bound the last target gets the rest of the rule.
+        let (nodes, rules) = plan_resolved(&mut chain(3), &with_long).unwrap();
+        assert_eq!(kinds(&nodes).get("h3").map(|v| v.0), Some(Kind::Container));
+        let rest = long[3..].join("\\");
+        assert!(rules.spelled().contains(&format!(r"h3\{rest}")));
     }
 
     #[test]
@@ -1645,10 +1952,18 @@ mod tests {
         }
         // Some entries are links or cannot be listed.
         let keys: Vec<String> = t.dirs.keys().filter(|k| !k.is_empty()).cloned().collect();
-        for k in keys {
-            match rng.below(12) {
-                0 => t.entry_mut(&k).skip = Some("reparse point".into()),
-                1 => t.unreadable.push(k),
+        for k in &keys {
+            match rng.below(10) {
+                // A link: to another directory of the tree, or out of
+                // the profile.
+                0 => {
+                    let target = match rng.below(4) {
+                        0 => None,
+                        _ => Some(keys[rng.below(keys.len())].clone()),
+                    };
+                    t.link(k, target.as_deref());
+                }
+                1 => t.unreadable.push(k.clone()),
                 _ => {}
             }
         }
@@ -1668,9 +1983,12 @@ mod tests {
         ];
         let rules = Rules::new(None, None, &extra);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for round in 0..400 {
+        let original = rules;
+        for round in 0..600 {
             let mut t = random_tree(&mut rng);
-            let nodes = plan(&mut t, &rules).unwrap();
+            // The rules as the plan ends up with them: the original
+            // ones, and those carried over to the targets of links.
+            let (nodes, rules) = plan_resolved(&mut t, &original).unwrap();
             let by_rel: BTreeMap<String, &Node> =
                 nodes.iter().map(|n| (n.rel.join("\\"), n)).collect();
             assert_eq!(by_rel.len(), nodes.len(), "round {round}: a path twice");
@@ -1721,6 +2039,59 @@ mod tests {
                 }
                 if !n.rel.is_empty() {
                     assert_eq!(by_rel[""].kind, Kind::Container);
+                }
+            }
+            // Links. For every link the walk met, whatever is planned
+            // at or beneath its target is looked at under the name it
+            // has THROUGH the link, against the rules as written: what
+            // is excluded under that name is not granted under its
+            // real one, and nothing that could become excluded under
+            // that name lies beneath an inheriting allow.
+            // (A link INSIDE an ungranted-only directory that no rule
+            // points at leads to an ordinary place, like a link inside
+            // any directory the grant does not enter: its target is
+            // judged by where it really is.)
+            for (link, _) in t.links.iter().filter(|(l, _)| {
+                let parent = split_path(l);
+                by_rel
+                    .get(l.as_str())
+                    .is_some_and(|n| n.kind == Kind::Skipped)
+                    && !original.ungranted(&names(&parent[..parent.len() - 1]))
+            }) {
+                let Some(target) = t.real(link) else { continue };
+                for n in &nodes {
+                    let real = n.rel.join("\\");
+                    let rest = if real == target {
+                        ""
+                    } else if let Some(r) = real.strip_prefix(&format!("{target}\\")) {
+                        r
+                    } else if target.is_empty() {
+                        real.as_str()
+                    } else {
+                        continue;
+                    };
+                    let alias = names(&split_path(&format!("{link}\\{rest}")));
+                    if original.excludes(&alias) {
+                        assert!(
+                            matches!(n.kind, Kind::Denied | Kind::Skipped),
+                            "round {round}: {real} is {:?} though excluded as {link}\\{rest}",
+                            n.kind
+                        );
+                    }
+                    if n.kind == Kind::Granted {
+                        assert!(
+                            !original.could_exclude_beneath(&alias),
+                            "round {round}: granted {real} is {link}\\{rest}, beneath which \
+                             an exclusion can lie"
+                        );
+                    }
+                    if original.ungranted(&alias) {
+                        assert!(
+                            matches!(n.kind, Kind::Ungranted | Kind::Denied | Kind::Skipped),
+                            "round {round}: {real} is {:?} though ungranted as {link}\\{rest}",
+                            n.kind
+                        );
+                    }
                 }
             }
             // Every excluded object on disk whose ancestors were all
