@@ -764,6 +764,15 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
+        // A read deny holds against the profile read grant only if it
+        // is also on each recorded path beneath it that carries an
+        // allow of its own. Worked out here, from the record, so the
+        // caller names the deny once whatever it covers.
+        if matches!(ace, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)) {
+            for also in srt_win::profile::read_deny_also(&canon)? {
+                targets.push((also, ace));
+            }
+        }
         // Full-chain hold (see doc). Duplicates are merged below.
         if matches!(ace, SbAce::Deny(_)) {
             for anc in db.placeholder_ancestors_of(&canon)? {

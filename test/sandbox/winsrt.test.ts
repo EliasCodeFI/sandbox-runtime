@@ -5510,10 +5510,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           lists(),
           { write: true },
         ),
-        denyTargets: winUtils.windowsProfileGrantDenyTargets(
-          paths,
-          recorded() as winUtils.WindowsProfileGrantPath[],
-        ),
         calls: calls.map(c => `${c.cmd} ${c.sub}`),
       },
       null,
@@ -5543,7 +5539,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     kind,
   })
   /** The grant as recorded for `home`. */
+  /** More recorded paths, for one test. */
+  let extraRecorded: ReturnType<typeof rec>[] = []
   const recorded = () => [
+    ...extraRecorded,
     rec('container'),
     rec('granted', 'Documents'),
     rec('file', '.npmrc'),
@@ -5558,7 +5557,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
    * What the grant protects: built-in entries, one added one, and an
    * added one inside the temporary directory.
    */
+  /** More recorded exclusions, for one test. */
+  let extraExclusions: string[] = []
   const exclusions = () => [
+    ...extraExclusions,
     join(home, '.ssh'),
     join(home, '.cargo', 'credentials.toml'),
     join(home, 'NTUSER.DAT*'),
@@ -5794,10 +5796,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   }
 
   describe('a default session: initialize() checks the record and never writes the grant', () => {
-    it('a current grant: one `profile status --paths`, then the session as usual', async () => {
+    it('a current grant: one `profile status`, without the path list, then the session as usual', async () => {
       await SandboxManager.initialize(config())
       expect(names()).toEqual(['profile status', 'acl grant'])
-      expect(calls[0].argv).toEqual(['--paths'])
+      expect(calls[0].argv).toEqual([])
       expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(names()).not.toContain('profile grant')
       expect(names()).not.toContain('profile forget')
@@ -5937,38 +5939,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   })
 
   describe('a session read deny against the grant', () => {
+    // A read deny on or above a path the grant made readable has to
+    // be on that path too. srt-win works that out from its record
+    // (covered there by its own tests and the smoke script); what is
+    // checked here is that the library hands it the deny once, as
+    // given, and never a list that grows with the record.
     const denyRead = async (
       ...paths: string[]
     ): Promise<string[] | undefined> => {
       await SandboxManager.initialize(config({}, { denyRead: paths }))
       return stdinOf('acl grant')?.denyRead
     }
-    const readable = [
-      () => home,
-      () => join(home, 'Documents'),
-      () => join(home, '.npmrc'),
-      () => join(home, '.cargo'),
-      () => join(home, '.cargo', 'config.toml'),
-    ]
 
-    it('on the profile directory: stamped on every path the grant made readable, and on none it excluded', async () => {
-      const stamped = await denyRead(home)
-      await explained([home], () => {
-        expect(new Set(stamped)).toEqual(new Set(readable.map(p => p())))
-        // Each once: the profile directory is itself a recorded path.
-        expect(stamped).toHaveLength(5)
-      })
+    it('on the profile directory, a container, a granted directory or a path beneath one: the deny itself, once', async () => {
+      for (const p of [
+        home,
+        join(home, '.cargo'),
+        join(home, 'Documents'),
+        join(home, 'Documents', 'sub'),
+      ]) {
+        calls = []
+        expect(await denyRead(p)).toEqual([p])
+        await SandboxManager.reset()
+      }
     })
 
-    it('on the profile directory as the session spells it (a short name, a link, another case): the same stamps', async () => {
-      // However the deny itself ends up spelled, it and its stamps
-      // are, as objects, exactly the readable paths.
-      const stamped = await denyRead(homeAsSpelled)
-      await explained([homeAsSpelled], () => {
-        expect(new Set((stamped ?? []).map(canonical))).toEqual(
-          new Set(readable.map(p => p())),
-        )
-      })
+    it('the record is not asked for path by path: status is read without the path list', async () => {
+      await denyRead(home)
+      const status = calls.find(c => c.cmd === 'profile' && c.sub === 'status')
+      expect(status?.argv).toEqual([])
     })
 
     it('denyRead of the profile directory holds for that session only: the next one stamps nothing', async () => {
@@ -5989,24 +5988,57 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(stdinOf('acl grant')?.denyRead).toEqual([])
     })
 
-    it('on a granted directory: that directory, once', async () => {
-      expect(await denyRead(join(home, 'Documents'))).toEqual([
-        join(home, 'Documents'),
-      ])
-    })
-
-    it('on a container: the container and the files granted in it', async () => {
-      const stamped = await denyRead(join(home, '.cargo'))
-      await explained([join(home, '.cargo')], () => {
-        expect(new Set(stamped)).toEqual(
-          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
-        )
+    it("a write root with a read-denied file inside it: the session starts, and the deny is the session's, not a recorded exclusion", async () => {
+      const proj = join(home, 'proj')
+      mkdirSync(proj)
+      writeFileSync(join(proj, '.env'), 'TOKEN=x')
+      const cfg = config(
+        {},
+        { allowWrite: [proj], denyRead: [join(proj, '.env')] },
+      )
+      await SandboxManager.initialize(cfg)
+      // The root is granted for writing and the file denied for
+      // reading, in the one call a session makes.
+      expect(stdinOf('acl grant')).toMatchObject({
+        write: [proj],
+        denyRead: [join(proj, '.env')],
       })
+      // Nothing about the session is written into the grant's record:
+      // the grant is neither made nor refreshed by initialize().
+      expect(names()).toEqual(['profile status', 'acl grant'])
+      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(argv.filter((_, i) => argv[i - 1] === '--write-root')).toEqual([
+        proj,
+      ])
+      await SandboxManager.reset()
+      // And again: nothing a first session did stands in the way of
+      // the second.
+      calls = []
+      await SandboxManager.initialize(cfg)
+      expect(stdinOf('acl grant')).toMatchObject({ write: [proj] })
+      // No helper offers a session's denies as exclusions to record.
+      expect(
+        (winUtils as Record<string, unknown>).windowsProfileReadExclusions,
+      ).toBeUndefined()
     })
 
-    it('beneath a granted directory: only its own path — a deny there already comes first', async () => {
-      const sub = join(home, 'Documents', 'sub')
-      expect(await denyRead(sub)).toEqual([sub])
+    it('a grant recorded with such a file as an added exclusion refuses the root until the added list is replaced', async () => {
+      // What an earlier arrangement produced: the session's deny,
+      // recorded with the grant. The root above it cannot be granted
+      // for writing; `grantWindowsProfileRead({ exclude: [],
+      // replaceExclusions: true })` drops it.
+      const proj = join(home, 'proj')
+      mkdirSync(proj)
+      extraExclusions = [join(proj, '.env')]
+      profileStatus = current()
+      try {
+        const e = await rejection(
+          config({}, { allowWrite: [proj], denyRead: [join(proj, '.env')] }),
+        )
+        expect(e.code).toBe('profile_exclusion_read_grant')
+      } finally {
+        extraExclusions = []
+      }
     })
 
     it('outside the profile: only its own path', async () => {
@@ -6034,23 +6066,46 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(SandboxManager.getConfig()).toBeUndefined()
     })
 
-    it('a per-command read deny is stamped on the covered paths for that command', async () => {
-      await SandboxManager.initialize(config())
-      const cfg = config(
-        {},
-        { denyRead: [join(home, '.cargo')], allowWrite: [] },
+    it('a per-command read deny above thousands of recorded paths is one argument, not one per path', async () => {
+      // A record of a few thousand paths under AppData — more than a
+      // command line could carry if each were named on it.
+      const big = Array.from({ length: 4000 }, (_, i) =>
+        rec(
+          i % 2 ? 'granted' : 'file',
+          'AppData',
+          'Local',
+          `application-${i % 50}`,
+          `entry-with-a-long-name-${i}`,
+        ),
       )
-      const { argv } = await SandboxManager.wrapWithSandboxArgv(
-        'echo x',
-        undefined,
-        cfg,
+      expect(big.map(r => r.path).join(' --deny-read ').length).toBeGreaterThan(
+        32_767,
       )
-      const denied = argv.filter((_, i) => argv[i - 1] === '--deny-read')
-      await explained([join(home, '.cargo')], () => {
-        expect(new Set(denied)).toEqual(
-          new Set([join(home, '.cargo'), join(home, '.cargo', 'config.toml')]),
+      extraRecorded = big
+      profileStatus = current()
+      try {
+        await SandboxManager.initialize(config())
+        mkdirSync(join(home, 'AppData'), { recursive: true })
+        const cfg = config(
+          {},
+          {
+            denyRead: [join(home, 'AppData'), join(home, '.cargo')],
+            allowWrite: [],
+          },
         )
-      })
+        const { argv } = await SandboxManager.wrapWithSandboxArgv(
+          'echo x',
+          undefined,
+          cfg,
+        )
+        const denied = argv.filter((_, i) => argv[i - 1] === '--deny-read')
+        expect(denied).toEqual([join(home, 'AppData'), join(home, '.cargo')])
+        // Nothing of the record is on the command line.
+        expect(argv.some(a => a.includes('entry-with-a-long-name'))).toBe(false)
+        expect(argv.join(' ').length).toBeLessThan(8000)
+      } finally {
+        extraRecorded = []
+      }
     })
 
     it('under the ordinary token there is no grant, and nothing is added to a deny', async () => {
@@ -7104,24 +7159,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       ]) {
         expect(envNames).not.toContain(v)
       }
-    })
-
-    it('windowsProfileReadExclusions: the credential files and read denies inside the profile', () => {
-      mkdirSync(join(home, '.secrets'))
-      mkdirSync(join(work, 'private'))
-      const cfg = config(
-        {},
-        { denyRead: [join(home, '.secrets'), join(work, 'private'), home] },
-      )
-      cfg.credentials = {
-        files: [
-          { path: join(home, '.npmrc'), mode: 'mask' },
-          { path: join(work, 'token'), mode: 'deny' },
-        ],
-      }
-      expect(new Set(winUtils.windowsProfileReadExclusions(cfg, home))).toEqual(
-        new Set([join(home, '.secrets'), join(home, '.npmrc')]),
-      )
     })
 
     it('user status: the grant is reported unless srt-win says there is none', () => {

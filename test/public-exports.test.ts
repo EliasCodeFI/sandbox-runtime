@@ -71,7 +71,6 @@ const PUBLIC_VALUE_EXPORTS = [
   'windowsProfileGrantNotice',
   'windowsProfileGrantSkipReason',
   'windowsProfileReadEnv',
-  'windowsProfileReadExclusions',
   'windowsStateDir',
   'windowsTrustCa',
   'windowsTrustCaAsync',

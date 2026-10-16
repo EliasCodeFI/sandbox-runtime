@@ -91,7 +91,6 @@ import {
   forgetWindowsProfileRead,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
-  windowsProfileGrantDenyTargets,
   revokeWindowsAclChecked,
   windowsAclIncompleteRevoke,
   type WindowsAclRevokeResult,
@@ -104,7 +103,6 @@ import {
   type SrtWinSpawn,
   type WindowsBinShell,
   type WindowsFsAccessSet,
-  type WindowsProfileGrantPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
@@ -231,12 +229,6 @@ const windowsWfpVerified = { defaultToken: false }
 // it is the option's default, so a wrap made there never gets the
 // ordinary token.
 let windowsWriteRestrictedToken = true
-// Windows, under the write-restricted token: the paths the profile read
-// grant wrote on, as recorded when initialize() checked it. A read deny
-// has to be stamped on each of these it covers
-// (windowsProfileGrantDenyTargets); `undefined` under the ordinary
-// token, where there is no such grant.
-let windowsProfileGrantPaths: readonly WindowsProfileGrantPath[] | undefined
 // Windows: whether this session's commands read the user's profile
 // through the profile read grant. 'absent': no grant is recorded (it
 // was skipped at install, or forgotten) or the session runs under the
@@ -1169,7 +1161,6 @@ async function initializeSteps(
     //    keep excluded cannot be relied on.
     // Under the ordinary token there is no grant: one that is found is
     // removed before anything else is granted.
-    windowsProfileGrantPaths = undefined
     windowsProfileRead = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
@@ -1178,7 +1169,7 @@ async function initializeSteps(
       if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
         if (u.profileGrant) forgetWindowsProfileRead({ srtWin })
       } else if (u.profileGrant) {
-        const grant = getWindowsProfileReadStatus({ paths: true, srtWin })
+        const grant = getWindowsProfileReadStatus({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
@@ -1193,7 +1184,6 @@ async function initializeSteps(
           )
         }
         if (grant.state === 'current') {
-          windowsProfileGrantPaths = grant.paths ?? []
           profileExclusions = grant
           windowsProfileRead = 'granted'
         }
@@ -1388,18 +1378,10 @@ async function initializeSteps(
         )
       }
       // A read deny on or above a path the profile read grant made
-      // readable is stamped on that path too, for the session: the
-      // path's own ALLOW would otherwise be met first. These ride the
-      // session's deny list, so reset() releases them with it, and a
-      // failure to stamp one fails initialize() below.
-      if (windowsProfileGrantPaths) {
-        acc.denyRead.push(
-          ...windowsProfileGrantDenyTargets(
-            acc.denyRead,
-            windowsProfileGrantPaths,
-          ),
-        )
-      }
+      // readable has to be on that path too, for the session: the
+      // path's own ALLOW would otherwise be met first. `srt-win` adds
+      // those from its record when it is handed the deny, so the deny
+      // is passed as it is, once, whatever it covers.
       // The trust bundle the CA-trust env vars point at
       // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
       // srt-sandbox child. It's written into the broker's %TEMP%,
@@ -2862,16 +2844,11 @@ async function wrapWithSandboxArgv(
         held: windowsFsStampedSet,
       })
       // As at initialize(): a deny on or above a path of the profile
-      // read grant goes on that path too, for this command.
-      const denyRead = windowsProfileGrantPaths
-        ? [
-            ...ranked.denyRead,
-            ...windowsProfileGrantDenyTargets(
-              ranked.denyRead,
-              windowsProfileGrantPaths,
-            ),
-          ]
-        : ranked.denyRead
+      // read grant goes on that path too, for this command — added by
+      // `srt-win` from its record, not listed here, so the command
+      // line carries one `--deny-read` per deny however many recorded
+      // paths it covers.
+      const denyRead = ranked.denyRead
       perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
@@ -3183,7 +3160,6 @@ async function reset(): Promise<void> {
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
-  windowsProfileGrantPaths = undefined
   windowsProfileRead = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 

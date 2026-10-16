@@ -31,11 +31,7 @@ export {
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
 import { literalReadings } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type {
-  FilesystemPathEntry,
-  SandboxRuntimeConfig,
-  SrtWinConfig,
-} from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -3065,10 +3061,16 @@ export interface WindowsProfileGrantOptions {
   /**
    * Paths inside the profile to keep unreadable in addition to the
    * built-in list (absolute, or relative to the profile): for example
-   * the embedding program's own configuration directory, or
-   * {@link windowsProfileReadExclusions} of a session configuration.
-   * They are recorded with the grant and stay in force on later runs
-   * that do not name them. Nothing removes a built-in exclusion.
+   * the embedding program's own configuration directory. They are
+   * recorded with the grant and stay in force — for every session,
+   * read and write — on later runs that do not name them. Nothing
+   * removes a built-in exclusion.
+   *
+   * These are deliberate, lasting choices. A session's own
+   * `filesystem.denyRead` and `credentials.files` do NOT belong here:
+   * a session denies those itself, for as long as it runs, and a path
+   * recorded here can no longer lie inside any session's
+   * `allowWrite` root.
    */
   exclude?: readonly string[]
   /**
@@ -3304,40 +3306,6 @@ function profilePathKey(p: string): string {
     .toLowerCase()
 }
 
-/** `p` relative to `profile` (`/`-separated, lower case), or `undefined` if it is not beneath it. */
-function relativeToProfile(profile: string, p: string): string | undefined {
-  const root = profilePathKey(profile)
-  const key = profilePathKey(p)
-  return key.startsWith(root + '/') ? key.slice(root.length + 1) : undefined
-}
-
-/**
- * The paths a session configuration keeps unreadable that lie inside
- * the profile — every `credentials.files` path and
- * `filesystem.denyRead` path — to pass to
- * {@link grantWindowsProfileRead} (or the install) as `exclude`. A
- * session denies those itself (see
- * {@link windowsProfileGrantDenyTargets}); excluding them when the
- * grant is made keeps them unreadable for every other session too.
- *
- * `profileDir` is the profile of the user running this; globs are
- * expanded as of now.
- */
-export function windowsProfileReadExclusions(
-  config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>,
-  profileDir: string,
-): string[] {
-  const out = new Set<string>()
-  const named: FilesystemPathEntry[] = [
-    ...(config.filesystem?.disabled ? [] : (config.filesystem?.denyRead ?? [])),
-    ...(config.credentials?.files ?? []).map(f => f.path),
-  ]
-  for (const p of expandWindowsFsPaths(named, { mode: 'deny' })) {
-    if (relativeToProfile(profileDir, p) !== undefined) out.add(p)
-  }
-  return [...out]
-}
-
 /** How a path a session wants to grant stands to a profile exclusion. */
 export interface WindowsProfileExclusionConflict {
   /** The path as the session configuration resolved it. */
@@ -3568,38 +3536,6 @@ export function windowsProfileExclusionConflicts(
       })
       break
     }
-  }
-  return out
-}
-
-/**
- * What a session's read denies have to be stamped on, beyond their
- * own paths, while a profile read grant exists.
- *
- * A granted directory, a container and a granted file each carry an
- * ALLOW of their own for the sandbox group. A deny on the same path,
- * or on anything beneath a granted directory, comes first and wins. A
- * deny on a directory ABOVE one of them reaches it only by
- * inheritance, behind its own ALLOW, and loses. So for every deny
- * that is such a path or lies above it, the path itself gets the deny
- * for the session.
- *
- * Returns the recorded paths to add to `denyRead` (none that is
- * already in it).
- */
-export function windowsProfileGrantDenyTargets(
-  denyRead: readonly string[],
-  paths: readonly WindowsProfileGrantPath[],
-): string[] {
-  if (denyRead.length === 0 || paths.length === 0) return []
-  const denyKeys = denyRead.map(windowsPathKey)
-  const already = new Set(denyKeys)
-  const out: string[] = []
-  for (const p of paths) {
-    if (p.kind === 'denied') continue
-    const key = normalizeCaseForComparison(profilePathKey(p.path))
-    if (already.has(key)) continue
-    if (denyKeys.some(d => isAtOrUnder(key, d))) out.push(p.path)
   }
   return out
 }

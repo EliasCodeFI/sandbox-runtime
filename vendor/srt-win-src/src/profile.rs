@@ -847,6 +847,26 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
     )
 }
 
+/// The recorded paths a session's read deny on `deny` (canonical) is
+/// written on as well ([`plan::covered_by_read_deny`]), among those
+/// that still exist. Nothing when no grant is recorded. A record that
+/// cannot be read is an error: a deny that silently covered less than
+/// it says is worse than a command that does not start.
+pub fn read_deny_also(deny: &str) -> Result<Vec<String>> {
+    let m = read_marker_at(persist::MARKER_KEY).context("read the profile read grant record")?;
+    Ok(
+        plan::covered_by_read_deny(deny, m.paths.iter().map(|r| (r.path.as_str(), r.kind)))
+            .into_iter()
+            .filter(|p| match open_no_follow(p, FILE_READ_ATTRIBUTES) {
+                Ok(_) => true,
+                // Gone since it was recorded: nothing to deny.
+                Err(e) => !path_id::is_not_found(&e),
+            })
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 /// The entries of the directory `dir`, read through a handle opened
 /// without following a link.
 ///

@@ -85,7 +85,6 @@ export {
   grantWindowsProfileRead,
   forgetWindowsProfileRead,
   getWindowsProfileReadStatus,
-  windowsProfileReadExclusions,
   windowsProfileReadEnv,
   windowsProfileExclusionConflicts,
   windowsProfileGrantSkipReason,

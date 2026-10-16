@@ -1314,6 +1314,42 @@ fn walk(
     }
 }
 
+// ─── A session's read deny on top of the grant ─────────────────────────
+
+/// The recorded paths a read deny on `deny` has to be written on as
+/// well, for it to hold against the grant.
+///
+/// A container, a granted directory and a granted file each carry an
+/// ALLOW of their own for the sandbox group. A deny on the same path
+/// comes first and wins, and a deny on a granted directory reaches
+/// everything beneath it, where nothing carries an entry of its own.
+/// A deny on a directory ABOVE a recorded path reaches that path only
+/// by inheritance, behind its own allow, and loses. So each recorded
+/// path that carries an allow and lies beneath `deny` gets the deny
+/// itself. That is the smallest set: one entry per recorded allow,
+/// none for what lies beneath a granted directory.
+///
+/// This is worked out by `srt-win`, which holds the record, from the
+/// deny alone — so the caller passes one path however many recorded
+/// paths it covers, and no list has to travel on a command line.
+pub fn covered_by_read_deny<'a>(
+    deny: &str,
+    recorded: impl IntoIterator<Item = (&'a str, Kind)>,
+) -> Vec<&'a str> {
+    let norm =
+        |p: &str| -> Vec<String> { split_path(p).iter().map(|c| norm_component(c)).collect() };
+    let deny = norm(deny);
+    recorded
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Container | Kind::Granted | Kind::File))
+        .filter(|(path, _)| {
+            let path = norm(path);
+            path.len() > deny.len() && path[..deny.len()] == deny[..]
+        })
+        .map(|(path, _)| path)
+        .collect()
+}
+
 // ─── Configuration pointers ─────────────────────────────────────────
 
 /// Environment variables an embedder may set for a sandboxed command
@@ -2737,6 +2773,87 @@ mod tests {
         assert_eq!(relation(&p(r".ssh\a"), &p(".ssh")), Some(Relation::Inside));
         assert_eq!(relation(&p(""), &p(".ssh")), Some(Relation::Above));
         assert_eq!(relation(&p("x"), &p(".ssh")), None);
+    }
+
+    #[test]
+    fn a_read_deny_is_also_written_on_each_recorded_allow_beneath_it() {
+        let root = r"\\?\C:\Users\me";
+        let rec: Vec<(String, Kind)> = [
+            ("", Kind::Container),
+            (r"\Documents", Kind::Granted),
+            (r"\.gitconfig", Kind::File),
+            (r"\.ssh", Kind::Denied),
+            (r"\AppData", Kind::Container),
+            (r"\AppData\Local", Kind::Container),
+            (r"\AppData\Local\Temp", Kind::Ungranted),
+            (r"\AppData\Local\Programs", Kind::Granted),
+            (r"\AppData\Local\IconCache.db", Kind::File),
+            (r"\AppData\Roaming", Kind::Container),
+            (r"\OneDrive", Kind::Skipped),
+        ]
+        .iter()
+        .map(|(p, k)| (format!("{root}{p}"), *k))
+        .collect();
+        let also = |deny: &str| -> Vec<String> {
+            covered_by_read_deny(
+                &format!("{root}{deny}"),
+                rec.iter().map(|(p, k)| (p.as_str(), *k)),
+            )
+            .into_iter()
+            .map(|p| p[root.len()..].to_owned())
+            .collect()
+        };
+        // On a container: every recorded allow beneath it, and neither
+        // the denied, the ungranted, the skipped nor the path itself.
+        assert_eq!(
+            also(r"\AppData"),
+            [
+                r"\AppData\Local",
+                r"\AppData\Local\Programs",
+                r"\AppData\Local\IconCache.db",
+                r"\AppData\Roaming"
+            ]
+        );
+        // However the deny is spelled.
+        assert_eq!(also(r"\APPDATA\local.").len(), 2);
+        // On a granted directory, a file, or something inside a
+        // granted directory: nothing more — the deny on the path
+        // itself reaches all there is.
+        assert!(also(r"\Documents").is_empty());
+        assert!(also(r"\.gitconfig").is_empty());
+        assert!(also(r"\Documents\work\secret").is_empty());
+        // A name that only begins like a recorded one is not above it.
+        assert!(also(r"\App").is_empty());
+        // On the profile itself: all of them but itself.
+        assert_eq!(also("").len(), 7);
+
+        // A record of a few thousand paths: one deny in, the paths
+        // out, with nothing to pass along a command line.
+        let many: Vec<(String, Kind)> = (0..6000)
+            .map(|i| {
+                let kind = match i % 3 {
+                    0 => Kind::Container,
+                    1 => Kind::Granted,
+                    _ => Kind::File,
+                };
+                (
+                    format!(r"{root}\AppData\Local\dir{}\entry-{i}", i % 40),
+                    kind,
+                )
+            })
+            .chain((0..500).map(|i| (format!(r"{root}\Documents\d{i}"), Kind::Granted)))
+            .collect();
+        let got = covered_by_read_deny(
+            &format!(r"{root}\AppData"),
+            many.iter().map(|(p, k)| (p.as_str(), *k)),
+        );
+        assert_eq!(got.len(), 6000);
+        assert!(got.iter().map(|p| p.len() + 14).sum::<usize>() > 32_767);
+        let one = covered_by_read_deny(
+            &format!(r"{root}\AppData\Local\dir7"),
+            many.iter().map(|(p, k)| (p.as_str(), *k)),
+        );
+        assert_eq!(one.len(), 150);
     }
 
     #[test]
