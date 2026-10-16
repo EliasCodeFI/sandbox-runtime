@@ -70,11 +70,14 @@ if ($pre.state -ne 'absent') {
 
 Run (@('install') + $isl + $pr)
 $iw = J (@('wfp', 'status') + $isl)
-# 6 = per ALE connect layer (v4, v6): loopback PERMIT, sandbox-user
-# BLOCK, anonymous BLOCK. `installed` (not `outdated`) also says each
-# BLOCK is present at this build's fence revision on both layers.
-if ($iw.state -ne 'installed' -or $iw.filters -lt 6) {
-  throw "install: wfp expected installed/>=6, got $($iw.state)/$($iw.filters)"
+# 4 = per ALE connect layer (v4, v6): loopback PERMIT, sandbox-user
+# BLOCK. Exactly 4: the count is of every srt-win filter under the
+# sublayer, so a fifth would be one this build must not install (a
+# BLOCK keyed on the anonymous token, say). `installed` (not
+# `outdated`) also says the BLOCK is present at this build's fence
+# revision on both layers.
+if ($iw.state -ne 'installed' -or $iw.filters -ne 4) {
+  throw "install: wfp expected installed/4, got $($iw.state)/$($iw.filters)"
 }
 if ($iw.port_range[0] -ne 60080 -or $iw.port_range[1] -ne 60089) {
   throw "install: expected port_range [60080,60089], got [$($iw.port_range -join ',')]"
