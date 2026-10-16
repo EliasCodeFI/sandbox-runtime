@@ -660,12 +660,13 @@ export interface WindowsSandboxParams {
    */
   denyReadExcept?: readonly string[]
   /**
-   * Under the write-restricted token: the process whose session this
-   * command belongs to and which `srt-win` has recorded as a holder of
-   * the kept grants ({@link grantWindowsAclPersistent} with that
-   * `holderPid`). Leave it out for a command with no such session:
-   * `srt-win exec` then records itself as the holder until the
-   * command has exited, so that neither the profile read grant nor a
+   * Under either token: the process whose session this command
+   * belongs to and which `srt-win` has recorded as one
+   * ({@link grantWindowsAclPersistent} or {@link grantWindowsAcl} with
+   * that `holderPid`). Leave it out for a command with no such
+   * session: `srt-win exec` then records itself until the command has
+   * exited — one more acquisition of its lock — so that the profile
+   * read grant is not made or removed beside the command, and no
    * write root is removed from under it.
    */
   heldBy?: number
@@ -978,7 +979,7 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
       args[0],
     )
   }
-  throwIfProfileBusy(args, r.status)
+  throwIfRefusedBesideOthers(args, r.status, r.stdout ?? '')
   return {
     status: r.status,
     signal: r.signal,
@@ -995,18 +996,96 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
  * waiting it out.
  */
 export const SRT_WIN_EXIT_PROFILE_BUSY = 25
+/** `srt-win`'s exit code for "nothing was removed: sandbox sessions or commands are running". */
+export const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
+/** `srt-win profile grant`'s exit code for "nothing was changed: sandbox sessions or commands are running". */
+export const SRT_WIN_EXIT_GRANT_BLOCKED = 24
 
-function throwIfProfileBusy(
+/** One row of `srt-win`'s `{"held_by": […]}`, said as what it is. */
+function describeWindowsHolder(h: {
+  pid?: unknown
+  kind?: unknown
+  path?: unknown
+}): string {
+  const who = `process ${String(h.pid)}`
+  const at = String(h.path)
+  switch (h.kind) {
+    case 'profile':
+      return `${who} is a sandbox session or command`
+    case 'kept_root':
+      return `${who} runs on the kept write grant on ${at}`
+    case 'grant':
+      return `${who} holds a session grant on ${at}`
+    case 'deny':
+    case 'deny_fdc':
+    case 'deny_delete':
+    case 'deny_satisfied':
+      return `${who} holds a session deny on ${at}`
+    default:
+      return `${who} holds ${String(h.kind)} on ${at}`
+  }
+}
+
+function describeWindowsHolders(stdout: string): string {
+  let held: { pid?: unknown; kind?: unknown; path?: unknown }[] = []
+  try {
+    const parsed = JSON.parse(stdout) as { held_by?: unknown }
+    if (Array.isArray(parsed.held_by)) held = parsed.held_by as typeof held
+  } catch {
+    // The exit code says it; the list is for the message only.
+  }
+  const said = held.slice(0, 8).map(describeWindowsHolder)
+  if (held.length > said.length) {
+    said.push(`${held.length - said.length} more`)
+  }
+  return said.join('; ')
+}
+
+/**
+ * The one mapping of the exit codes with which `srt-win` refuses to
+ * act beside other sandbox activity, used by every way this module
+ * runs it: a profile operation is running (25); sessions or commands
+ * are running and nothing was removed (22) or the profile grant was
+ * not changed (24).
+ */
+function throwIfRefusedBesideOthers(
   args: readonly string[],
   status: number | null,
+  stdout: string,
 ): void {
-  if (status !== SRT_WIN_EXIT_PROFILE_BUSY) return
+  if (status === SRT_WIN_EXIT_PROFILE_BUSY) {
+    throw new WindowsSandboxError(
+      'profile_operation_in_progress',
+      `The read grant on your user profile is being written or removed ` +
+        `right now (srt-win profile grant / profile forget). Nothing in the ` +
+        `sandbox can start until that is done; try again when it has ` +
+        `finished.`,
+      args[0],
+    )
+  }
+  if (
+    status !== SRT_WIN_EXIT_HELD_BY_OTHERS &&
+    status !== SRT_WIN_EXIT_GRANT_BLOCKED
+  ) {
+    return
+  }
+  const what = describeWindowsHolders(stdout)
+  const who = what ? ` (${what})` : ''
+  if (status === SRT_WIN_EXIT_GRANT_BLOCKED) {
+    throw new WindowsSandboxError(
+      'profile_grant_blocked_by_session',
+      `The read grant on your user profile was not changed: sandbox ` +
+        `sessions or commands are running${who}, and the grant is written ` +
+        `only while none is, so that no session sees it change. What was ` +
+        `granted before is as it was. End them and run it again.`,
+      args[0],
+    )
+  }
   throw new WindowsSandboxError(
-    'profile_operation_in_progress',
-    `The read grant on your user profile is being written or removed ` +
-      `right now (srt-win profile grant / profile forget). Nothing in the ` +
-      `sandbox can start until that is done; try again when it has ` +
-      `finished.`,
+    'kept_grants_in_use',
+    `srt-win ${args.slice(0, 2).join(' ')} removed nothing: sandbox ` +
+      `sessions or commands are running${who}, and what they run on is ` +
+      `not taken from under them. End them and run it again.`,
     args[0],
   )
 }
@@ -1070,7 +1149,7 @@ function runSrtWinAsync(
         return
       }
       try {
-        throwIfProfileBusy(args, status)
+        throwIfRefusedBesideOthers(args, status, stdout)
       } catch (e) {
         reject(e as Error)
         return
@@ -2703,6 +2782,20 @@ function installProfileGrantOptions(
  */
 function throwInstallProfileGrantFailure(e: unknown): never {
   const cause = e as Error
+  // Refused beside other sandbox activity: nothing was written, and
+  // a grant made before is still the current one. Said as that, under
+  // its own code.
+  if (
+    cause instanceof WindowsSandboxError &&
+    (cause.code === 'profile_grant_blocked_by_session' ||
+      cause.code === 'profile_operation_in_progress')
+  ) {
+    throw new WindowsSandboxError(
+      cause.code,
+      `The Windows sandbox is installed. ${cause.message}`,
+      'profile',
+    )
+  }
   const timedOut =
     cause instanceof WindowsSandboxError && cause.code === 'srt_win_timeout'
   throw new WindowsSandboxError(
@@ -3549,7 +3642,6 @@ export async function forgetWindowsPersistentGrants(
     `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
   )
-  throwIfKeptGrantsInUse(r, 'acl')
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'acl_forget_failed',
@@ -3560,46 +3652,10 @@ export async function forgetWindowsPersistentGrants(
   }
 }
 
-/** `srt-win`'s exit code for "another live session runs on a kept grant". */
-const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
-
 function unlessHeldArgs(holderPid: number | undefined): string[] {
   return holderPid === undefined
     ? []
     : ['--unless-held-by-others', `${holderPid}`]
-}
-
-/**
- * Turn `srt-win`'s refusal to remove a kept grant from under another
- * live session into the typed error, naming those sessions.
- */
-function throwIfKeptGrantsInUse(r: RunResult, command: string): void {
-  if (r.status !== SRT_WIN_EXIT_HELD_BY_OTHERS) return
-  let held: { pid?: unknown; kind?: unknown; path?: unknown }[] = []
-  try {
-    const parsed = JSON.parse(r.stdout) as { held_by?: unknown }
-    if (Array.isArray(parsed.held_by)) held = parsed.held_by as typeof held
-  } catch {
-    // The exit code says it; the list is for the message only.
-  }
-  const what = held
-    .map(
-      h =>
-        `process ${String(h.pid)} ` +
-        (h.kind === 'profile'
-          ? `reads the profile through the profile read grant`
-          : `writes ${String(h.path)} through a kept grant`),
-    )
-    .join('; ')
-  throw new WindowsSandboxError(
-    'kept_grants_in_use',
-    `Another sandbox session is running on grants this one would have to ` +
-      `remove to use windows.writeRestrictedToken: false` +
-      (what ? ` (${what})` : '') +
-      `. Nothing was removed and nothing was granted. End that session ` +
-      `first, or start this one with the write-restricted token.`,
-    command,
-  )
 }
 
 /**
@@ -3949,12 +4005,16 @@ export function getWindowsProfileReadStatus(
 ): WindowsProfileGrantStatus {
   const args = ['profile', 'status']
   if (opts.paths) args.push('--paths')
-  return mapProfileStatus(
-    runSrtWinJson<RawProfileStatus>(args, {
-      timeoutMs: 30_000,
-      srtWin: opts.srtWin,
-    }),
-  )
+  const raw = runSrtWinJson<RawProfileStatus>(args, {
+    timeoutMs: 30_000,
+    srtWin: opts.srtWin,
+  })
+  // Asked while a grant or forget is running: the record is being
+  // rewritten, and is not a run that was cut short.
+  if (raw.state === 'in_progress') {
+    throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
+  }
+  return mapProfileStatus(raw)
 }
 
 export interface WindowsProfileGrantOptions {
@@ -4006,6 +4066,21 @@ export interface WindowsProfileGrantItem {
    * identity is not known), `not_local`, `probe_failed`.
    */
   cause?: string
+  /**
+   * Set where an entry THIS PRODUCT wrote is what makes the path
+   * readable to sandboxed commands and could not be removed: whether
+   * the path is on the exclusion list now (`true`: a protected store
+   * open through that entry — such an item is among `unprotected`) or
+   * has merely left the grant (`false`, among `staleAllow`).
+   */
+  protectedExclusion?: boolean
+  /**
+   * With `protectedExclusion`: `explicit` — the entry is on the
+   * object, which you may not change; `inherited` — a copy handed down
+   * from a directory above, which could not be taken off the object.
+   * `reason` carries the `icacls` command that removes it.
+   */
+  entry?: 'explicit' | 'inherited'
 }
 
 export interface WindowsProfileGrantResult {
@@ -4050,21 +4125,17 @@ export interface WindowsProfileGrantResult {
    */
   unprotected: WindowsProfileGrantItem[]
   /**
-   * Paths that are no longer to be readable — excluded now, or no
-   * longer part of the grant — and still carry the allow of an
+   * Paths that have left the grant and still carry the allow of an
    * earlier run, which could not be removed: readable through the
-   * grant's own entry. Show these to the user as well.
+   * grant's own entry. (One that is on the exclusion list now is
+   * among `unprotected`, with `protectedExclusion` set.) Show these to
+   * the user as well.
    */
   staleAllow: WindowsProfileGrantItem[]
-  /** Always empty; kept for readers of earlier results. */
-  failed: WindowsProfileGrantItem[]
   elapsedMs: number
 }
 
 const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
-
-/** `srt-win profile grant`'s exit code for "a live session's read deny covers a path it would newly allow". */
-const SRT_WIN_EXIT_GRANT_BLOCKED = 24
 
 /** A `[{path, reason}]` list as `srt-win` reports it; anything else is none. */
 function grantItems(v: unknown): WindowsProfileGrantItem[] {
@@ -4075,9 +4146,16 @@ function grantItems(v: unknown): WindowsProfileGrantItem[] {
           reason?: unknown
         }
         if (typeof p !== 'string') return []
-        const { caller_reads: reads, cause } = i as {
+        const {
+          caller_reads: reads,
+          cause,
+          protected_exclusion: protectedExclusion,
+          entry,
+        } = i as {
           caller_reads?: unknown
           cause?: unknown
+          protected_exclusion?: unknown
+          entry?: unknown
         }
         return [
           {
@@ -4087,6 +4165,10 @@ function grantItems(v: unknown): WindowsProfileGrantItem[] {
               callerReads: reads,
             }),
             ...(typeof cause === 'string' && { cause }),
+            ...(typeof protectedExclusion === 'boolean' && {
+              protectedExclusion,
+            }),
+            ...((entry === 'explicit' || entry === 'inherited') && { entry }),
           },
         ]
       })
@@ -4179,7 +4261,7 @@ export async function grantWindowsProfileRead(
         return
       }
       try {
-        throwIfProfileBusy(args, status)
+        throwIfRefusedBesideOthers(args, status, stdout)
       } catch (e) {
         reject(e as Error)
         return
@@ -4204,17 +4286,6 @@ function profileGrantResult(
   logForDebugging(
     `[Sandbox Windows] profile grant exit=${r.status}: ${r.stderr.slice(-2000)}`,
   )
-  if (r.status === SRT_WIN_EXIT_GRANT_BLOCKED) {
-    throw new WindowsSandboxError(
-      'profile_grant_blocked_by_session',
-      `The read grant on your user profile was not changed: sandbox ` +
-        `sessions or commands are running, and the grant is written only ` +
-        `while none is, so that no session sees it change. End them and ` +
-        `run it again. ` +
-        `${r.stderr.slice(-2000) || r.stdout}`,
-      'profile',
-    )
-  }
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'profile_grant_failed',
@@ -4259,7 +4330,6 @@ function profileGrantResult(
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
     staleAllow: grantItems(raw.stale_allow),
-    failed: raw.failed ?? [],
     elapsedMs: raw.elapsed_ms,
   }
 }
@@ -4332,7 +4402,6 @@ export async function forgetWindowsProfileReadAsync(
       srtWin: opts.srtWin,
     },
   )
-  throwIfKeptGrantsInUse(r, 'profile')
   profileForgetResult(r)
 }
 
@@ -4913,10 +4982,10 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
+  if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
   if (writeRestricted) {
     argv.push('--write-restricted-token')
     for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
-    if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
   }
   if (p.loopbackPortRange) {
     argv.push(

@@ -217,6 +217,10 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
 let windowsFsSbUserSid: string | undefined
+// Whether initialize() registered this process with srt-win as a
+// session: always under the write-restricted token; under the
+// ordinary one only with an srt-win that says it keeps such records.
+let windowsSessionRegistered = false
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -347,11 +351,22 @@ export function windowsProfileReadWarningsOf(
   const list = (items: readonly WindowsProfileGrantItem[]) =>
     items.map(i => i.path).join(', ')
   const out: WindowsProfileReadWarning[] = []
-  const byList = grant.unprotected
+  // Open through an entry this product wrote and could not take
+  // back: the strongest case, said first and as what it is.
+  const byOurs = grant.unprotected.filter(i => i.entry !== undefined)
+  const byList = grant.unprotected.filter(i => i.entry === undefined)
   const callerReads = grant.unverifiable.filter(i => i.callerReads === true)
   const rest = grant.unverifiable.filter(i => i.callerReads !== true)
-  if (byList.length + callerReads.length > 0) {
+  if (byOurs.length + byList.length + callerReads.length > 0) {
     const parts: string[] = []
+    if (byOurs.length > 0) {
+      parts.push(
+        `${byOurs.length} READABLE THROUGH AN ENTRY THIS PRODUCT WROTE and ` +
+          `could not remove — each path's reason gives the icacls command ` +
+          `that removes it, to be run as the object's owner or from an ` +
+          `elevated prompt, followed by the grant again (${list(byOurs)})`,
+      )
+    }
     if (byList.length > 0) {
       parts.push(
         `${byList.length} by their own access lists, which you may not ` +
@@ -372,7 +387,7 @@ export function windowsProfileReadWarningsOf(
         `be denied and are, or may be, readable to sandboxed commands: ` +
         parts.join('; ') +
         `. Only their owner or an administrator can close them.`,
-      paths: [...byList, ...callerReads],
+      paths: [...byOurs, ...byList, ...callerReads],
     })
   }
   if (rest.length > 0) {
@@ -412,10 +427,11 @@ export function windowsProfileReadWarningsOf(
     out.push({
       code: 'profile_stale_allow',
       message:
-        `${grant.staleAllow.length} path(s) that are no longer to be ` +
-        `readable still carry an entry of the profile read grant that ` +
-        `could not be removed, and are readable to sandboxed commands ` +
-        `through it: ${list(grant.staleAllow)}.`,
+        `${grant.staleAllow.length} path(s) that have left the profile ` +
+        `read grant still carry an entry of it that could not be removed, ` +
+        `and are readable to sandboxed commands through it: ` +
+        `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
+        `path's reason gives the icacls command that removes the entry.`,
       paths: grant.staleAllow,
     })
   }
@@ -1715,6 +1731,9 @@ async function initializeSteps(
         acc.grantWrite.length > 0 ||
         acc.denyRead.length > 0 ||
         denyWrite.length > 0
+      const registersUnderOrdinaryToken =
+        !writeRestricted &&
+        u.capabilities.includes(WINDOWS_SRT_WIN_CAPABILITIES.execHolder)
       if (writeRestricted) {
         // One call: the write roots are granted persistently (kept at
         // reset(); a root granted before costs one DACL read), the
@@ -1758,7 +1777,18 @@ async function initializeSteps(
         // Grant FIRST so the sandbox user has working-tree access by
         // the time the deny stamp runs. The two are independent
         // refcounted state-DB sets keyed on the same holder PID.
-        if (grantRead.length > 0 || acc.grantWrite.length > 0) {
+        //
+        // With an srt-win that records sessions it is made with
+        // nothing to grant too: the call is what records this process
+        // as one, and the profile read grant is not made or removed
+        // while one exists. An srt-win that does not say so is asked
+        // for nothing it was not asked for before: this token needs
+        // no capability of it.
+        if (
+          registersUnderOrdinaryToken ||
+          grantRead.length > 0 ||
+          acc.grantWrite.length > 0
+        ) {
           grantWindowsAcl({
             sandboxUserSid: sb,
             read: grantRead,
@@ -1775,14 +1805,14 @@ async function initializeSteps(
           })
         }
       }
-      // Only record when something was actually applied — gates
-      // running revoke/restore at reset(). Recorded AFTER success —
-      // the catch below clears `config`, and a non-undefined
+      // Gates running revoke/restore at reset(). Recorded AFTER
+      // success — the catch below clears `config`, and a non-undefined
       // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed. A session under the write-restricted token
-      // always registered as a holder of the profile read grant, and
-      // releases that the same way.
-      if (anyApplied || writeRestricted) {
+      // that never landed. Recorded whenever something was applied or
+      // the session registered itself with srt-win, which it releases
+      // the same way.
+      windowsSessionRegistered = writeRestricted || registersUnderOrdinaryToken
+      if (anyApplied || windowsSessionRegistered) {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
@@ -1806,6 +1836,7 @@ async function initializeSteps(
         }
       }
       windowsFsSbUserSid = undefined
+      windowsSessionRegistered = false
       windowsProfileRead = undefined
       if (windowsJavaAgentJarPath) {
         removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
@@ -3268,13 +3299,17 @@ async function wrapWithSandboxArgv(
       // The session's own grants beneath those denies keep their
       // rank: srt-win leaves the recorded profile paths they cover
       // out of what it denies for this command.
-      denyReadExcept: windowsGrantsBeneathDenies(
-        [
-          ...(windowsFsStampedSet?.grantRead ?? []),
-          ...(windowsFsStampedSet?.grantWrite ?? []),
-        ],
-        perExecDenyRead,
-      ),
+      // (Under the ordinary token there is no profile grant and
+      // nothing to leave out; the flag is not sent.)
+      denyReadExcept: writeRestrictedToken
+        ? windowsGrantsBeneathDenies(
+            [
+              ...(windowsFsStampedSet?.grantRead ?? []),
+              ...(windowsFsStampedSet?.grantWrite ?? []),
+            ],
+            perExecDenyRead,
+          )
+        : undefined,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -3290,9 +3325,11 @@ async function wrapWithSandboxArgv(
       // checks that it really holds — an embedder that revoked the
       // session's grants in the middle of it no longer does — and
       // otherwise, as for a command with no session behind it, holds
-      // for the command itself.
+      // for the command itself. Named only where the session did
+      // register: under the ordinary token an srt-win that keeps no
+      // such records does not know the flag.
       heldBy:
-        writeRestrictedToken && windowsFsSbUserSid !== undefined
+        windowsSessionRegistered && windowsFsSbUserSid !== undefined
           ? process.pid
           : undefined,
       // The roots initialize() granted persistently; their capability
@@ -3550,6 +3587,7 @@ async function reset(): Promise<void> {
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
+  windowsSessionRegistered = false
   windowsFsRawInputs = undefined
   // After the revoke and restore above, so both ACEs are released
   // while the path still resolves.

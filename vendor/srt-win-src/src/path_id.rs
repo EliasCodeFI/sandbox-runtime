@@ -683,10 +683,6 @@ pub fn locate_by_file_id_local(file_id: &FileId) -> Located {
 }
 
 fn locate_on(file_id: &FileId, local_only: bool) -> Located {
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
-    use windows::Win32::Storage::FileSystem::{
-        ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
-    };
     // A handle ON the volume the file lived on, to anchor
     // OpenFileById. The volume is found by its serial among the
     // volumes of this machine — not among drive letters: a volume
@@ -696,57 +692,134 @@ fn locate_on(file_id: &FileId, local_only: bool) -> Located {
         // No volume that is present carries this serial.
         return Located::VolumeAbsent;
     };
+    // `ERROR_INVALID_PARAMETER` is how NTFS rejects a stale file
+    // reference.
+    locate_from(vh.raw(), file_id, true)
+}
+
+/// The root of the share `canon` is on: `\\?\UNC\server\share\`, or
+/// the root of a drive letter (one mapped to a share). `None` for any
+/// other shape.
+pub fn share_root(canon: &str) -> Option<String> {
+    let rest = canon.strip_prefix(r"\\?\")?;
+    if let Some(unc) = rest
+        .strip_prefix(r"UNC\")
+        .or_else(|| rest.strip_prefix(r"unc\"))
     {
-        let desc = FILE_ID_DESCRIPTOR {
-            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
-            Type: ExtendedFileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 {
-                ExtendedFileId: FILE_ID_128 {
-                    Identifier: file_id.id128,
-                },
-            },
-        };
-        // dwDesiredAccess = 0: GetFinalPathNameByHandleW needs only
-        // a valid handle, not read-data, so a relocated file whose
-        // DACL no longer grants the broker read still resolves.
-        let fh = match unsafe {
-            OpenFileById(
-                vh.raw(),
-                &desc,
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
-        } {
-            Ok(h) => OwnedHandle(h),
-            Err(e)
-                if e.code() == ERROR_FILE_NOT_FOUND.into()
-                    || e.code() == ERROR_INVALID_PARAMETER.into() =>
-            {
-                return Located::Gone;
-            }
-            Err(_) => return Located::Unknown,
-        };
-        // By drive letter or mount folder where the volume has one,
-        // by volume GUID path where it has none.
-        let Ok(buf) = final_path_from_handle(fh.raw())
-            .or_else(|_| final_path_with(fh.raw(), VOLUME_NAME_GUID.0))
-        else {
-            return Located::Unknown;
-        };
-        let s = String::from_utf16_lossy(&buf);
-        if utf16_roundtrips(&buf, &s) {
-            Located::At(s)
-        } else {
-            Located::Unknown
+        let mut parts = unc.split('\\').filter(|p| !p.is_empty());
+        let (server, share) = (parts.next()?, parts.next()?);
+        return Some(format!(r"\\?\UNC\{server}\{share}\"));
+    }
+    let b = rest.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        .then(|| format!(r"\\?\{}\", &rest[..2]))
+}
+
+/// [`locate_by_file_id`] for an object on a network share, asked of
+/// the share `canon` is on: the caller named that path, so the server
+/// is contacted.
+///
+/// A share may not open files by id at all, and says so in more than
+/// one way; only its plain "no such file" is [`Located::Gone`]. The
+/// share not answering is [`Located::VolumeAbsent`]; everything else —
+/// unsupported, refused, another volume behind the same name — is
+/// [`Located::Unknown`].
+pub fn locate_on_share(canon: &str, file_id: &FileId) -> Located {
+    let Some(root) = share_root(canon) else {
+        return Located::Unknown;
+    };
+    let root_handle = match open_for_metadata(&root) {
+        Ok(h) => h,
+        Err(e) => {
+            return match open_failure(&e) {
+                OpenFailure::Other => Located::Unknown,
+                _ => Located::VolumeAbsent,
+            };
         }
+    };
+    // The same name may lead to another volume now: an id means
+    // nothing there.
+    match file_id_from_handle(root_handle.raw()) {
+        Ok(now) if now.volume_serial == file_id.volume_serial => {}
+        _ => return Located::Unknown,
+    }
+    locate_from(root_handle.raw(), file_id, false)
+}
+
+/// Open the object `file_id` names on the volume `anchor` is a handle
+/// on, and say where it is. `stale_is_gone`: the volume's
+/// `ERROR_INVALID_PARAMETER` means the id names nothing (true of a
+/// local NTFS volume, not of a share, where it may mean "not
+/// supported").
+fn locate_from(anchor: HANDLE, file_id: &FileId, stale_is_gone: bool) -> Located {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
+    use windows::Win32::Storage::FileSystem::{
+        ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
+    };
+    let desc = FILE_ID_DESCRIPTOR {
+        dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: ExtendedFileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            ExtendedFileId: FILE_ID_128 {
+                Identifier: file_id.id128,
+            },
+        },
+    };
+    // dwDesiredAccess = 0: GetFinalPathNameByHandleW needs only
+    // a valid handle, not read-data, so a relocated file whose
+    // DACL no longer grants the broker read still resolves.
+    let fh = match unsafe {
+        OpenFileById(
+            anchor,
+            &desc,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    } {
+        Ok(h) => OwnedHandle(h),
+        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.into() => return Located::Gone,
+        Err(e) if stale_is_gone && e.code() == ERROR_INVALID_PARAMETER.into() => {
+            return Located::Gone;
+        }
+        Err(_) => return Located::Unknown,
+    };
+    // By drive letter or mount folder where the volume has one,
+    // by volume GUID path where it has none.
+    let Ok(buf) =
+        final_path_from_handle(fh.raw()).or_else(|_| final_path_with(fh.raw(), VOLUME_NAME_GUID.0))
+    else {
+        return Located::Unknown;
+    };
+    let s = String::from_utf16_lossy(&buf);
+    if utf16_roundtrips(&buf, &s) {
+        Located::At(s)
+    } else {
+        Located::Unknown
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The share a path is on, for a lookup by file id there.
+    #[test]
+    fn the_root_of_a_share_is_its_server_and_share_or_its_drive() {
+        assert_eq!(
+            share_root(r"\\?\UNC\srv\data\a\b").as_deref(),
+            Some(r"\\?\UNC\srv\data\")
+        );
+        assert_eq!(
+            share_root(r"\\?\UNC\srv\data").as_deref(),
+            Some(r"\\?\UNC\srv\data\")
+        );
+        assert_eq!(share_root(r"\\?\Z:\a\b").as_deref(), Some(r"\\?\Z:\"));
+        assert_eq!(share_root(r"\\?\UNC\srv"), None);
+        assert_eq!(share_root(r"\\srv\data\a"), None);
+        assert_eq!(share_root(r"\\?\Volume{x}\a"), None);
+    }
 
     /// The table of open errors.
     #[test]

@@ -392,15 +392,30 @@ try {
   # that names no administrator: a directory that would be GRANTED,
   # with the access list the Windows Installer directory has, and an
   # EXCLUDED directory that Users may read.
+  #
+  # The owner is changed FIRST, while the access list the directory
+  # inherited still lets the caller do it, and the restrictive list is
+  # written after, through that same inherited entry: an owner's
+  # implied rights do not include giving the object away, so the other
+  # order is refused. `srt-win` then runs as this same administrator,
+  # who is no longer the owner and is named by no entry — it enables
+  # no privilege for the grant, so it has no right to write the list.
+  # (An administrator CAN take the object back; cleanup does, with
+  # `takeown`. The product never does.)
   $instDir  = Join-Path $prof 'AppData\Roaming\Microsoft\Installer'
   $instFile = Seed 'AppData\Roaming\Microsoft\Installer\x.txt' 'INSTALLER-CONTENT'
   $openDir  = Join-Path $prof '.docker'
   $openFile = Seed '.docker\config.json' 'DOCKER-CONTENT'
-  Set-OnlyAces $instDir @('(A;OICI;0x1200a9;;;WD)', '(A;OICI;FA;;;SY)')
-  Set-OnlyAces $openDir @('(A;OICI;0x1200a9;;;BU)', '(A;OICI;FA;;;SY)')
   foreach ($d in @($instDir, $openDir)) {
     & icacls $d /setowner '*S-1-5-18' | Out-Null
     if ($LASTEXITCODE -eq 0) { $disowned += $d } else { Fail "B: setup — could not hand $d to SYSTEM" }
+  }
+  Set-OnlyAces $instDir @('(A;OICI;0x1200a9;;;WD)', '(A;OICI;FA;;;SY)')
+  Set-OnlyAces $openDir @('(A;OICI;0x1200a9;;;BU)', '(A;OICI;FA;;;SY)')
+  foreach ($d in @($instDir, $openDir)) {
+    if ((Get-Acl -LiteralPath $d).Owner -notmatch 'SYSTEM') {
+      Fail "B: setup — $d is not owned by SYSTEM; the rows about it prove nothing"
+    }
   }
 
   # ── G: the grant ─────────────────────────────────────────────────
@@ -414,8 +429,8 @@ try {
   else { Fail "G: profile grant exit=$($g.exit) complete=$($g.json.complete) raw: $($g.raw)" }
   if ($g.raw -match 'top-level item\(s\) done') { Ok 'G: progress lines on stderr' }
   else { Fail 'G: no progress line in the output' }
-  if (@($g.json.failed).Count -eq 0) { Ok 'G: no path failed' }
-  else { Fail "G: failed paths: $($g.json.failed | ConvertTo-Json -Compress)" }
+  if ($g.json.complete -and @($g.json.stale_allow).Count -eq 0) { Ok 'G: the grant is complete and left no entry behind' }
+  else { Fail "G: complete=$($g.json.complete) stale_allow=$($g.json.stale_allow | ConvertTo-Json -Compress)" }
   $st = Status
   if ($st.state -eq 'current' -and $st.env.NPM_CONFIG_USERCONFIG -and @($st.paths).Count -gt 0) {
     Ok "G: status is current for the made-up profile, with NPM_CONFIG_USERCONFIG=$($st.env.NPM_CONFIG_USERCONFIG)"
@@ -935,7 +950,7 @@ finally {
     & icacls $lockedDir /remove:d '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' 2>&1 | Out-Null
   }
   foreach ($d in $disowned) {
-    & icacls $d /setowner '*S-1-5-32-544' 2>&1 | Out-Null
+    & takeown /F $d /A /R /D Y 2>&1 | Out-Null
     & icacls $d /reset /T /C /Q 2>&1 | Out-Null
   }
   # Junctions first, as links: never through them.

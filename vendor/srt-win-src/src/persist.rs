@@ -96,9 +96,11 @@
 //! returns except `acl forget --drop-pending` ([`drop_pending`]), which
 //! says what it leaves behind.
 //!
-//! An entry on a network share cannot be looked for by file id, and
-//! looking contacts the server: it is tried at its recorded path, by
-//! an explicit `forget` or uninstall only, and does not refuse the
+//! An entry on a network share is tried at its recorded path and
+//! then looked for by its file id on that share, which contacts the
+//! server: by an explicit `forget` or uninstall only. Where the share
+//! cannot say where the object is, or that it is gone, the entry
+//! stays until `--drop-pending`. It does not refuse the
 //! ordinary token meanwhile (a local group's entries on a share's
 //! files match no token there).
 //!
@@ -1275,10 +1277,11 @@ fn forget_one_with(
 /// removes an entry — a volume that will never return is given up
 /// only by [`drop_pending`], on request.
 ///
-/// One on a network share cannot be looked for by id. It is tried at
-/// its recorded path, and only when `probe_network` is set — an
-/// explicit `forget` or uninstall — because trying contacts the
-/// server: never at a session start.
+/// One on a network share is tried at its recorded path and, when
+/// that does not lead to it, looked for by its id on that share —
+/// only when `probe_network` is set (an explicit `forget` or
+/// uninstall), because either contacts the server: never at a session
+/// start.
 ///
 /// Returns what is still pending.
 pub(crate) fn retry_pending(
@@ -1295,31 +1298,40 @@ pub(crate) fn retry_pending(
             if !probe_network {
                 return Located::VolumeAbsent;
             }
-            // On a share an object cannot be looked for by its id;
-            // its recorded path is all there is. If the path answers
-            // with the recorded object, it is stripped there. If it
-            // answers with ANOTHER object — the directory was removed
-            // and made again — the recorded one is gone, and so is
-            // the entry: there is nothing left that could be stripped
-            // or waited for. If it does not answer, the entry waits.
+            // On a share the recorded path is tried first. If it does
+            // not lead to the recorded object — nothing there, or
+            // another object — the object may have been renamed and
+            // still carry the grant: it is looked for by its id on
+            // that share. Found, it is stripped where it is. The
+            // share saying the id names nothing, the entry goes. The
+            // share not saying (it does not open files by id, or
+            // refused), the entry STAYS: only `--drop-pending` gives
+            // it up. A path that does not answer waits.
+            let elsewhere = || match path_id::locate_on_share(&p.path, &p.file_id) {
+                Located::Gone => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on no longer \
+                         exists on its share; its record is dropped",
+                        p.path
+                    );
+                    Located::Gone
+                }
+                Located::At(at) => Located::At(at),
+                other => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on is not at \
+                         that path, and the share could not say where it is or that it is \
+                         gone; if it was renamed it still carries the grant. The record \
+                         stays (`srt-win acl forget --drop-pending` gives it up).",
+                        p.path
+                    );
+                    other
+                }
+            };
             match path_id::capture_file_id(&p.path) {
                 Ok(now) if now == p.file_id => Located::At(p.path.clone()),
-                Ok(_) => {
-                    eprintln!(
-                        "srt-win: the object the kept grant on '{}' was made on is no longer \
-                         there (another one is at that path); its record is dropped",
-                        p.path
-                    );
-                    Located::Gone
-                }
-                Err(e) if path_id::is_not_found(&e) => {
-                    eprintln!(
-                        "srt-win: the object the kept grant on '{}' was made on is no longer \
-                         there; its record is dropped",
-                        p.path
-                    );
-                    Located::Gone
-                }
+                Ok(_) => elsewhere(),
+                Err(e) if path_id::is_not_found(&e) => elsewhere(),
                 Err(_) => Located::VolumeAbsent,
             }
         },
@@ -1377,10 +1389,12 @@ fn retry_pending_with(
 ///
 /// Only an entry whose volume really is absent can be given up. First
 /// everything that can be removed is ([`retry_pending`]); an entry
-/// that is then still pending while its volume is present — by the
-/// same enumeration of volumes everything else uses, or, on a share,
-/// by its path answering — is live on a reachable object: it is not
-/// dropped, and the call fails saying so. A path with no pending
+/// that is then still pending while its volume is present, by the
+/// same enumeration of volumes everything else uses, is live on a
+/// reachable object: it is not dropped, and the call fails saying so.
+/// One on a share that is still pending is one whose path does not
+/// answer or whose object could not be found by its id there: it may
+/// be given up, and what that leaves behind is said. A path with no pending
 /// entry is an error too. Either way nothing is dropped.
 pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Vec<PendingStrip>> {
     let pending = retry_pending(conn, ids, true)?;
@@ -1403,7 +1417,8 @@ pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Ve
     }
     for p in pending.iter().filter(|p| named(p)) {
         // What is left on a share after the retry above is a path
-        // that does not answer: nothing reachable is given up there.
+        // that does not answer, or an object the share could not
+        // find by its id.
         let reachable = !on_network(&p.path) && path_id::volume_mounted(p.file_id.volume_serial);
         if reachable {
             bail!(
@@ -1415,6 +1430,28 @@ pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Ve
         }
     }
     let (dropped, left): (Vec<_>, Vec<_>) = pending.into_iter().partition(named);
+    for p in dropped.iter().filter(|p| on_network(&p.path)) {
+        // What is given up on a share, exactly: the object was not at
+        // its path and could not be found by its id — which is not
+        // the share saying it is gone.
+        eprintln!(
+            "srt-win: giving up the kept grant recorded at '{}': the object is not at that \
+             path and its share could not be asked where it is. If it still exists under \
+             another name it keeps the entries of {}; `icacls <its path> /remove:g \"*{}\" \
+             /T` removes them.",
+            p.path,
+            if p.group_sid.is_empty() {
+                "the sandbox group"
+            } else {
+                "group"
+            },
+            if p.group_sid.is_empty() {
+                "<sandbox group SID>"
+            } else {
+                &p.group_sid
+            },
+        );
+    }
     write_pending(&left)?;
     Ok(dropped)
 }
