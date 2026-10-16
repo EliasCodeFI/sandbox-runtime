@@ -377,6 +377,20 @@ fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
     Ok(buf)
 }
 
+/// The `\\?\`-prefixed path of the object `h` is open on, as
+/// [`canonicalize_path`] would give it. For a handle opened without
+/// following a link this is where the object itself is, so comparing
+/// it with the path that was opened shows whether a directory on the
+/// way redirected the open.
+pub(crate) fn final_path_of(h: HANDLE) -> Result<String> {
+    let buf = final_path_from_handle(h)?;
+    let s = String::from_utf16_lossy(&buf);
+    if !utf16_roundtrips(&buf, &s) {
+        bail!("the path is not representable as UTF-8");
+    }
+    Ok(s)
+}
+
 /// Immediate parent of a `\\?\…` canonical path, as a string.
 /// Returns `None` when there is no targetable parent (the path is
 /// a root, or its immediate parent is a root — touching the
@@ -426,7 +440,7 @@ impl FileId {
 }
 
 /// `FILE_ID_INFO` of an already-open handle.
-fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
+pub(crate) fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
     use windows::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
@@ -487,15 +501,33 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)>
     Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
-/// Best-effort: locate the CURRENT path of a file by its captured
+/// Where a recorded `(volume_serial, file_id)` is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    /// The object exists; this is its current path.
+    At(String),
+    /// Positively gone: its volume was found and the volume reported
+    /// that no file has this id.
+    Gone,
+    /// Could not be established either way — the volume is not
+    /// mounted, or the open-by-id or path query failed for a reason
+    /// other than "no such file". The object may still exist.
+    Unknown,
+}
+
+/// Locate the CURRENT path of a file by its captured
 /// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
 /// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`. Returns `None` if the file was
-/// deleted or the open fails for any reason. Used ONLY for
-/// reporting `movedTo` — restore is path-anchored and never
-/// relocates by inode (chasing the file by ID to remove its stamp
-/// would re-expose a relocated secret).
-pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
+/// `GetFinalPathNameByHandleW`.
+///
+/// [`Located::Gone`] is returned only when the volume itself answered
+/// that the id names no file (`ERROR_FILE_NOT_FOUND`, or
+/// `ERROR_INVALID_PARAMETER`, which is how NTFS rejects a stale file
+/// reference). Every other failure is [`Located::Unknown`]: a caller
+/// that is about to forget an ACE must not read "could not look" as
+/// "nothing there".
+pub fn locate_by_file_id(file_id: &FileId) -> Located {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
     };
@@ -539,13 +571,26 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
             )
         } {
             Ok(h) => OwnedHandle(h),
-            Err(_) => return None,
+            Err(e)
+                if e.code() == ERROR_FILE_NOT_FOUND.into()
+                    || e.code() == ERROR_INVALID_PARAMETER.into() =>
+            {
+                return Located::Gone;
+            }
+            Err(_) => return Located::Unknown,
         };
-        let buf = final_path_from_handle(fh.raw()).ok()?;
+        let Ok(buf) = final_path_from_handle(fh.raw()) else {
+            return Located::Unknown;
+        };
         let s = String::from_utf16_lossy(&buf);
-        return utf16_roundtrips(&buf, &s).then_some(s);
+        return if utf16_roundtrips(&buf, &s) {
+            Located::At(s)
+        } else {
+            Located::Unknown
+        };
     }
-    None
+    // No mounted volume carries this serial.
+    Located::Unknown
 }
 
 #[cfg(test)]
