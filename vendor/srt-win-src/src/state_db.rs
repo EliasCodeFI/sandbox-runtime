@@ -1213,7 +1213,7 @@ fn release_hold(
         IdGate::Mismatch if kind == "grant" => match (disk.locate)(&want_id) {
             path_id::Located::At(at) => Site::Moved(at),
             path_id::Located::Gone => Site::Gone,
-            path_id::Located::Unknown => {
+            path_id::Located::Unknown | path_id::Located::VolumeAbsent => {
                 eprintln!(
                     "srt-win: grant '{canon}': not at its path and \
                      could not be located by file_id; ACE may \

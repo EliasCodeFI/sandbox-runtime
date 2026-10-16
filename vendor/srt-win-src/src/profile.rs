@@ -955,7 +955,20 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
                 }
             }
             Located::Gone => {}
-            Located::Unknown => bail!(
+            // On a volume attached to this machine that is not mounted
+            // now: its entry waits there, listed with the kept grants
+            // whose volume is gone, and comes off when the volume is
+            // back (`persist::retry_pending`).
+            Located::VolumeAbsent
+                if path_id::is_drive_path(&r.path) && !path_id::on_network_drive(&r.path) =>
+            {
+                persist::marker_add_pending(&[persist::PendingStrip {
+                    file_id: id,
+                    group_sid: ids.group_sid.clone().unwrap_or_default(),
+                    path: r.path.clone(),
+                }])?;
+            }
+            Located::VolumeAbsent | Located::Unknown => bail!(
                 "the object recorded for '{}' is no longer at that path and could not be \
                  located by file id; its entry may still be on disk",
                 r.path
@@ -1114,6 +1127,9 @@ pub fn grant(
     let before = all_recorded(store, &old)?;
     if store.key == persist::MARKER_KEY {
         persist::marker_set_ever()?;
+        if let Some(g) = &ids.group_sid {
+            persist::marker_set_group_sid(g)?;
+        }
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
     let absolute = |rel: Vec<String>| -> Vec<String> {
@@ -1423,6 +1439,13 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
 /// `srt-win uninstall`: forget the calling user's profile grant.
 /// Does nothing, and creates no state, when none is recorded.
 pub fn forget_everything() -> Result<Option<Forgotten>> {
+    forget_everything_as(None)
+}
+
+/// [`forget_everything`] with the identities read earlier: after the
+/// install record is gone, `ids` taken before it went still name the
+/// group the grant was written for.
+pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
     let marker_empty = read_marker_at(persist::MARKER_KEY).is_ok_and(|m| m.is_empty());
     let db_empty = match crate::state_db::open_db_ro() {
         Ok(Some(conn)) => db_has_rows(&conn).is_ok_and(|rows| !rows),
@@ -1432,10 +1455,17 @@ pub fn forget_everything() -> Result<Option<Forgotten>> {
     if marker_empty && db_empty {
         return Ok(None);
     }
-    let ids = Ids::load()?;
+    let loaded;
+    let ids = match ids {
+        Some(ids) => ids,
+        None => {
+            loaded = Ids::load()?;
+            &loaded
+        }
+    };
     let holder = crate::state_db::HolderPid(std::process::id());
     let (out, _) =
-        crate::state_db::with_init_lock(holder, false, |db| forget(&Store::of(db.conn()), &ids))?;
+        crate::state_db::with_init_lock(holder, false, |db| forget(&Store::of(db.conn()), ids))?;
     Ok(Some(out))
 }
 

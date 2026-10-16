@@ -1239,43 +1239,31 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Persistent write grants go with the account. Done here,
-            // before the elevation hop: the records are the CALLING
-            // user's (their registry hive, their session database),
-            // and the elevated process may be another user. They name
-            // the sandbox group, so this must also precede its
-            // removal. A root that cannot be completed stays recorded
-            // (`acl forget --all` retries) and does not stop the
-            // uninstall: once the group is gone its ACEs match no
-            // token.
-            if !keep_user {
-                match srt_win::profile::forget_everything() {
-                    Ok(None) => {}
-                    Ok(Some(f)) if f.failed.is_empty() => eprintln!(
-                        "srt-win: profile read grant removed ({} path(s))",
-                        f.removed + f.absent
-                    ),
-                    Ok(Some(f)) => eprintln!(
-                        "srt-win: warning: the profile read grant could not be removed from \
-                         {} path(s), which stay recorded",
-                        f.failed.len()
-                    ),
-                    Err(e) => eprintln!("srt-win: warning: profile read grant cleanup: {e:#}"),
-                }
-                match srt_win::persist::forget_everything() {
-                    Ok((0, _)) => {}
-                    Ok((n, 0)) => {
-                        eprintln!("srt-win: persistent write grants removed from {n} root(s)")
-                    }
-                    Ok((n, failed)) => eprintln!(
-                        "srt-win: warning: {failed} of {n} persistent write grant(s) could \
-                         not be removed and stay recorded"
-                    ),
-                    Err(e) => eprintln!("srt-win: warning: persistent write grant cleanup: {e:#}"),
-                }
-            }
+            // The calling user's kept grants go with the account —
+            // AFTER the elevated removal has succeeded, never before
+            // (`persist::after_elevation`): a declined or failed
+            // elevation leaves everything as it was. What they need
+            // from the install record, the group's SID, is read now,
+            // while the record is still there.
+            let ids = if keep_user {
+                None
+            } else {
+                srt_win::persist::Ids::load().ok()
+            };
             if let Some(code) = maybe_self_elevate(args)? {
-                std::process::exit(code);
+                use srt_win::persist::{AfterElevation, after_elevation};
+                match after_elevation(code) {
+                    AfterElevation::LeaveEverything(code) => {
+                        eprintln!(
+                            "srt-win: uninstall did not complete (exit {code}); nothing was \
+                             removed, and the grants kept for this user are unchanged"
+                        );
+                        std::process::exit(code);
+                    }
+                    AfterElevation::ForgetGrants => {
+                        std::process::exit(forget_grants_after_removal(ids.as_ref(), keep_user));
+                    }
+                }
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
@@ -1334,6 +1322,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotent on already-absent.
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
+            // Already elevated, so no hop: this process is also the
+            // calling user's half.
+            let code = forget_grants_after_removal(ids.as_ref(), keep_user);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
 
         // ─── status (combined) ─────────────────────────────────────
@@ -1758,11 +1752,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 .iter()
                 .filter(|(_, r)| matches!(r, persist::Forgot::Failed(_)))
                 .count();
+            let pending = out
+                .iter()
+                .filter(|(_, r)| *r == persist::Forgot::Pending)
+                .count();
             eprintln!(
-                "srt-win: acl forget — {} root(s){}",
+                "srt-win: acl forget — {} root(s){}{}",
                 out.len(),
                 if failed > 0 {
                     format!(", {failed} FAILED (still recorded)")
+                } else {
+                    String::new()
+                },
+                if pending > 0 {
+                    format!(", {pending} on a volume that is not mounted (removed when it is back)")
                 } else {
                     String::new()
                 },
@@ -2376,6 +2379,89 @@ fn require_elevated() -> anyhow::Result<()> {
             "this command requires elevation — run from an \
              administrator prompt"
         ))
+    }
+}
+
+/// Exit code of `uninstall` when the machine-wide removal succeeded
+/// and the calling user's grants could not all be forgotten: they stay
+/// recorded, and `acl forget --all` / `profile forget` finish the job.
+const EXIT_GRANTS_NOT_FORGOTTEN: i32 = 23;
+
+/// The calling user's half of `uninstall`, run once the machine-wide
+/// removal has succeeded: forget their profile read grant and their
+/// kept write grants. `ids` were read before the removal and still
+/// name the sandbox group, whose ACEs are what is taken off.
+///
+/// Returns the exit code: 0, or [`EXIT_GRANTS_NOT_FORGOTTEN`] when
+/// something could not be removed. Such a grant stays recorded (with
+/// the group's SID, in the marker) so a later `forget` can finish. A
+/// grant on a volume that is not mounted is not a failure, but it is
+/// said: the removal is not clean until that volume has been back.
+fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: bool) -> i32 {
+    if keep_user {
+        return 0;
+    }
+    let mut incomplete = false;
+    match srt_win::profile::forget_everything_as(ids) {
+        Ok(None) => {}
+        Ok(Some(f)) if f.failed.is_empty() => eprintln!(
+            "srt-win: profile read grant removed ({} path(s))",
+            f.removed + f.absent
+        ),
+        Ok(Some(f)) => {
+            incomplete = true;
+            eprintln!(
+                "srt-win: WARNING: the profile read grant could not be removed from {} \
+                 path(s), which stay recorded; run `srt-win profile forget`",
+                f.failed.len()
+            );
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: profile read grant not removed: {e:#}");
+        }
+    }
+    match srt_win::persist::forget_everything_as(ids) {
+        Ok(f) => {
+            if f.roots > 0 && f.failed == 0 {
+                eprintln!(
+                    "srt-win: persistent write grants removed from {} root(s)",
+                    f.roots - f.pending.len()
+                );
+            }
+            if f.failed > 0 {
+                incomplete = true;
+                eprintln!(
+                    "srt-win: WARNING: {} of {} persistent write grant(s) could not be \
+                     removed and stay recorded; run `srt-win acl forget --all`",
+                    f.failed, f.roots
+                );
+            }
+            if !f.pending.is_empty() {
+                eprintln!(
+                    "srt-win: NOTE: {} grant(s) are on volumes that are not mounted and are \
+                     still on disk there. They stay recorded and are removed by `srt-win acl \
+                     forget --all` once the volume is back:",
+                    f.pending.len()
+                );
+                for p in &f.pending {
+                    eprintln!("srt-win:   {p}");
+                }
+            }
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: persistent write grants not removed: {e:#}");
+        }
+    }
+    if incomplete {
+        eprintln!(
+            "srt-win: the sandbox account and filters are removed, but not every grant kept \
+             for this user was (see above)"
+        );
+        EXIT_GRANTS_NOT_FORGOTTEN
+    } else {
+        0
     }
 }
 
