@@ -2477,7 +2477,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
                 if self_hold.is_some() {
                     let own = srt_win::state_db::HolderPid(std::process::id());
-                    srt_win::state_db::with_init_lock(own, false, |db| hold_for_self(db))
+                    // The hold and nothing else: no crash recovery here,
+                    // so starting a command does not release what a
+                    // holder that is gone left behind.
+                    srt_win::state_db::with_init_lock_unrecovered(own, |db| hold_for_self(db))
                         .context("hold the kept grants for this command")?;
                 }
                 None

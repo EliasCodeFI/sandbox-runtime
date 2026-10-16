@@ -448,7 +448,7 @@ use crate::profile::is_access_denied;
 /// look at before they change anything: they run only on a quiet
 /// machine, where no session and no sandboxed command exists.
 pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
-    live_holders_with(db.conn(), except, alive_by_one_snapshot())
+    live_holders_with(db.conn(), except, alive_by_one_snapshot()?)
 }
 
 fn live_holders_with(
@@ -899,6 +899,23 @@ pub fn with_init_lock<R>(
     Ok((out, report))
 }
 
+/// [`with_init_lock`] WITHOUT crash recovery, for a command that only
+/// records its own hold. Recovery releases what dead holders left;
+/// when that happens is the business of the session commands (`acl
+/// grant`, `stamp`, `revoke`, `restore`, `recover`), not of every
+/// sandboxed command that starts.
+pub fn with_init_lock_unrecovered<R>(
+    holder_pid: HolderPid,
+    f: impl FnOnce(&mut Locked) -> Result<R>,
+) -> Result<R> {
+    let _mutex = InitMutex::acquire()?;
+    let mut locked = Locked {
+        conn: open_db()?,
+        holder_pid,
+    };
+    f(&mut locked)
+}
+
 /// [`with_init_lock`] for a profile grant or forget: the same lock, held for the whole run. Once `f` has
 /// found the machine quiet it calls [`mark_profile_operation`], and
 /// from then a session start or a command that needs the lock is told
@@ -1059,7 +1076,7 @@ impl Locked {
         kept_holders_with(
             &self.conn,
             self.holder_pid.0 as i64,
-            alive_by_one_snapshot(),
+            alive_by_one_snapshot()?,
         )
     }
 
@@ -1922,30 +1939,45 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
         return true;
     }
     // Decided from the system's process list, which gives every
-    // process's creation time to any caller: the holder is alive if
-    // its pid is listed with the recorded creation time. Opening the
-    // process instead cannot tell a holder that died, whose pid now
-    // belongs to a process this user may not open, from a live one.
+    // process's creation time to any caller. Opening the process
+    // instead cannot tell a holder that died, whose pid now belongs to
+    // a process this user may not open, from a live one.
     match process_create_times() {
-        Ok(all) => all.get(&pid) == Some(&expected_create_filetime),
-        // The list could not be had (it is not known to happen): the
-        // process is asked directly, and whatever that cannot settle
-        // counts as alive — better a stale row than a live holder
-        // reaped and its files restored under it.
+        Ok(all) => listed_alive(&all, pid, expected_create_filetime),
+        // No complete list: the process is asked directly, and
+        // whatever that cannot settle counts as alive — better a stale
+        // row than a live holder reaped and its files restored under
+        // it.
         Err(_) => is_process_alive_by_opening(pid, expected_create_filetime),
+    }
+}
+
+/// The rule: a holder is DEAD only on positive evidence from a
+/// complete process list — its pid is not in it, or is in it with a
+/// creation time other than the one recorded. A holder recorded with
+/// no creation time (0) cannot be told from whoever has its pid now,
+/// and counts as alive while that pid exists.
+fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i64) -> bool {
+    match all.get(&pid) {
+        None => false,
+        Some(&created) => recorded == 0 || created == recorded,
     }
 }
 
 /// [`is_process_alive`] over ONE reading of the process list, for a
 /// query that judges a holder per row: a session with hundreds of
 /// rows is one reading, not hundreds.
-fn alive_by_one_snapshot() -> impl Fn(u32, i64) -> bool {
-    let all = process_create_times();
-    move |pid, created| match &all {
-        _ if pid == std::process::id() => true,
-        Ok(all) => all.get(&pid) == Some(&created),
-        Err(_) => is_process_alive_by_opening(pid, created),
-    }
+///
+/// These queries decide whether something may be removed or changed
+/// beside other sessions. Without a complete list they do not guess:
+/// the query fails, and the operation with it, saying why — it neither
+/// goes ahead nor names a process it cannot identify as a session.
+fn alive_by_one_snapshot() -> Result<impl Fn(u32, i64) -> bool> {
+    let all = process_create_times().context(
+        "cannot tell which sandbox sessions are running (the system's process list could \
+         not be read); nothing was changed",
+    )?;
+    Ok(move |pid, created| pid == std::process::id() || listed_alive(&all, pid, created))
 }
 
 /// Every process on the machine: pid to creation time (a FILETIME as
@@ -1990,33 +2022,40 @@ fn process_create_times() -> Result<std::collections::HashMap<u32, i64>> {
             bail!("NtQuerySystemInformation(processes): status {status:#x}");
         }
         let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
-        return Ok(parse_process_list(
-            bytes, NEXT_AT, CREATED_AT, PID_AT, ENTRY_MIN,
-        ));
+        // Only what the system said it wrote.
+        let written = match needed as usize {
+            0 => bytes.len(),
+            n => n.min(bytes.len()),
+        };
+        return parse_process_list(&bytes[..written], NEXT_AT, CREATED_AT, PID_AT, ENTRY_MIN)
+            .context("the process list is incomplete");
     }
     bail!("the process list kept growing")
 }
 
+/// The list as pid → creation time, or `None` if it is not complete:
+/// an entry that does not fit in what was written, or a chain that
+/// does not end in a last entry. A list cut short would make every
+/// process after the cut look absent.
 fn parse_process_list(
     bytes: &[u8],
     next_at: usize,
     created_at: usize,
     pid_at: usize,
     entry_min: usize,
-) -> std::collections::HashMap<u32, i64> {
+) -> Option<std::collections::HashMap<u32, i64>> {
     let mut out = std::collections::HashMap::new();
     let mut at = 0usize;
-    while let Some(entry) = bytes.get(at..).filter(|e| e.len() >= entry_min) {
+    loop {
+        let entry = bytes.get(at..).filter(|e| e.len() >= entry_min)?;
         let u32_at = |o: usize| u32::from_le_bytes(entry[o..o + 4].try_into().unwrap());
         let i64_at = |o: usize| i64::from_le_bytes(entry[o..o + 8].try_into().unwrap());
         out.insert(i64_at(pid_at) as u32, i64_at(created_at));
-        let next = u32_at(next_at) as usize;
-        if next == 0 {
-            break;
+        match u32_at(next_at) as usize {
+            0 => return Some(out),
+            next => at = at.checked_add(next)?,
         }
-        at += next;
     }
-    out
 }
 
 fn is_process_alive_by_opening(pid: u32, expected_create_filetime: i64) -> bool {
@@ -2327,9 +2366,39 @@ mod tests {
         two[80..88].copy_from_slice(&11u64.to_le_bytes());
         two[132..140].copy_from_slice(&9i64.to_le_bytes());
         two[180..188].copy_from_slice(&12u64.to_le_bytes());
-        let parsed = parse_process_list(&two, 0, 32, 80, 88);
+        let parsed = parse_process_list(&two, 0, 32, 80, 88).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!((parsed[&11], parsed[&12]), (7, 9));
+        // A list cut short is no list: the second entry is announced
+        // and not all there, or not there at all. Nothing is concluded
+        // from it — least of all that process 12 is gone.
+        assert!(parse_process_list(&two[..150], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&two[..100], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&two[..40], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&[], 0, 32, 80, 88).is_none());
+        // Dead only on positive evidence.
+        assert!(listed_alive(&parsed, 11, 7));
+        assert!(!listed_alive(&parsed, 11, 8), "its pid is another's now");
+        assert!(!listed_alive(&parsed, 13, 7), "its pid is nobody's");
+        // Recorded without a creation time: not told apart from
+        // whoever has the pid, so not declared dead while it exists.
+        assert!(listed_alive(&parsed, 11, 0));
+        assert!(!listed_alive(&parsed, 13, 0));
+        // Every process this one can see directly is in the real list
+        // under the creation time it reports itself — the list and the
+        // recorded value are the same clock, to the tick.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 3 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let recorded = pid_create_time(child.id()).unwrap();
+        assert!(is_process_alive(child.id(), recorded));
+        assert!(alive_by_one_snapshot().unwrap()(child.id(), recorded));
+        // Gone, it is dead by the same list.
+        let pid = child.id();
+        child.kill().ok();
+        child.wait().unwrap();
+        assert!(!is_process_alive(pid, recorded));
     }
 
     /// A read deny the object's own list stands in for leaves one row
