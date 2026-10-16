@@ -1262,6 +1262,21 @@ pub fn read_aces_at(target: DaclTarget<'_>) -> Result<Vec<AceView>> {
     Ok(out)
 }
 
+/// [`read_aces_at`], telling an object with no access list at all
+/// (`None`: everyone may do everything) from one with an empty list.
+pub fn read_dacl_views(target: DaclTarget<'_>) -> Result<Option<Vec<AceView>>> {
+    let (_sd, dacl) = target.read()?;
+    if dacl.is_null() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    filter_aces(dacl, |hdr, body| {
+        out.extend(ace_view(hdr, body));
+        false
+    })?;
+    Ok(Some(out))
+}
+
 /// The trustees whose ACEs on a persistent path belong to this crate.
 #[derive(Debug, Clone, Copy)]
 pub struct PersistentTrustees<'a> {

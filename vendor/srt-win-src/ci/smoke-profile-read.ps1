@@ -269,6 +269,7 @@ $outside = Join-Path $root 'outside'
 $sbSid = $null
 $script:grpSid = $null
 $lSsh = $null; $lCfg = $null; $ownerDenied = $null; $wrDeny = $null
+$lockedDir = $null; $disowned = @()
 try {
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange)
   $us = J @('user', 'status')
@@ -378,6 +379,30 @@ try {
     Ok 'T: a default build refuses --test-profile and records nothing'
   } else { Fail "T: default build with --test-profile: exit=$($r.exit) state=$($st.state) Sddl=$(Sddl $prof)" }
 
+  # ── B: objects in a real profile that its user may not change ────
+  # As met on a real profile. (1) An excluded directory whose owner
+  # denied reading to Everyone, Authenticated Users and Users: the
+  # ordinary open of it is refused even to its owner, who may still
+  # read and write its access list.
+  $lockedDir  = Join-Path $prof '.azure'
+  $lockedFile = Seed '.azure\tok.txt' 'LOCKED-CONTENT'
+  & icacls $lockedDir /deny '*S-1-1-0:(OI)(CI)(RX)' '*S-1-5-11:(OI)(CI)(RX)' '*S-1-5-32-545:(OI)(CI)(RX)' | Out-Null
+  # (2) Objects the caller neither owns nor may change — this script
+  # runs elevated, so they are handed to SYSTEM with an access list
+  # that names no administrator: a directory that would be GRANTED,
+  # with the access list the Windows Installer directory has, and an
+  # EXCLUDED directory that Users may read.
+  $instDir  = Join-Path $prof 'AppData\Roaming\Microsoft\Installer'
+  $instFile = Seed 'AppData\Roaming\Microsoft\Installer\x.txt' 'INSTALLER-CONTENT'
+  $openDir  = Join-Path $prof '.docker'
+  $openFile = Seed '.docker\config.json' 'DOCKER-CONTENT'
+  Set-OnlyAces $instDir @('(A;OICI;0x1200a9;;;WD)', '(A;OICI;FA;;;SY)')
+  Set-OnlyAces $openDir @('(A;OICI;0x1200a9;;;BU)', '(A;OICI;FA;;;SY)')
+  foreach ($d in @($instDir, $openDir)) {
+    & icacls $d /setowner '*S-1-5-18' | Out-Null
+    if ($LASTEXITCODE -eq 0) { $disowned += $d } else { Fail "B: setup — could not hand $d to SYSTEM" }
+  }
+
   # ── G: the grant ─────────────────────────────────────────────────
   $files = $bulkDirs * $bulkFiles
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -402,6 +427,31 @@ try {
   if ($brief.state -eq 'present') { Ok 'G: user status reports a profile grant' }
   else { Fail "G: user status profile_grant = $($brief | ConvertTo-Json -Compress)" }
   Outside-Unchanged 'after the grant'
+
+  # B, continued: the grant above is complete with all three in the
+  # profile, and says what it did about each.
+  $paths = { param($items) @($items | ForEach-Object { ($_.path -replace '^\\\\\?\\', '') }) }
+  $notGranted  = & $paths $g.json.not_granted
+  $unprotected = & $paths $g.json.unprotected
+  $closedOrDenied = (& $paths $g.json.self_closed) -contains $lockedDir -or
+    -not ((& $paths $g.json.unverifiable) + $unprotected + $notGranted -contains $lockedDir)
+  if ($closedOrDenied -and ((& $paths $g.json.unverifiable) -notcontains $lockedDir) -and ($unprotected -notcontains $lockedDir)) {
+    Ok 'B: an excluded directory its owner is denied reading of is denied, or recorded as closed by its own access list'
+  } else { Fail "B: the locked excluded directory: $($g.json | ConvertTo-Json -Compress -Depth 4)" }
+  Expect-NoRead 'B (the locked excluded directory)' $lockedFile 'LOCKED-CONTENT'
+  if ($notGranted -contains $instDir -and -not (Has-Group $instDir)) {
+    Ok 'B: a directory the caller may not change is reported as not granted, and carries nothing of ours'
+  } else { Fail "B: Installer-like directory: not_granted=[$($notGranted -join ', ')] Sddl=$(Sddl $instDir)" }
+  if ($unprotected -contains $openDir) { Ok 'B: an excluded directory that cannot be denied and that Users may read is reported as unprotected' }
+  else { Fail "B: unprotected=[$($unprotected -join ', ')] want $openDir" }
+  if (@($st.unprotected | Where-Object { ($_.path -replace '^\\\\\?\\', '') -eq $openDir }).Count -eq 1 -and
+      @($st.not_granted).Count -ge 1) { Ok 'B: profile status lists them with the reason' }
+  else { Fail "B: status: unprotected=$($st.unprotected | ConvertTo-Json -Compress) not_granted=$($st.not_granted | ConvertTo-Json -Compress)" }
+  # Sessions start on such a grant (every row below is one), and a
+  # refresh is as quiet as on any other profile.
+  $g2 = Grant
+  if ($g2.exit -eq 0 -and $g2.json.complete -and $g2.json.writes -eq 0) { Ok 'B: a refresh of that grant writes nothing and is complete' }
+  else { Fail "B: refresh: exit=$($g2.exit) writes=$($g2.json.writes) raw: $($g2.raw)" }
 
   # ── R: what is readable ──────────────────────────────────────────
   Expect-Read 'R1' $note 'NOTE-CONTENT'
@@ -840,7 +890,7 @@ try {
     else { Fail "H: acl forget --all with a live holder: exit=$($h.exit) root still granted=$(Has-Group $workDir) raw: $($h.raw)" }
     Expect-Read 'H (the held grant still reads)' $note 'NOTE-CONTENT'
     # The session's own process is not "another".
-    $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--unless-held-by-others', "$PID", (Join-Path $root 'never-granted'))
+    $h = Invoke-Srt $ExeAbs @('acl', 'forget', '--all', '--unless-held-by-others', "$PID")
     if ($h.exit -eq 0) { Ok 'H: the holder itself is not refused' }
     else { Fail "H: forget asked by the holder: exit=$($h.exit) raw: $($h.raw)" }
   }
@@ -874,6 +924,13 @@ finally {
     & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
     & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   }
+  if ($lockedDir -and (Test-Path -LiteralPath $lockedDir)) {
+    & icacls $lockedDir /remove:d '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' 2>&1 | Out-Null
+  }
+  foreach ($d in $disowned) {
+    & icacls $d /setowner '*S-1-5-32-544' 2>&1 | Out-Null
+    & icacls $d /reset /T /C /Q 2>&1 | Out-Null
+  }
   # Junctions first, as links: never through them.
   foreach ($d in @($ownerDenied, $wrDeny)) {
     if ($d -and (Test-Path -LiteralPath $d)) { & icacls $d /remove:d '*S-1-5-32-545' 2>&1 | Out-Null }
@@ -890,4 +947,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, U)'
+Write-Host 'smoke-profile-read: PASS (T, B, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, U)'

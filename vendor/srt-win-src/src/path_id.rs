@@ -60,11 +60,8 @@ impl std::error::Error for CanonError {}
 /// True iff the [`windows::core::Error`] at `e`'s root is
 /// `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3).
 pub fn is_not_found(e: &anyhow::Error) -> bool {
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-    e.root_cause()
-        .downcast_ref::<windows::core::Error>()
-        .map(|we| we.code())
-        .is_some_and(|c| c == ERROR_FILE_NOT_FOUND.into() || c == ERROR_PATH_NOT_FOUND.into())
+    // By the one table of open errors.
+    open_failure(e) == OpenFailure::NotFound
 }
 
 /// Why a path could not be opened, as far as it decides what to do

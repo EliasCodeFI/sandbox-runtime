@@ -137,6 +137,7 @@ export type WindowsSandboxErrorCode =
   | 'profile_forget_failed'
   | 'kept_grants_in_use'
   | 'srt_win_outdated'
+  | 'profile_grant_blocked_by_session'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -2345,10 +2346,23 @@ export function windowsGrantsBeneathDenies(
 ): string[] {
   if (grants.length === 0 || denies.length === 0) return []
   const denyKeys = denies.map(windowsPathKey)
-  return grants.filter(g => {
-    const key = windowsPathKey(g)
-    return denyKeys.some(d => key !== d && isAtOrUnder(key, d))
-  })
+  const beneath = grants
+    .map(g => ({ path: g, key: windowsPathKey(g) }))
+    .filter(g => denyKeys.some(d => g.key !== d && isAtOrUnder(g.key, d)))
+  // Only the topmost: `srt-win` spares everything at or beneath a path
+  // it is given, so a grant beneath another one in the list adds
+  // nothing — and the list rides on a command line. (If it is still
+  // too long for one, the command is refused with `argv_too_long`;
+  // neither an exception nor the deny is dropped to make it fit.)
+  return beneath
+    .filter(
+      g =>
+        !beneath.some(
+          other => other.key !== g.key && isAtOrUnder(g.key, other.key),
+        ),
+    )
+    .filter((g, i, all) => all.findIndex(o => o.key === g.key) === i)
+    .map(g => g.path)
 }
 
 /** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
@@ -3079,6 +3093,16 @@ export interface WindowsProfileGrantStatus {
    * not say.
    */
   capabilities: string[]
+  /**
+   * What the last run of the grant left as it found it, as
+   * {@link WindowsProfileGrantResult} reports it: objects in the
+   * profile this user may not change. None of them makes the grant
+   * unusable. `unprotected` is the list to show the user.
+   */
+  notGranted: WindowsProfileGrantItem[]
+  selfClosed: WindowsProfileGrantItem[]
+  unverifiable: WindowsProfileGrantItem[]
+  unprotected: WindowsProfileGrantItem[]
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
@@ -3111,6 +3135,10 @@ export interface WindowsProfileGrantStatus {
 type RawProfileStatus = {
   record_version?: unknown
   capabilities?: unknown
+  not_granted?: unknown
+  self_closed?: unknown
+  unverifiable?: unknown
+  unprotected?: unknown
   state?: string
   reason?: string
   profile?: string | null
@@ -3215,6 +3243,10 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     ...(reason && { reason }),
     ...(raw.profile && { profile: raw.profile }),
     capabilities: capabilityList(raw.capabilities),
+    notGranted: grantItems(raw.not_granted),
+    selfClosed: grantItems(raw.self_closed),
+    unverifiable: grantItems(raw.unverifiable),
+    unprotected: grantItems(raw.unprotected),
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],
@@ -3308,12 +3340,59 @@ export interface WindowsProfileGrantResult {
   removed: number
   /** Junctions, symbolic links, cloud placeholders: nothing is written on or through them. */
   skipped: WindowsProfileGrantItem[]
-  /** Paths that are not readable because their entry could not be written. */
+  /**
+   * Paths that were to be granted and whose access list this user may
+   * not change. They stay unreadable to sandboxed commands; where one
+   * was to be a directory whose children are granted one by one,
+   * nothing beneath it is granted either. The grant is whole without
+   * them.
+   */
+  notGranted: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written, and whose own
+   * access list gives the sandbox account no read.
+   */
+  selfClosed: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written and whose access
+   * list this user may not even read (and so cannot use either).
+   */
+  unverifiable: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written and whose own
+   * access list lets the sandbox account read them — as it did before
+   * the grant, which neither opened them nor can close them. Show
+   * these to the user: only the owner of the object or an
+   * administrator can close it.
+   */
+  unprotected: WindowsProfileGrantItem[]
+  /**
+   * Entries of an earlier run that are no longer wanted and could not
+   * be removed.
+   */
   failed: WindowsProfileGrantItem[]
   elapsedMs: number
 }
 
 const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
+
+/** `srt-win profile grant`'s exit code for "a live session's read deny covers a path it would newly allow". */
+const SRT_WIN_EXIT_GRANT_BLOCKED = 24
+
+/** A `[{path, reason}]` list as `srt-win` reports it; anything else is none. */
+function grantItems(v: unknown): WindowsProfileGrantItem[] {
+  return Array.isArray(v)
+    ? v.flatMap(i => {
+        const { path: p, reason } = (i ?? {}) as {
+          path?: unknown
+          reason?: unknown
+        }
+        return typeof p === 'string'
+          ? [{ path: p, reason: typeof reason === 'string' ? reason : '' }]
+          : []
+      })
+    : []
+}
 
 /**
  * Write the profile read grant, or bring it up to date
@@ -3328,9 +3407,16 @@ const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
  * receives a line per top-level item. Other sessions of the same user
  * cannot start while it runs.
  *
- * @throws `profile_grant_failed` on a non-zero exit (the grant is then
- *   recorded as incomplete, or not at all), `srt_win_timeout` when
- *   `timeoutMs` passes.
+ * Objects in the profile that this user may not change do not fail
+ * it: see `notGranted`, `selfClosed`, `unverifiable` and `unprotected`
+ * in the result.
+ *
+ * @throws `profile_grant_blocked_by_session` when a running session
+ *   denies reading of paths the run would newly make readable (nothing
+ *   is written; run it again when that session has ended),
+ *   `profile_grant_failed` on any other non-zero exit (the grant is
+ *   then recorded as incomplete, or not at all), `srt_win_timeout`
+ *   when `timeoutMs` passes.
  */
 export async function grantWindowsProfileRead(
   opts: WindowsProfileGrantOptions = {},
@@ -3407,6 +3493,17 @@ function profileGrantResult(
   logForDebugging(
     `[Sandbox Windows] profile grant exit=${r.status}: ${r.stderr.slice(-2000)}`,
   )
+  if (r.status === SRT_WIN_EXIT_GRANT_BLOCKED) {
+    throw new WindowsSandboxError(
+      'profile_grant_blocked_by_session',
+      `The read grant on your user profile was not changed: a sandbox ` +
+        `session that is running denies reading of paths this run would ` +
+        `make readable, and would read them from now on. Run it again ` +
+        `when no such session is running. ` +
+        `${r.stderr.slice(-2000) || r.stdout}`,
+      'profile',
+    )
+  }
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'profile_grant_failed',
@@ -3427,6 +3524,10 @@ function profileGrantResult(
     unchanged: number
     removed: number
     skipped?: WindowsProfileGrantItem[]
+    not_granted?: unknown
+    self_closed?: unknown
+    unverifiable?: unknown
+    unprotected?: unknown
     failed?: WindowsProfileGrantItem[]
     elapsed_ms: number
   }>(args, r)
@@ -3441,6 +3542,10 @@ function profileGrantResult(
     unchanged: raw.unchanged,
     removed: raw.removed,
     skipped: raw.skipped ?? [],
+    notGranted: grantItems(raw.not_granted),
+    selfClosed: grantItems(raw.self_closed),
+    unverifiable: grantItems(raw.unverifiable),
+    unprotected: grantItems(raw.unprotected),
     failed: raw.failed ?? [],
     elapsedMs: raw.elapsed_ms,
   }
@@ -3938,7 +4043,12 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     throw new WindowsSandboxError(
       'argv_too_long',
       `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
-        `(CreateProcessW limit is 32 767).`,
+        `(CreateProcessW limit is 32 767). Besides the command itself it ` +
+        `carries ${p.denyRead?.length ?? 0} per-command read denies, ` +
+        `${p.denyReadExcept?.length ?? 0} session grants beneath them, ` +
+        `${p.denyWrite?.length ?? 0} write denies and ` +
+        `${p.writeRoots?.length ?? 0} write roots; the command was not ` +
+        `run with fewer.`,
     )
   }
 

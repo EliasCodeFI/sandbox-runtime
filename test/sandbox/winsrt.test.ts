@@ -1424,6 +1424,10 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
       spyOn(winUtils, 'getWindowsProfileReadStatus').mockReturnValue({
         state: 'current',
         capabilities: SRT_WIN_CAPABILITIES,
+        notGranted: [],
+        selfClosed: [],
+        unverifiable: [],
+        unprotected: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
@@ -7112,16 +7116,25 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         writeFileSync(other, 'replaced with something longer')
         await via(other)
         expect(asked()).toBe(5)
-        // No read deny, nothing to rely on: no look at all.
+        // Without a read deny the command still relies on its srt-win
+        // — to hold the kept grants for it — so one that does not say
+        // it can is refused as outdated all the same, instead of dying
+        // on a flag it does not know.
         await SandboxManager.reset()
         calls = []
         old(undefined)
-        await SandboxManager.wrapWithSandboxArgv(
-          'echo x',
-          undefined,
-          config({}, { allowWrite: [] }),
-        )
-        expect(names()).toEqual([])
+        let code: string | undefined
+        try {
+          await SandboxManager.wrapWithSandboxArgv(
+            'echo x',
+            undefined,
+            config({}, { allowWrite: [] }),
+          )
+        } catch (e) {
+          code = (e as WindowsSandboxError).code
+        }
+        expect(code).toBe('srt_win_outdated')
+        expect(names()).toEqual(['profile status'])
       })
 
       it("within a session a per-command srt-win that differs from the session's is asked too", async () => {
@@ -7247,7 +7260,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       await SandboxManager.reset()
       expect(names()).toEqual(['acl grant', 'acl revoke', 'acl restore'])
       // A command with no session behind it names no holder: srt-win
-      // holds for the length of the command itself.
+      // holds for the length of the command itself. (Its srt-win is
+      // asked what it does first, once.)
+      calls = []
+      profileStatus = { state: 'none', capabilities: SRT_WIN_CAPABILITIES }
       const alone = await SandboxManager.wrapWithSandboxArgv(
         'echo x',
         undefined,
@@ -7255,6 +7271,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       )
       expect(alone.argv).toContain('--write-restricted-token')
       expect(alone.argv).not.toContain('--held-by')
+      expect(names()).toEqual(['profile status'])
       // Under the ordinary token there is nothing to hold.
       await SandboxManager.initialize(config(ORDINARY))
       const ordinary = await SandboxManager.wrapWithSandboxArgv('echo x')
@@ -7570,9 +7587,115 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unchanged: 0,
         removed: 1,
         skipped: [{ path: join(home, 'link'), reason: 'reparse point' }],
+        notGranted: [],
+        selfClosed: [],
+        unverifiable: [],
+        unprotected: [],
         failed: [],
         elapsedMs: 1234,
       })
+    })
+
+    describe('objects in the profile that its user may not change', () => {
+      const item = (rel: string, reason: string) => ({
+        path: join(home, rel),
+        reason,
+      })
+      const classes = () => ({
+        not_granted: [item('AppData/Roaming/Microsoft/Installer', 'no right')],
+        self_closed: [item('.ssh', 'closed by its own access list')],
+        unverifiable: [item('.kube', 'cannot be read')],
+        unprotected: [item('.docker', 'readable by its own access list')],
+      })
+
+      it('the grant succeeds and reports them by class', async () => {
+        syncResult['profile grant'] = undefined as never
+        const json = { ...JSON.parse(grantJson()), ...classes() }
+        grantRun = { code: 0, stderr: [], stdout: JSON.stringify(json) }
+        const r = await winUtils.grantWindowsProfileRead({ srtWin })
+        expect(r.notGranted).toEqual(classes().not_granted)
+        expect(r.selfClosed).toEqual(classes().self_closed)
+        expect(r.unverifiable).toEqual(classes().unverifiable)
+        expect(r.unprotected).toEqual(classes().unprotected)
+        expect(r.failed).toEqual([])
+      })
+
+      it('the status lists them, and the grant is current all the same', () => {
+        profileStatus = { ...current(), ...classes() }
+        const st = winUtils.getWindowsProfileReadStatus({ srtWin })
+        expect(st.state).toBe('current')
+        expect(st.notGranted).toEqual(classes().not_granted)
+        expect(st.selfClosed).toEqual(classes().self_closed)
+        expect(st.unverifiable).toEqual(classes().unverifiable)
+        expect(st.unprotected).toEqual(classes().unprotected)
+        // A status that says nothing of them has none; one that says
+        // nonsense has none either.
+        profileStatus = { ...current(), unprotected: 'yes', self_closed: [7] }
+        const plain = winUtils.getWindowsProfileReadStatus({ srtWin })
+        expect(plain.unprotected).toEqual([])
+        expect(plain.selfClosed).toEqual([])
+        expect(plain.notGranted).toEqual([])
+      })
+
+      it('a session starts on such a grant; an excluded path that is readable all the same is a typed warning', async () => {
+        profileStatus = { ...current(), ...classes() }
+        await SandboxManager.initialize(config())
+        expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+        const warnings = SandboxManager.getWindowsProfileReadWarnings()
+        expect(warnings).toHaveLength(1)
+        expect(warnings[0]!.code).toBe('profile_exclusion_unprotected')
+        expect(warnings[0]!.paths).toEqual(classes().unprotected)
+        expect(warnings[0]!.message).toContain(join(home, '.docker'))
+        // The other classes are not warnings: nothing is open.
+        await SandboxManager.reset()
+        expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
+        profileStatus = { ...current(), ...classes(), unprotected: [] }
+        await SandboxManager.initialize(config())
+        expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
+      })
+
+      it('a grant that live sessions block is its own typed error', async () => {
+        grantRun = {
+          code: 24,
+          stderr: [
+            'srt-win: profile grant: a running session (process 7) denies reading',
+          ],
+          stdout: '',
+        }
+        let thrown: unknown
+        try {
+          await winUtils.grantWindowsProfileRead({ srtWin })
+        } catch (e) {
+          thrown = e
+        }
+        expect((thrown as WindowsSandboxError).code).toBe(
+          'profile_grant_blocked_by_session',
+        )
+        expect((thrown as WindowsSandboxError).message).toContain('process 7')
+      })
+    })
+
+    it('the grants sent with a per-command deny are the topmost ones, each once', () => {
+      const p = (...rel: string[]) => join(home, ...rel)
+      mkdirSync(p('Documents', 'a', 'b'), { recursive: true })
+      const many = Array.from({ length: 400 }, (_, i) =>
+        p('Documents', 'a', `generated-${i}`),
+      )
+      expect(
+        winUtils.windowsGrantsBeneathDenies(
+          [
+            p('Documents', 'a'),
+            ...many,
+            p('Documents', 'a', 'b'),
+            p('Documents', 'a'),
+            p('.cargo'),
+            work,
+          ],
+          [home],
+        ),
+      ).toEqual([p('Documents', 'a'), p('.cargo')])
+      // A grant that is itself denied is not beneath the deny.
+      expect(winUtils.windowsGrantsBeneathDenies([home], [home])).toEqual([])
     })
 
     it('grantWindowsProfileRead: a refresh names no exclusion and drops none; replacing them is explicit', async () => {
@@ -7740,6 +7863,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       ): winUtils.WindowsProfileGrantStatus => ({
         state,
         capabilities: [],
+        notGranted: [],
+        selfClosed: [],
+        unverifiable: [],
+        unprotected: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
