@@ -847,6 +847,31 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
     )
 }
 
+/// What this build does that a caller built separately may rely on,
+/// reported as `capabilities` by `user status` and `profile status`.
+/// The library and this program are not always the same build: the
+/// library asks for a behaviour by name instead of assuming it, and
+/// refuses to start a session that depends on one that is missing.
+/// A token is added when a behaviour moves here and is never reused
+/// for another.
+///
+/// - `profile-deny-expansion`: a read deny (`acl grant`, `acl stamp`,
+///   `exec --deny-read`) is also written on every recorded path of the
+///   profile read grant beneath it that carries an allow of its own
+///   ([`read_deny_also`]). A caller that names a deny once depends on
+///   this: without it a deny on the profile directory would not reach
+///   a granted directory in it.
+/// - `profile-session-grant-check`: `acl grant` refuses a path that
+///   reaches a recorded exclusion ([`check_session_grants`]).
+/// - `kept-grant-holders`: sessions are recorded as holders of the
+///   kept grants they run on, and `acl forget` / `profile forget`
+///   take `--unless-held-by-others`.
+pub const CAPABILITIES: &[&str] = &[
+    "profile-deny-expansion",
+    "profile-session-grant-check",
+    "kept-grant-holders",
+];
+
 /// The profile a read grant is recorded for, if one is: what a
 /// default session runs on, and so holds for as long as it lives
 /// (`state_db::Locked::hold_kept`). A record that cannot be read

@@ -136,6 +136,7 @@ export type WindowsSandboxErrorCode =
   /** `srt-win profile forget` could not remove the whole grant. */
   | 'profile_forget_failed'
   | 'kept_grants_in_use'
+  | 'srt_win_outdated'
   /**
    * A path the session would grant — `filesystem.allowRead`, or a
    * write root (`allowWrite`) — is, contains, or lies inside a path
@@ -301,6 +302,12 @@ export interface WindowsSandboxUserStatus {
     state: 'present' | 'unknown'
     reason?: string
   }
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
   /**
    * SID of the user who owns the interactive session this process
    * runs in, when `srt-win` can tell. It differs from
@@ -933,6 +940,55 @@ type RawUserStatus = {
   /** Absent from an `srt-win` without the profile read grant. */
   profile_grant?: { state: string; reason?: string } | null
   session_user_sid?: string | null
+  /** Absent from an `srt-win` that does not name what it does. */
+  capabilities?: unknown
+}
+
+/**
+ * Behaviours of `srt-win` this library relies on and asks for by
+ * name. `srt-win` lists what it does as `capabilities` in `user
+ * status` and `profile status`. The two are not always the same
+ * build — an embedder can ship `srt-win` inside its own runtime and
+ * take this library from the package registry — so a behaviour that
+ * lives in `srt-win` is verified, not assumed: a session that depends
+ * on one that is not listed is refused (`srt_win_outdated`).
+ */
+export const WINDOWS_SRT_WIN_CAPABILITIES = {
+  /**
+   * A read deny handed to `srt-win` is also written on every recorded
+   * path of the profile read grant beneath it that carries an allow
+   * of its own. This library names a deny once and leaves that to
+   * `srt-win`; with one that does not do it, a `denyRead` on the
+   * profile directory would not reach a granted directory in it.
+   */
+  profileDenyExpansion: 'profile-deny-expansion',
+  /**
+   * Sessions are recorded as holders of the kept grants they run on,
+   * and `acl forget` / `profile forget` take
+   * `--unless-held-by-others`.
+   */
+  keptGrantHolders: 'kept-grant-holders',
+} as const
+
+function capabilityList(v: unknown): string[] {
+  return Array.isArray(v)
+    ? v.filter((x): x is string => typeof x === 'string')
+    : []
+}
+
+/** The typed error for an `srt-win` that lacks a behaviour by name. */
+export function windowsSrtWinOutdatedError(
+  capability: string,
+  why: string,
+): WindowsSandboxError {
+  return new WindowsSandboxError(
+    'srt_win_outdated',
+    `The srt-win in use is older than this library: it does not report ` +
+      `the capability '${capability}', which ${why}. Update srt-win (the ` +
+      `one shipped with the program embedding this library, or the ` +
+      `package's own) to a build that matches the library. Nothing was ` +
+      `granted.`,
+  )
 }
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
@@ -971,6 +1027,7 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
       raw.session_user_sid !== '' && {
         sessionUserSid: raw.session_user_sid,
       }),
+    capabilities: capabilityList(raw.capabilities),
     // As above: only an explicit "none" is no grant.
     ...(raw.profile_grant &&
       raw.profile_grant.state !== 'none' && {
@@ -2936,6 +2993,12 @@ export interface WindowsProfileGrantStatus {
   reason?: string
   /** The profile directory the grant was made for. */
   profile?: string
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
@@ -2967,6 +3030,7 @@ export interface WindowsProfileGrantStatus {
 
 type RawProfileStatus = {
   record_version?: unknown
+  capabilities?: unknown
   state?: string
   reason?: string
   profile?: string | null
@@ -3070,6 +3134,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     state,
     ...(reason && { reason }),
     ...(raw.profile && { profile: raw.profile }),
+    capabilities: capabilityList(raw.capabilities),
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],

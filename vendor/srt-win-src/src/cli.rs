@@ -863,6 +863,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // Whether a profile read grant is recorded (`none`, `present`
         // or `unknown`); `profile status` says whether it is current.
         "profile_grant": srt_win::profile::brief_status_json(),
+        "capabilities": srt_win::profile::CAPABILITIES,
         // The user of the interactive session this process is in, when
         // that can be told (`null` otherwise): an install applies the
         // profile read grant only when it runs as that user.
@@ -2105,14 +2106,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let test_profile: Option<String> = None;
             #[cfg(feature = "test-hooks")]
             let test_profile = test_profile.or_else(test_profile_from_env);
-            println!(
-                "{}",
-                profile::status_json(
-                    persist::MARKER_KEY,
-                    profile::Layout::resolve(test_profile.as_deref()),
-                    paths,
-                )
+            let mut status = profile::status_json(
+                persist::MARKER_KEY,
+                profile::Layout::resolve(test_profile.as_deref()),
+                paths,
             );
+            // Whatever the state: what this build does, by name.
+            if let Some(o) = status.as_object_mut() {
+                o.insert("capabilities".to_owned(), json!(profile::CAPABILITIES));
+            }
+            println!("{status}");
         }
 
         // ─── runner ────────────────────────────────────────────────
