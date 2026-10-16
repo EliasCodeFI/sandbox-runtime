@@ -170,6 +170,12 @@ enum Cmd {
         /// unit).
         #[arg(long)]
         keep_user: bool,
+        /// Set by `uninstall` itself on the elevated process it
+        /// starts: do the machine-wide removal only. The grants kept
+        /// for the calling user are that user's to forget, in the
+        /// process that asked.
+        #[arg(long, hide = true)]
+        elevated_step: bool,
     },
     /// Print `{user: <user-status>, wfp: <wfp-status>}` as one line
     /// of JSON — the same objects `user status` and `wfp status`
@@ -258,6 +264,25 @@ enum Cmd {
         /// caller error, not a skip).
         #[arg(long = "deny-read")]
         deny_read: Vec<String>,
+        /// A path the caller's session is granted (read or write)
+        /// that lies beneath a `--deny-read` path. While a profile
+        /// read grant is recorded, a read deny is also written on the
+        /// recorded paths beneath it; one at or beneath a path given
+        /// here is left out, as the session's own allow there ranks
+        /// above a deny set further up. Repeatable. A path that
+        /// cannot be resolved spares nothing.
+        #[arg(long = "deny-read-except", value_name = "PATH")]
+        deny_read_except: Vec<String>,
+        /// The process whose session this command belongs to and
+        /// which is recorded as a holder of the kept grants the
+        /// command runs on (`acl grant --persistent --holder-pid`).
+        /// Without it, under `--write-restricted-token`, this process
+        /// records itself as the holder — of the profile read grant
+        /// and of each `--write-root` — until the command has exited,
+        /// so that neither is removed from under it
+        /// (`--unless-held-by-others`).
+        #[arg(long = "held-by", value_name = "PID")]
+        held_by: Option<u32>,
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
@@ -669,6 +694,15 @@ enum AclCmd {
         /// one of this process id is running on a kept grant.
         #[arg(long, value_name = "PID")]
         unless_held_by_others: Option<u32>,
+        /// Stop waiting for the volume of a grant that `forget`
+        /// reported as pending, and drop its record: for a volume that
+        /// will not come back (reformatted, discarded). The entries on
+        /// that object are NOT removed — it cannot be reached — and
+        /// nothing will remove them later; the command says so, with
+        /// the group they name. Nothing else ever drops a pending
+        /// record. Repeatable; an unknown path is an error.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["all", "roots"])]
+        drop_pending: Vec<String>,
         /// The roots to forget.
         #[arg(value_name = "PATH")]
         roots: Vec<String>,
@@ -725,6 +759,12 @@ struct AceTargets {
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
     bad_inputs: Vec<(String, String)>,
+    /// Recorded paths of the profile read grant that a read deny among
+    /// `targets` is written on as well — for
+    /// `Locked::apply_aces_and`. They exist only because of the
+    /// expansion: they are denied for the holder's session, and are
+    /// never handed to `persist::apply` to be kept with a write root.
+    also_read_deny: Vec<String>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -758,10 +798,16 @@ struct AceTargets {
 /// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
+///
+/// `allows` are the canonical paths the same session is granted (read
+/// or write): a read deny is not carried onto a recorded profile path
+/// that such a grant allows more specifically
+/// (`RecordedAllows::covered`).
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
+    allows: &[String],
 ) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
     use srt_win::acl::SbAce;
@@ -771,6 +817,10 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut also_read_deny: Vec<String> = Vec::new();
+    // The profile read grant's record, read at the first read deny
+    // and once for all of them.
+    let mut recorded: Option<srt_win::profile_plan::RecordedAllows> = None;
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -855,11 +905,18 @@ fn canonicalize_ace_targets(
         targets.push((canon.clone(), ace));
         // A read deny holds against the profile read grant only if it
         // is also on each recorded path beneath it that carries an
-        // allow of its own. Worked out here, from the record, so the
+        // allow of its own — other than those the session allows more
+        // specifically. Worked out here, from the record, so the
         // caller names the deny once whatever it covers.
         if matches!(ace, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)) {
-            for also in srt_win::profile::read_deny_also(&canon)? {
-                targets.push((also, ace));
+            let recorded = match &recorded {
+                Some(r) => r,
+                None => recorded.insert(srt_win::profile::recorded_allows()?),
+            };
+            for also in recorded.covered(&canon, allows) {
+                if !also_read_deny.iter().any(|p| p == also) {
+                    also_read_deny.push(also.to_owned());
+                }
             }
         }
         // Full-chain hold (see doc). Duplicates are merged below.
@@ -869,9 +926,17 @@ fn canonicalize_ace_targets(
             }
         }
     }
+    let targets = merge_ace_targets(targets);
+    // A path named outright is not also an expansion.
+    also_read_deny.retain(|p| {
+        !targets
+            .iter()
+            .any(|(t, a)| t == p && matches!(a, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)))
+    });
     Ok(AceTargets {
-        targets: merge_ace_targets(targets),
+        targets,
         bad_inputs,
+        also_read_deny,
     })
 }
 
@@ -1536,30 +1601,50 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Uninstall {
             sublayer_guid,
             keep_user,
+            elevated_step,
         } => {
-            // The calling user's kept grants go with the account —
-            // AFTER the elevated removal has succeeded, never before
-            // (`persist::after_elevation`): a declined or failed
-            // elevation leaves everything as it was. What they need
-            // from the install record, the group's SID, is read now,
-            // while the record is still there.
-            let ids = if keep_user {
+            // Two halves (`persist::after_elevation`). The elevated
+            // one removes the machine-wide install and nothing else.
+            // The calling user's kept grants are forgotten by the
+            // calling user's own process — this one, unless it is the
+            // elevated step of another — and only once the install is
+            // really gone. What that needs from the install record,
+            // the group's SID, is read now, while the record is there.
+            let ids = if keep_user || elevated_step {
                 None
             } else {
                 srt_win::persist::Ids::load().ok()
             };
-            if let Some(code) = maybe_self_elevate(args)? {
+            let mut for_step: Vec<OsString> = args.to_vec();
+            for_step.push("--elevated-step".into());
+            if !elevated_step && let Some(code) = maybe_self_elevate(&for_step)? {
                 use srt_win::persist::{AfterElevation, after_elevation};
-                match after_elevation(code) {
+                if keep_user {
+                    // Nothing of the caller's goes with --keep-user.
+                    std::process::exit(code);
+                }
+                // By what is true now, not by the step's word alone.
+                let install_present = srt_win::install::read_setup()
+                    .map(|s| s.is_some())
+                    .unwrap_or(true);
+                match after_elevation(code, install_present) {
                     AfterElevation::LeaveEverything(code) => {
                         eprintln!(
-                            "srt-win: uninstall did not complete (exit {code}); nothing was \
-                             removed, and the grants kept for this user are unchanged"
+                            "srt-win: the elevated step did not remove the sandbox account \
+                             (exit {code}). The grants kept for this user are unchanged."
                         );
                         std::process::exit(code);
                     }
-                    AfterElevation::ForgetGrants => {
-                        std::process::exit(forget_grants_after_removal(ids.as_ref(), keep_user));
+                    AfterElevation::ForgetGrants { step_failed } => {
+                        if let Some(code) = step_failed {
+                            eprintln!(
+                                "srt-win: the elevated step removed the sandbox account and \
+                                 then reported a failure (exit {code}); the grants kept for \
+                                 this user are removed all the same."
+                            );
+                        }
+                        let forgot = forget_grants_after_removal(ids.as_ref(), keep_user);
+                        std::process::exit(step_failed.unwrap_or(forgot));
                     }
                 }
             }
@@ -1623,11 +1708,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotent on already-absent.
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
-            // Already elevated, so no hop: this process is also the
-            // calling user's half.
-            let code = forget_grants_after_removal(ids.as_ref(), keep_user);
-            if code != 0 {
-                std::process::exit(code);
+            // Started elevated by the user, so no hop: this process is
+            // also the calling user's half. As the elevated step of
+            // another process it is not: that process forgets.
+            if !elevated_step {
+                let code = forget_grants_after_removal(ids.as_ref(), keep_user);
+                if code != 0 {
+                    std::process::exit(code);
+                }
             }
         }
 
@@ -2000,16 +2088,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 acl::SbAce::Deny(acl::DenyMask::WriteDeny),
                             ),
                         ],
+                        &[],
                     )?;
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
@@ -2089,6 +2180,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
                         ],
+                        &[],
                     )?;
                     // Before anything is granted, in either mode: no
                     // grant may reach what a recorded profile read
@@ -2124,6 +2216,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                              sandbox user"
                         ));
                     }
+                    // What this same call grants: a read deny is not
+                    // carried onto a recorded profile path one of
+                    // these allows more specifically.
+                    let allowed: Vec<String> = grants.iter().map(|(p, _)| p.clone()).collect();
                     let denies = canonicalize_ace_targets(
                         db,
                         "deny",
@@ -2134,6 +2230,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 acl::SbAce::Deny(acl::DenyMask::WriteDeny),
                             ),
                         ],
+                        &allowed,
                     )?;
                     at.bad_inputs.extend(denies.bad_inputs);
                     for (p, e) in &at.bad_inputs {
@@ -2149,11 +2246,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     let (kept, per_session_denies) =
                         persist::apply(db, &ids, &roots, &denies.targets)?;
                     // From here the holder's session runs on these
-                    // kept roots, and on the profile read grant if one
-                    // is recorded: said in the holder table, so that
-                    // nothing removes either from under it
-                    // (`--unless-held-by-others`).
-                    db.hold_kept(&roots, srt_win::profile::held_profile().as_deref())?;
+                    // kept roots and on the profile read grant: said
+                    // in the holder table, so that nothing removes
+                    // either from under it
+                    // (`--unless-held-by-others`). The profile grant
+                    // is held whether or not one is recorded now — one
+                    // made while the session runs is read through by
+                    // its commands from then on.
+                    db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))?;
                     // Per session, for the sandbox user SID as without
                     // the flag: the read grants, and the denies under
                     // no persistent root.
@@ -2164,13 +2264,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .cloned()
                         .collect();
                     rest.extend(per_session_denies);
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &rest)?;
+                    // With them, for this session only, the recorded
+                    // profile paths the read denies cover. These never
+                    // went through `persist::apply`: a deny that
+                    // exists only because of the expansion is not kept
+                    // with a root, whatever root it lies under.
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &rest, &denies.also_read_deny)?;
                     at.targets.extend(denies.targets);
                     Ok((at, w, f, Some(kept)))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             if let Some(k) = kept {
@@ -2224,10 +2331,44 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     all,
                     json,
                     unless_held_by_others,
+                    drop_pending,
                     roots,
                 },
         } => {
             use srt_win::{path_id, persist, state_db};
+            if !drop_pending.is_empty() {
+                let holder = state_db::HolderPid(std::process::id());
+                let (dropped, _) = state_db::with_init_lock(holder, false, |_| {
+                    persist::drop_pending(&drop_pending)
+                })?;
+                for p in &dropped {
+                    eprintln!(
+                        "srt-win: no longer waiting for the volume of '{}'. The entries the \
+                         kept grant wrote on that object (for the group {}) were NOT removed \
+                         and will not be: if the volume is ever attached again, they are \
+                         still on it.",
+                        p.path,
+                        if p.group_sid.is_empty() {
+                            "that was installed then"
+                        } else {
+                            p.group_sid.as_str()
+                        },
+                    );
+                }
+                if json {
+                    let entries: Vec<AceReleaseEntry> = dropped
+                        .iter()
+                        .map(|p| AceReleaseEntry {
+                            path: p.path.clone(),
+                            status: "abandoned",
+                        })
+                        .collect();
+                    serde_json::to_writer(std::io::stdout(), &entries)
+                        .context("write --json forget result")?;
+                    println!();
+                }
+                return Ok(());
+            }
             if !all && roots.is_empty() {
                 return Err(anyhow!(
                     "acl forget: name the roots to forget, or pass --all"
@@ -2239,9 +2380,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let holder =
                 state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _report) = state_db::with_init_lock(holder, false, |db| {
-                if unless_held_by_others.is_some() {
-                    exit_if_held_by_others(db)?;
-                }
                 // A root that no longer resolves is looked up as
                 // given: it may be recorded under that spelling.
                 let targets: Vec<String> = roots
@@ -2252,6 +2390,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             .unwrap_or_else(|_| r.clone())
                     })
                     .collect();
+                if unless_held_by_others.is_some() {
+                    // The roots to be forgotten: all, or these.
+                    exit_if_held_by_others(db, Held::Roots(&targets))?;
+                }
                 persist::forget(db, &ids, &targets, all)
             })?;
             let failed = out
@@ -2532,7 +2674,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
             let (out, _) = state_db::with_init_lock(holder, false, |db| {
                 if unless_held_by_others.is_some() {
-                    exit_if_held_by_others(db)?;
+                    exit_if_held_by_others(db, Held::Profile)?;
                 }
                 profile::forget(&profile::Store::of(db.conn()), &ids)
             })?;
@@ -2632,6 +2774,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Exec {
             loopback_port_range,
             deny_read,
+            deny_read_except,
+            held_by,
             deny_write,
             env,
             env_stdin,
@@ -2789,11 +2933,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // error (glob, canon-fail, apply-fail) FAILS the exec
             // rather than running the child with an incomplete deny
             // set.
+            // A command with no session holding the kept grants for it
+            // holds them itself while it runs. Not taking the hold is
+            // not running the command: without it the grant could be
+            // removed in the middle of it.
+            let kept_hold = if write_restricted_token && held_by.is_none() {
+                Some(KeptHold::take(&write_root).context("hold the kept grants for this command")?)
+            } else {
+                None
+            };
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
                 None
             } else {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
+                let deny_read_except: Vec<String> = deny_read_except
+                    .iter()
+                    .filter_map(|p| srt_win::path_id::canonicalize_path(p).ok())
+                    .map(|(canon, _)| canon)
+                    .collect();
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
                     let at = canonicalize_ace_targets(
                         db,
@@ -2802,11 +2960,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
                             (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
                         ],
+                        &deny_read_except,
                     )?;
                     if let Some((p, e)) = at.bad_inputs.first() {
                         return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                     }
-                    let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
+                    let (w, f) = db.apply_aces_and(&sb_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })
                 .context("per-exec deny-ace")?;
@@ -2894,6 +3053,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                     );
                     drop(per_exec_guard);
+                    drop(kept_hold);
                     std::process::exit(16);
                 }
             };
@@ -2902,6 +3062,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // per-exec restore guard's Drop must be explicit
             // BEFORE it.
             drop(per_exec_guard);
+            drop(kept_hold);
             std::process::exit(code as i32);
         }
     }
@@ -3036,6 +3197,49 @@ fn require_elevated() -> anyhow::Result<()> {
 /// grant: nothing was removed.
 const EXIT_HELD_BY_OTHERS: i32 = 22;
 
+/// Which kept grant a removal is about.
+#[derive(Clone, Copy)]
+enum Held<'a> {
+    /// The profile read grant.
+    Profile,
+    /// These kept write roots (canonical); every one if empty.
+    Roots(&'a [String]),
+}
+
+/// A sandboxed command's own hold on the kept grants it runs on, for
+/// one `exec` with no session holding for it: taken before the child
+/// starts, given back when it has exited. Crash recovery gives it back
+/// if this process dies first.
+struct KeptHold(srt_win::state_db::HolderPid);
+
+impl KeptHold {
+    fn take(write_roots: &[String]) -> anyhow::Result<Self> {
+        use srt_win::state_db;
+        let own = state_db::HolderPid(std::process::id());
+        let roots: Vec<String> = write_roots
+            .iter()
+            .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+            .map(|(canon, _)| canon)
+            .collect();
+        state_db::with_init_lock(own, false, |db| {
+            db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))
+        })?;
+        Ok(Self(own))
+    }
+}
+
+impl Drop for KeptHold {
+    fn drop(&mut self) {
+        if let Err(e) = srt_win::state_db::with_init_lock(self.0, false, |db| db.release_kept()) {
+            eprintln!(
+                "srt-win: WARNING: this command's hold on the kept grants was not released \
+                 ({e:#}); it is dropped once pid {} is gone",
+                self.0.0
+            );
+        }
+    }
+}
+
 /// Under the init lock, after crash recovery has dropped the holds of
 /// sessions that died: if a live session other than the lock's holder
 /// runs on a kept write root or on the profile read grant, say which
@@ -3043,8 +3247,22 @@ const EXIT_HELD_BY_OTHERS: i32 = 22;
 /// before anything is removed. Removing the grant would take the
 /// working directory, or the profile, away from under that session's
 /// commands.
-fn exit_if_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Result<()> {
-    let held = db.other_kept_holders()?;
+fn exit_if_held_by_others(db: &srt_win::state_db::Locked, what: Held<'_>) -> anyhow::Result<()> {
+    use srt_win::state_db::{KIND_KEPT_PROFILE, KIND_KEPT_ROOT};
+    // Only the holds on what is about to be removed count: a session
+    // that reads the profile through the grant does not keep another
+    // user of the machine from forgetting a write root it never used.
+    let held: Vec<_> = db
+        .other_kept_holders()?
+        .into_iter()
+        .filter(|h| match what {
+            Held::Profile => h.kind == KIND_KEPT_PROFILE,
+            Held::Roots(roots) => {
+                h.kind == KIND_KEPT_ROOT
+                    && (roots.is_empty() || roots.iter().any(|r| r.eq_ignore_ascii_case(&h.path)))
+            }
+        })
+        .collect();
     if held.is_empty() {
         return Ok(());
     }
@@ -3225,7 +3443,7 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
     if ok.is_err() {
         let err = unsafe { GetLastError() };
         if err == ERROR_CANCELLED {
-            eprintln!("srt-win: UAC prompt cancelled by user");
+            eprintln!("srt-win: UAC prompt cancelled by user; nothing was changed");
             std::process::exit(10);
         }
         return Err(anyhow::anyhow!(
@@ -3646,6 +3864,39 @@ mod tests {
         }
         // Either every root or the named ones.
         assert!(forget(&["srt-win", "acl", "forget", "--all", r"C:\a"]).is_err());
+        // Giving up a pending grant is its own request, by path.
+        match forget(&["srt-win", "acl", "forget", "--drop-pending", r"E:\w"]) {
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    drop_pending, all, ..
+                },
+            }) => {
+                assert!(!all);
+                assert_eq!(drop_pending, [r"E:\w"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        for mixed in [
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                "--all",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                r"C:\a",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &["srt-win", "acl", "forget", "--drop-pending"][..],
+        ] {
+            assert!(forget(mixed).is_err(), "{mixed:?}");
+        }
 
         // The deny lists ride in the same stdin document.
         let input: AclGrantInput = serde_json::from_str(

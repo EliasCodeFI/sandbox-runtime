@@ -265,6 +265,8 @@ const SRT_WIN_CAPABILITIES = [
   'profile-deny-expansion',
   'profile-session-grant-check',
   'kept-grant-holders',
+  'read-deny-except',
+  'exec-holder',
 ]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
@@ -3786,12 +3788,26 @@ describe('Windows write-restricted token, the default: write roots are granted o
         denyWrite: [],
       }
       await SandboxManager.initialize(cfg)
-      expect(subs()).toEqual([])
+      // The one call is still made, with empty lists: it is what
+      // records this process as a holder of the profile read grant,
+      // whether or not one exists yet.
+      expect(subs()).toEqual(['grant'])
+      expect(acl[0].stdin).toEqual({
+        read: [],
+        write: [],
+        denyRead: [],
+        denyWrite: [],
+      })
       expect(verifyCalls).toHaveLength(1)
       expect(verifyCalls[0]?.writeRoots).toEqual([])
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
       expect(argv).toContain('--write-restricted-token')
       expect(argv).not.toContain('--write-root')
+      // The command names the session that holds for it.
+      expect(argv[argv.indexOf('--held-by') + 1]).toBe(`${process.pid}`)
+      // … and the hold is released with the session.
+      await SandboxManager.reset()
+      expect(subs()).toEqual(['grant', 'revoke', 'restore'])
     })
 
     for (const status of [1, 2]) {
@@ -7960,6 +7976,167 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       }
     })
 
+    // The table srt-win's own tests read: what the library hands over
+    // after ranking a session's lists, and which recorded paths must
+    // end up denied. Here the library's side of it: the ranking gives
+    // exactly the handed lists, and by the ranking's own rule — an
+    // allow set beneath a deny is the one that counts there — the
+    // recorded paths that are denied are the expected ones.
+    it('read denies and session allows: the ranking matches the table srt-win is tested against', () => {
+      const table = readFileSync(
+        join(
+          __dirname,
+          '..',
+          '..',
+          'vendor',
+          'srt-win-src',
+          'tests',
+          'data',
+          'read-deny-cases.txt',
+        ),
+        'utf8',
+      )
+      const at = (p: string) => {
+        const t = p.trim()
+        if (!t.startsWith('P')) throw new Error(`'${t}' is not beneath P`)
+        return 'C:\\Users\\me' + t.slice(1)
+      }
+      const list = (v: string) =>
+        v
+          .split(' | ')
+          .map(x => x.trim())
+          .filter(x => x !== '')
+          .map(at)
+      type Case = Record<
+        | 'read'
+        | 'write'
+        | 'deny'
+        | 'credential'
+        | 'handed-read'
+        | 'handed-write'
+        | 'handed-deny'
+        | 'expect',
+        string[]
+      > & { name: string }
+      const blank = (name: string): Case => ({
+        name,
+        read: [],
+        write: [],
+        deny: [],
+        credential: [],
+        'handed-read': [],
+        'handed-write': [],
+        'handed-deny': [],
+        expect: [],
+      })
+      const recorded: { path: string; kind: string }[] = []
+      const cases: Case[] = []
+      for (const raw of table.split(/\r?\n/)) {
+        const line = raw.trim()
+        if (line === '' || line.startsWith('#')) continue
+        const colon = line.indexOf(':')
+        const key = line.slice(0, colon)
+        const value = line.slice(colon + 1).trim()
+        if (key === 'recorded') {
+          for (const item of value.split(' | ')) {
+            const [kind, ...rest] = item.trim().split(' ')
+            recorded.push({ kind: kind!, path: at(rest.join(' ')) })
+          }
+        } else if (key === 'case') {
+          cases.push(blank(value))
+        } else {
+          const c = cases[cases.length - 1]!
+          expect(Object.keys(c)).toContain(key)
+          c[key as Exclude<keyof Case, 'name'>] = list(value)
+        }
+      }
+      expect(cases.length).toBeGreaterThanOrEqual(12)
+      const key = (p: string) =>
+        p.toLowerCase().replace(/\\+$/, '').split('\\').join('/')
+      const covers = (dir: string, p: string) =>
+        key(p) === key(dir) || key(p).startsWith(key(dir) + '/')
+      const depth = (p: string) => key(p).split('/').length
+      for (const c of cases) {
+        const ranked = winUtils.rankWindowsFsAccess({
+          allowRead: c.read,
+          allowWrite: c.write,
+          denyRead: c.deny,
+          denyWrite: [],
+          credentialDeny: c.credential,
+        })
+        // What is handed to srt-win is what the table says.
+        expect({
+          name: c.name,
+          read: ranked.grantRead,
+          write: ranked.grantWrite,
+          deny: ranked.denyRead,
+        }).toEqual({
+          name: c.name,
+          read: c['handed-read'],
+          write: c['handed-write'],
+          deny: c['handed-deny'],
+        })
+        // The ranking's rule, applied to each recorded path that
+        // carries an allow: the deepest handed entry at or above it
+        // decides, a deny winning on the same path.
+        const allows = [...ranked.grantRead, ...ranked.grantWrite]
+        const denied = recorded
+          .filter(r => ['container', 'granted', 'file'].includes(r.kind))
+          .filter(r => {
+            const best = (list: string[]) =>
+              Math.max(
+                0,
+                ...list.filter(e => covers(e, r.path)).map(e => depth(e)),
+              )
+            const deny = best(ranked.denyRead)
+            return deny > 0 && deny >= best(allows)
+          })
+          .map(r => r.path)
+        expect({ name: c.name, denied: denied.sort() }).toEqual({
+          name: c.name,
+          denied: [...c.expect].sort(),
+        })
+        // And what a per-command deny is sent with: the grants that
+        // outrank it.
+        expect(
+          winUtils.windowsGrantsBeneathDenies(allows, ranked.denyRead).sort(),
+        ).toEqual(
+          allows
+            .filter(a =>
+              ranked.denyRead.some(d => covers(d, a) && key(d) !== key(a)),
+            )
+            .sort(),
+        )
+      }
+    })
+
+    it('a per-command read deny is sent with the session grants that lie beneath it', async () => {
+      const proj = join(home, 'proj')
+      const lib = join(home, 'Documents', 'lib')
+      mkdirSync(proj)
+      mkdirSync(lib, { recursive: true })
+      await SandboxManager.initialize(
+        config({}, { allowWrite: [proj], allowRead: [lib] }),
+      )
+      const { argv } = await SandboxManager.wrapWithSandboxArgv(
+        'echo x',
+        undefined,
+        config({}, { denyRead: [home, proj], allowWrite: [] }),
+      )
+      const flag = (name: string) => argv.filter((_, i) => argv[i - 1] === name)
+      expect(flag('--deny-read')).toEqual([home, proj])
+      // Both grants lie beneath the deny on the profile; the root is
+      // itself denied by name as well, which is the more specific.
+      expect(new Set(flag('--deny-read-except'))).toEqual(new Set([proj, lib]))
+      // No deny, or none above a grant: nothing is sent.
+      const plain = await SandboxManager.wrapWithSandboxArgv(
+        'echo x',
+        undefined,
+        config({}, { denyRead: [join(home, '.cargo')], allowWrite: [] }),
+      )
+      expect(plain.argv).not.toContain('--deny-read-except')
+    })
+
     it('the stamps cannot be written → initialize() rejects', async () => {
       syncResult['acl grant'] = exit(1, '', 'access denied')
       const e = await rejection(config({}, { denyRead: [home] }))
@@ -8792,13 +8969,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       })
       await SandboxManager.reset()
       expect(names().slice(2)).toEqual(['acl revoke', 'acl restore'])
-      // Without a grant to hold, a session with nothing to grant
-      // makes no call at all.
+      // With no grant recorded the session registers all the same:
+      // one made while it runs is read through from then on, and
+      // must not be removable from under it.
       calls = []
       profileStatus = { state: 'none' }
       briefGrant = { state: 'none' }
       await SandboxManager.initialize(cfg)
-      expect(names()).toEqual([])
+      expect(SandboxManager.getWindowsProfileRead()).toBe('absent')
+      expect(names()).toEqual(['acl grant'])
+      expect(calls[0].argv).toContain('--persistent')
+      const inSession = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(inSession.argv[inSession.argv.indexOf('--held-by') + 1]).toBe(
+        `${process.pid}`,
+      )
+      await SandboxManager.reset()
+      expect(names()).toEqual(['acl grant', 'acl revoke', 'acl restore'])
+      // A command with no session behind it names no holder: srt-win
+      // holds for the length of the command itself.
+      const alone = await SandboxManager.wrapWithSandboxArgv(
+        'echo x',
+        undefined,
+        config({}, { allowWrite: [] }),
+      )
+      expect(alone.argv).toContain('--write-restricted-token')
+      expect(alone.argv).not.toContain('--held-by')
+      // Under the ordinary token there is nothing to hold.
+      await SandboxManager.initialize(config(ORDINARY))
+      const ordinary = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(ordinary.argv).not.toContain('--held-by')
     })
 
     it('profile forget fails → profile_forget_failed; nothing granted, no session', async () => {

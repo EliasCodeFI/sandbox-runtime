@@ -648,6 +648,25 @@ export interface WindowsSandboxParams {
    * a caller bug.
    */
   denyRead?: readonly string[]
+  /**
+   * Paths the session is granted (read or write) that lie beneath a
+   * {@link denyRead} path — see {@link windowsGrantsBeneathDenies}.
+   * `srt-win` writes a read deny on the recorded paths of the profile
+   * read grant beneath it, and leaves out those at or beneath one of
+   * these: the session's own allow there ranks above a deny set
+   * further up.
+   */
+  denyReadExcept?: readonly string[]
+  /**
+   * Under the write-restricted token: the process whose session this
+   * command belongs to and which `srt-win` has recorded as a holder of
+   * the kept grants ({@link grantWindowsAclPersistent} with that
+   * `holderPid`). Leave it out for a command with no such session:
+   * `srt-win exec` then records itself as the holder until the
+   * command has exited, so that neither the profile read grant nor a
+   * write root is removed from under it.
+   */
+  heldBy?: number
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
@@ -1180,6 +1199,19 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
    * holds when that status does not show a grant that is on disk.
    */
   profileSessionGrantCheck: 'profile-session-grant-check',
+  /**
+   * That expansion leaves out the recorded paths the session allows
+   * more specifically: the grants of the same `acl grant` call, and
+   * the ones a command names with `--deny-read-except`. Without it a
+   * deny on the profile would take a session's own write root away.
+   */
+  readDenyExcept: 'read-deny-except',
+  /**
+   * A session under the write-restricted token is recorded as a
+   * holder of the profile read grant from its start, and `exec` is
+   * told which session holds for it (`--held-by`) or holds for itself.
+   */
+  execHolder: 'exec-holder',
 } as const
 
 /**
@@ -2874,6 +2906,26 @@ function coveringWindowsPath(
     const covering = keys.findIndex(dir => isAtOrUnder(key, dir))
     return covering < 0 ? undefined : dirs[covering]
   }
+}
+
+/**
+ * The ones of `grants` that lie strictly beneath one of `denies`: the
+ * grants that rank above those denies, an allow set further down
+ * being the one that counts. `srt-win` is told about them with a
+ * per-command read deny, so that it does not carry the deny onto a
+ * recorded path of the profile read grant that the session's own
+ * allow covers.
+ */
+export function windowsGrantsBeneathDenies(
+  grants: readonly string[],
+  denies: readonly string[],
+): string[] {
+  if (grants.length === 0 || denies.length === 0) return []
+  const denyKeys = denies.map(windowsPathKey)
+  return grants.filter(g => {
+    const key = windowsPathKey(g)
+    return denyKeys.some(d => key !== d && isAtOrUnder(key, d))
+  })
 }
 
 /** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
@@ -4659,6 +4711,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (writeRestricted) {
     argv.push('--write-restricted-token')
     for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
+    if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
   }
   if (p.loopbackPortRange) {
     argv.push(
@@ -4667,6 +4720,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     )
   }
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
+  for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as

@@ -355,43 +355,87 @@ struct DiskTree<'a> {
 /// destination worked out from that ([`plan::link_destination`]) and
 /// refused unless it is on a local drive; and the walk starts over on
 /// the destination, a bounded number of times. The spelling of the
-/// result comes from a handle on the object opened the same way.
-fn resolve_on_local_drives(path: &str) -> std::result::Result<String, String> {
+/// result comes from a handle on the object opened the same way; if
+/// the way ends at something that does not exist, the result is the
+/// path as the links spell it.
+fn resolve_on_local_drives(path: &str) -> Resolved {
     const MAX_LINKS: usize = 32;
     let mut cur = path.to_owned();
     for _ in 0..MAX_LINKS {
         if !path_id::is_drive_path(&cur) || path_id::on_network_drive(&cur) {
-            return Err(format!(
+            return Resolved::Elsewhere(format!(
                 "leads to '{cur}', which is not on a local drive; not followed"
             ));
         }
         let (root, tail) = cur.split_at(7);
         let comps: Vec<&str> = tail.split('\\').filter(|c| !c.is_empty()).collect();
         let mut link = None;
+        // The last component that was opened, for its spelling on disk.
+        let mut above: Option<Opened> = None;
         for i in 0..comps.len() {
             let prefix = format!("{root}{}", comps[..=i].join("\\"));
-            let o = open_no_follow(&prefix, FILE_READ_ATTRIBUTES)
-                .map_err(|e| format!("cannot be resolved: {e:#}"))?;
+            let o = match open_no_follow(&prefix, FILE_READ_ATTRIBUTES) {
+                Ok(o) => o,
+                // Nothing is there (yet). No link can lie beyond a
+                // component that does not exist, so the rest of the way
+                // is as written: this is where the link leads, and a
+                // rule is carried here as to any other target. What
+                // does exist is spelled as it is on disk, so that the
+                // result compares with the profile's own path.
+                Err(e) if path_id::is_not_found(&e) => {
+                    let base = match &above {
+                        Some(a) => match path_id::final_path_of(a.h.raw()) {
+                            Ok(real) => real,
+                            Err(e) => return Resolved::Unreadable(format!("{e:#}")),
+                        },
+                        None => root.trim_end_matches('\\').to_owned(),
+                    };
+                    return Resolved::At(format!("{base}\\{}", comps[i..].join("\\")));
+                }
+                Err(e) => return Resolved::Unreadable(format!("'{prefix}': {e:#}")),
+            };
             if o.attrs & ATTR_REPARSE_POINT != 0 {
                 let rest: Vec<String> = comps[i + 1..].iter().map(|c| (*c).to_owned()).collect();
                 link = Some((prefix, o, rest));
                 break;
             }
             if i + 1 == comps.len() {
-                return path_id::final_path_of(o.h.raw())
-                    .map_err(|e| format!("cannot be resolved: {e:#}"));
+                return match path_id::final_path_of(o.h.raw()) {
+                    Ok(real) => Resolved::At(real),
+                    Err(e) => Resolved::Unreadable(format!("'{prefix}': {e:#}")),
+                };
             }
+            above = Some(o);
         }
         let Some((at, o, rest)) = link else {
             // The root of a drive.
-            return Ok(cur);
+            return Resolved::At(cur);
         };
-        let data = read_reparse(o.h.raw()).map_err(|e| format!("'{at}': {e:#}"))?;
-        cur = plan::link_destination(&at, &data, &rest)?;
+        let data = match read_reparse(o.h.raw()) {
+            Ok(data) => data,
+            Err(e) => return Resolved::Unreadable(format!("'{at}': {e:#}")),
+        };
+        cur = match plan::link_destination(&at, &data, &rest) {
+            Ok(next) => next,
+            Err(plan::NoDestination::Elsewhere(why)) => return Resolved::Elsewhere(why),
+            Err(plan::NoDestination::Malformed(why)) => return Resolved::Unreadable(why),
+        };
     }
-    Err(format!(
+    Resolved::Unreadable(format!(
         "'{path}' leads through more than {MAX_LINKS} links"
     ))
+}
+
+/// What [`resolve_on_local_drives`] found.
+enum Resolved {
+    /// The object, or — where a component on the way does not exist —
+    /// the path the links lead to as written.
+    At(String),
+    /// Off this machine's drives, or not a redirection: not followed,
+    /// and known not to be inside the profile.
+    Elsewhere(String),
+    /// A link's data or a component on the way could not be read.
+    Unreadable(String),
 }
 
 /// The reparse data of the link open on `h`.
@@ -425,11 +469,12 @@ impl Tree for DiskTree<'_> {
     /// read; nothing is written at either end here.
     fn resolve_link(&mut self, rel: &[String]) -> LinkTarget {
         match resolve_on_local_drives(&join(self.profile, rel)) {
-            Ok(real) => match plan::rel_components(self.profile, &real) {
+            Resolved::At(real) => match plan::rel_components(self.profile, &real) {
                 Ok(inside) => LinkTarget::Inside(inside),
                 Err(_) => LinkTarget::Elsewhere(format!("leads to '{real}'")),
             },
-            Err(why) => LinkTarget::Elsewhere(why),
+            Resolved::Elsewhere(why) => LinkTarget::Elsewhere(why),
+            Resolved::Unreadable(why) => LinkTarget::Unreadable(why),
         }
     }
 
@@ -866,46 +911,33 @@ pub fn check_session_grants(grants: &[(String, bool)], admitted_raw: &[String]) 
 /// - `kept-grant-holders`: sessions are recorded as holders of the
 ///   kept grants they run on, and `acl forget` / `profile forget`
 ///   take `--unless-held-by-others`.
+/// - `read-deny-except`: that expansion leaves out what the session
+///   allows more specifically — the grants of the same `acl grant`
+///   call, and `exec --deny-read-except`.
+/// - `exec-holder`: every session under the write-restricted token is
+///   recorded as a holder of the profile read grant from its start,
+///   and `exec` either is told the session that holds for it
+///   (`--held-by`) or holds for the duration of the command itself.
 pub const CAPABILITIES: &[&str] = &[
     "profile-deny-expansion",
     "profile-session-grant-check",
     "kept-grant-holders",
+    "read-deny-except",
+    "exec-holder",
 ];
 
-/// The profile a read grant is recorded for, if one is: what a
-/// default session runs on, and so holds for as long as it lives
-/// (`state_db::Locked::hold_kept`). A record that cannot be read
-/// counts as a grant — the session may well be reading through it.
-pub fn held_profile() -> Option<String> {
-    match read_marker_at(persist::MARKER_KEY) {
-        Ok(m) if m.is_empty() => None,
-        Ok(m) => Some(
-            m.header
-                .map(|h| h.profile)
-                .unwrap_or_else(|| "(profile)".to_owned()),
-        ),
-        Err(_) => Some("(profile)".to_owned()),
-    }
-}
-
-/// The recorded paths a session's read deny on `deny` (canonical) is
-/// written on as well ([`plan::covered_by_read_deny`]), among those
-/// that still exist. Nothing when no grant is recorded. A record that
-/// cannot be read is an error: a deny that silently covered less than
-/// it says is worse than a command that does not start.
-pub fn read_deny_also(deny: &str) -> Result<Vec<String>> {
+/// The recorded paths that carry an allow of their own, for working
+/// out what a session's read denies are also written on
+/// ([`plan::RecordedAllows::covered`]). Read from the record ONCE per
+/// command, however many denies it carries. Empty when no grant is
+/// recorded. A record that cannot be read is an error: a deny that
+/// silently covered less than it says is worse than a command that
+/// does not start.
+pub fn recorded_allows() -> Result<plan::RecordedAllows> {
     let m = read_marker_at(persist::MARKER_KEY).context("read the profile read grant record")?;
-    Ok(
-        plan::covered_by_read_deny(deny, m.paths.iter().map(|r| (r.path.as_str(), r.kind)))
-            .into_iter()
-            .filter(|p| match open_no_follow(p, FILE_READ_ATTRIBUTES) {
-                Ok(_) => true,
-                // Gone since it was recorded: nothing to deny.
-                Err(e) => !path_id::is_not_found(&e),
-            })
-            .map(str::to_owned)
-            .collect(),
-    )
+    Ok(plan::RecordedAllows::new(
+        m.paths.iter().map(|r| (r.path.as_str(), r.kind)),
+    ))
 }
 
 /// The entries of the directory `dir`, read through a handle opened
@@ -1090,17 +1122,33 @@ fn stamp(store: &Store<'_>, ids: &Ids, path: &str, node: &Node, created: bool) -
 /// that can be neither found at its path nor located by id is an
 /// error and stays recorded.
 fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
+    // The open error decides, by the one table
+    // (`path_id::classify_open_failure`): nothing there, the volume
+    // away for now, or a failure.
+    let mut unavailable = false;
     let here = match open_for_stamp(&r.path) {
         Ok(o) => Some(o),
-        Err(e) if path_id::is_not_found(&e) => None,
-        Err(e) => return Err(e),
+        Err(e) => match path_id::open_failure(&e) {
+            path_id::OpenFailure::NotFound => None,
+            path_id::OpenFailure::VolumeUnavailable => {
+                unavailable = true;
+                None
+            }
+            path_id::OpenFailure::Other => return Err(e),
+        },
     };
+    let network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
     let mut targets: Vec<(String, Opened)> = Vec::new();
     match (here, r.file_id) {
         (Some(o), Some(id)) if o.id == id => targets.push((r.path.clone(), o)),
         // Never opened after it was recorded: the path is all that
         // identifies it.
         (Some(o), None) => targets.push((r.path.clone(), o)),
+        (None, None) if unavailable => bail!(
+            "'{}' is on a volume that cannot be reached now, and nothing records which \
+             object it was; its entry may still be on disk",
+            r.path
+        ),
         (None, None) => {}
         (_, Some(id)) => match path_id::locate_by_file_id(&id) {
             Located::At(p) => {
@@ -1114,9 +1162,14 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
             // now: its entry waits there, listed with the kept grants
             // whose volume is gone, and comes off when the volume is
             // back (`persist::retry_pending`).
-            Located::VolumeAbsent
-                if path_id::is_drive_path(&r.path) && !path_id::on_network_drive(&r.path) =>
-            {
+            Located::VolumeAbsent | Located::Unknown if unavailable => {
+                persist::marker_add_pending(&[persist::PendingStrip {
+                    file_id: id,
+                    group_sid: ids.group_sid.clone().unwrap_or_default(),
+                    path: r.path.clone(),
+                }])?;
+            }
+            Located::VolumeAbsent if !network => {
                 persist::marker_add_pending(&[persist::PendingStrip {
                     file_id: id,
                     group_sid: ids.group_sid.clone().unwrap_or_default(),
@@ -1760,6 +1813,7 @@ mod tests {
             group_sid: Some(GROUP.to_owned()),
             sandbox_user_sid: None,
             real_user_sid: crate::sid::current_user_sid().unwrap(),
+            previous_group_sids: Vec::new(),
         }
     }
 
@@ -2179,6 +2233,49 @@ mod tests {
         assert!(group_aces(&prof.join(r"dotfiles\.ssh")).is_empty());
         std::fs::remove_dir(prof.join(".ssh")).ok();
         std::fs::remove_dir(prof.join(".config")).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A link to a target that does not exist yet: the rule is carried
+    /// there all the same, with the directory created to hold the
+    /// deny, so keys put there later are not readable.
+    #[test]
+    fn a_link_to_a_missing_target_protects_where_it_leads() {
+        let base = scratch("dangling");
+        let prof = base.join("profile");
+        write(&prof, r"dotfiles\README");
+        write(&prof, r"Documents\a.txt");
+        // Made while the target exists, which is then removed.
+        std::fs::create_dir_all(prof.join(r"dotfiles\.ssh")).unwrap();
+        junction(&prof.join(".ssh"), &prof.join(r"dotfiles\.ssh"));
+        std::fs::remove_dir(prof.join(r"dotfiles\.ssh")).unwrap();
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let key = format!("{TEST_KEY}Dangling");
+        let store = Store {
+            conn: &conn,
+            key: &key,
+        };
+        clear_marker(&key).unwrap();
+        let ids = ids();
+        let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
+        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert!(report.complete && report.failed.is_empty(), "{report:?}");
+        // `dotfiles` is a container, not granted whole, and the place
+        // the link leads to exists again, denied.
+        assert_eq!(group_aces(&prof.join("dotfiles")), [(true, false, 0, LIST)]);
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\.ssh")),
+            [(true, true, 0x3u8, ALL)]
+        );
+        assert_eq!(
+            group_aces(&prof.join(r"dotfiles\README")),
+            [(true, false, 0, RX)]
+        );
+        let f = forget(&store, &ids).unwrap();
+        assert!(f.failed.is_empty(), "{f:?}");
+        // The directory the grant created goes with it.
+        assert!(!prof.join(r"dotfiles\.ssh").exists());
+        std::fs::remove_dir(prof.join(".ssh")).ok();
         std::fs::remove_dir_all(&base).ok();
     }
 

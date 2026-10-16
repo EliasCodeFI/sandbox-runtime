@@ -92,6 +92,7 @@ import {
   WINDOWS_SRT_WIN_CAPABILITIES,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
+  windowsGrantsBeneathDenies,
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -1601,9 +1602,11 @@ async function initializeSteps(
         // The same call records this process as a holder of its kept
         // roots and of the profile read grant, so that another
         // session switching the token off cannot remove them from
-        // under this one. That is wanted even with nothing to grant,
-        // whenever this session reads the profile through the grant.
-        if (anyApplied || windowsProfileRead === 'granted') {
+        // under this one. That is why it is made always — with
+        // nothing to grant, and with no grant recorded: one made
+        // while this session runs is read through by its commands
+        // from then on, and must be held by then.
+        {
           await grantWindowsAclPersistent({
             sandboxUserSid: sb,
             read: grantRead,
@@ -1653,9 +1656,10 @@ async function initializeSteps(
       // running revoke/restore at reset(). Recorded AFTER success —
       // the catch below clears `config`, and a non-undefined
       // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed. A session that only registered as a holder
-      // of the profile read grant releases that the same way.
-      if (anyApplied || (writeRestricted && windowsProfileRead === 'granted')) {
+      // that never landed. A session under the write-restricted token
+      // always registered as a holder of the profile read grant, and
+      // releases that the same way.
+      if (anyApplied || writeRestricted) {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
@@ -3130,6 +3134,16 @@ async function wrapWithSandboxArgv(
       javaAgentJarPath: hasNetworkConfig ? windowsJavaAgentJarPath : undefined,
       unsetEnvVars: credentialRestrictions.unsetEnvVars,
       denyRead: perExecDenyRead,
+      // The session's own grants beneath those denies keep their
+      // rank: srt-win leaves the recorded profile paths they cover
+      // out of what it denies for this command.
+      denyReadExcept: windowsGrantsBeneathDenies(
+        [
+          ...(windowsFsStampedSet?.grantRead ?? []),
+          ...(windowsFsStampedSet?.grantWrite ?? []),
+        ],
+        perExecDenyRead,
+      ),
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -3140,6 +3154,14 @@ async function wrapWithSandboxArgv(
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
       writeRestrictedToken,
+      // The session that holds the kept grants for this command:
+      // this process, once initialize() has registered it. A command
+      // with no session behind it names none, and srt-win holds for
+      // the length of the command itself.
+      heldBy:
+        writeRestrictedToken && windowsFsSbUserSid !== undefined
+          ? process.pid
+          : undefined,
       // The roots initialize() granted persistently; their capability
       // SIDs are what let this command write them.
       writeRoots: writeRestrictedToken

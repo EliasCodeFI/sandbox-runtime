@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
 };
 
 use crate::util::{OwnedHandle, pcwstr, wstr};
@@ -65,6 +65,63 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
         .downcast_ref::<windows::core::Error>()
         .map(|we| we.code())
         .is_some_and(|c| c == ERROR_FILE_NOT_FOUND.into() || c == ERROR_PATH_NOT_FOUND.into())
+}
+
+/// Why a path could not be opened, as far as it decides what to do
+/// with a record that names the path ([`classify_open_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFailure {
+    /// Nothing has that name: the object is gone from there, or its
+    /// drive letter names nothing. Where the object is, if anywhere,
+    /// is a question for its file id.
+    NotFound,
+    /// The volume cannot be reached right now — no media in the drive,
+    /// a locked encrypted volume, a device that is not connected, a
+    /// share whose server does not answer. The object may be exactly
+    /// where it was; nothing can be read or written there until the
+    /// volume is back.
+    VolumeUnavailable,
+    /// Anything else (access denied, a sharing violation, an I/O
+    /// error): a failure, not an absence.
+    Other,
+}
+
+/// The one table of open errors, by `HRESULT`.
+pub fn classify_open_failure(hresult: u32) -> OpenFailure {
+    // BitLocker: the volume is locked (`FVE_E_LOCKED_VOLUME`).
+    const FVE_E_LOCKED_VOLUME: u32 = 0x8031_0000;
+    if hresult == FVE_E_LOCKED_VOLUME {
+        return OpenFailure::VolumeUnavailable;
+    }
+    // Everything else of interest is a Win32 error code.
+    if hresult & 0xFFFF_0000 != 0x8007_0000 {
+        return OpenFailure::Other;
+    }
+    match hresult & 0xFFFF {
+        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+        2 | 3 => OpenFailure::NotFound,
+        // ERROR_INVALID_DRIVE, ERROR_BAD_UNIT, ERROR_NOT_READY,
+        // ERROR_REM_NOT_LIST, ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST,
+        // ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED,
+        // ERROR_BAD_NET_NAME, ERROR_NO_SUCH_DEVICE,
+        // ERROR_UNRECOGNIZED_VOLUME, ERROR_MEDIA_CHANGED,
+        // ERROR_NO_MEDIA_IN_DRIVE, ERROR_DEVICE_NOT_CONNECTED,
+        // ERROR_NO_NET_OR_BAD_PATH, ERROR_NETWORK_UNREACHABLE,
+        // ERROR_HOST_UNREACHABLE, ERROR_DEVICE_REMOVED
+        15 | 20 | 21 | 51 | 53 | 55 | 59 | 64 | 67 | 433 | 1005 | 1110 | 1112 | 1167 | 1203
+        | 1231 | 1232 | 1617 => OpenFailure::VolumeUnavailable,
+        _ => OpenFailure::Other,
+    }
+}
+
+/// [`classify_open_failure`] of the system error at the root of `e`;
+/// [`OpenFailure::Other`] when there is none.
+pub fn open_failure(e: &anyhow::Error) -> OpenFailure {
+    e.root_cause()
+        .downcast_ref::<windows::core::Error>()
+        .map_or(OpenFailure::Other, |we| {
+            classify_open_failure(we.code().0 as u32)
+        })
 }
 
 /// True iff `p` names a UNC network path (`\\server\share\…`,
@@ -359,7 +416,13 @@ fn open_for_metadata(path: &str) -> Result<OwnedHandle> {
 /// `GetFinalPathNameByHandleW` two-call sizing pattern. Returns the
 /// raw UTF-16 buffer (no NUL); caller decodes and round-trip-checks.
 fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
-    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
+    final_path_with(h, VOLUME_NAME_DOS.0)
+}
+
+/// [`final_path_from_handle`] with the volume named as `volume_name`
+/// says (`VOLUME_NAME_DOS`, `VOLUME_NAME_GUID`).
+fn final_path_with(h: HANDLE, volume_name: u32) -> Result<Vec<u16>> {
+    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | volume_name);
     let need = unsafe { GetFinalPathNameByHandleW(h, &mut [], flags) };
     if need == 0 {
         bail!("sizing: {}", std::io::Error::last_os_error());
@@ -509,8 +572,10 @@ pub enum Located {
     /// Positively gone: its volume was found and the volume reported
     /// that no file has this id.
     Gone,
-    /// No mounted volume has the recorded serial number: a removable
-    /// or virtual disk that is not attached, or a volume that was
+    /// No volume present on this machine has the recorded serial
+    /// number — looked for among all its volumes, with or without a
+    /// drive letter: a removable or virtual disk that is not
+    /// attached, a volume that is locked, or one that was
     /// reformatted. The object may still exist on it; nothing can be
     /// read or written there until the volume is back.
     VolumeAbsent,
@@ -532,22 +597,6 @@ pub fn is_drive_path(canon: &str) -> bool {
         && b[6] == b'\\'
 }
 
-/// Whether `root` (`X:\`) is a volume attached to this machine — a
-/// fixed, removable, optical or RAM disk — as opposed to a network
-/// drive or a letter with nothing behind it. Asked of the drive table;
-/// the drive is not opened.
-fn is_local_drive_root(root: &str) -> bool {
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
-    // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_CDROM, DRIVE_RAMDISK.
-    let wide = wstr(root);
-    matches!(
-        // SAFETY: `wide` is a NUL-terminated UTF-16 string that
-        // outlives the call.
-        unsafe { GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) },
-        2 | 3 | 5 | 6
-    )
-}
-
 /// Whether the drive letter `canon` (a drive path) is on names a
 /// network share right now.
 pub fn on_network_drive(canon: &str) -> bool {
@@ -557,27 +606,60 @@ pub fn on_network_drive(canon: &str) -> bool {
         return false;
     }
     let wide = wstr(&canon[4..7]);
-    // SAFETY: as in `is_local_drive_root`.
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives
+    // the call.
     unsafe { GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) == DRIVE_REMOTE }
 }
 
-/// Whether a volume with this serial number is mounted on a drive
-/// letter now.
-///
-/// Only drives on this machine are looked at. A drive letter mapped to
-/// a network share is skipped without being opened: opening it would
-/// contact the server.
-pub fn volume_mounted(volume_serial: u64) -> bool {
-    (b'A'..=b'Z').any(|drive| {
-        let root = format!(r"{}:\", drive as char);
-        if !is_local_drive_root(&root) {
-            return false;
+/// The root (`\\\\?\\Volume{…}\\`) of every volume on this machine, whether
+/// it has a drive letter, is mounted only at a folder, or neither.
+/// Network shares are not volumes and are not among them.
+fn local_volume_roots() -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW, FindVolumeClose};
+    let mut out = Vec::new();
+    // A volume GUID path is 49 characters and a NUL.
+    let mut buf = [0u16; 64];
+    // SAFETY: `buf` is writable for its length for both calls, and the
+    // search handle is closed once.
+    let Ok(find) = (unsafe { FindFirstVolumeW(&mut buf) }) else {
+        return out;
+    };
+    loop {
+        let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        out.push(String::from_utf16_lossy(&buf[..len]));
+        buf.fill(0);
+        if unsafe { FindNextVolumeW(find, &mut buf) }.is_err() {
+            break;
         }
-        open_for_metadata(&format!(r"\\?\{root}"))
-            .ok()
-            .and_then(|vh| file_id_from_handle(vh.raw()).ok())
-            .is_some_and(|id| id.volume_serial == volume_serial)
-    })
+    }
+    let _ = unsafe { FindVolumeClose(find) };
+    out
+}
+
+/// A handle on the root of the volume with this serial number, if it
+/// is present and can be opened: looked for among the volumes of this
+/// machine and, unless `local_only`, the drive letters mapped to
+/// network shares (opening one of those contacts its server).
+fn open_volume(volume_serial: u64, local_only: bool) -> Option<OwnedHandle> {
+    let remote = (b'A'..=b'Z')
+        .map(|drive| format!(r"{}:\", drive as char))
+        .filter(|root| !local_only && on_network_drive(&format!(r"\\?\{root}")))
+        .map(|root| format!(r"\\?\{root}"));
+    local_volume_roots()
+        .into_iter()
+        .chain(remote)
+        .find_map(|root| {
+            let vh = open_for_metadata(&root).ok()?;
+            (file_id_from_handle(vh.raw()).ok()?.volume_serial == volume_serial).then_some(vh)
+        })
+}
+
+/// Whether the volume with this serial number is present on this
+/// machine now and can be opened — by a drive letter, at a folder, or
+/// with no mount point at all. A drive whose media is out, a locked
+/// encrypted volume and a network share are not.
+pub fn volume_mounted(volume_serial: u64) -> bool {
+    open_volume(volume_serial, true).is_some()
 }
 
 /// Locate the CURRENT path of a file by its captured
@@ -608,26 +690,16 @@ fn locate_on(file_id: &FileId, local_only: bool) -> Located {
     use windows::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
     };
-    // Open the volume root the file lived on. We need a handle ON
-    // the volume to anchor OpenFileById; the captured volume
-    // serial doesn't directly map to a drive letter, so try each
-    // mounted local drive and match the serial — keeping the
-    // locate volume-keyed (a moved file may not be on the drive
-    // its canonical_path was recorded under).
-    for drive in b'A'..=b'Z' {
-        let root = format!(r"\\?\{}:\", drive as char);
-        if local_only && !is_local_drive_root(&root[4..]) {
-            continue;
-        }
-        let vh = match open_for_metadata(&root) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        // Match the volume by reading FILE_ID_INFO of the root.
-        match file_id_from_handle(vh.raw()) {
-            Ok(id) if id.volume_serial == file_id.volume_serial => {}
-            _ => continue,
-        }
+    // A handle ON the volume the file lived on, to anchor
+    // OpenFileById. The volume is found by its serial among the
+    // volumes of this machine — not among drive letters: a volume
+    // mounted only at a folder has none, and the object may have moved
+    // to another directory of it since its path was recorded.
+    let Some(vh) = open_volume(file_id.volume_serial, local_only) else {
+        // No volume that is present carries this serial.
+        return Located::VolumeAbsent;
+    };
+    {
         let desc = FILE_ID_DESCRIPTOR {
             dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
             Type: ExtendedFileIdType,
@@ -659,23 +731,94 @@ fn locate_on(file_id: &FileId, local_only: bool) -> Located {
             }
             Err(_) => return Located::Unknown,
         };
-        let Ok(buf) = final_path_from_handle(fh.raw()) else {
+        // By drive letter or mount folder where the volume has one,
+        // by volume GUID path where it has none.
+        let Ok(buf) = final_path_from_handle(fh.raw())
+            .or_else(|_| final_path_with(fh.raw(), VOLUME_NAME_GUID.0))
+        else {
             return Located::Unknown;
         };
         let s = String::from_utf16_lossy(&buf);
-        return if utf16_roundtrips(&buf, &s) {
+        if utf16_roundtrips(&buf, &s) {
             Located::At(s)
         } else {
             Located::Unknown
-        };
+        }
     }
-    // No mounted volume carries this serial.
-    Located::VolumeAbsent
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table of open errors.
+    #[test]
+    fn open_errors_are_absence_unavailability_or_failure() {
+        let win32 = |code: u32| classify_open_failure(0x8007_0000 | code);
+        // Nothing has that name.
+        for code in [2, 3] {
+            assert_eq!(win32(code), OpenFailure::NotFound, "{code}");
+        }
+        // The volume cannot be reached right now: the drive keeps its
+        // letter with the media out (21), the device is gone (55, 433,
+        // 1167, 1617), the media changed or is missing (1110, 1112),
+        // nothing recognisable is on it (1005), the letter names no
+        // drive (15, 20), the share or its server is away (51, 53, 59,
+        // 64, 67, 1203, 1231, 1232) …
+        for code in [
+            15, 20, 21, 51, 53, 55, 59, 64, 67, 433, 1005, 1110, 1112, 1167, 1203, 1231, 1232, 1617,
+        ] {
+            assert_eq!(win32(code), OpenFailure::VolumeUnavailable, "{code}");
+        }
+        // … or it is a BitLocker volume that is locked.
+        assert_eq!(
+            classify_open_failure(0x8031_0000),
+            OpenFailure::VolumeUnavailable
+        );
+        // Everything else is a failure, never an absence: access
+        // denied (5), a sharing violation (32), an I/O error (1117),
+        // a bad name (123), success codes, other facilities.
+        for code in [0, 1, 5, 32, 87, 123, 1117, 1920] {
+            assert_eq!(win32(code), OpenFailure::Other, "{code}");
+        }
+        for hr in [0, 5, 0x8031_0001, 0x8000_4005, 0xC000_0022] {
+            assert_eq!(classify_open_failure(hr), OpenFailure::Other, "{hr:#x}");
+        }
+        // As read from an error.
+        let e = anyhow::Error::from(windows::core::Error::from(
+            windows::Win32::Foundation::ERROR_NOT_READY,
+        ))
+        .context("open 'E:\\work'");
+        assert_eq!(open_failure(&e), OpenFailure::VolumeUnavailable);
+        assert_eq!(
+            open_failure(&anyhow::anyhow!("no system error")),
+            OpenFailure::Other
+        );
+    }
+
+    /// Volumes are found by enumeration, not by drive letter.
+    #[test]
+    fn the_system_volume_is_found_among_the_volumes() {
+        let roots = local_volume_roots();
+        assert!(
+            roots
+                .iter()
+                .all(|r| r.starts_with(r"\\?\Volume{") && r.ends_with('\\')),
+            "{roots:?}"
+        );
+        let here = capture_file_id(std::env::temp_dir().to_str().unwrap()).unwrap();
+        assert!(volume_mounted(here.volume_serial));
+        assert!(!volume_mounted(here.volume_serial ^ 0x5a5a_5a5a_5a5a_5a5a));
+        // An object on it is located by its file id …
+        match locate_by_file_id_local(&here) {
+            Located::At(p) => assert_eq!(capture_file_id(&p).unwrap(), here),
+            other => panic!("{other:?}"),
+        }
+        // … and one on a volume that is not there is said to be so.
+        let mut elsewhere = here;
+        elsewhere.volume_serial ^= 0x5a5a_5a5a_5a5a_5a5a;
+        assert_eq!(locate_by_file_id_local(&elsewhere), Located::VolumeAbsent);
+    }
 
     #[test]
     fn canonicalize_rejects_globs() {
