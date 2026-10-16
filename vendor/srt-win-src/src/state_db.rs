@@ -2394,11 +2394,21 @@ mod tests {
         let recorded = pid_create_time(child.id()).unwrap();
         assert!(is_process_alive(child.id(), recorded));
         assert!(alive_by_one_snapshot().unwrap()(child.id(), recorded));
-        // Gone, it is dead by the same list.
+        // Gone, it is dead by the same list. An exited process stays
+        // listed until its last handle is closed, and may for a moment
+        // after, so the handle is dropped and the answer is awaited.
         let pid = child.id();
         child.kill().ok();
         child.wait().unwrap();
-        assert!(!is_process_alive(pid, recorded));
+        drop(child);
+        let gone = (0..50).any(|_| {
+            if !is_process_alive(pid, recorded) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        });
+        assert!(gone);
     }
 
     /// A read deny the object's own list stands in for leaves one row
