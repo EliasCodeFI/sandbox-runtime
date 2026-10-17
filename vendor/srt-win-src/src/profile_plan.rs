@@ -1606,6 +1606,88 @@ pub fn unstamped_exclusion(
     }
 }
 
+// ─── Stores an environment variable moves ───────────────────────────
+
+/// What a variable that relocates a protected store names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moved {
+    /// A directory; these paths in it are the protected ones.
+    Beneath(&'static [&'static str]),
+    /// The protected file or directory itself.
+    Itself,
+    /// A `;`-separated list of protected files.
+    List,
+}
+
+/// The built-in list protects each tool's store where the tool keeps
+/// it by default. These variables move one: a user who has set one to
+/// a place inside the profile keeps credentials where the list does
+/// not look. What the variable names is then protected as well.
+pub const ENV_STORES: &[(&str, Moved)] = &[
+    (
+        "CARGO_HOME",
+        Moved::Beneath(&["credentials", "credentials.toml"]),
+    ),
+    (
+        "GRADLE_USER_HOME",
+        Moved::Beneath(&[r"enterprise\keys.properties", r"develocity\keys.properties"]),
+    ),
+    ("GNUPGHOME", Moved::Itself),
+    ("DOCKER_CONFIG", Moved::Itself),
+    ("AZURE_CONFIG_DIR", Moved::Itself),
+    ("GH_CONFIG_DIR", Moved::Itself),
+    ("AWS_SHARED_CREDENTIALS_FILE", Moved::Itself),
+    ("AWS_CONFIG_FILE", Moved::Itself),
+    ("NETRC", Moved::Itself),
+    ("KUBECONFIG", Moved::List),
+];
+
+/// A path as a variable gives it: separators one way, none at the end.
+fn env_path(v: &str) -> Option<String> {
+    let v = v.trim().replace('/', "\\");
+    let v = v.trim_end_matches('\\');
+    (!v.is_empty()).then(|| v.to_owned())
+}
+
+/// The paths the calling user's environment (`own_env`) says hold a
+/// protected store ([`ENV_STORES`]), as the variables give them.
+/// Whether each lies inside the profile is the caller's to decide.
+pub fn env_exclusions(own_env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (var, moved) in ENV_STORES {
+        let Some(value) = own_env(var) else {
+            continue;
+        };
+        match moved {
+            Moved::Beneath(rel) => {
+                if let Some(dir) = env_path(&value) {
+                    out.extend(rel.iter().map(|r| format!("{dir}\\{r}")));
+                }
+            }
+            Moved::Itself => out.extend(env_path(&value)),
+            Moved::List => out.extend(value.split(';').filter_map(env_path)),
+        }
+    }
+    out
+}
+
+/// Whether both credential files of the cargo home `dir` are among
+/// the recorded protected exclusions (absolute paths, as recorded).
+/// Only then is the directory offered as `CARGO_HOME`: a grant made
+/// before the variable pointed there has not protected them.
+pub fn cargo_home_protected(exclusions: &[String], dir: &str) -> bool {
+    let key = |p: &str| {
+        p.strip_prefix(r"\\?\")
+            .unwrap_or(p)
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    ["credentials", "credentials.toml"].iter().all(|f| {
+        let want = format!("{}\\{f}", key(dir));
+        exclusions.iter().any(|e| key(e) == want)
+    })
+}
+
 // ─── Configuration pointers ─────────────────────────────────────────
 
 /// Environment variables an embedder may set for a sandboxed command
@@ -3024,6 +3106,50 @@ mod tests {
             2,
             "the defaults"
         );
+    }
+
+    /// Variables that move a protected store name what is protected
+    /// there; the cargo home is offered only once its credential
+    /// files are on record.
+    #[test]
+    fn stores_moved_by_the_environment_are_named() {
+        let env = |var: &str| match var {
+            "CARGO_HOME" => Some(r"C:\Users\me\tools\cargo\".to_owned()),
+            "GRADLE_USER_HOME" => Some(r"C:\Users\me\g".to_owned()),
+            "GNUPGHOME" => Some("C:/Users/me/keys".to_owned()),
+            "KUBECONFIG" => Some(r"C:\Users\me\k\a.yaml;;D:\k\b.yaml; ".to_owned()),
+            "NETRC" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            env_exclusions(&env),
+            [
+                r"C:\Users\me\tools\cargo\credentials",
+                r"C:\Users\me\tools\cargo\credentials.toml",
+                r"C:\Users\me\g\enterprise\keys.properties",
+                r"C:\Users\me\g\develocity\keys.properties",
+                r"C:\Users\me\keys",
+                r"C:\Users\me\k\a.yaml",
+                r"D:\k\b.yaml",
+            ]
+        );
+        assert!(env_exclusions(&|_| None).is_empty());
+        // Each variable is one the fixed list has a default place for.
+        for (var, _) in ENV_STORES {
+            assert!(!["RUSTUP_HOME", "PIP_CONFIG_FILE", "NPM_CONFIG_USERCONFIG"].contains(var));
+        }
+        // On record: both files, however the record spells the path.
+        let recorded = vec![
+            r"\\?\C:\Users\me\.cargo\credentials".to_owned(),
+            r"\\?\C:\Users\me\.cargo\credentials.toml".to_owned(),
+            r"\\?\C:\Users\me\tools\cargo\credentials.toml".to_owned(),
+        ];
+        assert!(cargo_home_protected(&recorded, r"C:\Users\ME\.cargo"));
+        assert!(cargo_home_protected(&recorded, r"C:\Users\me\.cargo\"));
+        // One of the two is not both; none is none.
+        assert!(!cargo_home_protected(&recorded, r"C:\Users\me\tools\cargo"));
+        assert!(!cargo_home_protected(&recorded, r"C:\Users\me\other"));
+        assert!(!cargo_home_protected(&[], r"C:\Users\me\.cargo"));
     }
 
     /// What "traversable through the grant" is for a directory, on

@@ -97,6 +97,10 @@ pub struct Layout {
     pub profile: String,
     pub roaming: Option<String>,
     pub local: Option<String>,
+    /// The calling user's own settings of the variables that move a
+    /// tool's home or a protected store ([`plan::ENV_STORES`],
+    /// `RUSTUP_HOME`), read once.
+    pub own_env: Vec<(String, String)>,
 }
 
 impl Layout {
@@ -120,6 +124,7 @@ impl Layout {
                 roaming: sub(r"AppData\Roaming"),
                 local: sub(r"AppData\Local"),
                 profile,
+                own_env: Layout::read_own_env(),
             });
         }
         use windows::Win32::UI::Shell::{
@@ -133,7 +138,25 @@ impl Layout {
             local: known_folder(&FOLDERID_LocalAppData)
                 .and_then(|p| canon(&p))
                 .ok(),
+            own_env: Layout::read_own_env(),
         })
+    }
+
+    fn read_own_env() -> Vec<(String, String)> {
+        plan::ENV_STORES
+            .iter()
+            .map(|(var, _)| *var)
+            .chain(["RUSTUP_HOME"])
+            .filter_map(|var| Some((var.to_owned(), std::env::var(var).ok()?)))
+            .collect()
+    }
+
+    /// The calling user's own value of `var`, if it was set.
+    fn own(&self, var: &str) -> Option<String> {
+        self.own_env
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(var))
+            .map(|(_, v)| v.clone())
     }
 
     /// `folder` as components beneath the profile; `None` when it is
@@ -677,6 +700,7 @@ impl Tree for DiskTree<'_> {
 
 const VAL_HEADER: &str = "Profile";
 const VAL_EXTRA: &str = "ProfileExtra";
+const VAL_ENV_EXTRA: &str = "ProfileEnvExclusions";
 const VAL_PATHS: &str = "ProfilePaths";
 const VAL_EXCLUSIONS: &str = "ProfileExclusions";
 const VAL_UNGRANTED: &str = "ProfileUngranted";
@@ -903,6 +927,14 @@ pub struct Marker {
     /// as paths beneath the profile. A later run keeps them unless it
     /// is told to replace them.
     pub extra: Vec<String>,
+    /// Exclusions that came from the calling user's environment
+    /// ([`plan::ENV_STORES`]): a store a variable had moved inside the
+    /// profile when a grant ran. Kept apart from `extra` because no
+    /// run drops them — not one made after the variable changed, not
+    /// one told to replace the added exclusions: what was protected
+    /// once stays protected until the grant is forgotten, so no file
+    /// that exists is ever opened up by a variable going away.
+    pub env_extra: Vec<String>,
     /// Every PROTECTED exclusion the grant was made with — the
     /// built-in list of the build that made it, at this profile's
     /// locations, and `extra` — as absolute paths, wildcards as
@@ -957,6 +989,7 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .map(|s| Header::decode(&s))
             .transpose()?,
         extra: k.get_multi_sz(VAL_EXTRA)?.unwrap_or_default(),
+        env_extra: k.get_multi_sz(VAL_ENV_EXTRA)?.unwrap_or_default(),
         exclusions: k.get_multi_sz(VAL_EXCLUSIONS)?.unwrap_or_default(),
         ungranted_only: k.get_multi_sz(VAL_UNGRANTED)?.unwrap_or_default(),
         paths: k
@@ -983,6 +1016,7 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
     let paths: Vec<String> = m.paths.iter().map(Recorded::encode).collect();
     k.set_multi_sz(VAL_PATHS, &paths)?;
     k.set_multi_sz(VAL_EXTRA, &m.extra)?;
+    k.set_multi_sz(VAL_ENV_EXTRA, &m.env_extra)?;
     k.set_multi_sz(VAL_EXCLUSIONS, &m.exclusions)?;
     k.set_multi_sz(VAL_UNGRANTED, &m.ungranted_only)?;
     let notes: Vec<String> = m.notes.iter().map(Note::encode).collect();
@@ -998,6 +1032,7 @@ fn clear_marker(key: &str) -> Result<()> {
         for v in [
             VAL_HEADER,
             VAL_EXTRA,
+            VAL_ENV_EXTRA,
             VAL_EXCLUSIONS,
             VAL_UNGRANTED,
             VAL_PATHS,
@@ -1985,10 +2020,28 @@ pub fn grant(
             extra.push(x);
         }
     }
+    // What the calling user's environment says holds a protected
+    // store, where that is inside the profile — added to those an
+    // earlier run recorded, which no run drops (`Marker::env_extra`).
+    // A value that names nothing inside the profile adds nothing.
+    let mut env_extra: Vec<Vec<String>> = old
+        .env_extra
+        .iter()
+        .map(|x| plan::split_path(x))
+        .filter(|x| !x.is_empty())
+        .collect();
+    for named in plan::env_exclusions(&|var| layout.own(var)) {
+        for x in resolve_extra(profile, &[named]).unwrap_or_default() {
+            if !env_extra.contains(&x) {
+                env_extra.push(x);
+            }
+        }
+    }
+    let env_strings: Vec<String> = env_extra.iter().map(|x| x.join("\\")).collect();
     let rules = Rules::new(
         layout.rel(&layout.roaming).as_deref(),
         layout.rel(&layout.local).as_deref(),
-        &extra,
+        &[extra.clone(), env_extra].concat(),
     );
     // The rules the plan ends with include those carried over to the
     // targets of links; they are what is recorded.
@@ -2068,6 +2121,7 @@ pub fn grant(
         &Marker {
             header: Some(header.clone()),
             extra: extra_strings.clone(),
+            env_extra: env_strings.clone(),
             exclusions: exclusions.clone(),
             ungranted_only: ungranted_only.clone(),
             paths: pre,
@@ -2405,6 +2459,7 @@ pub fn grant(
         &Marker {
             header: Some(header),
             extra: extra_strings,
+            env_extra: env_strings,
             exclusions,
             ungranted_only,
             paths,
@@ -2500,6 +2555,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                     ..h
                 }),
                 extra: marker.extra,
+                env_extra: marker.env_extra,
                 exclusions: marker.exclusions,
                 ungranted_only: marker.ungranted_only,
                 paths: all
@@ -2617,6 +2673,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
+        "env_exclusions": m.env_extra,
         "exclusions": m.exclusions,
         "ungranted_only": m.ungranted_only,
         "containers": count(Kind::Container),
@@ -2793,17 +2850,38 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         let dir_readable = |p: &str| {
             std::fs::symlink_metadata(p).is_ok_and(|md| md.is_dir()) && traversable(&m.paths, p)
         };
+        let mut withheld = serde_json::Map::new();
         let env: serde_json::Map<String, serde_json::Value> = plan::env_pointers(
             &shown(&l.profile),
             l.roaming.as_deref().map(shown).as_deref(),
             &readable,
             &dir_readable,
-            &|var| std::env::var(var).ok(),
+            &|var| l.own(var),
         )
         .into_iter()
+        // The cargo home only where its credential files are on
+        // record as protected: a grant made before `CARGO_HOME`
+        // pointed there has not excluded them, and the directory is
+        // not advertised until a refresh has.
+        .filter(|(var, dir)| {
+            let ok = *var != "CARGO_HOME" || plan::cargo_home_protected(&m.exclusions, dir);
+            if !ok {
+                withheld.insert(
+                    (*var).to_owned(),
+                    json!(format!(
+                        "'{dir}' was not the cargo home when the grant was made: its \
+                         credential files are not excluded. Run `srt-win profile grant` again."
+                    )),
+                );
+            }
+            ok
+        })
         .map(|(k, v)| (k.to_owned(), json!(v)))
         .collect();
         out["env"] = serde_json::Value::Object(env);
+        if !withheld.is_empty() {
+            out["env_withheld"] = serde_json::Value::Object(withheld);
+        }
     }
     out
 }
@@ -2966,6 +3044,7 @@ mod tests {
         let recorded = || Marker {
             header: Some(header.clone()),
             extra: Vec::new(),
+            env_extra: Vec::new(),
             exclusions: vec![p(".ssh"), p("NTUSER.DAT*")],
             ungranted_only: vec![p(r"AppData\Local\Temp")],
             paths: Vec::new(),
@@ -3351,6 +3430,107 @@ mod tests {
     /// The second: objects the caller neither owns nor may change.
     /// Needs to hand objects to another owner, which takes an elevated
     /// run (CI's); elsewhere it stops after finding that out.
+    /// A cargo home the user has moved inside the profile: its
+    /// credential files are protected like those of the default one —
+    /// from the run that first sees the variable, and from then on
+    /// whatever the variable says — and the directory is offered as
+    /// `CARGO_HOME` only once they are.
+    #[test]
+    fn a_cargo_home_moved_inside_the_profile_has_its_credentials_protected() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestCargoHome";
+        let base = scratch("cargohome");
+        let prof = base.join("profile");
+        write(&prof, r"tools\cargo\credentials.toml");
+        write(&prof, r"tools\cargo\config.toml");
+        write(&prof, r"tools\cargo\registry\index\x");
+        write(&prof, r"tools\other.txt");
+        write(&prof, r".cargo\credentials.toml");
+        write(&prof, r".cargo\config.toml");
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        clear_marker(KEY).unwrap();
+        let ids = ids();
+        let unset = Layout {
+            own_env: Vec::new(),
+            ..Layout::resolve(Some(prof.to_str().unwrap())).unwrap()
+        };
+        let moved_to =
+            path_id::strip_extended_prefix(&canon(&prof.join(r"tools\cargo"))).to_owned();
+        let moved = Layout {
+            own_env: vec![("CARGO_HOME".to_owned(), moved_to.clone())],
+            ..unset.clone()
+        };
+        let denied = |rel: &str| {
+            let aces = group_aces(&prof.join(rel));
+            !aces.is_empty() && aces.iter().all(|a| a.1)
+        };
+        let cargo_home = |l: &Layout| {
+            let st = status_json(KEY, Ok(l.clone()), false);
+            assert_eq!(st["state"], "current", "{st}");
+            (
+                st["env"]["CARGO_HOME"].as_str().map(str::to_lowercase),
+                st["env_withheld"]["CARGO_HOME"].is_string(),
+            )
+        };
+
+        // Granted without the variable: the default home is as it
+        // always was — its credential file denied, itself offered —
+        // and `tools` is an ordinary directory, readable whole.
+        let report = grant(&store, &ids, &unset, &[], false, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(denied(r".cargo\credentials.toml"));
+        assert!(!denied(r"tools\cargo\credentials.toml"));
+        let default_home =
+            path_id::strip_extended_prefix(&canon(&prof.join(".cargo"))).to_lowercase();
+        assert_eq!(cargo_home(&unset), (Some(default_home), false));
+        // The variable set since: that directory is not offered, and
+        // the status says a refresh is needed.
+        assert_eq!(cargo_home(&moved), (None, true));
+
+        // The refresh that sees it protects both files there — the one
+        // that exists is denied, the other is on record — and turns
+        // the directories above them into ones granted child by child.
+        let report = grant(&store, &ids, &moved, &[], false, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(denied(r"tools\cargo\credentials.toml"));
+        assert!(!denied(r"tools\cargo\config.toml"));
+        assert!(!group_aces(&prof.join(r"tools\other.txt")).is_empty());
+        let m = read_marker_at(KEY).unwrap();
+        assert_eq!(
+            m.env_extra,
+            [r"tools\cargo\credentials", r"tools\cargo\credentials.toml"]
+        );
+        assert!(plan::cargo_home_protected(&m.exclusions, &moved_to));
+        assert_eq!(cargo_home(&moved), (Some(moved_to.to_lowercase()), false));
+        // The default home is still protected.
+        assert!(denied(r".cargo\credentials.toml"));
+
+        // The variable gone again, and a run told to replace the added
+        // exclusions: what was protected stays protected.
+        let report = grant(&store, &ids, &unset, &[], true, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(denied(r"tools\cargo\credentials.toml"));
+        assert_eq!(read_marker_at(KEY).unwrap().env_extra.len(), 2);
+
+        // One that names a place outside the profile adds nothing.
+        let outside = Layout {
+            own_env: vec![("CARGO_HOME".to_owned(), base.to_str().unwrap().to_owned())],
+            ..unset.clone()
+        };
+        let report = grant(&store, &ids, &outside, &[], false, false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(read_marker_at(KEY).unwrap().env_extra.len(), 2);
+        assert_eq!(cargo_home(&outside), (None, false));
+
+        let f = forget(&store, &ids).unwrap();
+        assert!(f.failed.is_empty(), "{f:?}");
+        assert!(read_marker_at(KEY).unwrap().env_extra.is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn objects_the_caller_may_not_change_are_classed_and_do_not_stop_the_grant() {
         let icacls = |args: &[&str]| {
