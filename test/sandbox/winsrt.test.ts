@@ -113,6 +113,22 @@ function hasTool(name: string): boolean {
   return whereAll(name).length > 0
 }
 
+/**
+ * Whether the `node` on PATH reads NODE_USE_ENV_PROXY for `https`:
+ * 22.21 on its line, and 24.5.
+ */
+function nodeReadsProxyEnv(): boolean {
+  if (!hasTool('node')) return false
+  const r = spawnSync('node', ['-p', 'process.versions.node'], {
+    encoding: 'utf8',
+  })
+  if (r.status !== 0) return false
+  const [major = 0, minor = 0] = r.stdout.trim().split('.').map(Number)
+  return (
+    (major === 22 && minor >= 21) || (major === 24 && minor >= 5) || major > 24
+  )
+}
+
 // Direct helper calls (and SandboxManager configs) must thread an
 // explicit srt-win path — there is no ambient vendor fallback.
 // getSrtWinPath() picks the built exe (vendored or cargo
@@ -1891,18 +1907,38 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it.skipIf(!hasTool('node'))(
     'B5: node https.get direct egress is BLOCKED (proxy env not honoured)',
     async () => {
-      // KEY: with NODE_USE_ENV_PROXY cleared, Node's built-in https
-      // does NOT read HTTPS_PROXY, so it attempts a DIRECT connect.
-      // The user-SID WFP filter must refuse it. This is the
-      // load-bearing proof that WFP — not the proxy env vars — is
-      // the real network boundary.
+      // KEY: the request is made with an agent of the script's own,
+      // which reads no proxy variable whatever NODE_USE_ENV_PROXY
+      // says, so it attempts a DIRECT connect. (Clearing the variable
+      // in the command is not enough: the runner hands the child every
+      // *_PROXY name in both cases, and `set` removes one.) The
+      // user-SID WFP filter must refuse it. This is the load-bearing
+      // proof that WFP — not the proxy env vars — is the real network
+      // boundary.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
-        `set "NODE_USE_ENV_PROXY=" & node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
+        `node -e "const s=Date.now();const h=require('https');h.get('https://example.com',{agent:new h.Agent()},r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
       )
       expect(r.stdout.startsWith('OK:')).toBe(false)
     },
     60_000,
+  )
+
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B6: node https.get to an allowedDomains host → 200 via proxy (NODE_USE_ENV_PROXY)',
+    async () => {
+      // The same request as B5 with Node's default agent, which
+      // NODE_USE_ENV_PROXY=1 in the overlay points at HTTPS_PROXY.
+      // Direct egress is fenced (B5), so a 200 came through the proxy.
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
+        x => x.stdout.trim() === 'OK:200',
+      )
+      expectStatus('B6', r, [0])
+      expect(r.stdout.trim()).toBe('OK:200')
+    },
+    90_000,
   )
 
   // ════════════════════════════════════════════════════════════════
