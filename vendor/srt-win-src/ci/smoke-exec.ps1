@@ -305,12 +305,16 @@ Write-Host 'R4e ok: Start-Process -RedirectStandardOutput starts its command'
 # through it.
 $gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
 if (Test-Path $gitBash) {
-  $r = RExec ($bothCases + @('--', $gitBash, '-c',
-    "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; " +
-    "/usr/bin/env | /usr/bin/grep -c '^http_proxy='"))
+  # Two counts: the names that are http_proxy ignoring case, then the
+  # ones spelled in lower case. The script is one argument to `-c`: in
+  # an array literal `,` binds tighter than `+`, so a string joined
+  # there would be split in two, and bash would run only the first.
+  $script = "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; " +
+            "/usr/bin/env | /usr/bin/grep -c '^http_proxy='"
+  $r = RExec ($bothCases + @('--', $gitBash, '-c', $script))
   $counts = @($r.out -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-  if ($counts.Count -ne 2 -or $counts[0] -ne '1' -or $counts[1] -ne '1') {
-    throw "R4f: expected one http_proxy, in lower case, in the shell's environment. raw: $($r.raw)"
+  if ($r.exit -ne 0 -or $counts.Count -ne 2 -or $counts[0] -ne '1' -or $counts[1] -ne '1') {
+    throw "R4f: expected one http_proxy, in lower case, in the shell's environment; counts: $($counts -join ' / '). exit: $($r.exit). raw: $($r.raw)"
   }
   # Only the proxy names are counted here: what else the shell's own
   # startup adds to its environment is not this row's subject.
