@@ -869,8 +869,12 @@ The sandboxed process has its own profile, so a tool does not look in yours by i
 | `GIT_CONFIG_GLOBAL` | git 2.32+ | replaces both global files; left out when you set it yourself |
 | `PIP_CONFIG_FILE` | pip | read in addition to pip's other files |
 | `MAVEN_ARGS` (`-s … -Dsettings.security=…`) | Maven 3.9+ | older Maven needs `-s` on the command line |
+| `RUSTUP_HOME` | rustup (`cargo`, `rustc`) | a directory: your `RUSTUP_HOME` if you set one, else `%USERPROFILE%\.rustup`; without it rustup's shims find no toolchain |
+| `CARGO_HOME` | cargo | a directory: your `CARGO_HOME` if you set one, else `%USERPROFILE%\.cargo`; read-only — see below |
 | — | NuGet | no variable names the user file: pass `--configfile`, or keep a `NuGet.Config` in or above the project |
 | — | Gradle | no variable names `gradle.properties` (`GRADLE_USER_HOME` would move the caches too): pass properties as `ORG_GRADLE_PROJECT_<name>` or `-P` |
+
+`RUSTUP_HOME` and `CARGO_HOME` are the two that name a directory rather than a file, and are returned only when the directory exists and the grant reaches it (a location outside your profile is not offered, and neither is the default in its place). With `CARGO_HOME` pointing at your real, read-only directory, cargo builds from what is already cached there (`--offline`) but cannot add to the registry cache or install binaries from inside the sandbox. That is the intended trade: an empty writable cache in the sandbox account's own profile would be no better, since cargo's downloads use the Windows TLS stack, which does not work under the sandbox token. `.cargo\credentials` and `.cargo\credentials.toml` stay unreadable — they are denied on the files themselves, whatever names the directory — so an operation that needs a registry token fails there.
 
 #### Exclusions
 

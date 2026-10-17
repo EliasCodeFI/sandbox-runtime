@@ -8266,9 +8266,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           GIT_CONFIG_GLOBAL: 'g',
           PIP_CONFIG_FILE: 'p',
           MAVEN_ARGS: 'm',
+          RUSTUP_HOME: 'r',
+          CARGO_HOME: 'c',
+          // Not one of the names: dropped, whatever srt-win says.
+          GRADLE_USER_HOME: 'x',
         },
       })
+      expect(winUtils.WINDOWS_PROFILE_READ_ENV_VARS).toEqual([
+        'NPM_CONFIG_USERCONFIG',
+        'GIT_CONFIG_GLOBAL',
+        'PIP_CONFIG_FILE',
+        'MAVEN_ARGS',
+        'RUSTUP_HOME',
+        'CARGO_HOME',
+      ])
       expect(winUtils.windowsProfileReadEnv(status('current'))).toEqual({
+        NPM_CONFIG_USERCONFIG: 'n',
+        GIT_CONFIG_GLOBAL: 'g',
+        PIP_CONFIG_FILE: 'p',
+        MAVEN_ARGS: 'm',
+        RUSTUP_HOME: 'r',
+        CARGO_HOME: 'c',
+      })
+      // The embedder's own value stands, in whatever case it names it.
+      expect(
+        winUtils.windowsProfileReadEnv(status('current'), {
+          cargo_home: 'D:\\cargo',
+          RUSTUP_HOME: 'D:\\rustup',
+        }),
+      ).toEqual({
         NPM_CONFIG_USERCONFIG: 'n',
         GIT_CONFIG_GLOBAL: 'g',
         PIP_CONFIG_FILE: 'p',
@@ -8280,7 +8306,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           maven_args: '-o',
           PIP_CONFIG_FILE: undefined,
         }),
-      ).toEqual({ NPM_CONFIG_USERCONFIG: 'n', PIP_CONFIG_FILE: 'p' })
+      ).toEqual({
+        NPM_CONFIG_USERCONFIG: 'n',
+        PIP_CONFIG_FILE: 'p',
+        RUSTUP_HOME: 'r',
+        CARGO_HOME: 'c',
+      })
       for (const s of ['none', 'outdated', 'incomplete', 'unknown'] as const) {
         expect(winUtils.windowsProfileReadEnv(status(s))).toEqual({})
       }

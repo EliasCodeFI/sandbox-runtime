@@ -1635,12 +1635,34 @@ pub fn unstamped_exclusion(
 /// profile): its properties have to be passed as
 /// `ORG_GRADLE_PROJECT_<name>` variables or `-P` arguments.
 ///
-/// A variable is returned only when `readable` says its file is
+/// Two name a DIRECTORY, because the tool does not work without it:
+///
+/// - `RUSTUP_HOME` — where rustup keeps its toolchains. The `cargo`
+///   and `rustc` on the real user's PATH are rustup's shims, which
+///   look for a toolchain under the home they see; in the sandbox
+///   account's profile there is none.
+/// - `CARGO_HOME` — cargo's registry cache, configuration and
+///   installed binaries.
+///
+/// Neither moves a tool's writes into the real profile: nothing there
+/// is writable to the sandboxed command, so cargo builds from what is
+/// already cached and cannot add to it. Each is the directory the
+/// real user's own environment names (`own_env`), else the default
+/// one in the profile — and is returned only when `dir_readable` says
+/// that directory is there and the grant makes it traversable: one
+/// granted whole, or one whose children are granted one by one
+/// (`.cargo`, whose credential files stay denied on the files
+/// themselves, whatever names the directory). A location the grant
+/// does not cover, such as one outside the profile, yields nothing.
+///
+/// A file variable is returned only when `readable` says its file is
 /// there and covered by the grant.
 pub fn env_pointers(
     profile: &str,
     roaming: Option<&str>,
     readable: &dyn Fn(&str) -> bool,
+    dir_readable: &dyn Fn(&str) -> bool,
+    own_env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(&'static str, String)> {
     let at = |base: &str, rel: &str| format!("{}\\{rel}", base.trim_end_matches('\\'));
     let first = |candidates: &[String]| candidates.iter().find(|p| readable(p)).cloned();
@@ -1667,6 +1689,15 @@ pub fn env_pointers(
             v.push_str(&format!(" \"-Dsettings.security={sec}\""));
         }
         out.push(("MAVEN_ARGS", v));
+    }
+    for (var, rel) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+        let dir = own_env(var)
+            .map(|v| v.trim_end_matches('\\').to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| at(profile, rel));
+        if dir_readable(&dir) {
+            out.push((var, dir));
+        }
     }
     out
 }
@@ -2874,7 +2905,9 @@ mod tests {
         let profile = r"C:\Users\me";
         let roaming = r"C:\Users\me\AppData\Roaming";
         let all = |_: &str| true;
-        let got = env_pointers(profile, Some(roaming), &all);
+        let none = |_: &str| false;
+        let unset = |_: &str| None;
+        let got = env_pointers(profile, Some(roaming), &all, &none, &unset);
         assert_eq!(
             got,
             vec![
@@ -2893,7 +2926,7 @@ mod tests {
             ]
         );
         // Nothing there: nothing returned.
-        assert!(env_pointers(profile, Some(roaming), &|_| false).is_empty());
+        assert!(env_pointers(profile, Some(roaming), &none, &none, &unset).is_empty());
         // Fallbacks: git's XDG file, pip's older and XDG locations,
         // Maven settings without the security file.
         let only =
@@ -2902,6 +2935,8 @@ mod tests {
             profile,
             Some(roaming),
             &only(&[r".config\git\config", r"me\pip\pip.ini", "settings.xml"]),
+            &none,
+            &unset,
         );
         assert_eq!(
             got,
@@ -2917,7 +2952,7 @@ mod tests {
                 ),
             ]
         );
-        let got = env_pointers(profile, None, &only(&["pip.conf"]));
+        let got = env_pointers(profile, None, &only(&["pip.conf"]), &none, &unset);
         assert_eq!(
             got,
             vec![(
@@ -2927,7 +2962,7 @@ mod tests {
         );
         // The directory variables that would move a tool's writes
         // into the real profile are never among them.
-        for (var, _) in env_pointers(profile, Some(roaming), &all) {
+        for (var, _) in env_pointers(profile, Some(roaming), &all, &all, &unset) {
             assert!(
                 ![
                     "USERPROFILE",
@@ -2937,11 +2972,78 @@ mod tests {
                     "TEMP",
                     "TMP",
                     "GRADLE_USER_HOME",
-                    "CARGO_HOME"
                 ]
                 .contains(&var)
             );
         }
+    }
+
+    /// The two directories a Rust toolchain is found through: each
+    /// named when it is there and traversable through the grant —
+    /// granted whole or child by child — at the place the real user's
+    /// own environment says, else the default one.
+    #[test]
+    fn the_rust_homes_are_named_where_the_grant_reaches_them() {
+        let profile = r"C:\Users\me";
+        let none = |_: &str| false;
+        let unset = |_: &str| None;
+        let rust = |dirs: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>| {
+            env_pointers(profile, None, &none, dirs, env)
+        };
+        // Both there.
+        assert_eq!(
+            rust(&|_| true, &unset),
+            vec![
+                ("RUSTUP_HOME", r"C:\Users\me\.rustup".to_owned()),
+                ("CARGO_HOME", r"C:\Users\me\.cargo".to_owned()),
+            ]
+        );
+        // Absent, or not reached by the grant: not named. Each on its
+        // own.
+        assert!(rust(&none, &unset).is_empty());
+        assert_eq!(
+            rust(&|p| p.ends_with(".cargo"), &unset),
+            vec![("CARGO_HOME", r"C:\Users\me\.cargo".to_owned())]
+        );
+        // The real user keeps them elsewhere: that is the place, with
+        // or without a separator at its end …
+        let own = |var: &str| match var {
+            "RUSTUP_HOME" => Some(r"C:\Users\me\tools\rustup\".to_owned()),
+            "CARGO_HOME" => Some(r"D:\cargo".to_owned()),
+            _ => None,
+        };
+        // … if the grant reaches it; one outside the profile it does
+        // not, and the default is not offered in its place.
+        assert_eq!(
+            rust(&|p| p.starts_with(r"C:\Users\me\"), &own),
+            vec![("RUSTUP_HOME", r"C:\Users\me\tools\rustup".to_owned())]
+        );
+        // An empty value is no value.
+        assert_eq!(
+            rust(&|_| true, &|_| Some(String::new())).len(),
+            2,
+            "the defaults"
+        );
+    }
+
+    /// What "traversable through the grant" is for a directory, on
+    /// the plan of a profile: `.rustup` is granted whole; `.cargo` is
+    /// a container whose children are granted one by one, with its
+    /// credential files denied.
+    #[test]
+    fn a_container_is_traversable_and_its_exclusions_stay_denied() {
+        let mut t = Mem::default();
+        t.add(r".cargo\credentials.toml")
+            .add(r".cargo\config.toml")
+            .add(r".cargo\registry\index\x")
+            .add(r".rustup\toolchains\stable\bin\cargo.exe");
+        let k = kinds(&plan(&mut t, &rules()).unwrap());
+        let kind = |p: &str| k.get(p).map(|v| v.0);
+        assert_eq!(kind(".rustup"), Some(Kind::Granted));
+        assert_eq!(kind(".cargo"), Some(Kind::Container));
+        assert_eq!(kind(r".cargo\registry"), Some(Kind::Granted));
+        assert_eq!(kind(r".cargo\config.toml"), Some(Kind::File));
+        assert_eq!(kind(r".cargo\credentials.toml"), Some(Kind::Denied));
     }
 
     #[test]

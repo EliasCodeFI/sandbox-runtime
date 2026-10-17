@@ -296,6 +296,7 @@ try {
   $sshKey   = Seed '.ssh\id_test'                               'SSH-CONTENT'
   $cargoCr  = Seed '.cargo\credentials.toml'                    'CARGO-CRED-CONTENT'
   $cargoCfg = Seed '.cargo\config.toml'                         'CARGO-CONFIG-CONTENT'
+  $null     = Seed '.rustup\settings.toml'                      'RUSTUP-SETTINGS-CONTENT'
   $credBlob = Seed 'AppData\Roaming\Microsoft\Credentials\blob' 'CRED-CONTENT'
   $npmTool  = Seed 'AppData\Roaming\npm\tool.cmd'               '@echo NPM-TOOL'
   $tempFile = Seed 'AppData\Local\Temp\t.txt'                   'TEMP-CONTENT'
@@ -435,6 +436,24 @@ try {
   if ($st.state -eq 'current' -and $st.env.NPM_CONFIG_USERCONFIG -and @($st.paths).Count -gt 0) {
     Ok "G: status is current for the made-up profile, with NPM_CONFIG_USERCONFIG=$($st.env.NPM_CONFIG_USERCONFIG)"
   } else { Fail "G: status: $($st | ConvertTo-Json -Compress -Depth 4)" }
+  # The Rust homes: named where the grant reaches them — `.cargo`, a
+  # directory whose children are granted one by one, included — at the
+  # default place when the caller's environment names none, and not at
+  # all when it names one outside the profile.
+  $savedHomes = @{ RUSTUP_HOME = $env:RUSTUP_HOME; CARGO_HOME = $env:CARGO_HOME }
+  try {
+    $env:RUSTUP_HOME = $null; $env:CARGO_HOME = $null
+    $st = Status
+    if ($st.env.CARGO_HOME -eq (Join-Path $prof '.cargo') -and $st.env.RUSTUP_HOME -eq (Join-Path $prof '.rustup')) {
+      Ok "G: status names RUSTUP_HOME and CARGO_HOME in the profile"
+    } else { Fail "G: Rust homes: env=$($st.env | ConvertTo-Json -Compress)" }
+    $env:RUSTUP_HOME = $outside; $env:CARGO_HOME = $outside
+    $st = Status
+    if (-not $st.env.CARGO_HOME -and -not $st.env.RUSTUP_HOME) { Ok 'G: Rust homes outside the profile are not named' }
+    else { Fail "G: Rust homes outside the profile: env=$($st.env | ConvertTo-Json -Compress)" }
+  } finally {
+    $env:RUSTUP_HOME = $savedHomes.RUSTUP_HOME; $env:CARGO_HOME = $savedHomes.CARGO_HOME
+  }
   $real = (Invoke-Srt $ExeAbs @('profile', 'status')).json
   if ($real.state -eq 'outdated') { Ok 'G: for the real profile the same record is outdated (made for another directory)' }
   else { Fail "G: status for the real profile is '$($real.state)', want outdated" }

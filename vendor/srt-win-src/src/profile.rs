@@ -2552,6 +2552,24 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
 
 // ─── Status ─────────────────────────────────────────────────────────
 
+/// Whether `path` is a directory the grant lets a sandboxed command
+/// enter and list: recorded as granted whole, or as a container
+/// (children granted one by one, exclusions among them denied on
+/// themselves), or beneath a directory granted whole.
+fn traversable(paths: &[Recorded], path: &str) -> bool {
+    let p = path_id::strip_extended_prefix(path).to_lowercase();
+    paths.iter().any(|r| {
+        let at = path_id::strip_extended_prefix(&r.path).to_lowercase();
+        match r.kind {
+            Kind::Granted | Kind::Container if at == p => true,
+            Kind::Granted => {
+                p.len() > at.len() && p.starts_with(&at) && p.as_bytes()[at.len()] == b'\\'
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Whether `path` (as a tool would be given it, without the `\\?\`
 /// prefix) is a file the grant makes readable: recorded as a granted
 /// file, or beneath a recorded granted directory.
@@ -2770,10 +2788,17 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         let shown = |p: &str| path_id::strip_extended_prefix(p).to_owned();
         let readable =
             |p: &str| std::fs::metadata(p).is_ok_and(|md| md.is_file()) && covered(&m.paths, p);
+        // A directory: a real one (not a link to somewhere else),
+        // which the grant made traversable.
+        let dir_readable = |p: &str| {
+            std::fs::symlink_metadata(p).is_ok_and(|md| md.is_dir()) && traversable(&m.paths, p)
+        };
         let env: serde_json::Map<String, serde_json::Value> = plan::env_pointers(
             &shown(&l.profile),
             l.roaming.as_deref().map(shown).as_deref(),
             &readable,
+            &dir_readable,
+            &|var| std::env::var(var).ok(),
         )
         .into_iter()
         .map(|(k, v)| (k.to_owned(), json!(v)))

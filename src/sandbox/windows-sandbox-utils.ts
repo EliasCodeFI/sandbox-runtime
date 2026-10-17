@@ -3293,17 +3293,25 @@ const PROFILE_PATH_KINDS: ReadonlySet<string> = new Set([
 
 /**
  * The variables {@link windowsProfileReadEnv} can return. Each names
- * one configuration FILE. None of them is a directory a tool also
- * writes under (`USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`,
- * `TEMP`, `TMP`, `GRADLE_USER_HOME`, …): those stay in the sandbox
- * account's own profile, and a name outside this list is dropped
- * whatever `srt-win` reports.
+ * one configuration FILE, but for `RUSTUP_HOME` and `CARGO_HOME`,
+ * which name the directories a Rust toolchain is found through:
+ * rustup's `cargo` and `rustc` look for a toolchain under the home
+ * they see, and the sandbox account's has none. Nothing in the real
+ * profile is writable to a sandboxed command, so cargo builds from
+ * what is already cached there (`--offline`) and cannot add to it.
+ * None of the others is a directory a tool also writes under
+ * (`USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`,
+ * `GRADLE_USER_HOME`, …): those stay in the sandbox account's own
+ * profile, and a name outside this list is dropped whatever `srt-win`
+ * reports.
  */
 export const WINDOWS_PROFILE_READ_ENV_VARS: readonly string[] = [
   'NPM_CONFIG_USERCONFIG',
   'GIT_CONFIG_GLOBAL',
   'PIP_CONFIG_FILE',
   'MAVEN_ARGS',
+  'RUSTUP_HOME',
+  'CARGO_HOME',
 ]
 
 /**
@@ -4065,8 +4073,11 @@ export function windowsProfileExclusionConflicts(
  * Environment variables an embedder may set for a sandboxed command
  * so each tool reads the real user's configuration FILE in place:
  * `NPM_CONFIG_USERCONFIG`, `GIT_CONFIG_GLOBAL`, `PIP_CONFIG_FILE`,
- * `MAVEN_ARGS` — each only if its file exists and the grant covers
- * it, and never one `env` (what the embedder sets itself) already
+ * `MAVEN_ARGS` — and finds the real user's Rust toolchain:
+ * `RUSTUP_HOME`, `CARGO_HOME`, the directories the user's own
+ * environment names or else `.rustup` and `.cargo` in the profile.
+ * Each only if its file or directory exists and the grant covers it,
+ * and never one `env` (what the embedder sets itself) already
  * holds. Empty unless the grant is current. The library sets none of
  * them by itself.
  *
