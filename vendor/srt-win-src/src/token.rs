@@ -284,9 +284,8 @@ pub fn make_sandbox_token(
     // SeChangeNotifyPrivilege.
     let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;
 
-    // Restricting SIDs: none by default; the capability SIDs plus
-    // the fixed three when `write_restricted`. `restrict_sids` owns
-    // the SID memory and must outlive `CreateRestrictedToken`.
+    // `restrict_sids` owns the SID memory and must outlive
+    // `CreateRestrictedToken`.
     let restrict_want: Vec<String> = if write_restricted {
         restricting_sid_list(&token_user_sid(base)?, capability_sids)
     } else {

@@ -206,18 +206,15 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the DEFAULT child token only. The WFP block filter
+// That holds for the default child token only. The WFP block filter
 // matches by an access check of the connecting token, and the
-// write-restricted token's restricting SIDs include the capability
-// SIDs of the session's write roots — a different token per session.
-// So with `windows.writeRestrictedToken` every initialize() probes,
-// with that session's token, and nothing is remembered.
+// write-restricted token differs per session (it carries the
+// capability SIDs of the session's write roots), so with
+// `windows.writeRestrictedToken` every initialize() probes.
 let windowsWfpVerified = false
-// The child-token shape initialize() verified the fence for, captured
-// like `srtWinSpawn` so the wrap path uses it rather than `config`:
-// updateConfig() swaps `config` live without re-verifying, and a
-// swapped-in `windows.writeRestrictedToken` must not change the token
-// a command runs under until the next initialize().
+// The child-token shape initialize() verified the fence for. The wrap
+// path uses this rather than `config`, which updateConfig() swaps
+// live without re-verifying.
 let windowsWriteRestrictedToken = false
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -1227,10 +1224,8 @@ async function initializeSteps(
         acc.denyWrite.length > 0
       if (writeRestricted) {
         // One call: the write roots are granted persistently (kept at
-        // reset(); a root granted before costs one DACL read), the
-        // denies under them are converged with them, and the rest is
-        // per-session as below. A failure throws — there is no
-        // fallback to per-session grants.
+        // reset()), the denies under them are converged with them,
+        // and the rest is per-session as below. A failure throws.
         if (anyApplied) {
           grantWindowsAclPersistent({
             sandboxUserSid: sb,
@@ -1242,9 +1237,7 @@ async function initializeSteps(
           })
         }
         // The egress probe, under the token this session's commands
-        // get. Anything but a refused connect (including a probe
-        // child that could not be created) throws, so the session
-        // never starts with that token unfenced.
+        // get; anything but a refused connect throws.
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
           writeRestrictedToken: true,

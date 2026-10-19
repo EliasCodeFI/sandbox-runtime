@@ -128,14 +128,11 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 ///
 /// `write_restricted` builds the child token write-restricted (see
 /// [`crate::token`]), with `capability_sids` — the capability SIDs of
-/// the session's write roots — among its restricting SIDs. It is
-/// fail-closed throughout: token creation,
-/// the runner's process self-protect and its thread self-protect
-/// must all succeed or no child runs — there is no fallback to the
-/// ordinary token. Both self-protects matter more here than in the
-/// default mode, because the runner's own token is NOT
-/// write-restricted: a child that could open the runner, or one of
-/// its threads, could act with the runner's token and write wherever
+/// the session's write roots — among its restricting SIDs, and is
+/// fail-closed: token creation and the runner's process and thread
+/// self-protect must all succeed or no child runs. The runner's own
+/// token is NOT write-restricted, so a child that could open the
+/// runner, or one of its threads, could write wherever
 /// `BUILTIN\Users` can.
 pub fn run_lockdown(
     target_exe: &Path,

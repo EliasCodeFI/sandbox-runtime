@@ -2268,19 +2268,14 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
  * Session start for `windows.writeRestrictedToken`: one `srt-win acl
  * grant --persistent` carrying the grants and the deny lists.
  *
- * Each `write` path becomes a persistent root. It gets ACEs for the
- * sandbox group and for a capability SID of its own — none for the
- * sandbox user — and they are KEPT when the session ends:
- * {@link revokeWindowsAclChecked} does not remove them,
- * {@link forgetWindowsPersistentGrants} does. A root that already
- * carries them costs one DACL read here instead of a walk of its
- * tree. Deny targets under a persistent root are stamped for the
- * sandbox group and kept with it; `read` grants and deny targets
- * elsewhere are per-session, as with {@link grantWindowsAcl} and
- * {@link stampWindowsAcl}, and are released the same way.
- *
- * Pass `write` to {@link wrapCommandWithSandboxWindows} as
- * `writeRoots`.
+ * Each `write` path becomes a persistent root: its ACEs name the
+ * sandbox group and a capability SID of its own (not the sandbox
+ * user) and are KEPT when the session ends —
+ * {@link forgetWindowsPersistentGrants} removes them,
+ * {@link revokeWindowsAclChecked} does not. Deny targets under a
+ * persistent root are kept with it; `read` grants and deny targets
+ * elsewhere are per-session. Pass `write` to
+ * {@link wrapCommandWithSandboxWindows} as `writeRoots`.
  *
  * @throws on exit ≠ 0, including exit 2 (an input was skipped).
  *   Nothing falls back to a per-session grant.

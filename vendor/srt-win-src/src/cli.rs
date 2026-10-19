@@ -1094,15 +1094,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Persistent write grants go with the account. Done here,
-            // before the elevation hop: the records are the CALLING
-            // user's (their registry hive, their session database),
-            // and the elevated process may be another user. They name
-            // the sandbox group, so this must also precede its
-            // removal. A root that cannot be completed stays recorded
-            // (`acl forget --all` retries) and does not stop the
-            // uninstall: once the group is gone its ACEs match no
-            // token.
+            // Persistent write grants go with the account. Before the
+            // elevation hop: the records are the CALLING user's, and
+            // the elevated process may be another user. They name the
+            // sandbox group, so this also precedes its removal. A
+            // root that cannot be completed stays recorded and does
+            // not stop the uninstall: once the group is gone its ACEs
+            // match no token.
             if !keep_user {
                 match srt_win::persist::forget_everything() {
                     Ok((0, _)) => {}
@@ -2360,9 +2358,6 @@ mod tests {
         ));
     }
 
-    /// `probe token` and `probe parent-access` are CI smoke hooks:
-    /// they parse only in a `test-hooks` build, so a default (shipped)
-    /// binary does not have them at all.
     #[test]
     fn persistent_grant_subcommands_parse() {
         let grant = |extra: &[&str]| {
@@ -2427,6 +2422,9 @@ mod tests {
         assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
     }
 
+    /// `probe token` and `probe parent-access` are CI smoke hooks:
+    /// they parse only in a `test-hooks` build, so a default (shipped)
+    /// binary does not have them at all.
     #[test]
     fn probe_test_hooks_follow_the_feature() {
         for sub in ["token", "parent-access"] {

@@ -1049,18 +1049,13 @@ pub struct PersistentWant<'a> {
 ///    gives `Authenticated Users` modify). This gives back what
 ///    ownership gave them.
 ///
-/// Why the order works. `OWNER RIGHTS` is an ALLOW: it takes nothing
-/// away in the ACE walk, it only switches the implicit owner grant
-/// off, so ACE 4 does not have to precede it. What can stop ACE 4 is
-/// a DENY met earlier in the walk. The four are explicit ACEs at the
-/// head of the root's DACL, ahead of every ACE the root had and of
-/// everything it inherits; on a descendant they arrive as inherited
-/// ACEs from the root, which are placed ahead of those inherited from
-/// further up. So no deny of the root or of a directory above it is
-/// reached before ACE 4. Only an explicit deny on the descendant
-/// itself comes first — the one case where the real user had
-/// `WRITE_DAC` as owner and no longer has it. None of the denies
-/// written here name the real user.
+/// `OWNER RIGHTS` is an ALLOW: it only switches the implicit owner
+/// grant off, so ACE 4 does not have to precede it. What can stop ACE
+/// 4 is a DENY met earlier in the walk, and these explicit ACEs sit
+/// at the head of the root's DACL (on a descendant, ahead of ACEs
+/// inherited from further up), so only an explicit deny on the
+/// descendant itself comes first. None of the denies written here
+/// name the real user.
 ///
 /// No ACE names the sandbox USER SID: it is a restricting SID of
 /// every session, so an ALLOW for it would pass both checks for all
