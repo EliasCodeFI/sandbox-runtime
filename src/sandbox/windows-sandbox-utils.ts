@@ -1121,6 +1121,15 @@ export function interpretWindowsWfpVerify(r: {
         `\`srt-win install\`. (${r.stderr})`,
     )
   }
+  // Exit 0 alone is not a pass: the plain attempt must say `blocked`.
+  if (raw.egress_probe !== 'blocked') {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — \`srt-win wfp verify\` ` +
+        `exited 0 but reported the plain attempt as ` +
+        `'${raw.egress_probe ?? 'missing'}' [${summary}]. (${r.stderr})`,
+    )
+  }
   const residuals = (raw.residuals ?? []).filter(isWfpResidual)
   const warnings = residuals.map(
     x => `WFP egress fence residual '${x}': ${WFP_RESIDUAL_TEXT[x]}`,

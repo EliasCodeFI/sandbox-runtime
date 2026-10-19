@@ -1865,6 +1865,21 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(await verifyCode(0, '')).toBe('wfp_verify_unparseable')
   })
 
+  it('verifyWindowsWfpEgress: exit 0 without a blocked plain attempt does not resolve', async () => {
+    const { egress_probe: _dropped, ...withoutPlain } = JSON.parse(
+      verifyOut(),
+    ) as Record<string, unknown>
+    for (const stdout of [
+      JSON.stringify(withoutPlain),
+      verifyOut({ egress_probe: 'novel' }),
+      verifyOut({ egress_probe: 'skipped' }),
+    ]) {
+      expect(await verifyCode(0, stdout)).toBe('wfp_verify_inconclusive')
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+    }
+  })
+
   it('verifyWindowsWfpEgress: a residual named beside a failing exit still rejects', async () => {
     // Residuals qualify a pass only; they never soften a failure.
     expect(
