@@ -1083,10 +1083,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       }),
       spyOn(winUtils, 'revokeWindowsAcl').mockReturnValue([]),
       spyOn(winUtils, 'restoreWindowsAcl').mockReturnValue([]),
-      // The JVM agent jar is the one a test's config names, or none. The
-      // default lookup finds a jar wherever one has been built (`npm run
-      // build:java-agent`), and initialize() stages what it finds: the
-      // session's grants would then depend on the machine.
+      // Pinned: the default lookup would stage whatever jar this machine built.
       spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync').mockImplementation(
         explicitPath => Promise.resolve(explicitPath ?? null),
       ),
@@ -3449,12 +3446,6 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
 // ────────────────────────────────────────────────────────────────────
 // Group J — JVM proxy agent (JAVA_TOOL_OPTIONS=-javaagent:…)
 // ────────────────────────────────────────────────────────────────────
-//
-// The env-composition layer is covered on every platform by the
-// "Windows wrapper" block in java-proxy-agent.test.ts; here: the
-// staging step (pure), then on Windows the session plumbing and,
-// where the runner has a JDK and the jar was built, a real JVM
-// through the real proxy.
 
 describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
   it('copies the jar into a fresh directory holding nothing else', () => {
@@ -3466,13 +3457,9 @@ describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
     try {
       staged = stageWindowsJavaAgentJar(jar)
       expect(staged).toBeDefined()
-      // The directory that gets granted is NOT the one the jar came
-      // from: whatever shares the original's directory stays out of
-      // the sandbox user's reach.
       expect(dirname(staged!)).not.toBe(src)
       expect(readdirSync(dirname(staged!))).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
       expect(readFileSync(staged!, 'utf8')).toBe('JAR-BYTES')
-      // Each session stages its own copy.
       const again = stageWindowsJavaAgentJar(jar)!
       expect(dirname(again)).not.toBe(dirname(staged!))
       removeStagedWindowsJavaAgentJar(again)
@@ -3480,7 +3467,6 @@ describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
 
       removeStagedWindowsJavaAgentJar(staged!)
       expect(existsSync(dirname(staged!))).toBe(false)
-      // The source is left exactly as it was.
       expect(readdirSync(src).sort()).toEqual([
         'neighbour.txt',
         JAVA_PROXY_AGENT_JAR_NAME,
@@ -3517,8 +3503,7 @@ describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
       const created = lstatSync(dir, { bigint: true })
       expect(isUnswappedDirectory(dir, created)).toBe(true)
 
-      // A link (symlink here; a junction reads the same under lstat on
-      // Windows) planted where the directory was.
+      // A link planted where the directory was.
       const elsewhere = join(root, 'elsewhere')
       mkdirSync(elsewhere)
       renameSync(dir, join(root, 'moved-aside'))
@@ -3535,8 +3520,7 @@ describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
       renameSync(join(root, 'moved-aside'), dir)
       expect(isUnswappedDirectory(dir, created)).toBe(true)
 
-      // The PARENT swapped for a link to a look-alike tree: the leaf is
-      // a real directory, but not ours, and not reached link-free.
+      // The PARENT swapped for a link to a look-alike tree.
       const fakeParent = join(root, 'fake-parent')
       mkdirSync(join(fakeParent, 'staged'), { recursive: true })
       renameSync(parent, join(root, 'parent-aside'))
@@ -3579,8 +3563,6 @@ const JAVA =
   JAVA_CANDIDATE !== undefined && javaMajor(JAVA_CANDIDATE) >= 11
     ? JAVA_CANDIDATE
     : undefined
-// The jar is a build artifact (`npm run build:java-agent`); CI builds it
-// on the Windows legs when the runner has a JDK.
 const BUILT_AGENT_JAR = isWindows ? await getJavaProxyAgentJarPathAsync() : null
 const JAVA_FIXTURE_DIR = join(
   import.meta.dir,
@@ -3608,9 +3590,8 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
         srtWin: TEST_SRT_WIN,
       })
     }
-    // A stand-in jar beside a file the sandbox must NOT gain access
-    // to, both under the broker's %TEMP% — which the sandbox user has
-    // no rights on, so any read that succeeds came from the grant.
+    // The sandbox user has no rights on the broker's %TEMP%: a read that
+    // succeeds came from the grant.
     scratch = mkdtempSync(join(tmpdir(), 'srt-j-'))
     fakeJar = join(scratch, JAVA_PROXY_AGENT_JAR_NAME)
     neighbour = join(scratch, 'neighbour.txt')
@@ -3647,11 +3628,7 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
       : []
   }
 
-  /**
-   * The JAVA_TOOL_OPTIONS value the child will receive and the jar it
-   * names. It must come from the `--env-stdin` frame: the value can
-   * carry the broker's own JAVA_TOOL_OPTIONS, so it never rides argv.
-   */
+  /** The JAVA_TOOL_OPTIONS value in the `--env-stdin` frame and its jar. */
   function agentFromWrap(w: { argv: string[]; stdinPayload?: Buffer }): {
     jto: string
     staged: string
@@ -3683,10 +3660,8 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
       const wrapped = await SandboxManager.wrapWithSandboxArgv('echo hi')
       const { jto, staged } = agentFromWrap(wrapped)
       stagedDir = dirname(staged)
-      // A copy in a directory of its own — not the configured path.
       expect(stagedDir).not.toBe(scratch)
       expect(readdirSync(stagedDir)).toEqual([JAVA_PROXY_AGENT_JAR_NAME])
-      // The credential is not in it, and not on argv at all.
       expect(jto).not.toContain('@')
       const token = /:([^:@]+)@localhost:\d+$/.exec(
         frameOf(wrapped.stdinPayload).find(([k]) => k === 'HTTPS_PROXY')![1],
@@ -3721,15 +3696,11 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
     } finally {
       await SandboxManager.reset()
     }
-    // The session's revoke + restore ran against the still-existing
-    // directory, then the directory itself went.
     expect(existsSync(stagedDir)).toBe(false)
   }, 180_000)
 
   it('J1b: the staged jar stays read-only when an allowWrite root covers the temp directory', async () => {
-    // The hostile layout: %TEMP% sits inside a tree the session grants
-    // the sandbox MODIFY on. Point this process's temp root at such a
-    // tree for the duration, so the staged directory lands under it.
+    // The hostile layout: %TEMP% inside a tree the sandbox may MODIFY.
     const root = mkdtempSync(join(tmpdir(), 'srt-jw-'))
     const temp = join(root, 'tmp')
     mkdirSync(temp)
@@ -3746,7 +3717,6 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
       const wrapped = await SandboxManager.wrapWithSandboxArgv('echo hi')
       const { staged } = agentFromWrap(wrapped)
       stagedDir = dirname(staged)
-      // Premise: the staged directory really is under the write grant.
       expect(stagedDir.toLowerCase()).toContain(
         realpathSync.native(root).toLowerCase(),
       )
@@ -3754,9 +3724,7 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
       const ctl = join(temp, 'control.txt')
       const planted = join(stagedDir, 'planted.jar')
       const r = await runSandboxed(
-        // Control first: the allowWrite grant is live right next door.
         `echo CTL>"${ctl}" & ` +
-          // Then every way to swap what the JVM would load.
           `echo POISON>"${staged}" & ` +
           `echo POISON>"${planted}" & ` +
           `del /f /q "${staged}" & ` +
@@ -3784,8 +3752,6 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
       else process.env.TMP = saved.TMP
     }
     try {
-      // Grant, write-deny and the parent's delete-child deny all
-      // released; staged directory gone.
       expect(existsSync(stagedDir)).toBe(false)
       const out = spawnSync('icacls', [temp], {
         encoding: 'utf8',
@@ -3800,8 +3766,7 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
   }, 180_000)
 
   it('J2: no agent, no error, when the configured jar does not exist and none is built', async () => {
-    // Falls back past the missing explicit path to the normal lookup:
-    // either the built vendor jar, or nothing — never the bogus path.
+    // Falls back to the normal lookup: never the bogus path.
     await SandboxManager.initialize(
       createJavaTestConfig(join(scratch, 'missing.jar'), ['example.com']),
     )
@@ -3826,10 +3791,7 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
   it.skipIf(!existsSync(GIT_BASH))(
     'J3: the option survives the msys2 → native hop (git-bash → cmd.exe)',
     async () => {
-      // Maven/Gradle wrappers are commonly run from git-bash. msys2
-      // rewrites env values that look like POSIX paths when it spawns
-      // a native program; the value is a native Windows path, so it
-      // must come out the other side byte-for-byte.
+      // msys2 rewrites env values that look like POSIX paths; not this one.
       await SandboxManager.initialize(
         createJavaTestConfig(fakeJar, ['example.com']),
       )
@@ -3851,11 +3813,6 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
     120_000,
   )
 
-  // A JVM, which ignores HTTPS_PROXY and whose direct connects the WFP
-  // fence drops, reaches an allow-listed host — so it went through the
-  // proxy, with the session credential — and is refused BY THE PROXY
-  // for a host that is not on the list. Also the runtime check on
-  // leaving -Djava.net.preferIPv4Stack off.
   it.skipIf(JAVA === undefined || BUILT_AGENT_JAR === null)(
     'J4: a real JVM reaches an allowed host through the proxy and is refused for another',
     async () => {
@@ -3864,8 +3821,7 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
         createJavaTestConfig(
           BUILT_AGENT_JAR!,
           ['example.com'],
-          // The probe source lives in the checkout, which the sandbox
-          // user cannot read without a grant.
+          // The sandbox user cannot read the checkout without a grant.
           [JAVA_FIXTURE_DIR],
         ),
       )

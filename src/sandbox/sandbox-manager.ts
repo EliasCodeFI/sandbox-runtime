@@ -185,9 +185,7 @@ let mitmCA: MitmCA | undefined
 let javaAgentJarPath: string | undefined
 /**
  * Windows: this session's staged copy of the agent jar, in a directory of
- * its own that the sandbox user is granted read on (the child runs as a
- * different account and cannot read {@link javaAgentJarPath} where it
- * sits). This is what the Windows wrap advertises.
+ * its own that the sandbox user is granted read on.
  */
 let windowsJavaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
@@ -1108,18 +1106,8 @@ async function initializeSteps(
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
         : [...acc.grantRead]
-      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at:
-      // a copy is staged in a directory of its own and that directory
-      // rides the read-set, as the trust bundle's does.
-      //
-      // The sandbox must never be able to WRITE there: every JVM it
-      // starts loads this jar, and the sandbox account is shared
-      // across sessions. A temp path does not guarantee that — an
-      // allowWrite root may cover it, or %TEMP% may be Users-writable
-      // — so the directory is also stamped with the session's write
-      // denies; the broker composes the deny ahead of any allow. Like
-      // the grant, it is the library's own and stays out of `acc`.
-      // Resolved here because the grant has to precede the first exec.
+      // The JVM proxy agent jar is staged in a directory of its own. Every JVM
+      // loads it as code, so the directory is write-denied as well as granted.
       const denyWrite = [...acc.denyWrite]
       const jar = await getJavaProxyAgentJarPathAsync(
         runtimeConfig.javaAgentJarPath,
@@ -2583,10 +2571,8 @@ async function wrapWithSandboxArgv(
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
-      // Only when a proxy is advertised, as on macOS/Linux. The deny
-      // list rides along solely so a denied JAVA_TOOL_OPTIONS is not
-      // composed back in from the broker's env. The composed value
-      // travels in the --env-stdin frame, not on argv.
+      // Only when a proxy is advertised. The deny list rides along so a denied
+      // JAVA_TOOL_OPTIONS is not composed back in from the broker's env.
       javaAgentJarPath: hasNetworkConfig ? windowsJavaAgentJarPath : undefined,
       unsetEnvVars: credentialRestrictions.unsetEnvVars,
       denyRead: perExecDenyRead,

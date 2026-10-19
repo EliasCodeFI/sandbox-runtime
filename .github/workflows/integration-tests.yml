@@ -143,9 +143,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          # The JVM proxy agent jar, so the J rows in winsrt.test.ts can
-          # drive a real JVM through the proxy from inside the sandbox.
-          # Without the jar those rows skip.
+          # The JVM proxy agent jar, for the J rows in winsrt.test.ts; without
+          # it those rows skip.
           if ($env:JAVA_HOME -or (Get-Command javac -ErrorAction SilentlyContinue)) {
             npm run build:java-agent
           } else {

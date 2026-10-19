@@ -8,12 +8,8 @@
   (real user, full visibility of its own processes) and from INSIDE
   the sandbox (Win32_Process sweep as srt-sandbox).
 
-  Also proves that JAVA_TOOL_OPTIONS=-javaagent:<jar> rides the SAME
-  stdin frame (the TS wrapper composes the host's own
-  JAVA_TOOL_OPTIONS into it, which can hold -D secrets), arrives
-  byte-for-byte, backslashes intact, and is on no command line. The
-  agent reaching a host through the proxy is covered by the J rows in
-  test/sandbox/winsrt.test.ts.
+  Also proves that JAVA_TOOL_OPTIONS=-javaagent:<jar> rides the SAME stdin
+  frame, arrives byte-for-byte and is on no command line.
 
   Self-contained: provisions the `srt-sandbox` account + WFP filters
   under a fixed test-only sublayer GUID via `srt-win install`, and
@@ -92,10 +88,7 @@ $InnerProbe = Join-Path $ProbeDir 'inner.ps1'
 # go missing in the VM while single trailing lines (CHILD-DONE)
 # arrive, so stdout parsing is only the fallback oracle.
 $CenvFile   = Join-Path $ProbeDir 'cenv.txt'
-# What the TS wrapper puts in the frame for JVMs. The jar need not
-# exist - nothing in this chain is a JVM; the row is about the value
-# surviving frame -> broker -> runner -> child unchanged. No quotes
-# (the frame JSON below escapes backslashes only).
+# The jar need not exist: nothing in this chain is a JVM.
 $Jto        = '-javaagent:' + (Join-Path $ProbeDir 'srt-proxy-agent.jar')
 
 $decoy = $null
@@ -399,10 +392,7 @@ try {
   Write-Host "S4 ok: token present in the sandboxed child environment ($oracleSrc)"
 
   # -- S4b: JAVA_TOOL_OPTIONS reached the child exactly as framed -------
-  # Literal comparison, not -match: the value is a Windows path, and a
-  # regex would read its backslashes as escapes. Exact equality also
-  # proves no hop rewrote the path or appended anything - in
-  # particular not the token, which must stay in HTTPS_PROXY.
+  # Literal comparison, not -match: a regex would read the path's backslashes as escapes.
   $jtoWant = "JAVA_TOOL_OPTIONS=$Jto"
   $jtoEnv = @($dump | Where-Object {
     ($_ -eq "CENVD=$jtoWant") -or ($_ -eq "CENV=$jtoWant")

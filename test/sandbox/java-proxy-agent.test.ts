@@ -152,12 +152,6 @@ describe.if(isMacOS)('macOS wrapper', () => {
   })
 })
 
-// Pure object test — the Windows wrapper only builds an argv, so this runs
-// on every platform (srtWin.path is the test runner's own executable so the
-// existence check passes). What the child's environment receives is the
-// `--env` overlay plus the `--env-stdin` frame; the returned `env` is the
-// broker's. JAVA_TOOL_OPTIONS can carry the broker's own value (-D secrets
-// included), so it must reach the child through the frame only.
 describe('Windows wrapper (pure, all platforms)', () => {
   const JAR = 'C:\\srt\\java-agent-x\\srt-proxy-agent.jar'
   const TOKEN = 'tok-secret-not-for-argv'
@@ -182,8 +176,6 @@ describe('Windows wrapper (pure, all platforms)', () => {
       const frame: [string, string][] = r.stdinPayload
         ? JSON.parse(r.stdinPayload.subarray(4).toString('utf8'))
         : []
-      // Never on argv, in any form: command lines are readable by
-      // same-user sibling processes.
       expect(envArgs.some(e => /^JAVA_TOOL_OPTIONS=/i.test(e))).toBe(false)
       for (const a of r.argv) {
         expect(a).not.toContain('-javaagent:')
@@ -203,8 +195,6 @@ describe('Windows wrapper (pure, all platforms)', () => {
   }
 
   it('injects the agent through the stdin frame: native path, no IPv4 flag', () => {
-    // No -Djava.net.preferIPv4Stack=true: the WFP loopback PERMIT matches
-    // the IPv4 connect a dual-stack socket makes (see the wrapper).
     expect(wrap({ javaAgentJarPath: JAR }).jto).toEqual([
       `JAVA_TOOL_OPTIONS=-javaagent:${JAR}`,
     ])
@@ -217,11 +207,8 @@ describe('Windows wrapper (pure, all platforms)', () => {
     )
     expect(jto[0]).not.toContain('@')
     for (const a of argv) expect(a).not.toContain(TOKEN)
-    // The broker (srt-win) is not a JVM: the variable is dropped from its
-    // spawn env rather than left as one more same-user-readable copy.
+    // srt-win is not a JVM: the variable is dropped from its spawn env.
     expect(env.JAVA_TOOL_OPTIONS).toBeUndefined()
-    // What the agent reads at JVM start: the proxy endpoint in the
-    // loopback port range, with the per-session token as its password.
     const https = frame.find(([k]) => k === 'HTTPS_PROXY')![1]
     expect(https).toMatch(
       new RegExp(`^http://[^:@]+:${TOKEN}@localhost:60080$`),
@@ -266,8 +253,7 @@ describe('Windows wrapper (pure, all platforms)', () => {
     )
     expect(jto).toEqual([`JAVA_TOOL_OPTIONS=-javaagent:${JAR} -Dkey=SENTINEL`])
     for (const a of argv) expect(a).not.toContain('real-secret')
-    // The sentinel is overridden in the frame, not also left on --env:
-    // srt-win requires the two channels' keys to be disjoint.
+    // Not also left on --env: the two channels' keys must be disjoint.
     for (const a of argv) expect(a).not.toContain('SENTINEL')
   })
 
@@ -279,11 +265,8 @@ describe('Windows wrapper (pure, all platforms)', () => {
   })
 
   it('omits JAVA_TOOL_OPTIONS when there is no jar, even if the broker has one', () => {
-    // Without the agent nothing of the broker's is forwarded: the child
-    // keeps whatever its own profile environment carries.
     const off = wrap({}, '-Dbroker.only=1')
     expect(off.jto).toEqual([])
-    // …and the broker's own env is not touched either.
     expect(off.env.JAVA_TOOL_OPTIONS).toBe('-Dbroker.only=1')
     expect(wrap({}).jto).toEqual([])
   })
