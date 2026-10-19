@@ -198,9 +198,7 @@ function RExec {
   # 120s: a row that starts Windows PowerShell as the sandbox user can take
   # over 30s on some hosted runner images (powershell.exe is CPU-bound in
   # startup the whole time, then finishes). A limit only matters on a hang.
-  # -StdinText: give the broker a redirected stdin holding exactly this text,
-  # then close it. Without it the broker inherits this script's stdin.
-  param([string[]] $tail, [int] $TimeoutSec = 120, [string] $StdinText = $null)
+  param([string[]] $tail, [int] $TimeoutSec = 120)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -209,14 +207,9 @@ function RExec {
   $psi.UseShellExecute        = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
-  $feed = $PSBoundParameters.ContainsKey('StdinText')
-  if ($feed) { $psi.RedirectStandardInput = $true }
   $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p  = [System.Diagnostics.Process]::Start($psi)
-  if ($feed) {
-    try { $p.StandardInput.Write($StdinText); $p.StandardInput.Close() } catch { }
-  }
   # Drain both pipes concurrently so a full pipe buffer can't wedge
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
@@ -1384,16 +1377,7 @@ if ($r.out -match 'CHILD_DESK=Default') {
 }
 Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
 
-# ── R13: the child's stdin cannot be used to impersonate ─────────
-# The egress BLOCK matches the sandbox account's SID, so a thread
-# running under any other identity would fall through to permit. A
-# pipe's SERVER end can ImpersonateNamedPipeClient whoever opened the
-# other end; the child's stdin is a pipe whose other end the real
-# user's broker holds, so it must be a CLIENT end. One compiled
-# method does the whole sequence on a single thread (impersonation is
-# per-thread): direct connect to an out-of-range listener, then
-# impersonate via the stdin handle, and — only if that worked — the
-# same connect on a NEW socket before reverting.
+# ── R13: the child's stdio handles are pipe CLIENT ends ──────────
 $r13Lsn  = Bind-Listener (50003, 50004, 50005, 49997)
 $r13Port = $r13Lsn.LocalEndpoint.Port
 try {
@@ -1407,6 +1391,13 @@ public static class StdinProbe {
   [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetFileType(IntPtr h);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateNamedPipeClient(IntPtr h);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetNamedPipeInfo(IntPtr h, out uint flags, IntPtr o, IntPtr i, IntPtr m);
+  static string End(IntPtr h) {
+    if (GetFileType(h) != 3) { return "notpipe"; }
+    uint flags;
+    if (!GetNamedPipeInfo(h, out flags, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero)) { return "unknown le=" + Marshal.GetLastWin32Error(); }
+    return (flags & 1) != 0 ? "server" : "client";
+  }
   static string Connect(int port) {
     try { using (var c = new TcpClient()) { c.Connect("127.0.0.1", port); return "CONNECTED"; } }
     catch (SocketException e) { return "blocked code=" + e.SocketErrorCode; }
@@ -1414,14 +1405,20 @@ public static class StdinProbe {
   }
   public static string Run(int port) {
     string o = "DIRECT=" + Connect(port) + "\n";
-    IntPtr h = GetStdHandle(-10);
-    o += "STDIN_TYPE=" + GetFileType(h) + "\n";
-    bool ok = ImpersonateNamedPipeClient(h);
-    int le = Marshal.GetLastWin32Error();
-    if (!ok) { return o + "IMPERSONATE=fail le=" + le + "\n"; }
-    string r = Connect(port);
-    if (!RevertToSelf()) { Environment.Exit(97); }
-    return o + "IMPERSONATE=ok\nIMPERSONATED_CONNECT=" + r + "\n";
+    int[] ids = { -10, -11, -12 };
+    string[] names = { "STDIN", "STDOUT", "STDERR" };
+    for (int i = 0; i < 3; i++) { o += "END_" + names[i] + "=" + End(GetStdHandle(ids[i])) + "\n"; }
+    for (int i = 0; i < 3; i++) {
+      bool ok = ImpersonateNamedPipeClient(GetStdHandle(ids[i]));
+      int le = Marshal.GetLastWin32Error();
+      if (ok) {
+        string r = Connect(port);
+        if (!RevertToSelf()) { Environment.Exit(97); }
+        return o + "IMPERSONATE=ok via " + names[i] + "\nIMPERSONATED_CONNECT=" + r + "\n";
+      }
+      o += "IMPERSONATE_" + names[i] + "=fail le=" + le + "\n";
+    }
+    return o + "IMPERSONATE=fail\n";
   }
 }
 '@
@@ -1436,48 +1433,43 @@ Add-Type -TypeDefinition `$src
   if ($r.out -notmatch 'DIRECT=blocked') {
     throw "R13: probe did not report its direct connect. raw: $($r.raw)"
   }
-  # 3 = FILE_TYPE_PIPE: the handle probed really is the stdin pipe, so a
-  # failed impersonation is the pipe refusing, not a missing handle.
-  if ($r.out -notmatch 'STDIN_TYPE=3') {
-    throw "R13: child stdin is not a pipe — impersonation probe is vacuous. raw: $($r.raw)"
+  # GetNamedPipeInfo names the end; a refused impersonation alone does not
+  # (a server end is refused too until data has been read through it).
+  if ($r.out -notmatch '(?m)^END_STDIN=client\s*$') {
+    throw "R13: child stdin is not a pipe CLIENT end. raw: $($r.raw)"
+  }
+  foreach ($n in 'STDOUT', 'STDERR') {
+    if ($r.out -notmatch "(?m)^END_$n=(client|unknown)") {
+      throw "R13: child $n is not a pipe client end. raw: $($r.raw)"
+    }
   }
   if ($r.out -match 'IMPERSONATE=ok') {
-    throw "R13: child impersonated through its stdin handle (stdin is a pipe server end). raw: $($r.raw)"
+    throw "R13: child impersonated through a stdio handle (a pipe server end). raw: $($r.raw)"
   }
   if ($r.out -notmatch 'IMPERSONATE=fail') {
     throw "R13: probe did not report an impersonation result. raw: $($r.raw)"
   }
-  # Sanity: the listener was live, so "blocked" is the fence and not a
-  # closed port.
+  # The listener was live, so "blocked" is the fence and not a closed port.
   $hc = [System.Net.Sockets.TcpClient]::new()
   try { $hc.Connect('127.0.0.1', $r13Port) } catch {
     throw "R13: broker-side connect to its own listener on $r13Port failed — test invalid"
   } finally { $hc.Dispose() }
-  Write-Host 'R13 ok: stdin handle cannot impersonate; out-of-range connect blocked'
+  Write-Host 'R13 ok: stdio handles are pipe client ends and cannot impersonate; out-of-range connect blocked'
 } finally {
   $r13Lsn.Stop()
 }
 
 # ── R14: the child's stdin reads as end-of-file ──────────────────
-# The broker writes the launch spec to the runner's stdin and closes
-# it; it does not forward its own stdin. So a child that reads stdin
-# to the end must finish (a missing EOF is the RExec timeout) having
-# read nothing — in particular none of the spec. `sort` copies stdin
-# to stdout and exits at EOF; the marker after it proves it returned.
-# A payload is put on the BROKER's stdin so the row also shows what
-# reaches the child from there: either nothing, or exactly the
-# payload — never anything else.
-$r14Payload = 'R14-STDIN-PAYLOAD-7f3a'
-$r = RExec @('--', $cmd, '/c', 'sort & echo R14-EOF-MARK') `
-       -TimeoutSec 60 -StdinText "$r14Payload`r`n"
-if ($r.out -notmatch 'R14-EOF-MARK') {
-  throw "R14: child did not get past reading stdin. raw: $($r.raw)"
+# `&&`: the marker is printed only if `sort` read its input to the end.
+$r = RExec @('--', $cmd, '/c', 'sort && echo R14-EOF-MARK') -TimeoutSec 60
+if ($r.exit -ne 0 -or $r.out -notmatch 'R14-EOF-MARK') {
+  throw "R14: child could not read its stdin to the end (exit $($r.exit)). raw: $($r.raw)"
 }
 $r14Read = (($r.out -split 'R14-EOF-MARK')[0]).Trim()
-if ($r14Read -ne '' -and $r14Read -ne $r14Payload) {
-  throw "R14: child read unexpected bytes from stdin: '$r14Read'. raw: $($r.raw)"
+if ($r14Read -ne '') {
+  throw "R14: child stdin was not empty, or the read wrote to stderr: '$r14Read'. raw: $($r.raw)"
 }
-Write-Host "R14 ok: child stdin reaches end-of-file (read: '$r14Read')"
+Write-Host 'R14 ok: child stdin is readable and at end-of-file'
 
 # ── G-rows: per-session FS access for the sandbox user ──────────
 # The sandbox child has NO inherent rights on real-user-owned

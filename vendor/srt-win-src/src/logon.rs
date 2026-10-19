@@ -9,15 +9,10 @@
 //! back to the broker's own stdio, waits, and returns the runner's
 //! exit code.
 //!
-//! **The sandbox side only ever holds pipe CLIENT ends.** A pipe's
-//! server end can `ImpersonateNamedPipeClient` whoever opened the
-//! other end, and here that is the real user — so the runner (and
-//! the child that inherits its stdio) must never be handed one.
-//! stdout/stderr are `CreatePipe` pairs whose write end, the one the
-//! runner gets, is the client end. The read end of a `CreatePipe`
-//! pair is the server end, so stdin is built the other way round by
-//! [`make_stdin_pipe`]: the broker keeps the server (write) end and
-//! opens the client (read) end itself.
+//! **The sandbox side only ever holds pipe CLIENT ends**: a server end can
+//! `ImpersonateNamedPipeClient` whoever opened the other end, here the real
+//! user. The read end of a `CreatePipe` pair is a server end, so stdin is
+//! built by [`make_stdin_pipe`] instead.
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -36,9 +31,9 @@ use serde::Serialize;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, ERROR_SERVICE_DISABLED,
-    ERROR_SERVICE_DOES_NOT_EXIST, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
-    SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, ERROR_PIPE_BUSY,
+    ERROR_SERVICE_DISABLED, ERROR_SERVICE_DOES_NOT_EXIST, GENERIC_READ, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
@@ -288,20 +283,16 @@ impl std::fmt::Display for SeclogonDisabled {
 
 impl std::error::Error for SeclogonDisabled {}
 
-/// One pipe pair. The end the runner gets is inheritable; the
-/// broker's end is not, so the runner doesn't get a copy of it
-/// (which would keep the pipe open past the runner's exit and hang
-/// the pump).
+/// One pipe pair. The runner's end is inheritable; the broker's is not, or
+/// the runner's copy would keep the pipe open past its exit and hang the pump.
 struct PipePair {
     broker: OwnedHandle,
     runner: OwnedHandle,
 }
 
-/// An anonymous pipe the runner WRITES to (stdout / stderr). The
-/// write end of a `CreatePipe` pair is the pipe's client end, so the
-/// runner holds nothing it could impersonate through. Never use this
-/// shape for a pipe the runner reads: the read end is the server end
-/// (see [`make_stdin_pipe`]).
+/// An anonymous pipe the runner WRITES to (stdout / stderr). Never
+/// use this shape for a pipe the runner reads: the read end is the
+/// server end (see [`make_stdin_pipe`]).
 fn make_output_pipe() -> Result<PipePair> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -339,14 +330,11 @@ const STDIN_PIPE_MODE: NAMED_PIPE_MODE = NAMED_PIPE_MODE(
 /// else can connect to the name or create a second server for it.
 const STDIN_PIPE_MAX_INSTANCES: u32 = 1;
 
-/// Server-side buffer. A write larger than this just blocks until
-/// the runner reads, same as with an anonymous pipe.
+/// Server-side buffer; a larger write blocks until the runner reads.
 const STDIN_PIPE_OUT_BUFFER: u32 = 64 * 1024;
 
-/// Access the client (read) end is opened with: read, plus
-/// `FILE_WRITE_ATTRIBUTES` — the rights the read end of a
-/// `CreatePipe` pair carries, so a child that sets the read/wait
-/// mode on its stdin keeps working. No data-write access.
+/// Read, plus `FILE_WRITE_ATTRIBUTES`: what the read end of a `CreatePipe`
+/// pair carries, so a child that sets the read mode on its stdin keeps working.
 const STDIN_CLIENT_ACCESS: u32 = GENERIC_READ.0 | FILE_WRITE_ATTRIBUTES.0;
 
 /// The client end is opened at the ANONYMOUS impersonation level, so
@@ -356,38 +344,40 @@ const STDIN_CLIENT_FLAGS: FILE_FLAGS_AND_ATTRIBUTES =
     FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_ANONYMOUS.0);
 
 /// Name of the stdin pipe: the broker's pid plus 128 random bits.
-/// The name is not a secret the design leans on (the DACL and the
-/// single instance are what keep others out); it only has to be
-/// unique and not predictable enough to squat.
+/// The name is not a secret (the DACL and the single instance keep
+/// others out); it only has to be unique and hard to squat.
 fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
     let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
     format!(r"\\.\pipe\srt-win-stdin-{pid}-{hex}")
 }
 
-/// The stdin pipe for the runner, built so the runner's end is the
-/// pipe's CLIENT end.
-///
-/// With `CreatePipe` the read end is the server end, and the write
-/// end is opened by this process — the real user. Handing that read
-/// end to the sandbox account would let it (and the child that
-/// inherits it) call `ImpersonateNamedPipeClient` and act as the
-/// real user. So the roles are swapped: the broker creates a named
-/// pipe, keeps the server end to write to, and opens the client end
-/// itself for the runner to read from. A client end cannot
-/// impersonate anyone.
-///
-/// The pipe is reachable only through these two handles: its DACL
-/// grants the broker's own user and nobody else (not the sandbox
-/// account, not Everyone), it rejects remote clients, and its single
-/// instance is taken by the client opened here.
-///
-/// There is no fallback: if any step fails the launch fails.
+/// The runner's stdin pipe, with the runner holding the CLIENT end: the broker
+/// keeps the server end of a named pipe and opens the client end itself. The
+/// DACL grants only the broker's user; if any step fails the launch fails.
 fn make_stdin_pipe() -> Result<PipePair> {
+    once_more_if_pipe_busy(|| make_stdin_pipe_named(&fresh_stdin_pipe_name()?))
+}
+
+/// Run `make`, and once more if it failed with `ERROR_PIPE_BUSY`: another
+/// process took the pipe's single instance before the broker's own connect.
+fn once_more_if_pipe_busy<T>(mut make: impl FnMut() -> Result<T>) -> Result<T> {
+    match make() {
+        Err(e) if is_pipe_busy(&e) => make(),
+        r => r,
+    }
+}
+
+fn is_pipe_busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<windows::core::Error>()
+        .is_some_and(|w| w.code() == ERROR_PIPE_BUSY.to_hresult())
+}
+
+fn fresh_stdin_pipe_name() -> Result<String> {
     let mut rand = [0u8; 16];
     unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
         .ok()
         .context("BCryptGenRandom (stdin pipe name)")?;
-    make_stdin_pipe_named(&stdin_pipe_name(std::process::id(), &rand))
+    Ok(stdin_pipe_name(std::process::id(), &rand))
 }
 
 fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
@@ -430,11 +420,6 @@ fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
         )
     }
     .context("CreateFileW(runner stdin client end)")?;
-    if client.is_invalid() {
-        return Err(anyhow!(
-            "CreateFileW(runner stdin client end): invalid handle"
-        ));
-    }
     let runner = OwnedHandle(client);
     unsafe {
         SetHandleInformation(runner.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
@@ -825,7 +810,9 @@ mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_BROKEN_PIPE;
     use windows::Win32::Security::RevertToSelf;
-    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows::Win32::System::Pipes::{
+        GetNamedPipeInfo, ImpersonateNamedPipeClient, PIPE_SERVER_END,
+    };
 
     #[test]
     fn stdin_pipe_name_shape() {
@@ -834,7 +821,6 @@ mod tests {
             n,
             r"\\.\pipe\srt-win-stdin-1234-abababababababababababababababab"
         );
-        // All 16 bytes land in the name, zero-padded.
         let mut r = [0u8; 16];
         r[15] = 0x0f;
         assert!(stdin_pipe_name(1, &r).ends_with("-0000000000000000000000000000000f"));
@@ -843,44 +829,53 @@ mod tests {
 
     #[test]
     fn stdin_pipe_flags() {
-        // Server end: outbound only (bit 0 = inbound access), first
-        // instance, synchronous.
         assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x3, 0x2);
         assert_ne!(STDIN_PIPE_OPEN_MODE.0 & 0x0008_0000, 0);
         assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x4000_0000, 0);
-        // Byte stream, blocking, remote clients rejected.
         assert_eq!(STDIN_PIPE_MODE.0, 0x8);
         assert_eq!(STDIN_PIPE_MAX_INSTANCES, 1);
-        // Client end: GENERIC_READ + FILE_WRITE_ATTRIBUTES, nothing
-        // that writes data; SQOS present with level ANONYMOUS (the
-        // level lives in bits 16-17) and no context-tracking /
-        // effective-only bits.
+        // GENERIC_READ | FILE_WRITE_ATTRIBUTES; SQOS present at level ANONYMOUS.
         assert_eq!(STDIN_CLIENT_ACCESS, 0x8000_0100);
         assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
     }
 
-    /// The pair behaves like an anonymous pipe for a
-    /// reader — data, then `ERROR_BROKEN_PIPE` once the writer is
-    /// gone — and the reader's end can neither impersonate nor be
-    /// joined by a second client.
+    /// The runner's end reads like an anonymous pipe and cannot impersonate.
     #[test]
     fn stdin_pipe_runner_end_is_a_client_end() {
-        let mut rand = [0u8; 16];
-        unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
-            .ok()
-            .unwrap();
-        let name = stdin_pipe_name(std::process::id(), &rand);
+        let name = fresh_stdin_pipe_name().unwrap();
         let pipe = make_stdin_pipe_named(&name).unwrap();
 
-        // A client end cannot impersonate.
+        // Read first: until data has been read through it, even a server end
+        // is refused impersonation.
+        let payload = b"spec-bytes";
+        let mut wrote = 0u32;
+        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
+        assert_eq!(wrote as usize, payload.len());
+        let mut buf = [0u8; 64];
+        let mut read = 0u32;
+        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
+        assert_eq!(&buf[..read as usize], payload);
+
         let imp = unsafe { ImpersonateNamedPipeClient(pipe.runner.raw()) };
         if imp.is_ok() {
             unsafe { RevertToSelf().unwrap() };
             panic!("ImpersonateNamedPipeClient succeeded on the runner's stdin end");
         }
+        let server_end = |h: HANDLE| {
+            let mut flags = NAMED_PIPE_MODE(0);
+            unsafe { GetNamedPipeInfo(h, Some(&mut flags), None, None, None) }
+                .map(|()| flags.0 & PIPE_SERVER_END.0 != 0)
+        };
+        assert!(
+            !server_end(pipe.runner.raw()).expect("GetNamedPipeInfo(runner end)"),
+            "the runner's stdin end is the pipe's SERVER end"
+        );
+        // The write-only server end may not be queryable; when it is, it must
+        // read as the server end, or the check above proves nothing.
+        if let Ok(is_server) = server_end(pipe.broker.raw()) {
+            assert!(is_server, "the broker's end is not the pipe's server end");
+        }
 
-        // The single instance is taken: no second client, and no
-        // second server under the same name.
         let name_w = wstr(&name);
         let again = unsafe {
             CreateFileW(
@@ -893,26 +888,18 @@ mod tests {
                 None,
             )
         };
-        assert!(
-            again.is_err(),
-            "a second client connected to the stdin pipe"
-        );
+        let busy = again.expect_err("a second client connected to the stdin pipe");
+        assert_eq!(busy.code(), ERROR_PIPE_BUSY.to_hresult());
+        assert!(is_pipe_busy(
+            &anyhow::Error::from(busy).context("CreateFileW(runner stdin client end)")
+        ));
         assert!(
             make_stdin_pipe_named(&name).is_err(),
             "a second server was created under the stdin pipe's name"
         );
 
-        // Write, close the server end, then read: the bytes arrive,
-        // followed by ERROR_BROKEN_PIPE (what a reader treats as EOF).
-        let payload = b"spec-bytes";
-        let mut wrote = 0u32;
-        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
-        assert_eq!(wrote as usize, payload.len());
+        // ERROR_BROKEN_PIPE is what a reader treats as EOF.
         drop(pipe.broker);
-        let mut buf = [0u8; 64];
-        let mut read = 0u32;
-        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
-        assert_eq!(&buf[..read as usize], payload);
         let eof = unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) };
         assert_eq!(
             eof.unwrap_err().code(),
@@ -1011,6 +998,38 @@ mod tests {
             super::Ended::HolderGone
         );
         t.join().unwrap();
+    }
+
+    #[test]
+    fn a_busy_stdin_pipe_is_retried_once() {
+        let busy = || anyhow::Error::from(windows::core::Error::from(ERROR_PIPE_BUSY));
+        let other = || anyhow::Error::from(windows::core::Error::from(ERROR_BROKEN_PIPE));
+        assert!(is_pipe_busy(&busy().context("connect")));
+        assert!(!is_pipe_busy(&other().context("connect")));
+        assert!(!is_pipe_busy(&anyhow!("not a system error")));
+
+        let mut calls = 0;
+        let r = once_more_if_pipe_busy(|| {
+            calls += 1;
+            if calls == 1 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!((r.unwrap(), calls), (2, 2));
+
+        let mut calls = 0;
+        let r: Result<()> = once_more_if_pipe_busy(|| {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(r.is_err_and(|e| is_pipe_busy(&e)));
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let r: Result<()> = once_more_if_pipe_busy(|| {
+            calls += 1;
+            Err(other())
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
