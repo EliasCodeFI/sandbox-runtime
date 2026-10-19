@@ -1237,6 +1237,29 @@ mod tests {
     }
 
     #[test]
+    fn verdict_no_token_copy_can_be_assumed_is_fenced_with_each_reported() {
+        // A restricted token: every impersonation of a copy is refused.
+        let r = lowered(report(Blocked, Blocked, Blocked, Blocked), [Error; 4]);
+        let v = verdict(&r);
+        assert_eq!(v.exit, EXIT_FENCED);
+        assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
+        // The anonymous and deny-only copies refused as well.
+        let r = lowered(report(Blocked, Error, Error, Error), [Error; 4]);
+        let v = verdict(&r);
+        assert_eq!(v.exit, EXIT_FENCED);
+        assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
+        // Each reaches the broker as `error`, not as a block.
+        let r = Report::decode(r.encode()).unwrap();
+        assert_eq!(r.plain.label(), "blocked");
+        for (o, _) in r.lowered() {
+            assert_eq!(o.label(), "error");
+        }
+        for o in [r.anonymous, r.anonymous_loopback, r.deny_only] {
+            assert_eq!(o.label(), "error");
+        }
+    }
+
+    #[test]
     fn a_failed_revert_ends_the_run() {
         assert!(ensure_reverted().is_ok());
         REVERT_FAILURE.with(|f| f.set(Some(0x8007_0005_u32 as i32)));
