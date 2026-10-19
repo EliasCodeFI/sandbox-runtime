@@ -453,10 +453,15 @@ enum AclCmd {
         #[arg(long, conflicts_with = "roots")]
         all: bool,
         /// Emit a JSON array of per-root `{path, status}` objects on
-        /// stdout (`removed`, `absent`, `failed`), also when exiting
-        /// non-zero.
+        /// stdout (`removed`, `absent`, `failed`, `dropped`), also when
+        /// exiting non-zero.
         #[arg(long)]
         json: bool,
+        /// With `--all`: a root whose object can no longer be located
+        /// (its drive is gone, say) is reported and its record dropped
+        /// instead of failing the command. Its ACEs may still be on disk.
+        #[arg(long, requires = "all")]
+        force: bool,
         /// The roots to forget.
         #[arg(value_name = "PATH")]
         roots: Vec<String>,
@@ -918,6 +923,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // stamping step below (env reads + a stat per entry).
             let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
+            if !force
+                && let Some(why) = existing
+                    .as_ref()
+                    .and_then(|s| install::newer_setup_refusal(s.marker_version))
+            {
+                eprintln!("srt-win: {why}");
+                std::process::exit(13);
+            }
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && st.state == "installed"
@@ -1561,7 +1574,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Forget { all, json, roots },
+            sub:
+                AclCmd::Forget {
+                    all,
+                    json,
+                    force,
+                    roots,
+                },
         } => {
             use srt_win::{path_id, persist, state_db};
             if !all && roots.is_empty() {
@@ -1583,17 +1602,26 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             .unwrap_or_else(|_| r.clone())
                     })
                     .collect();
-                persist::forget(db, &ids, &targets, all)
+                persist::forget(db, &ids, &targets, all, force)
             })?;
             let failed = out
                 .iter()
                 .filter(|(_, r)| matches!(r, persist::Forgot::Failed(_)))
                 .count();
+            let dropped = out
+                .iter()
+                .filter(|(_, r)| *r == persist::Forgot::Dropped)
+                .count();
             eprintln!(
-                "srt-win: acl forget — {} root(s){}",
+                "srt-win: acl forget — {} root(s){}{}",
                 out.len(),
                 if failed > 0 {
                     format!(", {failed} FAILED (still recorded)")
+                } else {
+                    String::new()
+                },
+                if dropped > 0 {
+                    format!(", {dropped} DROPPED (not located; ACEs may remain)")
                 } else {
                     String::new()
                 },
@@ -2434,6 +2462,14 @@ mod tests {
         }
         // Either every root or the named ones.
         assert!(forget(&["srt-win", "acl", "forget", "--all", r"C:\a"]).is_err());
+        // --force is for --all only.
+        assert!(matches!(
+            forget(&["srt-win", "acl", "forget", "--all", "--force"]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget { force: true, .. }
+            })
+        ));
+        assert!(forget(&["srt-win", "acl", "forget", "--force", r"C:\a"]).is_err());
 
         // The deny lists ride in the same stdin document.
         let input: AclGrantInput = serde_json::from_str(

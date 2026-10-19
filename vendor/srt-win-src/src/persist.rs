@@ -512,7 +512,7 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
             if prior.is_some() {
                 // The path names another object than the one granted:
                 // take the grant off that one first.
-                forget_one(conn, ids, canon)?;
+                forget_one(conn, ids, canon, false)?;
             }
             let sid = new_capability_sid()?;
             conn.execute(
@@ -669,6 +669,9 @@ pub enum Forgot {
     Absent,
     /// Could not be completed; the root stays recorded.
     Failed(String),
+    /// `--force` only: the object could not be located; its record is
+    /// gone and its ACEs may still be on disk.
+    Dropped,
 }
 
 impl Forgot {
@@ -677,14 +680,32 @@ impl Forgot {
             Forgot::Removed => "removed",
             Forgot::Absent => "absent",
             Forgot::Failed(_) => "failed",
+            Forgot::Dropped => "dropped",
         }
     }
 }
 
-/// Remove `canon`'s persistent grant; returns whether any ACE was on
-/// disk. The rows are deleted only after every DACL write succeeded,
-/// and an object that cannot be located fails the call.
-fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
+/// A granted object that cannot be located fails the forget; with
+/// `force` it is reported and skipped, and the root's record is dropped.
+fn unlocatable(canon: &str, force: bool) -> Result<()> {
+    if !force {
+        bail!(
+            "the object '{canon}' was granted on is no longer at that path and could \
+             not be located by file id; its ACEs may still be on disk (`acl forget \
+             --all --force` drops its record)"
+        );
+    }
+    eprintln!(
+        "srt-win: acl forget --force: the object '{canon}' was granted on could not \
+         be located; its record is dropped and its ACEs may still be on disk"
+    );
+    Ok(())
+}
+
+/// Remove `canon`'s persistent grant. The rows are deleted only after
+/// every DACL write succeeded, and an object that cannot be located
+/// fails the call unless `force` ([`unlocatable`]).
+fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<Forgot> {
     let here = match path_id::capture_file_id(canon) {
         Ok(id) => Some(id),
         Err(e) if path_id::is_not_found(&e) => None,
@@ -716,6 +737,7 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     // With the rows gone, converging a path strips it (or leaves
     // what another root still records for it).
     let mut removed = false;
+    let mut dropped = false;
     if here.is_some() {
         removed |= converge(&tx, ids, canon)?;
     }
@@ -723,10 +745,10 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
         match path_id::locate_by_file_id(id) {
             Located::At(moved) => removed |= converge(&tx, ids, &moved)?,
             Located::Gone => {}
-            Located::Unknown => bail!(
-                "the object '{canon}' was granted on is no longer at that path and could \
-                 not be located by file id; its ACEs may still be on disk"
-            ),
+            Located::Unknown => {
+                unlocatable(canon, force)?;
+                dropped = true;
+            }
         }
     }
     for d in &denies {
@@ -738,7 +760,11 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     }
     tx.commit().context("commit forget")?;
     marker_remove(canon)?;
-    Ok(removed)
+    Ok(match (dropped, removed) {
+        (true, _) => Forgot::Dropped,
+        (false, true) => Forgot::Removed,
+        (false, false) => Forgot::Absent,
+    })
 }
 
 /// `acl forget`: remove the persistent grants of `roots`, or with
@@ -749,6 +775,7 @@ pub fn forget(
     ids: &Ids,
     roots: &[String],
     all: bool,
+    force: bool,
 ) -> Result<Vec<(String, Forgot)>> {
     let conn = db.conn();
     let mut targets: Vec<String> = roots.to_vec();
@@ -760,9 +787,8 @@ pub fn forget(
     targets.retain(|t| seen.insert(t.clone()));
     let mut out = Vec::with_capacity(targets.len());
     for t in targets {
-        let r = match forget_one(conn, ids, &t) {
-            Ok(true) => Forgot::Removed,
-            Ok(false) => Forgot::Absent,
+        let r = match forget_one(conn, ids, &t, force) {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("srt-win: forget '{t}': {e:#}");
                 Forgot::Failed(format!("{e:#}"))
@@ -790,7 +816,7 @@ pub fn forget_everything() -> Result<(usize, usize)> {
     let ids = Ids::load()?;
     let holder = crate::state_db::HolderPid(std::process::id());
     let (out, _) =
-        crate::state_db::with_init_lock(holder, false, |db| forget(db, &ids, &[], true))?;
+        crate::state_db::with_init_lock(holder, false, |db| forget(db, &ids, &[], true, false))?;
     let failed = out
         .iter()
         .filter(|(_, r)| matches!(r, Forgot::Failed(_)))
@@ -814,7 +840,7 @@ pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<(
             Ok(UnrecordedGrant::None) => {}
             Ok(UnrecordedGrant::Own) => {
                 eprintln!("srt-win: '{canon}' carries an unrecorded persistent grant; removing it");
-                forget_one(db.conn(), &ids, canon)
+                forget_one(db.conn(), &ids, canon, false)
                     .with_context(|| format!("remove the persistent grant on '{canon}'"))?;
             }
             Ok(UnrecordedGrant::Inherited) => bail!(
@@ -865,6 +891,14 @@ fn unrecorded_grant_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unlocatable_root_is_skipped_only_with_force() {
+        let e = unlocatable(r"\\?\X:\gone", false).unwrap_err();
+        assert!(format!("{e:#}").contains("could not be located"));
+        assert!(unlocatable(r"\\?\X:\gone", true).is_ok());
+        assert_eq!(Forgot::Dropped.as_str(), "dropped");
+    }
 
     #[test]
     fn a_kept_deny_on_a_hardlinked_file_is_refused() {

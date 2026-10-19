@@ -36,6 +36,18 @@ pub fn check_marker(marker_version: u32) -> Result<()> {
     Ok(())
 }
 
+/// Why a plain `install` must not replace an install with this marker
+/// version (a newer build made it); `None` when it may proceed.
+pub fn newer_setup_refusal(marker_version: u32) -> Option<String> {
+    (marker_version > SETUP_VERSION).then(|| {
+        format!(
+            "existing install has setup version {marker_version}, newer than this \
+             build's {SETUP_VERSION}; not replacing it. Use the release that made it, \
+             or pass --force to replace it with this one."
+        )
+    })
+}
+
 /// The install record, only if its marker is this build's
 /// ([`check_marker`]): required before launching or keeping a grant.
 pub fn require_current_setup() -> Result<SetupInfo> {
@@ -494,6 +506,11 @@ mod tests {
     #[test]
     fn only_this_builds_marker_version_passes() {
         assert!(check_marker(SETUP_VERSION).is_ok());
+        // Only a newer install is refused; an older one is upgraded.
+        assert!(newer_setup_refusal(SETUP_VERSION).is_none());
+        assert!(newer_setup_refusal(SETUP_VERSION - 1).is_none());
+        let why = newer_setup_refusal(SETUP_VERSION + 1).unwrap();
+        assert!(why.contains("newer than this build's"), "{why}");
         for other in [0, SETUP_VERSION - 1, SETUP_VERSION + 1, 99] {
             let e = check_marker(other).unwrap_err().to_string();
             assert!(e.contains("marker version mismatch"), "{e}");
