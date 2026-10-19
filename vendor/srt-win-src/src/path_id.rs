@@ -505,8 +505,8 @@ pub enum Located {
 /// `OpenFileById` with an `ExtendedFileId` descriptor, then
 /// `GetFinalPathNameByHandleW`.
 ///
-/// [`Located::Gone`] only when the volume itself answered that the id names
-/// no file; every other failure is [`Located::Unknown`].
+/// Returns [`Located::Gone`] only when the volume itself answered that the id
+/// names no file; every other failure is [`Located::Unknown`].
 pub fn locate_by_file_id(file_id: &FileId) -> Located {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{

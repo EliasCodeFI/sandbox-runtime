@@ -226,11 +226,11 @@ let windowsAclInFlight:
       abort: AbortController
     }
   | undefined
-// initialize()'s grant→stamp. wrapWithSandboxArgv awaits it so no command is
-// wrapped before both have resolved.
+// Resolves when initialize()'s grant→stamp has; wrapWithSandboxArgv awaits it
+// so no command is wrapped before both are applied.
 let windowsAclApply: Promise<void> | undefined
-// The latest revoke→restore. initialize() awaits it before granting: both key
-// on this process's holder PID, so a late one would strip the new ACEs.
+// Resolves when the latest revoke→restore has; initialize() awaits it before
+// granting, or the late release (same holder PID) would strip the new ACEs.
 let windowsAclTeardown: Promise<void> | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
@@ -341,7 +341,7 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   return false
 }
 
-/** Run `fn` with {@link windowsAclInFlight} set, for the exit handler. */
+/** Run `fn` with {@link windowsAclInFlight} set, so an exit can stop it. */
 async function withWindowsAclInFlight<T>(
   sandboxUserSid: string,
   srtWin: SrtWinSpawn | undefined,
@@ -2611,7 +2611,7 @@ async function wrapWithSandboxArgv(
   const platform = getPlatform()
 
   if (platform === 'windows') {
-    // initialize() is still applying the session ACLs; rethrows its error.
+    // Wait for initialize()'s ACL apply; this rethrows its error if it failed.
     if (windowsAclApply) {
       await windowsAclApply
     }

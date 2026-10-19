@@ -1022,7 +1022,8 @@ fn recompose(conn: &Connection, canon: &str, sandbox_sid: &str, force_write: boo
 struct ConvergedLedger<'a> {
     conn: &'a Connection,
     canon: &'a str,
-    /// The path's current identity; `None` never matches, is never recorded.
+    /// The path's current identity; `None` (unreadable) never matches and is
+    /// never recorded.
     file_id: Option<FileId>,
     /// Whether a completed write is worth recording.
     keep: bool,
@@ -1068,8 +1069,8 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
             );
         };
         record_write_intent(self.conn, self.canon, &id)?;
-        // Never on the recovery replay (`force_write`), which must be able
-        // to finish the write the hook interrupted.
+        // The test hook never fires on the recovery replay (`force_write`),
+        // which must be able to finish the write the hook interrupted.
         #[cfg(feature = "test-hooks")]
         if !self.force_write {
             debug_kill_before_write(self.canon);
@@ -1078,8 +1079,8 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
     }
 
     fn complete(&self, dacl: &[u8]) {
-        // Best-effort: a row that outlives its write only costs one
-        // redundant forced converge at the next recovery.
+        // The write returned: retire its journal row. Best-effort: one that
+        // outlives its write only costs a forced converge at the next recovery.
         let Some(id) = self.file_id else {
             return;
         };
@@ -1328,7 +1329,8 @@ pub enum AceRelease {
     /// Where the ACE is now could not be established. Nothing was changed:
     /// the rows are kept, and the ACE may still be on disk.
     Unreadable,
-    /// The release errored; the rows are as they were, the ACE may be on disk.
+    /// The release errored. The rows are as they were before it; the ACE may
+    /// still be on disk.
     Failed,
 }
 
@@ -1592,7 +1594,8 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     recover_with(conn, sb.as_deref(), force, &DISK)
 }
 
-/// Release `holds` for recovery, accounting in `report`; true if all released.
+/// Release `holds` for recovery and account for them in `report`. Returns
+/// whether every one was released.
 fn recover_batch(
     conn: &Connection,
     holder: Option<i64>,

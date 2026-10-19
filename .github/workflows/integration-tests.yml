@@ -97,7 +97,8 @@ jobs:
           cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
           # Second, test-only binary with the fault-injection hooks, for
-          # smoke-aces row A33 alone. Its own target dir: never the default build.
+          # smoke-aces row A33 alone. Its own target dir, so it never replaces
+          # the default build.
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 

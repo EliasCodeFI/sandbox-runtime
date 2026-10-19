@@ -2225,7 +2225,7 @@ export function restoreWindowsAcl(
   }
 }
 
-/** Async variant of {@link restoreWindowsAcl}, refusal included. */
+/** Async {@link restoreWindowsAcl}, refusal included; never rejects. */
 export async function restoreWindowsAclAsync(
   opts: WindowsAclReleaseOptions & WindowsAclAsyncOptions,
 ): Promise<WindowsAclAceOutcome[] | undefined> {
