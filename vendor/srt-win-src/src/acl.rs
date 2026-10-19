@@ -127,9 +127,10 @@ impl Mask {
     /// (see [`persistent_aces`]).
     pub const OWNER_IMPLICIT: Self = Self::READ_CONTROL.with(Self::WRITE_DAC);
 
-    /// List and traverse a directory ([`ProfileAce::Container`]); reads no
-    /// file. `SYNCHRONIZE` is there because every synchronous open asks for it.
-    pub const DIR_LIST: Self = Self(0x0010_00a1);
+    /// `FILE_GENERIC_READ | FILE_TRAVERSE` for a directory that is only
+    /// passed through ([`ProfileAce::Container`]): what a generic-read open
+    /// of the directory asks for. Not inherited, so it reads no file.
+    pub const DIR_LIST: Self = Self(0x0012_00a9);
 
     pub const fn bits(self) -> u32 {
         self.0
@@ -2050,7 +2051,7 @@ mod tests {
         };
         assert_eq!(
             list(Some(ProfileAce::Container), None, None),
-            [format!("(A;;0x1000a1;;;{GROUP})")]
+            [format!("(A;;0x1200a9;;;{GROUP})")]
         );
         assert_eq!(
             list(Some(ProfileAce::Granted), None, None),
@@ -2087,7 +2088,42 @@ mod tests {
                 assert_eq!(a.mask & (WRITE_BITS | GENERIC_BITS), 0, "{p:?}");
             }
         }
-        assert_eq!(Mask::DIR_LIST.bits(), 0x1 | 0x20 | 0x80 | 0x10_0000);
+        // FILE_GENERIC_READ (list, read EA, read attributes, read
+        // control, synchronize) and traverse.
+        assert_eq!(
+            Mask::DIR_LIST.bits(),
+            0x1 | 0x8 | 0x80 | 0x2_0000 | 0x10_0000 | 0x20
+        );
+        assert_eq!(Mask::DIR_LIST.bits() & 0x0012_0089, 0x0012_0089);
+    }
+
+    /// A container entry written with the narrower mask of an earlier
+    /// build is ours, and is not the wanted list: it is rewritten.
+    #[test]
+    fn a_container_entry_with_the_earlier_mask_converges() {
+        let want = persistent_aces(&PersistentWant {
+            capability_sid: None,
+            profile: Some(ProfileAce::Container),
+            ..root_want(CAP)
+        });
+        let earlier = AceView {
+            mask: 0x0010_00a1,
+            ..want[0].clone()
+        };
+        let listed: [AceView; 0] = [];
+        for t in [
+            T,
+            PersistentTrustees {
+                recorded_denies: Some(&listed),
+                ..T
+            },
+        ] {
+            assert!(is_persistent_ace(&earlier, &t));
+            let on_disk = persistent_on_disk(std::slice::from_ref(&earlier), &t, true);
+            assert_eq!(on_disk.len(), 1, "not left as someone else's");
+            assert_ne!(on_disk, comparable(&want, true));
+            assert_eq!(persistent_on_disk(&want, &t, true), comparable(&want, true));
+        }
     }
 
     /// An explicit DENY already on the object stays in front of the allows

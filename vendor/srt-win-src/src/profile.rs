@@ -2581,7 +2581,7 @@ mod tests {
     /// the identity the tests run as.
     const GROUP: &str = "S-1-5-32-546";
     const RX: u32 = 0x0012_00a9;
-    const LIST: u32 = 0x0010_00a1;
+    const LIST: u32 = 0x0012_00a9;
     const ALL: u32 = 0x001f_01ff;
 
     fn ids() -> Ids {

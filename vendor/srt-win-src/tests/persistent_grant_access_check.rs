@@ -249,7 +249,11 @@ fn profile_grant_access_matrix() {
             "{name}: traverse a container"
         );
         assert!(can(&container, FILE_READ_ATTRIBUTES));
-        assert!(!can(&container, FILE_GENERIC_READ.0));
+        // What a generic-read open of the directory asks for.
+        assert!(
+            can(&container, FILE_GENERIC_READ.0),
+            "{name}: open a container"
+        );
         for (right, access) in every_write {
             assert!(!can(&container, access), "{name}: {right} on a container");
         }

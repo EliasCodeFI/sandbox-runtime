@@ -467,6 +467,12 @@ try {
   else { Fail "R4: dir of the profile directory: exit=$($r.exit) raw: $($r.raw)" }
   Expect-NoRead 'R4 (a root file not granted by name)' $stray 'STRAY-CONTENT'
 
+  # A container's entry covers a generic-read open of the directory,
+  # which asks for READ_CONTROL as well: reading its access list does.
+  $r = Sb @($cmd, '/d', '/s', '/c', "icacls `"$(Join-Path $prof '.cargo')`"")
+  if ($r.exit -eq 0 -and $r.out -match [regex]::Escape($script:grpSid)) { Ok 'R4: a container can be opened for a generic read (its access list is readable)' }
+  else { Fail "R4: reading a container's access list: exit=$($r.exit) raw: $($r.raw)" }
+
   # ── X: exclusions ────────────────────────────────────────────────
   Expect-NoRead 'X (key directory)' $sshKey 'SSH-CONTENT'
   Expect-NoRead 'X (credential file in the root)' $netrc 'NETRC-CONTENT'
