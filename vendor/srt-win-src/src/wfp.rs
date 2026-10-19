@@ -118,6 +118,15 @@ pub fn is_loopback_floor_port(port: u16) -> bool {
     LOOPBACK_FLOOR_PORTS.iter().any(|(p, _)| *p == port)
 }
 
+/// The first of [`LOOPBACK_FLOOR_PORTS`] inside `range`, if any. The
+/// proxy PERMIT would open it, so install refuses such a range.
+pub fn floor_port_in(range: (u16, u16)) -> Option<u16> {
+    LOOPBACK_FLOOR_PORTS
+        .iter()
+        .map(|(p, _)| *p)
+        .find(|p| (range.0..=range.1).contains(p))
+}
+
 /// Every port from 1 to 65535 not in `floor` (which must be ascending),
 /// as inclusive ranges. Port 0 is left out: for ICMP the engine presents the
 /// message code as the remote port, and an echo request (code 0) must not match.
@@ -1237,6 +1246,19 @@ mod tests {
         ordered
             && covered(0) == 0
             && (1..=u16::MAX).all(|p| covered(p) == usize::from(!floor.contains(&p)))
+    }
+
+    #[test]
+    fn a_proxy_range_holding_a_floor_port_is_found() {
+        assert_eq!(floor_port_in(DEFAULT_PROXY_PORT_RANGE), None);
+        assert_eq!(floor_port_in((9220, 9230)), Some(9222));
+        // Either end of the range counts.
+        assert_eq!(floor_port_in((1080, 1090)), Some(1080));
+        assert_eq!(floor_port_in((3380, 3389)), Some(3389));
+        assert_eq!(floor_port_in((1081, 2374)), None);
+        for (port, _) in LOOPBACK_FLOOR_PORTS {
+            assert_eq!(floor_port_in((port, port)), Some(port));
+        }
     }
 
     #[test]

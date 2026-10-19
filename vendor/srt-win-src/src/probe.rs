@@ -304,17 +304,24 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     None
 }
 
-/// A loopback listener on a port the open-loopback PERMIT covers (never
-/// one of the floor). The caller holds it until the runner has reported;
-/// nothing needs to accept: a connect completes against the backlog.
-pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
-    let mut on_floor = Vec::new();
-    for _ in 0..4 {
+/// Whether a connect to loopback `port` shows that loopback is OPEN: not
+/// a floor port, and not in the proxy range, whose own PERMIT lets the
+/// connect through with loopback closed.
+pub fn is_open_loopback_probe_port(port: u16, proxy_range: (u16, u16)) -> bool {
+    !crate::wfp::is_loopback_floor_port(port) && !(proxy_range.0..=proxy_range.1).contains(&port)
+}
+
+/// A loopback listener on a port only the open-loopback PERMIT covers
+/// ([`is_open_loopback_probe_port`]). The caller holds it until the runner
+/// has reported; nothing needs to accept: a connect completes against the backlog.
+pub fn bind_open_loopback(proxy_range: (u16, u16)) -> Option<std::net::TcpListener> {
+    let mut unusable = Vec::new();
+    for _ in 0..8 {
         let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
-        if !crate::wfp::is_loopback_floor_port(l.local_addr().ok()?.port()) {
+        if is_open_loopback_probe_port(l.local_addr().ok()?.port(), proxy_range) {
             return Some(l);
         }
-        on_floor.push(l);
+        unusable.push(l);
     }
     None
 }
@@ -1002,6 +1009,22 @@ mod tests {
         };
         assert_eq!(all_error.encode() >> 31, 0);
         assert_eq!(Report::decode(all_error.encode()), Some(all_error));
+    }
+
+    #[test]
+    fn the_open_loopback_probe_port_is_one_only_open_loopback_permits() {
+        let range = crate::wfp::DEFAULT_PROXY_PORT_RANGE;
+        assert!(is_open_loopback_probe_port(49152, range));
+        assert!(is_open_loopback_probe_port(range.0 - 1, range));
+        assert!(is_open_loopback_probe_port(range.1 + 1, range));
+        // The proxy PERMIT opens these with loopback closed too.
+        for port in range.0..=range.1 {
+            assert!(!is_open_loopback_probe_port(port, range), "{port}");
+        }
+        for (port, _) in crate::wfp::LOOPBACK_FLOOR_PORTS {
+            assert!(!is_open_loopback_probe_port(port, range), "{port}");
+        }
+        assert!(!is_open_loopback_probe_port(3000, (3000, 3010)));
     }
 
     #[test]

@@ -70,6 +70,7 @@ import {
   VENDORED_SRT_WIN_EXE,
   WINDOWS_ALLOW_LOOPBACK_EFFECT,
   WINDOWS_LOOPBACK_FLOOR_PORTS,
+  windowsBlockedLoopbackProbePort,
   WINDOWS_LOOPBACK_NO_PROXY,
   type WindowsWfpVerifyResult,
   type WindowsAclGrantOptions,
@@ -2373,9 +2374,10 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     return { asked, closed, spy }
   }
 
-  it('verifyWindowsWfpEgress: with loopback open the listener goes on the first free port that stays blocked', async () => {
-    const [first, second, third] = WINDOWS_LOOPBACK_FLOOR_PORTS
-    const servers = fakeServers([first, second])
+  it('verifyWindowsWfpEgress: with loopback open the target is a blocked port and no listener is bound', async () => {
+    const [first] = WINDOWS_LOOPBACK_FLOOR_PORTS
+    // Every port is "in use": the probe must not need any of them.
+    const servers = fakeServers([...WINDOWS_LOOPBACK_FLOOR_PORTS])
     try {
       stubSpawn(() => ({ status: 0, stdout: openOut() }))
       await verifyWindowsWfpEgress({
@@ -2383,30 +2385,28 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
       const argv = spawnSyncSpy.mock.calls[0][1] as string[]
-      expect(argv[argv.indexOf('--target') + 1]).toBe(`127.0.0.1:${third}`)
-      // Never an ephemeral port: with loopback open that one is
-      // permitted, and a connect to it would read as a missing fence.
-      expect(servers.asked).toEqual([first, second, third])
-      expect(servers.closed).toEqual([first, second, third])
+      expect(argv[argv.indexOf('--target') + 1]).toBe(`127.0.0.1:${first}`)
+      expect(servers.asked).toEqual([])
     } finally {
       servers.spy.mockRestore()
     }
   })
 
-  it('verifyWindowsWfpEgress: with loopback open and none of those ports free, it rejects without probing', async () => {
-    const servers = fakeServers([...WINDOWS_LOOPBACK_FLOOR_PORTS])
-    try {
-      stubSpawn(() => ({ status: 0, stdout: openOut() }))
-      const err = await verifyWindowsWfpEgress({
-        allowLoopback: true,
-        srtWin: resolveSrtWin({ path: process.execPath }),
-      }).catch(e => e as WindowsSandboxError)
-      expect((err as WindowsSandboxError).code).toBe('wfp_verify_bind_failed')
-      expect(servers.asked).toEqual([...WINDOWS_LOOPBACK_FLOOR_PORTS])
-      expect(spawnSyncSpy.mock.calls.length).toBe(0)
-    } finally {
-      servers.spy.mockRestore()
-    }
+  it('verifyWindowsWfpEgress: with loopback open the target skips a blocked port inside the proxy range, and srt-win is told the range', async () => {
+    const [first, second] = WINDOWS_LOOPBACK_FLOOR_PORTS
+    expect(windowsBlockedLoopbackProbePort()).toBe(first)
+    expect(windowsBlockedLoopbackProbePort([first - 3, first + 3])).toBe(second)
+    stubSpawn(() => ({ status: 0, stdout: openOut() }))
+    await verifyWindowsWfpEgress({
+      allowLoopback: true,
+      proxyPortRange: [first - 3, first + 3],
+      srtWin: resolveSrtWin({ path: process.execPath }),
+    })
+    const argv = spawnSyncSpy.mock.calls[0][1] as string[]
+    expect(argv[argv.indexOf('--target') + 1]).toBe(`127.0.0.1:${second}`)
+    expect(argv[argv.indexOf('--proxy-port-range') + 1]).toBe(
+      `${first - 3}-${first + 3}`,
+    )
   })
 
   it('verifyWindowsWfpEgress: with loopback closed the listener is an ephemeral port outside the proxy range', async () => {

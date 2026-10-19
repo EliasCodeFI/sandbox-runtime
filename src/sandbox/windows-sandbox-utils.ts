@@ -179,6 +179,21 @@ export const WINDOWS_LOOPBACK_FLOOR_PORTS: readonly number[] = [
   53, 1080, 2375, 2376, 3389, 5985, 5986, 9222, 9229, 47001,
 ]
 
+/**
+ * The blocked loopback port the fence probe aims at with loopback open:
+ * the first of the floor outside the proxy port range, whose own
+ * PERMIT would open it.
+ */
+export function windowsBlockedLoopbackProbePort(
+  proxyPortRange: readonly [number, number] = DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+): number {
+  const [lo, hi] = proxyPortRange
+  return (
+    WINDOWS_LOOPBACK_FLOOR_PORTS.find(p => p < lo || p > hi) ??
+    WINDOWS_LOOPBACK_FLOOR_PORTS[0]
+  )
+}
+
 /** What `network.allowLocalBinding` opens on Windows, in plain words. */
 export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
   `Loopback is open: sandboxed commands can connect to every TCP and ` +
@@ -1289,9 +1304,10 @@ export function interpretWindowsWfpVerify(r: {
  * the synchronous `runSrtWin` is safe). Does not require elevation
  * and does not depend on any external host.
  *
- * With `opts.allowLoopback` the listener is bound on one of
+ * With `opts.allowLoopback` the target is one of
  * {@link WINDOWS_LOOPBACK_FLOOR_PORTS} (the loopback ports that stay
- * blocked), and `srt-win` also probes that loopback is open.
+ * blocked), with no listener bound there, and `srt-win` also probes
+ * that loopback is open.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed) fails closed
@@ -1321,29 +1337,9 @@ export async function verifyWindowsWfpEgress(
   let target = opts.target
   let server: net.Server | undefined
   if (!target && opts.allowLoopback) {
-    // Loopback is open, so the listener goes on a port that stays
-    // blocked: the first of the floor that is free.
-    for (const p of WINDOWS_LOOPBACK_FLOOR_PORTS) {
-      const s = net.createServer()
-      try {
-        s.listen(p, '127.0.0.1')
-        await once(s, 'listening')
-      } catch {
-        s.close()
-        continue
-      }
-      server = s
-      target = `127.0.0.1:${p}`
-      break
-    }
-    if (!target) {
-      throw new WindowsSandboxError(
-        'wfp_verify_bind_failed',
-        `verifyWindowsWfpEgress: could not bind a loopback listener on ` +
-          `any of the ports that stay blocked with loopback open ` +
-          `(${WINDOWS_LOOPBACK_FLOOR_PORTS.join(', ')})`,
-      )
-    }
+    // Loopback is open, so the target is a port that stays blocked. No
+    // listener is bound: a refused connect shows a missing fence too.
+    target = `127.0.0.1:${windowsBlockedLoopbackProbePort(opts.proxyPortRange)}`
   }
   if (!target) {
     // Bind ephemeral; retry if it lands inside the WFP
@@ -1373,7 +1369,12 @@ export async function verifyWindowsWfpEgress(
   }
   const args = ['wfp', 'verify', '--target', target]
   if (opts.anonymousEgress) args.push('--anonymous-egress')
-  if (opts.allowLoopback) args.push('--allow-loopback')
+  if (opts.allowLoopback) {
+    args.push('--allow-loopback')
+    if (opts.proxyPortRange) {
+      args.push('--proxy-port-range', opts.proxyPortRange.join('-'))
+    }
+  }
   try {
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and

@@ -859,6 +859,12 @@ enum WfpCmd {
         /// direction) and, when given, probed.
         #[arg(long)]
         allow_loopback: bool,
+        /// The installed proxy port range (default 60080-60089). With
+        /// `--allow-loopback`, the loopback listener this command
+        /// binds for `open_loopback_probe` avoids it: the proxy
+        /// range is reachable with loopback closed too.
+        #[arg(long, value_name = "LOW-HIGH")]
+        proxy_port_range: Option<String>,
         /// Off-loopback target (`host:port`) for the attempt made
         /// while impersonating the anonymous token, and for the
         /// lowered-integrity attempts' off-loopback half. Default: this
@@ -913,6 +919,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
                 None => wfp::DEFAULT_PROXY_PORT_RANGE,
             };
+            if let Some(port) = wfp::floor_port_in(range) {
+                return Err(anyhow!(
+                    "invalid --proxy-port-range {}-{}: it contains {port}, a loopback \
+                     port that stays blocked for the sandbox; choose a range without \
+                     any of {}",
+                    range.0,
+                    range.1,
+                    wfp::LOOPBACK_FLOOR_PORTS
+                        .map(|(p, _)| p.to_string())
+                        .join(", "),
+                ));
+            }
             if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
@@ -1282,6 +1300,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 WfpCmd::Verify {
                     target,
                     allow_loopback,
+                    proxy_port_range,
                     anonymous_target,
                     anonymous_egress,
                 },
@@ -1374,7 +1393,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             });
             // The listener is held for as long as the runner takes; nothing
             // listens at the off-loopback address with the same port.
-            let open_listener = allow_loopback.then(probe::bind_open_loopback).flatten();
+            let proxy_range = match &proxy_port_range {
+                Some(s) => wfp::parse_port_range(s)
+                    .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
+                None => wfp::DEFAULT_PROXY_PORT_RANGE,
+            };
+            let open_listener = allow_loopback
+                .then(|| probe::bind_open_loopback(proxy_range))
+                .flatten();
             let open_loopback_addr = open_listener.as_ref().and_then(|l| l.local_addr().ok());
             let open_loopback_target = open_loopback_addr.map(|a| a.to_string());
             let open_off_loopback_target = open_loopback_addr

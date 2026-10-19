@@ -1483,19 +1483,21 @@ Write-Host "L1 ok: loopback opened: $($l1.filters) filters, reported by wfp stat
 
 $lb = @('--allow-loopback')
 
-# L2: wfp verify with loopback open.
-$l2Lsn = $null
-try { $l2Lsn = Bind-Listener $LbFloor } catch { Write-Host 'L2 note: no blocked port free to listen on; probing one without a listener' }
-$l2port = if ($l2Lsn) { $l2Lsn.LocalEndpoint.Port } else { $LbFloor[0] }
-$l2out = & $Exe wfp verify --target "127.0.0.1:$l2port" @lb
+# L2: wfp verify with loopback open, aimed as the library aims it: at a
+# blocked port with no listener bound there.
+$l2port = $LbFloor[0]
+$l2out = & $Exe wfp verify --target "127.0.0.1:$l2port" --proxy-port-range $PortRange @lb
 $l2exit = $LASTEXITCODE
-if ($l2Lsn) { $l2Lsn.Stop() }
 Write-Host "L2: wfp verify exit=$l2exit stdout='$l2out'"
 if ($l2exit -ne 0) { throw "L2: wfp verify with loopback open expected exit 0, got $l2exit" }
 $l2 = $l2out | ConvertFrom-Json
 if ($l2.egress_probe -ne 'blocked') { throw "L2: loopback port $l2port expected blocked, got '$($l2.egress_probe)'" }
 if ($l2.open_loopback_probe -ne 'connected') {
   throw "L2: loopback listener ($($l2.open_loopback_target)) expected connected, got '$($l2.open_loopback_probe)'"
+}
+$l2open = [int]($l2.open_loopback_target -split ':')[-1]
+if ($l2open -ge $PortLo -and $l2open -le $PortHi) {
+  throw "L2: the open-loopback listener ($($l2.open_loopback_target)) is inside the proxy port range $PortRange"
 }
 if ($l2.open_off_loopback_probe -eq 'skipped') {
   Write-Host 'L2 note: off-loopback attempt skipped (no off-loopback address on this runner)'

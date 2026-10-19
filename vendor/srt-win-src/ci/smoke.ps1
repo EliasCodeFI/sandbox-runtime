@@ -54,6 +54,7 @@ function MustFail([string[]]$argv, [string]$why) {
 MustFail (@('install', '--proxy-port-range', '100-50') + $isl) 'low>high'
 MustFail (@('install', '--proxy-port-range', '1-1000') + $isl) 'range too wide'
 MustFail (@('install', '--proxy-port-range', '60080') + $isl) 'missing dash'
+MustFail (@('install', '--proxy-port-range', '9220-9230') + $isl) 'holds a loopback port that stays blocked'
 
 # ── pre-install absent ───────────────────────────────────────────────
 # CI runners are elevated so BFE enum succeeds; a non-elevated caller
