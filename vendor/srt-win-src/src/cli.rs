@@ -731,6 +731,14 @@ fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
     Ok(json!({ "paths": paths }))
 }
 
+fn quoted_list<S: AsRef<str>>(paths: &[S]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("'{}'", p.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Read `path` and decode it as a single DER-encoded X.509
 /// certificate (PEM, base64, or raw DER input — see
 /// [`srt_win::cert_store::CertDer::from_pem_or_der`]). Used by
@@ -1250,15 +1258,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Default token: the bare runner connects. Its token and
+            // Default token: the bare runner connects; its token and
             // the default child token give the filter's access check
             // the same answer. Write-restricted token: the runner
             // launches this binary's `probe connect` as a lockdown
-            // child, so the connect is made under the exact token
-            // (and job, desktop, mitigations) a sandboxed command
-            // gets. A probe child that cannot be created exits the
-            // runner with 1, which is reported as `error` below —
-            // never as `blocked`.
+            // child, so the connect is made under the exact token a
+            // sandboxed command gets. A probe child that cannot be
+            // created exits the runner with 1, reported as `error`.
             let cmd = if write_restricted_token {
                 // The probe child's restricting SIDs are the ones a
                 // command of this session gets. A root with no
@@ -1643,11 +1649,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     "acl revoke: {} grant(s) could not be released \
                      and may still be on disk (rows kept for retry): {}",
                     pending.len(),
-                    pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&pending),
                 ));
             }
         }
@@ -1727,12 +1729,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      and may still be on disk (rows, and their \
                      holders' deny ACEs, kept for retry): {}",
                     report.grants_pending.len(),
-                    report
-                        .grants_pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&report.grants_pending),
                 ));
             }
         }

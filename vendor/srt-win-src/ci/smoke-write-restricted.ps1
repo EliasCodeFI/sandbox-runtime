@@ -320,8 +320,9 @@ function Seed-Dir { param([string] $d)
 # verdict is read from the files, not the exit code.
 function Mutate { param([string] $d, [bool] $restricted)
   $line = "echo APPENDED>> `"$d\keep.txt`" & echo NEW> `"$d\new.txt`" & del /q `"$d\del.txt`""
-  if ($restricted) { return SbOn @($cmd, '/d', '/s', '/c', $line) }
-  return SbOff @($cmd, '/d', '/s', '/c', $line)
+  $tail = @($cmd, '/d', '/s', '/c', $line)
+  if ($restricted) { return SbOn $tail }
+  return SbOff $tail
 }
 function State { param([string] $d)
   [pscustomobject]@{

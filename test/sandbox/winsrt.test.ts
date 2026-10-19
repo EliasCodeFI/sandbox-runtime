@@ -1853,11 +1853,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 // Release ordering — no deny restore unless the revoke completed
 // (pure, all platforms)
 // ════════════════════════════════════════════════════════════════════
-// Revoke takes the session's ALLOW grants off, restore takes its DENY
-// stamps off. Running the restore after a revoke that failed, timed
-// out, was only partial or reported a grant it could not release
-// would leave a grant on disk with the stamps gone — and once that
-// has happened, no later revoke in the process unlocks the restore.
 // These drive the real SandboxManager with the platform pinned to
 // Windows and both child_process entry points stubbed.
 
@@ -2514,7 +2509,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
     await SandboxManager.reset()
-    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
+    expect(aclCalls).toEqual(WITH_RESTORE)
   })
 })
 

@@ -184,27 +184,24 @@ fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec
 }
 
 /// Rewrite the DACL of every thread this process currently has to
-/// SYSTEM + Admins + `OWNER_RIGHTS:READ_CONTROL` — the same shape
-/// [`install_broker_dacl`] gives the process, for the same reason. A
-/// thread object carries its own security descriptor, taken from the
-/// creating token's default DACL, which grants the account full
-/// access; the process DACL does not cover it. Without this a child
-/// running as the same account can open a runner thread for
+/// SYSTEM + Admins + `OWNER_RIGHTS:READ_CONTROL` — the shape
+/// [`install_broker_dacl`] gives the process. A thread object's
+/// descriptor comes from the creating token's default DACL, which
+/// grants the account full access, so without this a child running
+/// as the same account can open a runner thread for
 /// `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
 /// the runner's token, which is not write-restricted.
 ///
-/// Called by the runner when the write-restricted token is on, after
-/// the child exists but before it is resumed. Threads the runner
-/// starts after this call are not covered. Returns the number of
-/// threads rewritten; any thread that cannot be rewritten is an
-/// error.
+/// Threads started after this call are not covered. Returns the
+/// number of threads rewritten; any thread that cannot be rewritten
+/// is an error.
 pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenThread, THREAD_ACCESS_RIGHTS, THREAD_ALL_ACCESS,
     };
     /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
-    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
+    const DACL_RW: u32 = READ_CONTROL | 0x0004_0000;
 
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;

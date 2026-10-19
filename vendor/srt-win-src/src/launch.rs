@@ -166,8 +166,6 @@ pub fn run_lockdown(
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    //    `write_restricted` has no fallback: an error here ends the
-    //    launch.
     let restricted = OwnedHandle(
         token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
             .context("make_sandbox_token")?,
