@@ -539,12 +539,9 @@ Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
 # The egress BLOCK matches the sandbox account's SID, so a thread
 # running under any other identity would fall through to permit. A
 # pipe's SERVER end can ImpersonateNamedPipeClient whoever opened the
-# other end; the child's stdin is a pipe whose other end the real
-# user's broker holds, so it must be a CLIENT end. One compiled
-# method does the whole sequence on a single thread (impersonation is
-# per-thread): direct connect to an out-of-range listener, then
-# impersonate via the stdin handle, and — only if that worked — the
-# same connect on a NEW socket before reverting.
+# other end, and the real user's broker holds the other end of the
+# child's stdin. One compiled method does the whole sequence on a
+# single thread (impersonation is per-thread).
 $r13Lsn  = Bind-Listener (50003, 50004, 50005, 49997)
 $r13Port = $r13Lsn.LocalEndpoint.Port
 try {
@@ -611,13 +608,11 @@ Add-Type -TypeDefinition `$src
 
 # ── R14: the child's stdin reads as end-of-file ──────────────────
 # The broker writes the launch spec to the runner's stdin and closes
-# it; it does not forward its own stdin. So a child that reads stdin
-# to the end must finish (a missing EOF is the RExec timeout) having
-# read nothing — in particular none of the spec. `sort` copies stdin
-# to stdout and exits at EOF; the marker after it proves it returned.
-# A payload is put on the BROKER's stdin so the row also shows what
-# reaches the child from there: either nothing, or exactly the
-# payload — never anything else.
+# it, so a child that reads stdin to the end must finish (a missing
+# EOF is the RExec timeout) having read none of the spec. `sort`
+# copies stdin to stdout and exits at EOF. A payload on the BROKER's
+# stdin shows what reaches the child from there: nothing, or exactly
+# the payload.
 $r14Payload = 'R14-STDIN-PAYLOAD-7f3a'
 $r = RExec @('--', $cmd, '/c', 'sort & echo R14-EOF-MARK') `
        -TimeoutSec 60 -StdinText "$r14Payload`r`n"

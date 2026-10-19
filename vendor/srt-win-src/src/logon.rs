@@ -11,13 +11,10 @@
 //!
 //! **The sandbox side only ever holds pipe CLIENT ends.** A pipe's
 //! server end can `ImpersonateNamedPipeClient` whoever opened the
-//! other end, and here that is the real user — so the runner (and
-//! the child that inherits its stdio) must never be handed one.
-//! stdout/stderr are `CreatePipe` pairs whose write end, the one the
-//! runner gets, is the client end. The read end of a `CreatePipe`
-//! pair is the server end, so stdin is built the other way round by
-//! [`make_stdin_pipe`]: the broker keeps the server (write) end and
-//! opens the client (read) end itself.
+//! other end, and here that is the real user. The write end of a
+//! `CreatePipe` pair is the client end, so stdout/stderr are such
+//! pairs; the read end is the server end, so stdin is built the
+//! other way round by [`make_stdin_pipe`].
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -138,11 +135,9 @@ struct PipePair {
     runner: OwnedHandle,
 }
 
-/// An anonymous pipe the runner WRITES to (stdout / stderr). The
-/// write end of a `CreatePipe` pair is the pipe's client end, so the
-/// runner holds nothing it could impersonate through. Never use this
-/// shape for a pipe the runner reads: the read end is the server end
-/// (see [`make_stdin_pipe`]).
+/// An anonymous pipe the runner WRITES to (stdout / stderr). Never
+/// use this shape for a pipe the runner reads: the read end is the
+/// server end (see [`make_stdin_pipe`]).
 fn make_output_pipe() -> Result<PipePair> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -197,30 +192,22 @@ const STDIN_CLIENT_FLAGS: FILE_FLAGS_AND_ATTRIBUTES =
     FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_ANONYMOUS.0);
 
 /// Name of the stdin pipe: the broker's pid plus 128 random bits.
-/// The name is not a secret the design leans on (the DACL and the
-/// single instance are what keep others out); it only has to be
-/// unique and not predictable enough to squat.
+/// The name is not a secret (the DACL and the single instance keep
+/// others out); it only has to be unique and hard to squat.
 fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
     let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
     format!(r"\\.\pipe\srt-win-stdin-{pid}-{hex}")
 }
 
 /// The stdin pipe for the runner, built so the runner's end is the
-/// pipe's CLIENT end.
-///
-/// With `CreatePipe` the read end is the server end, and the write
-/// end is opened by this process — the real user. Handing that read
-/// end to the sandbox account would let it (and the child that
-/// inherits it) call `ImpersonateNamedPipeClient` and act as the
-/// real user. So the roles are swapped: the broker creates a named
-/// pipe, keeps the server end to write to, and opens the client end
-/// itself for the runner to read from. A client end cannot
-/// impersonate anyone.
+/// pipe's CLIENT end: the broker creates a named pipe, keeps the
+/// server end to write to, and opens the client end itself for the
+/// runner to read from.
 ///
 /// The pipe is reachable only through these two handles: its DACL
-/// grants the broker's own user and nobody else (not the sandbox
-/// account, not Everyone), it rejects remote clients, and its single
-/// instance is taken by the client opened here.
+/// grants the broker's own user and nobody else, it rejects remote
+/// clients, and its single instance is taken by the client opened
+/// here.
 ///
 /// There is no fallback: if any step fails the launch fails.
 fn make_stdin_pipe() -> Result<PipePair> {
@@ -634,10 +621,9 @@ mod tests {
         assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
     }
 
-    /// The pair behaves like an anonymous pipe for a
-    /// reader — data, then `ERROR_BROKEN_PIPE` once the writer is
-    /// gone — and the reader's end can neither impersonate nor be
-    /// joined by a second client.
+    /// The pair reads like an anonymous pipe — data, then
+    /// `ERROR_BROKEN_PIPE` once the writer is gone — and the reader's
+    /// end can neither impersonate nor be joined by a second client.
     #[test]
     fn stdin_pipe_runner_end_is_a_client_end() {
         let name = fresh_stdin_pipe_name().unwrap();
