@@ -2673,16 +2673,22 @@ export function windowsSetupVersionMismatch(
   if (us.setupVersion === undefined || us.markerVersion === us.setupVersion) {
     return undefined
   }
-  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
   return (
     `The Windows sandbox on this machine was set up by a different ` +
     `release (setup version ${us.markerVersion ?? 'unknown'}; this ` +
     `release needs ${us.setupVersion}). Re-run the install to upgrade ` +
     `it in place (one UAC prompt):\n` +
+    windowsInstallCommandLines(sublayerGuid) +
+    `Nothing is granted or run until then.`
+  )
+}
+
+function windowsInstallCommandLines(sublayerGuid: string | undefined): string {
+  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+  return (
     `  npx sandbox-runtime windows-install\n` +
     `  — or call installWindowsSandbox(), or run ` +
-    `\`srt-win.exe install${sl}\` directly.\n` +
-    `Nothing is granted or run until then.`
+    `\`srt-win.exe install${sl}\` directly.\n`
   )
 }
 
@@ -2692,12 +2698,9 @@ export function windowsSetupVersionMismatch(
 export function windowsInstallInstructions(
   sublayerGuid: string | undefined,
 ): string {
-  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
   return (
     `Windows sandbox needs a one-time install (one UAC prompt):\n` +
-    `  npx sandbox-runtime windows-install\n` +
-    `  — or call installWindowsSandbox(), or run ` +
-    `\`srt-win.exe install${sl}\` directly.\n` +
+    windowsInstallCommandLines(sublayerGuid) +
     `No logout is needed: the WFP filter keys on the dedicated ` +
     `\`srt-sandbox\` user's SID, so your network is unaffected.`
   )

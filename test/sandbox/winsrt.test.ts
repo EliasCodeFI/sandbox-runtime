@@ -2460,9 +2460,8 @@ describe('Windows write-restricted token, the default: write roots are granted o
       const dashes = argv.indexOf('--')
       expect(argv.slice(dashes)).toEqual(['--', 'C:\\sh.exe', '-c', 'echo x'])
       const between = argv.slice(4, dashes)
-      expect(between.filter((_, i) => i % 2 === 0)).toEqual(
-        between.filter((_, i) => i % 2 === 0).map(() => '--env'),
-      )
+      const flagSlots = between.filter((_, i) => i % 2 === 0)
+      expect(flagSlots).toEqual(flagSlots.map(() => '--env'))
       expect(argv.join(' ')).not.toContain('http.sslBackend')
       expect(argv).not.toContain('--write-restricted-token')
       expect(argv).not.toContain('--write-root')
