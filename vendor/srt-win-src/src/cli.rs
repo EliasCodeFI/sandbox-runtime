@@ -1256,13 +1256,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Default token: the bare runner connects; its token and
-            // the default child token give the filter's access check
-            // the same answer. Write-restricted token: the runner
-            // launches this binary's `probe connect` as a lockdown
-            // child, so the connect is made under the exact token a
-            // sandboxed command gets. A probe child that cannot be
-            // created exits the runner with 1, reported as `error`.
+            // Write-restricted: the runner launches `probe connect` as a
+            // lockdown child, so the connect is made under the child token.
             let cmd = if write_restricted_token {
                 // The probe child's restricting SIDs are the ones a
                 // command of this session gets. A root with no
@@ -2222,10 +2217,7 @@ mod tests {
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 
-    /// `--write-restricted-token` is off unless given, on `exec` and
-    /// on `wfp verify`, and the hidden `probe` subcommands the
-    /// write-restricted verify re-enters through parse — with the
-    /// dispatch sentinel stripped the way `run_from_args` strips it.
+    /// The flag is off unless given, and the hidden `probe` subcommands parse.
     #[test]
     fn write_restricted_token_flag_parses() {
         let on = Cli::try_parse_from([

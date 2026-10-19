@@ -501,17 +501,9 @@ pub enum Located {
     Unknown,
 }
 
-/// Locate the CURRENT path of a file by its captured
-/// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
-/// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`.
-///
-/// [`Located::Gone`] is returned only when the volume itself answered
-/// that the id names no file (`ERROR_FILE_NOT_FOUND`, or
-/// `ERROR_INVALID_PARAMETER`, which is how NTFS rejects a stale file
-/// reference). Every other failure is [`Located::Unknown`]: a caller
-/// that is about to forget an ACE must not read "could not look" as
-/// "nothing there".
+/// Locate the current path of a file by `(volume_serial, file_id)`.
+/// [`Located::Gone`] only when the volume answered that the id names
+/// no file; every other failure is [`Located::Unknown`].
 pub fn locate_by_file_id(file_id: &FileId) -> Located {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{

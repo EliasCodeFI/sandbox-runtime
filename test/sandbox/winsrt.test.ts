@@ -378,16 +378,13 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       ...base,
       writeRestrictedToken: true,
     })
-    // An srt-win option, so it must sit before `--`: after it the
-    // flag would be handed to the sandboxed command instead.
+    // Before `--`: after it the flag goes to the sandboxed command.
     const flagAt = on.argv.indexOf('--write-restricted-token')
     expect(flagAt).toBeGreaterThan(on.argv.indexOf('exec'))
     expect(flagAt).toBeLessThan(on.argv.indexOf('--'))
     expect(on.argv.filter(a => a === '--write-restricted-token')).toHaveLength(
       1,
     )
-    // The only differences from the option-off argv: the flag, one
-    // more git config entry, and the count that covers it.
     const added = on.argv.filter(a => !off.argv.includes(a))
     expect(added.sort()).toEqual(
       [
@@ -690,7 +687,6 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     // Appended last, so every earlier entry keeps its index.
     expect(values(on)).toEqual([...values(off), 'http.sslBackend=openssl'])
     expect(on.GIT_CONFIG_COUNT).toBe(String(Number(off.GIT_CONFIG_COUNT) + 1))
-    // On its own (no safe dirs, no schannel knobs) it is still emitted.
     expect(buildGitConfigEnv({ safeDirs: [], opensslBackend: true })).toEqual({
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'http.sslBackend',
@@ -1549,9 +1545,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
-    // 3 = the probe child connected (fence open for this token);
-    // 2 = unreachable; 1 = the probe child could not be created
-    // (e.g. the restricted token could not be built) → `error`.
+    // 3 = connected, 2 = unreachable, 1 = no probe child was created.
     for (const [status, probe, code] of [
       [3, 'connected', 'wfp_fence_inactive'],
       [2, 'unreachable', 'wfp_verify_inconclusive'],
@@ -2149,8 +2143,7 @@ describe('Windows writeRestrictedToken: write roots are granted once and kept (p
 
 describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
-  // For direct helper calls; spawnSync is stubbed, so any existing
-  // file does.
+  // spawnSync is stubbed, so any existing file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
   const RAW_USER = {
     user: {
@@ -2207,8 +2200,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     }),
   }
   type Revoke = [how: string, result: () => SyncResult]
-  // A revoke that exits 0 and lists one released path plus `path`
-  // with `status`.
   const reports = (status: string, path = 'p'): SyncResult =>
     exit(
       0,
@@ -2217,28 +2208,23 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         { path, status },
       ]),
     )
-  // The ways a revoke does not complete. (Thunks: `dir` exists only
-  // inside a test.)
+  // Thunks: `dir` exists only inside a test.
   const INCOMPLETE_REVOKES: Revoke[] = [
-    // Partial: srt-win lists the paths it did revoke and exits 1.
     ['exits non-zero', () => exit(1, '[{"path":"p","status":"revoked"}]')],
     ['times out', () => TIMED_OUT],
     ['prints unparseable output', () => exit(0, 'not json')],
     ['prints JSON that is not a list', () => exit(0, '{}')],
     ['lists an outcome with no status', () => exit(0, '[{"path":"p"}]')],
-    // Statuses outside the allow-list — the last one is a status this
-    // code has never heard of.
+    // The last status is one this code has never heard of.
     ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
       (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
     ),
-    // What an srt-win without "unreadable" says about a path it could
-    // not open.
+    // What an older srt-win says about a path it could not open.
     [
       'reports "missing" for a path that still exists',
       () => reports('missing', dir),
     ],
   ]
-  // The ways it does.
   const COMPLETE_REVOKES: Revoke[] = [
     ['releases nothing', () => exit(0, '[]')],
     ...['revoked', 'stillHeld', 'downgraded', 'relocated', 'noRow'].map(
@@ -2265,13 +2251,11 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      // The WFP probe binds a listener and is once-per-process; it is
-      // not what these tests are about.
+      // The WFP probe binds a listener and is once-per-process.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize().
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -2298,7 +2282,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         return child
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Sync spawns: every `acl` call.
       spyOn(child_process, 'spawnSync').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -2320,8 +2303,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
-  // external so initialize() binds nothing.
   const config = (): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -2359,11 +2340,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     return h[0] as () => unknown
   }
 
-  /**
-   * The listener registerCleanup() put on 'exit'. It is a function of
-   * its own, which starts with the handler the signals get and then
-   * removes what reset() only reaches after its first await.
-   */
+  /** The listener registerCleanup() put on 'exit'. */
   const exitListener = (): (() => unknown) => {
     const h = (process.listeners('exit') as unknown[]).filter(l =>
       /\bcleanupHandler\(\)/.test(String(l)),
@@ -2392,7 +2369,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     it(`initialize() failure cleanup: revoke ${how} → restore is not spawned`, async () => {
       aclResult.revoke = result()
       const e = await failingInitialize()
-      // Still rejects with the original failure.
       expect(e.code).toBe('acl_stamp_failed')
       expect(aclCalls).toEqual(NO_RESTORE)
       expect(SandboxManager.getConfig()).toBeUndefined()
@@ -2437,9 +2413,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     }
   }
 
-  // Once a revoke was incomplete, a later revoke that finds nothing
-  // wrong must not unlock the restore: the grant the first one left
-  // may no longer be recorded anywhere.
   describe('after one incomplete revoke in this process', () => {
     beforeEach(async () => {
       await SandboxManager.initialize(config())
@@ -2745,9 +2718,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     })
     const cfg = createTestConfig()
     cfg.windows = { ...cfg.windows, writeRestrictedToken: true }
-    // Runs `wfp verify --write-restricted-token` for real: a lockdown
-    // child holding the restricted token must be refused by the fence,
-    // or this throws.
     await SandboxManager.initialize(cfg)
     try {
       const { argv, env } =
@@ -2768,8 +2738,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
-      // The session's token shape is the one the fence was verified
-      // for; a command cannot switch to the other one.
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
         SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
@@ -2779,7 +2747,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     } finally {
       await SandboxManager.reset()
     }
-    // After reset the next session is back on the default token.
     await SandboxManager.initialize(createTestConfig())
     try {
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')

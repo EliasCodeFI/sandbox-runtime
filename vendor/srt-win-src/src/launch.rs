@@ -323,10 +323,8 @@ pub fn run_lockdown(
             )
         });
     }
-    // Runner threads get the process's self-protect DACL before the
-    // child can run (it is still suspended). Here rather than at
-    // entry so it covers every thread the runner has started by the
-    // time the child first runs.
+    // Here rather than at entry, so it covers every thread the runner
+    // has started by the time the (still suspended) child first runs.
     if write_restricted {
         let n = self_protect::protect_own_threads()
             .context("runner thread self-protect (required with --write-restricted-token)")?;

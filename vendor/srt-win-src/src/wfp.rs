@@ -510,16 +510,9 @@ fn add_filter(
 /// every other process carry a different user SID → no match → fall
 /// through to default-permit.
 ///
-/// **Write-restricted child token** (see [`crate::token`]). The
-/// filter matches only if the access check of the connecting token
-/// against this descriptor SUCCEEDS, so a failed check means "no
-/// BLOCK" — the fence fails open. A token with restricting SIDs is
-/// also checked against its restricting list, and the only ACE here
-/// names the sandbox user SID, so this descriptor works for that
-/// token only while the user SID stays in the list
-/// ([`crate::token::restricting_sid_list`]). Do not compensate by
-/// adding Everyone or RESTRICTED here — that would BLOCK every
-/// process on the machine.
+/// Under the write-restricted token the check must also pass against
+/// the restricting list, so the sandbox user SID must stay in it
+/// ([`crate::token::restricting_sid_list`]); a failed check means no BLOCK.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})")
 }

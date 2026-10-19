@@ -298,14 +298,9 @@ function logWindowsAclOutcomes(
 }
 
 /**
- * Whether the deny restore may run after `revoke`: only after a
- * revoke that completed, and never again in this process once one did
- * not. An ALLOW grant may then still be on disk, and the sandbox
- * account is shared by every session, so with the DENY stamps gone
- * another session's sandboxed process could write this tree's deny
- * targets. A later revoke that finds nothing left to release does not
- * show the earlier grant is gone (an older srt-win forgets a path it
- * could not open).
+ * Whether the deny restore may run: only after a revoke that
+ * completed, and never again in this process once one did not — a
+ * grant may still be on disk and the sandbox account is shared.
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
@@ -2652,9 +2647,8 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
-    // The token shape is session-level: initialize() verified the
-    // egress fence for exactly one shape, so a per-command override
-    // that differs is refused.
+    // initialize() verified the egress fence for one token shape, so a
+    // per-command override that differs is refused.
     const writeRestrictedToken = windowsWriteRestrictedToken
     const perCommandToken = customConfig?.windows?.writeRestrictedToken
     if (
