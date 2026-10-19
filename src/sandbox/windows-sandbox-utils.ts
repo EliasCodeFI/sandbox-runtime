@@ -2460,10 +2460,9 @@ function interpretDependencyProbes(
   if (us.seclogon === 'disabled' || us.seclogon === 'missing') {
     errors.push(seclogonDisabledMessage(us.seclogon))
   } else if (us.seclogon === 'cannot-read') {
-    warnings.push(
-      `Could not read the state of the Windows Secondary Logon ` +
-        `service (seclogon). If sandboxed commands fail to start, ` +
-        `check that the service is not disabled.`,
+    logForDebugging(
+      `[Sandbox Windows] Secondary Logon (seclogon) state cannot-read; ` +
+        `a launch will show whether it is usable`,
     )
   }
 

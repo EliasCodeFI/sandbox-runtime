@@ -1483,7 +1483,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(asynFail).toEqual(syncFail)
   })
 
-  it('checkWindowsDependencies{,Async}: seclogon state → error / warning / silent', async () => {
+  it('checkWindowsDependencies{,Async}: seclogon state → error / silent', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const withSeclogon = (seclogon: string | undefined) =>
       JSON.stringify({ ...JSON.parse(RAW_USER), seclogon })
@@ -1512,10 +1512,8 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(missing.errors.length).toBe(1)
     expect(missing.errors[0]).toMatch(/Secondary Logon service.*not present/)
 
-    const cannotRead = await run('cannot-read')
-    expect(cannotRead.errors).toEqual([])
-    expect(cannotRead.warnings.length).toBe(1)
-    expect(cannotRead.warnings[0]).toMatch(/Secondary Logon/)
+    // Unreadable is not a finding: the launch itself is the ground truth.
+    expect(await run('cannot-read')).toEqual({ errors: [], warnings: [] })
 
     expect(await run('ok')).toEqual({ errors: [], warnings: [] })
     // Field absent: an srt-win built before the probe existed.
