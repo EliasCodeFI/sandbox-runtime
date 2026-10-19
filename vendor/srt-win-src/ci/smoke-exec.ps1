@@ -726,15 +726,7 @@ try {
 }
 
 # ── S-rows: Secondary Logon (seclogon) preflight + typed failure ─
-# Every launch is CreateProcessWithLogonW, which needs the seclogon
-# service. With it Disabled, `status` must say so BEFORE a launch is
-# attempted, and a launch must fail with the typed `seclogon_disabled`
-# JSON line + exit 18. The invariant across all three states: a
-# `seclogon: ok` preflight means the launch works.
-#
-# This reconfigures a machine-wide service, so it runs last (only
-# the uninstall follows) and restores the original start type and
-# run state in `finally`; S4 then proves launches work again.
+# Reconfigures a machine-wide service: runs last and restores it in `finally`.
 function Seclogon-State {
   return (J @('status','--sublayer-guid',$Sublayer)).user.seclogon
 }
@@ -746,13 +738,7 @@ function Seclogon-Err {
   if (-not $line) { return $null }
   return $line | ConvertFrom-Json
 }
-# seclogon refuses SERVICE_CONTROL_STOP for a few milliseconds after
-# every launch it serviced (Stop-Service fails with
-# ERROR_INVALID_SERVICE_CONTROL, 1052), so the stop is retried.
-#
-# The service also stays unstoppable for as long as a process it
-# launched is alive, so after a few seconds any process still owned
-# by the sandbox account is listed and ended, and the wait goes on.
+# seclogon refuses STOP briefly after each launch (1052) and while a process it launched lives.
 function Stop-Seclogon {
   param([int] $TimeoutSec = 60)
   $start    = [DateTime]::UtcNow
@@ -762,8 +748,7 @@ function Stop-Seclogon {
   while ($true) {
     $s = Get-Service seclogon
     if ($s.Status -eq 'Stopped') { return }
-    # CanStop is not consulted: on some machines it stays false while
-    # a stop request is in fact accepted.
+    # CanStop is not consulted: it can stay false while a stop is accepted.
     try { Stop-Service seclogon -Force -ErrorAction Stop; return } catch { $last = "$_" }
     if (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
       $swept = $true
@@ -787,11 +772,7 @@ $slSkipped = $false
 try {
   # ── S1: Manual + stopped → ok; the launch demand-starts it ─────
   Set-Service seclogon -StartupType Manual
-  # A machine whose own session was started through this service
-  # keeps it unstoppable for as long as that session lives. The rows
-  # cannot run there; they are skipped by name, not passed. Only this
-  # first stop is excused — once it has succeeded, a later stop that
-  # fails is a failure.
+  # Unstoppable where this session itself came through seclogon: rows skipped by name.
   try { Stop-Seclogon -TimeoutSec 20 } catch { throw "SECLOGON-UNSTOPPABLE: $_" }
   $st = Seclogon-State
   if ($st -ne 'ok') { throw "S1: Manual+stopped expected seclogon=ok, got '$st'" }
@@ -802,7 +783,6 @@ try {
   Write-Host 'S1 ok: Manual+stopped reports ok and exec demand-starts the service'
 
   # ── S2: Disabled but still running → ok (and it does launch) ───
-  # Disabling a service does not stop it. S1's exec left it running.
   if ((Get-Service seclogon).Status -eq 'Running') {
     Set-Service seclogon -StartupType Disabled
     $st = Seclogon-State
@@ -817,8 +797,7 @@ try {
   }
 
   # ── S3: Disabled + stopped → status disabled; typed exit 18 ────
-  # Stop-Service refuses a service whose start type is Disabled, so
-  # stop it under Manual first and disable it once it is down.
+  # Stop-Service refuses a Disabled service: stop under Manual, then disable.
   Set-Service seclogon -StartupType Manual
   Stop-Seclogon
   (Get-Service seclogon).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
@@ -844,7 +823,6 @@ try {
   Write-Host "S3 ok: exec exits 18 with seclogon_disabled ($($e.message))"
 
   # ── S3b: wfp verify — same typed failure, no stdout verdict ────
-  # (the host's initialize() probe). The target is never dialled.
   $vErrFile = Join-Path ([System.IO.Path]::GetTempPath()) "srt-smoke-s3b-$PID.err"
   $vout  = & $Exe wfp verify --target '127.0.0.1:9' 2>$vErrFile
   $vexit = $LASTEXITCODE
@@ -865,8 +843,7 @@ try {
   $slSkipped = $true
   Write-Host "S1-S3 SKIPPED: the Secondary Logon service cannot be stopped on this machine. $_"
 } finally {
-  # Restore the original start type and run state. Warn rather than
-  # throw so an S-row failure above is not masked; S4 is the check.
+  # Warn rather than throw so an S-row failure above is not masked; S4 is the check.
   try {
     Set-Service seclogon -StartupType $slStartType
     if ($slWasRunning) { Start-Service seclogon } else { Stop-Seclogon }

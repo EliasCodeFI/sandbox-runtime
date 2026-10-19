@@ -595,22 +595,15 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
-        // Secondary Logon readiness: the launch needs the service
-        // as much as it needs the account and credential above.
         "seclogon": srt_win::logon::seclogon_state(),
     }))
 }
 
-/// Exit code for a launch that failed because the Secondary Logon
-/// service is disabled or absent ([`srt_win::logon::SeclogonDisabled`])
-/// — shared by `exec`, `wfp verify` and `user trust-ca`, the three
-/// commands that spawn the runner.
+/// Exit code of a launch that failed on [`srt_win::logon::SeclogonDisabled`].
 const EXIT_SECLOGON_DISABLED: i32 = 18;
 
-/// The one-line stderr JSON for a `logon::spawn_runner` failure
-/// caused by [`srt_win::logon::SeclogonDisabled`], or `None` for
-/// any other error. Sees through `.context(…)` layers, so callers
-/// can pass the error as they received it.
+/// The one-line stderr JSON for a [`srt_win::logon::SeclogonDisabled`]
+/// failure, seen through `.context(…)` layers; `None` for any other error.
 fn seclogon_error_json(e: &anyhow::Error) -> Option<serde_json::Value> {
     let s = e.downcast_ref::<srt_win::logon::SeclogonDisabled>()?;
     Some(serde_json::json!({
@@ -1607,11 +1600,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    // Secondary Logon disabled/absent (see
-                    // `logon::SeclogonDisabled`): same one-line
-                    // JSON shape as below, exit 18. The per-exec
-                    // restore runs first — `process::exit` skips
-                    // destructors.
+                    // Same one-line JSON shape as below, exit 18. The per-exec
+                    // restore runs first: `process::exit` skips destructors.
                     if let Some(j) = seclogon_error_json(&e) {
                         eprintln!("{j}");
                         drop(per_exec_guard);
@@ -1855,10 +1845,7 @@ mod tests {
         );
     }
 
-    /// A `SeclogonDisabled` from `logon::spawn_runner` maps to the
-    /// typed stderr JSON whether or not a caller wrapped it in
-    /// `.context(…)` (`wfp verify` and `install::trust_ca` do);
-    /// any other error is left for the generic exit-1 path.
+    /// The typed JSON survives `.context(…)`; other errors yield `None`.
     #[test]
     fn seclogon_error_json_shape() {
         use srt_win::logon::SeclogonDisabled;
