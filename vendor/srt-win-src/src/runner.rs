@@ -123,6 +123,7 @@ pub fn run() -> Result<u32> {
             launch::run_lockdown(&exe, &spec.argv[1..], &spec.env_overlay)
         }
         RunnerCmd::InstallCa { der } => {
+            crate::self_protect::protect_runner()?;
             let thumb = crate::cert_store::install_root_ca(&der)?;
             eprintln!(
                 "srt-win: runner: CA installed into sandbox-user \
@@ -133,6 +134,7 @@ pub fn run() -> Result<u32> {
         RunnerCmd::ProbeEgress { target } => {
             use std::net::{SocketAddr, TcpStream};
             use std::time::Duration;
+            crate::self_protect::protect_runner()?;
             // WSAEACCES — what WFP returns from ALE_AUTH_CONNECT
             // when the block-user filter denies the connect. Match
             // on the raw code (not `ErrorKind::PermissionDenied`)

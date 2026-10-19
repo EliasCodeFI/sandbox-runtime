@@ -207,6 +207,57 @@ fn build_protected_acl(full: u32) -> Result<Vec<u8>> {
     ])
 }
 
+/// Give a just-created, still-suspended runner the DACLs it gives itself, on
+/// the handles its creation returned (they must carry `WRITE_DAC`). Until then
+/// another process of the sandbox account could open the runner and keep it.
+pub fn protect_suspended_runner(process: HANDLE, thread: HANDLE) -> Result<()> {
+    set_protected_dacl(process, PROCESS_ALL_ACCESS.0).context("runner process DACL")?;
+    set_protected_dacl(thread, THREAD_ALL_ACCESS.0).context("runner initial-thread DACL")
+}
+
+fn set_protected_dacl(handle: HANDLE, full: u32) -> Result<()> {
+    let mut buf = build_protected_acl(full)?;
+    let r = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(buf.as_mut_ptr() as *mut ACL),
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(anyhow!("SetSecurityInfo(DACL): {r:?}"));
+    }
+    Ok(())
+}
+
+/// Self-protection for a runner mode that starts no child: the process DACL,
+/// the default DACL for threads created later, then every existing thread.
+pub fn protect_runner() -> Result<()> {
+    install_broker_dacl(None).context("runner self-protect (process)")?;
+    protect_future_threads().context("runner self-protect (default DACL for new threads)")?;
+    protect_own_threads().context("runner self-protect (threads)")?;
+    Ok(())
+}
+
+/// Whether the thread behind `h` (a handle with
+/// `THREAD_QUERY_LIMITED_INFORMATION`) belongs to this process. A thread id
+/// taken from a snapshot can have been reused by another process since.
+fn is_own_thread(h: HANDLE) -> Result<bool> {
+    use windows::Win32::System::Threading::{GetCurrentProcessId, GetProcessIdOfThread};
+    let owner = unsafe { GetProcessIdOfThread(h) };
+    if owner == 0 {
+        return Err(anyhow!(
+            "GetProcessIdOfThread: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(owner == unsafe { GetCurrentProcessId() })
+}
+
 /// Rewrite the DACL of every thread this process has to the shape
 /// [`install_broker_dacl`] gives the process. A thread whose DACL it cannot open
 /// counts as protected only if every [`withheld_thread_rights`] right is refused.
@@ -215,8 +266,9 @@ pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenThread, THREAD_ACCESS_RIGHTS,
     };
-    /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
-    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
+    /// `READ_CONTROL | WRITE_DAC` to replace the DACL, plus the right
+    /// [`is_own_thread`] needs.
+    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000 | THREAD_QUERY_LIMITED_INFORMATION;
 
     let mut buf = build_protected_acl(THREAD_ALL_ACCESS.0)?;
     let acl = buf.as_mut_ptr() as *mut ACL;
@@ -237,15 +289,24 @@ pub fn protect_own_threads() -> Result<usize> {
                 Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
                     if let Some(right) = openable_withheld_right(*tid)? {
                         return Err(anyhow!(
-                            "thread {tid}: its DACL cannot be rewritten and it grants \
-                             this account access {right:#x}"
+                            "thread {tid} cannot be protected: opening it to rewrite \
+                             its DACL was refused ({e}), yet this account can still \
+                             open it with access {right:#x}"
                         ));
                     }
                     protected += 1;
                     continue;
                 }
-                Err(e) => return Err(anyhow!("OpenThread(WRITE_DAC, tid={tid}): {e}")),
+                Err(e) => {
+                    return Err(anyhow!(
+                        "thread {tid} cannot be protected: OpenThread(WRITE_DAC): {e}"
+                    ));
+                }
             };
+            // The id now names another process's thread: ours has exited.
+            if !is_own_thread(h.raw()).with_context(|| format!("thread {tid}"))? {
+                continue;
+            }
             let r = SetSecurityInfo(
                 h.raw(),
                 SE_KERNEL_OBJECT,
@@ -256,7 +317,9 @@ pub fn protect_own_threads() -> Result<usize> {
                 None,
             );
             if r.is_err() {
-                return Err(anyhow!("SetSecurityInfo(thread {tid} DACL): {r:?}"));
+                return Err(anyhow!(
+                    "thread {tid} cannot be protected: SetSecurityInfo(DACL): {r:?}"
+                ));
             }
             protected += 1;
         }
@@ -277,6 +340,15 @@ fn openable_withheld_right(tid: u32) -> Result<Option<u32>> {
         match unsafe { OpenThread(THREAD_ACCESS_RIGHTS(right), false, tid) } {
             Ok(h) => {
                 drop(OwnedHandle(h));
+                // A reused id that now names another process's thread is not
+                // ours to judge. If its owner cannot be read, it counts as ours.
+                let query = THREAD_ACCESS_RIGHTS(THREAD_QUERY_LIMITED_INFORMATION);
+                if let Ok(q) = unsafe { OpenThread(query, false, tid) } {
+                    let q = OwnedHandle(q);
+                    if !is_own_thread(q.raw())? {
+                        return Ok(None);
+                    }
+                }
                 return Ok(Some(right));
             }
             Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {}
@@ -577,6 +649,46 @@ mod tests {
                 ace(AceKind::Allow, SID_OWNER_RIGHTS, READ_CONTROL),
             ]
         );
+    }
+
+    #[test]
+    fn a_thread_of_another_process_is_not_ours() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{
+            GetCurrentThreadId, OpenThread, THREAD_ACCESS_RIGHTS,
+        };
+        const CREATE_SUSPENDED: u32 = 0x4;
+        let open = |tid: u32, access: u32| {
+            unsafe { OpenThread(THREAD_ACCESS_RIGHTS(access), false, tid) }
+                .map(OwnedHandle)
+                .expect("OpenThread")
+        };
+        let me = open(
+            unsafe { GetCurrentThreadId() },
+            THREAD_QUERY_LIMITED_INFORMATION,
+        );
+        assert!(is_own_thread(me.raw()).unwrap());
+
+        let mut other = std::process::Command::new("cmd.exe")
+            .args(["/c", "exit"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn a suspended process");
+        let tids = crate::util::thread_ids_of(other.id()).unwrap();
+        assert_eq!(tids.len(), 1, "a suspended process has its initial thread");
+        let theirs = open(tids[0], THREAD_ALL_ACCESS.0);
+        assert!(!is_own_thread(theirs.raw()).unwrap());
+
+        // The broker's step on a suspended runner, on the same kind of handles.
+        let process = HANDLE(other.as_raw_handle());
+        protect_suspended_runner(process, theirs.raw()).unwrap();
+        for h in [process, theirs.raw()] {
+            let aces = thread_ace_views(h).unwrap();
+            assert!(dacl_shuts_out_account(&aces), "{aces:?}");
+        }
+        other.kill().unwrap();
+        let _ = other.wait();
     }
 
     /// A second sweep rewrites a thread again or finds it out of reach.
