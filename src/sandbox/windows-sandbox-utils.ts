@@ -2150,8 +2150,9 @@ export function uninstallWindowsSandbox(
     sublayerGuid?: string
     keepUser?: boolean
     /**
-     * How long to wait for the self-elevating uninstall subprocess.
-     * Defaults to {@link INSTALL_TIMEOUT_MS}.
+     * How long to wait for the uninstall: the elevation prompt, and
+     * then the removal of the grants kept for this user, which walks
+     * the profile. Defaults to the install's and the grant's together.
      */
     timeoutMs?: number
     srtWin?: SrtWinSpawn
@@ -2163,7 +2164,11 @@ export function uninstallWindowsSandbox(
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.keepUser) args.push('--keep-user')
   const r = runSrtWin(args, {
-    timeoutMs: installTimeoutMs(opts),
+    timeoutMs:
+      opts.timeoutMs ??
+      (opts.keepUser
+        ? INSTALL_TIMEOUT_MS
+        : INSTALL_TIMEOUT_MS + PROFILE_GRANT_TIMEOUT_MS),
     srtWin: opts.srtWin,
   })
   logForDebugging(

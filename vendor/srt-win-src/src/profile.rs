@@ -2198,6 +2198,25 @@ pub struct Forgotten {
     pub failed: Vec<Item>,
 }
 
+/// Mark the record incomplete before the first entry comes off: a forget
+/// that is killed leaves a grant no session starts on, which the next
+/// `profile grant`, `profile forget` or uninstall finishes.
+fn mark_forget_begun(key: &str, marker: &Marker) -> Result<()> {
+    match &marker.header {
+        Some(h) if h.complete => write_marker(
+            key,
+            &Marker {
+                header: Some(Header {
+                    complete: false,
+                    ..h.clone()
+                }),
+                ..marker.clone()
+            },
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// `profile forget`: remove the group's ACE from every recorded
 /// object, the empty directories the grant created, and the record.
 /// Every DACL is left as it was, minus this grant's entries.
@@ -2215,6 +2234,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
         ids
     };
     let marker = read_marker_at(store.key)?;
+    mark_forget_begun(store.key, &marker)?;
     let all = all_recorded(store, &marker)?;
     let mut out = Forgotten::default();
     let mut failed_paths: HashSet<&str> = HashSet::new();
@@ -3176,6 +3196,16 @@ mod tests {
         assert_eq!(read_marker_at(KEY).unwrap().env_extra.len(), 2);
         assert_eq!(cargo_home(&outside), (None, false));
 
+        // A forget that has begun and not ended leaves the grant
+        // incomplete, with everything still recorded; the next finishes.
+        let before = read_marker_at(KEY).unwrap();
+        mark_forget_begun(KEY, &before).unwrap();
+        let begun = read_marker_at(KEY).unwrap();
+        assert_eq!(begun.paths, before.paths);
+        assert_eq!(
+            status_json(KEY, Ok(unset.clone()), false)["state"],
+            "incomplete"
+        );
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");
         assert!(read_marker_at(KEY).unwrap().env_extra.is_empty());

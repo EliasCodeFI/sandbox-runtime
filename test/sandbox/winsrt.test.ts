@@ -2013,6 +2013,19 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(spawnSyncSpy.mock.calls.at(-2)?.[2].timeout).toBe(300_000)
   })
 
+  it('uninstallWindowsSandbox: the default timeout covers the removal of the kept grants; --keep-user removes none', () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    uninstallWindowsSandbox({ srtWin })
+    expect(spawnSyncSpy.mock.calls.at(-1)?.[2].timeout).toBe(
+      120_000 + 30 * 60_000,
+    )
+    uninstallWindowsSandbox({ srtWin, keepUser: true })
+    expect(spawnSyncSpy.mock.calls.at(-1)?.[2].timeout).toBe(120_000)
+    uninstallWindowsSandbox({ srtWin, timeoutMs: 5_000 })
+    expect(spawnSyncSpy.mock.calls.at(-1)?.[2].timeout).toBe(5_000)
+  })
+
   it('installWindowsSandbox{,Async}: timeout → identical install_timeout error', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     // Sync: spawnSync kills at `timeout` and reports ETIMEDOUT.
