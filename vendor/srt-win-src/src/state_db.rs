@@ -802,7 +802,7 @@ impl Locked {
             ])
             .context("UPSERT ace_holders")?;
         let holder_added = !already_held;
-        let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
+        let eff = effective_ace(&self.conn, canon, want.kind())?.unwrap_or(want);
         self.conn
             .prepare_cached(
                 "INSERT INTO working_aces \
@@ -827,11 +827,6 @@ impl Locked {
             holder_added,
             _sealed: (),
         })
-    }
-
-    /// `MAX(want_mask)` across live holders of `(canon, kind)`.
-    fn effective_ace(&self, canon: &str, kind: &str) -> Result<Option<SbAce>> {
-        effective_ace(&self.conn, canon, kind)
     }
 
     /// Release this holder's `(canon, kind)` hold — see
@@ -1106,9 +1101,7 @@ fn delete_holder(conn: &Connection, holder: Option<i64>, canon: &str, kind: &str
 ///    committed only after the converge succeeded. The converge reads
 ///    `working_aces` through the same connection, so it sees the
 ///    pending row changes; an error (or a crash) rolls them back and
-///    the rows are there for the next release or recovery. Deleting
-///    the rows first and converging afterwards would leave the ACE on
-///    disk with nothing recording it whenever the converge failed.
+///    the rows are there for the next release or recovery.
 fn release_hold(
     conn: &Connection,
     holder: Option<i64>,
@@ -1280,12 +1273,11 @@ fn recover_holds(
     conn: &Connection,
     holder: Option<i64>,
     holds: &[(String, String)],
-    blocked: bool,
+    mut blocked: bool,
     sb: &str,
     disk: &Disk,
     report: &mut RecoveryReport,
 ) {
-    let mut blocked = blocked;
     for (canon, kind) in holds.iter().filter(|(_, k)| k == "grant") {
         blocked |= !recover_one(conn, holder, canon, kind, sb, disk, report);
     }
@@ -1355,11 +1347,10 @@ fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<Reco
     }
 
     // 3. `working_aces` rows with zero `ace_holders` (a holder row
-    //    lost without its release — e.g. rows written before step 2
-    //    kept them). Nothing says which holder a row was for, so
-    //    their deny rows are kept while ANY grant — theirs or a dead
-    //    holder's — is still pending. When no sandbox user is
-    //    provisioned there are no such rows.
+    //    lost without its release). Nothing says which holder a row
+    //    was for, so their deny rows are kept while ANY grant —
+    //    theirs or a dead holder's — is still pending. When no
+    //    sandbox user is provisioned there are no such rows.
     if let Some(sb) = sb {
         let orphans: Vec<(String, String)> = query_vec(
             conn,
@@ -1604,8 +1595,6 @@ mod tests {
         // PID 0x7FFF_FFFE is well above any plausible live PID.
         assert!(!is_process_alive(0x7FFF_FFFE, 0));
     }
-
-    // ── Release / recovery bookkeeping, with the disk side faked ──
 
     const TREE: &str = r"\\?\C:\tree";
     const SECRET: &str = r"\\?\C:\tree\secret";

@@ -272,9 +272,8 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
-// 'restored'/'alreadyOriginal' are the pre- same-user-removal
-// srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-// post-. Either is non-anomalous.
+// An older srt-win reports 'restored'/'alreadyOriginal' where a
+// current one reports 'revoked'/'stillHeld'.
 const WINDOWS_ACL_RELEASE_OK = new Set([
   'revoked',
   'stillHeld',
@@ -299,32 +298,14 @@ function logWindowsAclOutcomes(
 }
 
 /**
- * The release-ordering gate, shared by every release path: the deny
- * restore runs only after a revoke that COMPLETED, and never again in
- * this process once one did not. Returns whether it may run.
- *
- * Revoke takes the ALLOW grants off, restore takes the DENY stamps
- * off. If the revoke failed, timed out, was only partial, or reported
- * a path whose grant it could not release, an ALLOW grant may still
- * be on disk — and the sandbox account is shared by every session, so
- * with the stamps gone another session's sandboxed process could
- * write this tree's deny targets (`.git/hooks`, settings files, …).
- * So the stamps stay: they name only the sandbox account's SID and
- * cost the real user nothing.
- *
- * The refusal lasts for the process: a later session's revoke that
- * finds nothing left to release does not show the earlier grant is
- * gone (an older srt-win forgets a path it could not open), so every
- * later reset() keeps its stamps too.
- *
- * What clears them afterwards depends on the srt-win in use. A
- * current one keeps the rows of a grant it could not release, held by
- * this process; once this process has exited, any `srt-win acl`
- * command retries those grants and takes this process's deny stamps
- * off only when all of them are released. An older one has already
- * dropped the row of such a grant: its crash recovery then removes
- * the deny stamps once this process is gone, and the leftover ALLOW
- * entry is recorded nowhere and has to be removed by hand.
+ * Whether the deny restore may run after `revoke`: only after a
+ * revoke that completed, and never again in this process once one did
+ * not. An ALLOW grant may then still be on disk, and the sandbox
+ * account is shared by every session, so with the DENY stamps gone
+ * another session's sandboxed process could write this tree's deny
+ * targets. A later revoke that finds nothing left to release does not
+ * show the earlier grant is gone (an older srt-win forgets a path it
+ * could not open).
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
@@ -349,6 +330,16 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
     { level: 'error' },
   )
   return false
+}
+
+function releaseWindowsSessionAcls(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+): void {
+  const o = { sandboxUserSid, srtWin }
+  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+  }
 }
 
 /**
@@ -1260,13 +1251,8 @@ async function initializeSteps(
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
-      // Restore only after a completed revoke — see
-      // windowsAclRestoreAllowed.
       if (windowsFsSbUserSid) {
-        const o = { sandboxUserSid: windowsFsSbUserSid, srtWin }
-        if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-          logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-        }
+        releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -2908,13 +2894,9 @@ async function reset(): Promise<void> {
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
     const srtWin = srtWinSpawn
-    // Restore only after a completed revoke — see
-    // windowsAclRestoreAllowed. (The 'exit'/signal handler lands
-    // here too: this part of reset() runs synchronously.)
-    const o = { sandboxUserSid: sb, srtWin }
-    if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-      logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-    }
+    // The 'exit'/signal handler lands here too: this part of
+    // reset() runs synchronously.
+    releaseWindowsSessionAcls(sb, srtWin)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
