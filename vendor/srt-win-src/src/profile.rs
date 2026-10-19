@@ -2618,6 +2618,12 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
 
 // ─── Status ─────────────────────────────────────────────────────────
 
+/// Whether `p` lies strictly inside the directory `dir` (both lower
+/// case, no `\\?\` prefix).
+fn is_beneath(dir: &str, p: &str) -> bool {
+    p.len() > dir.len() && p.starts_with(dir) && p.as_bytes()[dir.len()] == b'\\'
+}
+
 /// Whether `path` is a directory the grant lets a sandboxed command
 /// enter and list: recorded as granted whole, or as a container
 /// (children granted one by one, exclusions among them denied on
@@ -2628,9 +2634,7 @@ fn traversable(paths: &[Recorded], path: &str) -> bool {
         let at = path_id::strip_extended_prefix(&r.path).to_lowercase();
         match r.kind {
             Kind::Granted | Kind::Container if at == p => true,
-            Kind::Granted => {
-                p.len() > at.len() && p.starts_with(&at) && p.as_bytes()[at.len()] == b'\\'
-            }
+            Kind::Granted => is_beneath(&at, &p),
             _ => false,
         }
     })
@@ -2645,9 +2649,7 @@ fn covered(paths: &[Recorded], path: &str) -> bool {
         let at = path_id::strip_extended_prefix(&r.path).to_lowercase();
         match r.kind {
             Kind::File => at == p,
-            Kind::Granted => {
-                p.len() > at.len() && p.starts_with(&at) && p.as_bytes()[at.len()] == b'\\'
-            }
+            Kind::Granted => is_beneath(&at, &p),
             _ => false,
         }
     })
