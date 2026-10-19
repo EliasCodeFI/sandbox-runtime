@@ -1092,8 +1092,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Before the elevation hop: the records are the CALLING
-            // user's. And before the group the grants name is removed.
+            // Before the elevation hop (the records are the CALLING
+            // user's) and before the group the grants name is removed.
             if !keep_user {
                 match srt_win::persist::forget_everything() {
                     Ok((0, _)) => {}

@@ -719,8 +719,8 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
 }
 
 /// `acl forget`: remove the persistent grants of `roots`, or with
-/// `all` of every root the marker or the database lists; then the
-/// marker's `EverEnabled` is cleared once no root is left listed.
+/// `all` of every root the marker or the database lists. `all` also
+/// clears the marker's `EverEnabled` once no root is left listed.
 pub fn forget(
     db: &Locked,
     ids: &Ids,
