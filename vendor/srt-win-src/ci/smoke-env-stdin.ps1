@@ -224,7 +224,7 @@ try {
   # runner::decode_env_frame (vendor/srt-win-src/src/runner.rs,
   # reader); keep all three in sync.
   $proxyUrl = "http://sb:$Token@localhost:$PortLo"
-  $frameJson = '[["HTTP_PROXY","' + $proxyUrl + '"],["HTTPS_PROXY","' + $proxyUrl + '"]]'
+  $frameJson = '[["http_proxy","' + $proxyUrl + '"],["https_proxy","' + $proxyUrl + '"]]'
   $frameBody = [Text.Encoding]::UTF8.GetBytes($frameJson)
   $frameLen  = [BitConverter]::GetBytes([UInt32]$frameBody.Length)
 
@@ -362,9 +362,15 @@ try {
   # -- S4: child got the token in its ENVIRONMENT (mechanism works) -----
   # Either enumeration source counts: CENVD= ([Environment]::
   # GetEnvironmentVariables()) or CENV= (Get-ChildItem env:).
+  # Case-sensitive: the variable has one spelling, the lower-case one.
   $tokenEnv = @($dump | Where-Object {
-    $_ -match "^CENVD?=HTTPS_PROXY=http://sb:$Token@"
+    $_ -cmatch "^CENVD?=https_proxy=http://sb:$Token@"
   })
+  $upperEnv = @($dump | Where-Object { $_ -cmatch '^CENVD?=HTTPS?_PROXY=' })
+  if ($upperEnv.Count -gt 0) {
+    throw ("S4 FAIL: an upper-case proxy variable is in the child env: " +
+           ($upperEnv -join '; '))
+  }
   if ($tokenEnv.Count -lt 1) {
     # With S2b green the drop is in build_env_block / CreateProcess /
     # the cmd->powershell hop OR in the child-side enumeration. The

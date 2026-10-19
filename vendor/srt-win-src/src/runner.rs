@@ -120,19 +120,17 @@ pub fn decode_env_frame(r: &mut impl Read) -> Result<Vec<(String, String)>> {
 
 /// Append a decoded `--env-stdin` frame to the `--env` overlay. The
 /// writer-side invariant is that each key rides EXACTLY ONE channel
-/// (the TS wrapper partitions by key), so a case-insensitive overlap
-/// means the two sides disagree about the contract — fail loudly
-/// instead of silently picking a winner.
+/// (the TS wrapper partitions by key), so an overlap ignoring case — as
+/// the environment block is merged — means the two sides disagree about
+/// the contract: fail loudly instead of silently picking a winner.
 pub fn merge_env_overlay(
     mut base: Vec<(String, String)>,
     extra: Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>> {
-    let base_keys: std::collections::HashSet<String> =
-        base.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
-    if let Some((k, _)) = extra
-        .iter()
-        .find(|(k, _)| base_keys.contains(&k.to_ascii_uppercase()))
-    {
+    let fold = |k: &str| crate::launch::fold_env_name(std::ffi::OsStr::new(k));
+    let base_keys: std::collections::HashSet<Vec<u16>> =
+        base.iter().map(|(k, _)| fold(k)).collect();
+    if let Some((k, _)) = extra.iter().find(|(k, _)| base_keys.contains(&fold(k))) {
         return Err(anyhow!(
             "exec: --env-stdin frame key '{k}' duplicates an --env \
              argument (case-insensitive) — the caller must put each \
@@ -321,7 +319,7 @@ mod tests {
     fn merge_env_overlay_appends_disjoint_and_rejects_overlap() {
         let base = vec![("PATH".to_string(), "C:\\bin".to_string())];
         let extra = vec![(
-            "HTTPS_PROXY".to_string(),
+            "https_proxy".to_string(),
             "http://u:tok@localhost:60080".to_string(),
         )];
         let merged = merge_env_overlay(base.clone(), extra.clone()).unwrap();
@@ -330,7 +328,7 @@ mod tests {
             vec![
                 ("PATH".to_string(), "C:\\bin".to_string()),
                 (
-                    "HTTPS_PROXY".to_string(),
+                    "https_proxy".to_string(),
                     "http://u:tok@localhost:60080".to_string()
                 ),
             ]
@@ -340,12 +338,17 @@ mod tests {
         let overlapping_base = vec![
             ("PATH".to_string(), "C:\\bin".to_string()),
             (
-                "https_proxy".to_string(),
+                "HTTPS_PROXY".to_string(),
                 "http://localhost:60080".to_string(),
             ),
         ];
         let e = merge_env_overlay(overlapping_base, extra).unwrap_err();
         assert!(format!("{e:#}").contains("exactly one channel"), "{e:#}");
+
+        // The same fold as the block's merge: beyond ASCII too.
+        let pair = |k: &str| vec![(k.to_string(), "v".to_string())];
+        assert!(merge_env_overlay(pair("clé"), pair("CLÉ")).is_err());
+        assert!(merge_env_overlay(pair("clé"), pair("cle")).is_ok());
     }
 
     #[test]

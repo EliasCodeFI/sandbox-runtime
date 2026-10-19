@@ -1984,7 +1984,7 @@ mod tests {
         };
         let token = "tokprobe0123456789abcdef0123456789abcdef";
         let url = format!("http://sb:{token}@localhost:60080");
-        let json = format!(r#"[["HTTP_PROXY","{url}"],["HTTPS_PROXY","{url}"]]"#);
+        let json = format!(r#"[["http_proxy","{url}"],["https_proxy","{url}"]]"#);
         let mut frame = (json.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(json.as_bytes());
 
@@ -2013,7 +2013,7 @@ mod tests {
         .expect("encode spec");
         let spec_json = std::str::from_utf8(&spec_bytes[4..]).expect("utf8");
         assert!(
-            spec_json.contains(&format!(r#"["HTTPS_PROXY","{url}"]"#)),
+            spec_json.contains(&format!(r#"["https_proxy","{url}"]"#)),
             "token var missing from runner spec JSON: {spec_json}"
         );
         // And a decode round-trip of what the runner would parse.
@@ -2023,8 +2023,8 @@ mod tests {
                 assert!(
                     s.env_overlay
                         .iter()
-                        .any(|(k, v)| k == "HTTPS_PROXY" && v == &url),
-                    "HTTPS_PROXY lost across the spec pipe"
+                        .any(|(k, v)| k == "https_proxy" && v == &url),
+                    "https_proxy lost across the spec pipe"
                 );
             }
             _ => panic!("wrong variant"),
