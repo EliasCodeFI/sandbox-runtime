@@ -30,8 +30,8 @@ use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, GENERIC_READ, HANDLE,
-    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, ERROR_PIPE_BUSY,
+    GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
@@ -196,7 +196,21 @@ fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
 /// keeps the server end of a named pipe and opens the client end itself. The
 /// DACL grants only the broker's user; if any step fails the launch fails.
 fn make_stdin_pipe() -> Result<PipePair> {
-    make_stdin_pipe_named(&fresh_stdin_pipe_name()?)
+    once_more_if_pipe_busy(|| make_stdin_pipe_named(&fresh_stdin_pipe_name()?))
+}
+
+/// Run `make`, and once more if it failed with `ERROR_PIPE_BUSY`: another
+/// process took the pipe's single instance before the broker's own connect.
+fn once_more_if_pipe_busy<T>(mut make: impl FnMut() -> Result<T>) -> Result<T> {
+    match make() {
+        Err(e) if is_pipe_busy(&e) => make(),
+        r => r,
+    }
+}
+
+fn is_pipe_busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<windows::core::Error>()
+        .is_some_and(|w| w.code() == ERROR_PIPE_BUSY.to_hresult())
 }
 
 fn fresh_stdin_pipe_name() -> Result<String> {
@@ -247,11 +261,6 @@ fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
         )
     }
     .context("CreateFileW(runner stdin client end)")?;
-    if client.is_invalid() {
-        return Err(anyhow!(
-            "CreateFileW(runner stdin client end): invalid handle"
-        ));
-    }
     let runner = OwnedHandle(client);
     unsafe {
         SetHandleInformation(runner.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
@@ -572,7 +581,9 @@ mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_BROKEN_PIPE;
     use windows::Win32::Security::RevertToSelf;
-    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows::Win32::System::Pipes::{
+        GetNamedPipeInfo, ImpersonateNamedPipeClient, PIPE_SERVER_END,
+    };
 
     #[test]
     fn stdin_pipe_name_shape() {
@@ -605,10 +616,35 @@ mod tests {
         let name = fresh_stdin_pipe_name().unwrap();
         let pipe = make_stdin_pipe_named(&name).unwrap();
 
+        // Read first: until data has been read through it, even a server end
+        // is refused impersonation.
+        let payload = b"spec-bytes";
+        let mut wrote = 0u32;
+        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
+        assert_eq!(wrote as usize, payload.len());
+        let mut buf = [0u8; 64];
+        let mut read = 0u32;
+        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
+        assert_eq!(&buf[..read as usize], payload);
+
         let imp = unsafe { ImpersonateNamedPipeClient(pipe.runner.raw()) };
         if imp.is_ok() {
             unsafe { RevertToSelf().unwrap() };
             panic!("ImpersonateNamedPipeClient succeeded on the runner's stdin end");
+        }
+        let server_end = |h: HANDLE| {
+            let mut flags = NAMED_PIPE_MODE(0);
+            unsafe { GetNamedPipeInfo(h, Some(&mut flags), None, None, None) }
+                .map(|()| flags.0 & PIPE_SERVER_END.0 != 0)
+        };
+        assert!(
+            !server_end(pipe.runner.raw()).expect("GetNamedPipeInfo(runner end)"),
+            "the runner's stdin end is the pipe's SERVER end"
+        );
+        // The write-only server end may not be queryable; when it is, it must
+        // read as the server end, or the check above proves nothing.
+        if let Ok(is_server) = server_end(pipe.broker.raw()) {
+            assert!(is_server, "the broker's end is not the pipe's server end");
         }
 
         let name_w = wstr(&name);
@@ -623,31 +659,56 @@ mod tests {
                 None,
             )
         };
-        assert!(
-            again.is_err(),
-            "a second client connected to the stdin pipe"
-        );
+        let busy = again.expect_err("a second client connected to the stdin pipe");
+        assert_eq!(busy.code(), ERROR_PIPE_BUSY.to_hresult());
+        assert!(is_pipe_busy(
+            &anyhow::Error::from(busy).context("CreateFileW(runner stdin client end)")
+        ));
         assert!(
             make_stdin_pipe_named(&name).is_err(),
             "a second server was created under the stdin pipe's name"
         );
 
         // ERROR_BROKEN_PIPE is what a reader treats as EOF.
-        let payload = b"spec-bytes";
-        let mut wrote = 0u32;
-        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
-        assert_eq!(wrote as usize, payload.len());
         drop(pipe.broker);
-        let mut buf = [0u8; 64];
-        let mut read = 0u32;
-        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
-        assert_eq!(&buf[..read as usize], payload);
         let eof = unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) };
         assert_eq!(
             eof.unwrap_err().code(),
             ERROR_BROKEN_PIPE.to_hresult(),
             "reader must see ERROR_BROKEN_PIPE after the writer closes"
         );
+    }
+
+    #[test]
+    fn a_busy_stdin_pipe_is_retried_once() {
+        let busy = || anyhow::Error::from(windows::core::Error::from(ERROR_PIPE_BUSY));
+        let other = || anyhow::Error::from(windows::core::Error::from(ERROR_BROKEN_PIPE));
+        assert!(is_pipe_busy(&busy().context("connect")));
+        assert!(!is_pipe_busy(&other().context("connect")));
+        assert!(!is_pipe_busy(&anyhow!("not a system error")));
+
+        let mut calls = 0;
+        let r = once_more_if_pipe_busy(|| {
+            calls += 1;
+            if calls == 1 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!((r.unwrap(), calls), (2, 2));
+
+        let mut calls = 0;
+        let r: Result<()> = once_more_if_pipe_busy(|| {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(r.is_err_and(|e| is_pipe_busy(&e)));
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let r: Result<()> = once_more_if_pipe_busy(|| {
+            calls += 1;
+            Err(other())
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
