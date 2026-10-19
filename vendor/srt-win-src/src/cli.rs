@@ -2158,6 +2158,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             for s in &report.skipped {
                 eprintln!("srt-win: profile grant: skipped '{}': {}", s.path, s.reason);
             }
+            for r in &report.forgotten_roots {
+                eprintln!(
+                    "srt-win: profile grant: the write grant kept on '{}' was removed: {}",
+                    r.path, r.reason
+                );
+            }
             for v in &report.env_ignored {
                 eprintln!(
                     "srt-win: profile grant: {v} is a relative path and names no store to \

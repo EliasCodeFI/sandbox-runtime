@@ -386,6 +386,16 @@ try {
 
   # ── G: the grant ─────────────────────────────────────────────────
   $files = $bulkDirs * $bulkFiles
+  # A write root kept from an earlier session that lies above an
+  # exclusion: the grant must take it off, or what is created in the
+  # excluded directory later inherits the root's allow.
+  $keptAbove = Join-Path $prof '.config'
+  New-Item -ItemType Directory -Force -Path (Join-Path $keptAbove 'gh') | Out-Null
+  $kj = @{ read = @(); write = @($keptAbove); denyRead = @(); denyWrite = @() } | ConvertTo-Json -Compress
+  $kj | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 | Out-Null
+  $keptCode = $LASTEXITCODE
+  End-Session
+  if ($keptCode -ne 0 -or (Sddl $keptAbove) -notmatch 'S-1-0-1936880739-') { Fail "G: setup — no kept write root on $keptAbove (exit=$keptCode): $(Sddl $keptAbove)" }
   $untouched = @((Join-Path $prof 'AppData\Local\Temp'), $sessFile)
   $sdBefore = @($untouched | ForEach-Object { Sddl $_ })
   function Dacl-Flags { param([string] $p) [regex]::Match((Sddl $p), 'D:([A-Z]*)\(').Groups[1].Value }
@@ -400,6 +410,14 @@ try {
   else { Fail "G: below a container: before=$($sdBefore -join ' | ') after=$($sdAfter -join ' | ')" }
   if ($g.json.local_writes -ge $g.json.containers -and $g.json.containers -ge 1 -and (Dacl-Flags $prof) -eq $profFlags) { Ok "G: containers are written on the object alone ($($g.json.local_writes) such write(s) for $($g.json.containers) container(s)); the profile's access list keeps its marks ('$profFlags')" }
   else { Fail "G: local_writes=$($g.json.local_writes) containers=$($g.json.containers) tree_walks=$($g.json.tree_walks) flags before='$profFlags' profile=$(Sddl $prof)" }
+  $lateToken = Join-Path $keptAbove 'gh\late-token.txt'
+  'LATE-TOKEN' | Set-Content -Encoding ASCII -LiteralPath $lateToken
+  $lateSd = Sddl $lateToken
+  $forgot = @($g.json.forgotten_roots | ForEach-Object { $_.path })
+  if (@($forgot | Where-Object { $_ -like '*\.config' }).Count -eq 1 -and (Sddl $keptAbove) -notmatch 'S-1-0-1936880739-' -and
+      $lateSd -notmatch 'S-1-0-1936880739-' -and $lateSd -notmatch ('\(A;[^)]*;;;' + [regex]::Escape($script:grpSid) + '\)')) {
+    Ok 'G: a kept write root above an exclusion is forgotten by the grant; a file created later in the excluded directory inherits no allow'
+  } else { Fail "G: kept root above an exclusion: forgotten_roots=[$($forgot -join ', ')] root=$(Sddl $keptAbove) late=$lateSd" }
   if ($g.exit -eq 0 -and $g.json.complete) { Ok "G: grant complete ($($g.json.containers) containers, $($g.json.granted) granted, $($g.json.files) files, $($g.json.denied) excluded, $($g.json.placeholders) created)" }
   else { Fail "G: profile grant exit=$($g.exit) complete=$($g.json.complete) raw: $($g.raw)" }
   if ($g.raw -match 'top-level item\(s\) done') { Ok 'G: progress lines on stderr' }

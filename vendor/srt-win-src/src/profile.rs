@@ -1286,6 +1286,10 @@ pub struct Report {
     /// DACLs written by this run, and paths found as wanted.
     pub writes: usize,
     pub unchanged: usize,
+    /// Write roots kept from earlier sessions whose grant was removed by
+    /// this run: each is, lies inside, or lies above an exclusion, so its
+    /// inheriting allow would have reached one.
+    pub forgotten_roots: Vec<Item>,
     /// `VAR=value` settings of the calling user's environment that were not
     /// followed because the value is a relative path.
     pub env_ignored: Vec<String>,
@@ -2026,6 +2030,35 @@ pub fn grant(
         }
         Ok(true)
     };
+
+    // 0. A write root kept from an earlier session that no session could
+    //    be granted now would hand its allow down into an exclusion.
+    if store.key == persist::MARKER_KEY {
+        for root in persist::kept_roots(store.conn)? {
+            let Some(why) = plan::session_grant_refusal(
+                &root,
+                true,
+                &exclusions,
+                &ungranted_only,
+                &[],
+                &entry_names,
+            ) else {
+                continue;
+            };
+            persist::forget_one(store.conn, ids, &root).with_context(|| {
+                format!(
+                    "the write grant kept on '{root}' reaches an exclusion ({why}) and could \
+                     not be removed; run `srt-win acl forget \"{}\"` and then the grant again",
+                    path_id::strip_extended_prefix(&root)
+                )
+            })?;
+            report.forgotten_roots.push(Item {
+                path: root,
+                reason: why,
+                ..Default::default()
+            });
+        }
+    }
 
     // 1. Every exclusion, before any allow.
     let denies: Vec<&(String, &Node)> = planned

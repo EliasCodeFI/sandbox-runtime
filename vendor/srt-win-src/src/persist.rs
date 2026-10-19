@@ -447,6 +447,18 @@ impl Ids {
 
 // ─── Rows ───────────────────────────────────────────────────────────
 
+/// Every root that may carry a kept write grant: the marker's and the
+/// database's.
+pub(crate) fn kept_roots(conn: &Connection) -> Result<Vec<String>> {
+    let mut roots: Vec<String> = read_marker()?.roots.into_iter().map(|r| r.path).collect();
+    for r in all_root_paths(conn)? {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    Ok(roots)
+}
+
 fn all_root_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut s = conn.prepare("SELECT canonical_path FROM persistent_roots")?;
     let rows = s.query_map([], |r| r.get(0))?;
@@ -1084,7 +1096,7 @@ fn at_path(path: &str, id: &FileId) -> Result<AtPath> {
 /// Remove `canon`'s persistent grant. Rows are deleted only after every
 /// DACL write succeeded; an object that cannot be found while its volume
 /// is there fails the call, one whose volume is away becomes pending.
-fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<Forgot> {
+pub(crate) fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<Forgot> {
     forget_one_with(conn, ids, canon, path_id::locate_by_file_id)
 }
 

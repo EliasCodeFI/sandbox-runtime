@@ -3303,6 +3303,12 @@ export interface WindowsProfileGrantResult {
    * grant's own entry.
    */
   staleAllow: WindowsProfileGrantItem[]
+  /**
+   * Write roots kept from earlier sessions whose grant this run removed
+   * because it reached an exclusion (the root is one, lies inside one,
+   * or lies above one). A session that asks for such a root is refused.
+   */
+  forgottenRoots: WindowsProfileGrantItem[]
   elapsedMs: number
 }
 
@@ -3457,6 +3463,7 @@ function profileGrantResult(
     unverifiable?: unknown
     unprotected?: unknown
     stale_allow?: unknown
+    forgotten_roots?: unknown
     failed?: WindowsProfileGrantItem[]
     elapsed_ms: number
   }>(args, r)
@@ -3476,6 +3483,7 @@ function profileGrantResult(
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
     staleAllow: grantItems(raw.stale_allow),
+    forgottenRoots: grantItems(raw.forgotten_roots),
     elapsedMs: raw.elapsed_ms,
   }
 }

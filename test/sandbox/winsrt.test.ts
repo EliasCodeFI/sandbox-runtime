@@ -7355,6 +7355,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        forgottenRoots: [],
         elapsedMs: 1234,
       })
     })
@@ -7379,7 +7380,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
       it('the grant succeeds and reports them by class', async () => {
         syncResult['profile grant'] = undefined as never
-        const json = { ...JSON.parse(grantJson()), ...classes() }
+        const json = {
+          ...JSON.parse(grantJson()),
+          ...classes(),
+          forgotten_roots: [item('.config', 'lies above an exclusion')],
+        }
         grantRun = { code: 0, stderr: [], stdout: JSON.stringify(json) }
         const r = await winUtils.grantWindowsProfileRead({ srtWin })
         expect(r.notGranted).toEqual(classes().not_granted)
@@ -7393,6 +7398,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         ])
         expect(r.unprotected).toEqual(classes().unprotected)
         expect(r.staleAllow).toEqual([])
+        expect(r.forgottenRoots).toEqual([
+          { path: join(home, '.config'), reason: 'lies above an exclusion' },
+        ])
       })
 
       it('the status lists them, and the grant is current all the same', () => {
