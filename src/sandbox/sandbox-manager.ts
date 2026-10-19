@@ -1016,6 +1016,10 @@ async function initializeSteps(
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
           allowLoopback,
+          sublayerGuid:
+            runtimeConfig.windows?.sublayerGuid ??
+            runtimeConfig.windows?.wfpSublayerGuid,
+          sandboxUser: runtimeConfig.windows?.sandboxUser,
           srtWin,
         })
       } catch (e) {
@@ -1287,6 +1291,8 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   | {
       windows: {
         sublayerGuid?: string
+        proxyPortRange?: readonly [number, number]
+        sandboxUser?: string
         srtWin: SrtWinSpawn
         allowLoopback?: boolean
       }
@@ -1327,6 +1333,8 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
       windows: {
         sublayerGuid:
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+        proxyPortRange: config?.windows?.proxyPortRange,
+        sandboxUser: config?.windows?.sandboxUser,
         srtWin,
         // With a config to go by, an install whose loopback mode is
         // not the configured one is an error.

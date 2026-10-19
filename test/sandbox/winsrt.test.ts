@@ -2425,6 +2425,108 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
+  it('verifyWindowsWfpEgress: an out-of-date fence names one reinstall, for this session: its loopback mode and install options, --force only when needed', async () => {
+    const outdated = (over: Record<string, unknown>) =>
+      JSON.stringify({
+        egress_probe: 'not-run',
+        target: '127.0.0.1:9229',
+        outdated: true,
+        allow_loopback: true,
+        reason: 'the network fence on this machine is out of date (revision 3)',
+        ...over,
+      })
+    const message = async (stdout: string, opts: object = {}) => {
+      stubSpawn(() => ({ status: 19, stdout }))
+      const err = await verifyWindowsWfpEgress({
+        target: '127.0.0.1:9229',
+        allowLoopback: true,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+        ...opts,
+      }).catch(e => e as WindowsSandboxError)
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+      expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
+      return (err as WindowsSandboxError).message
+    }
+    // The installed set is closed and this session is open: the mode
+    // changes, which the install refuses without --force.
+    expect(await message(outdated({ reinstall_needs_force: true }))).toContain(
+      '`npx sandbox-runtime windows-install --allow-loopback --force`',
+    )
+    // The same mode on both sides: no --force.
+    expect(await message(outdated({ reinstall_needs_force: false }))).toContain(
+      '`npx sandbox-runtime windows-install --allow-loopback`',
+    )
+    // Install options that are not the defaults are named; defaults are not.
+    expect(
+      await message(outdated({}), {
+        sublayerGuid: '11111111-2222-3333-4444-555555555555',
+        proxyPortRange: [3000, 3010],
+        sandboxUser: 'alt-sandbox',
+      }),
+    ).toContain(
+      '`npx sandbox-runtime windows-install --sublayer-guid ' +
+        '11111111-2222-3333-4444-555555555555 --proxy-port-range 3000-3010 ' +
+        '--sandbox-user alt-sandbox --allow-loopback`',
+    )
+    expect(
+      await message(outdated({}), {
+        proxyPortRange: [60080, 60089],
+        sandboxUser: 'srt-sandbox',
+      }),
+    ).toContain('`npx sandbox-runtime windows-install --allow-loopback`')
+  })
+
+  it('checkWindowsDependencies: the suggested install carries the configured loopback mode and install options', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const errorsFor = (wfp: Record<string, unknown>, opts: object) => {
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: argv.includes('user') ? RAW_USER : rawWfp(wfp),
+      }))
+      const { errors } = checkWindowsDependencies({ srtWin, ...opts })
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+      return errors
+    }
+    // Out of date, closed, and the configuration wants it open: one
+    // reinstall, with --force because the mode changes.
+    const [changing] = errorsFor(
+      { state: 'outdated', reason: 'out of date', allow_loopback: false },
+      { allowLoopback: true },
+    )
+    expect(changing).toContain('windows-install --allow-loopback --force\n')
+    // Out of date and already open: the mode is kept, no --force.
+    const [same] = errorsFor(
+      { state: 'outdated', reason: 'out of date', allow_loopback: true },
+      { allowLoopback: true },
+    )
+    expect(same).toContain('windows-install --allow-loopback\n')
+    // Not installed: nothing to replace, and the other options are named.
+    const [absent] = errorsFor(
+      { state: 'absent', filters: 0 },
+      {
+        allowLoopback: true,
+        sublayerGuid: '11111111-2222-3333-4444-555555555555',
+        proxyPortRange: [3000, 3010],
+        sandboxUser: 'alt-sandbox',
+      },
+    )
+    expect(absent).toContain(
+      'windows-install --sublayer-guid 11111111-2222-3333-4444-555555555555 ' +
+        '--proxy-port-range 3000-3010 --sandbox-user alt-sandbox ' +
+        '--allow-loopback\n',
+    )
+    // A mode mismatch on a current install: the same options, with --force.
+    const [mismatch] = errorsFor(
+      { state: 'installed', allow_loopback: false },
+      { allowLoopback: true, proxyPortRange: [3000, 3010] },
+    )
+    expect(mismatch).toContain(
+      'windows-install --proxy-port-range 3000-3010 --allow-loopback --force',
+    )
+  })
+
   it('verifyWindowsWfpEgress: a loopback mode that is not the installed one rejects (wfp_fence_outdated) with the install command for this session, in either direction', async () => {
     const hint =
       "the network fence on this machine does not match this session's " +

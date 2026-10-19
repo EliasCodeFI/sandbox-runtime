@@ -1056,6 +1056,7 @@ type RawWfpVerify = {
   open_loopback_target?: string | null
   residuals?: string[]
   outdated?: boolean
+  reinstall_needs_force?: boolean
   allow_loopback_mismatch?: boolean
   hint?: string
   reason?: string
@@ -1063,15 +1064,43 @@ type RawWfpVerify = {
 }
 
 /**
- * The install command for the loopback mode `allowLoopback` asks for.
- * `--force`: the install refuses to change the mode silently.
+ * The options of the install a session expects. A suggested install
+ * command names only the ones that are not the defaults.
  */
-function windowsInstallCommandForLoopback(allowLoopback: boolean): string {
+export interface WindowsInstallContext {
+  sublayerGuid?: string
+  proxyPortRange?: readonly [number, number]
+  sandboxUser?: string
+  allowLoopback?: boolean
+}
+
+/**
+ * Install flags for `ctx`. `force` only when the install replaces a
+ * set that is in place with another configuration: it refuses that
+ * without `--force` (exit 13), and needs none otherwise.
+ */
+function windowsInstallFlags(
+  ctx: WindowsInstallContext,
+  force: boolean,
+): string {
+  const [lo, hi] = ctx.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+  const [defLo, defHi] = DEFAULT_WINDOWS_PROXY_PORT_RANGE
   return (
-    `npx sandbox-runtime windows-install` +
-    (allowLoopback ? ` --allow-loopback` : '') +
-    ` --force`
+    (ctx.sublayerGuid ? ` --sublayer-guid ${ctx.sublayerGuid}` : '') +
+    (lo !== defLo || hi !== defHi ? ` --proxy-port-range ${lo}-${hi}` : '') +
+    (ctx.sandboxUser && ctx.sandboxUser !== 'srt-sandbox'
+      ? ` --sandbox-user ${ctx.sandboxUser}`
+      : '') +
+    (ctx.allowLoopback ? ` --allow-loopback` : '') +
+    (force ? ` --force` : '')
   )
+}
+
+function windowsInstallCommand(
+  ctx: WindowsInstallContext,
+  force: boolean,
+): string {
+  return `npx sandbox-runtime windows-install` + windowsInstallFlags(ctx, force)
 }
 
 /**
@@ -1118,12 +1147,15 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
  * (pure). An attempt the fence must refuse that got through rejects
  * whatever the exit code says; a residual never throws.
  */
-export function interpretWindowsWfpVerify(r: {
-  status: number | null
-  signal?: NodeJS.Signals | null
-  stdout: string
-  stderr: string
-}): WindowsWfpVerifyResult {
+export function interpretWindowsWfpVerify(
+  r: {
+    status: number | null
+    signal?: NodeJS.Signals | null
+    stdout: string
+    stderr: string
+  },
+  install: WindowsInstallContext = {},
+): WindowsWfpVerifyResult {
   let raw: RawWfpVerify
   try {
     raw = JSON.parse(r.stdout) as RawWfpVerify
@@ -1176,6 +1208,12 @@ export function interpretWindowsWfpVerify(r: {
         `open-loopback=${probes.openLoopback} ` +
         `(${raw.open_loopback_target ?? 'no listener'})`
       : '')
+  // The reinstall that suits THIS session: its loopback mode, and the
+  // install options it was configured with.
+  const session: WindowsInstallContext = {
+    ...install,
+    allowLoopback: raw.allow_loopback ?? install.allowLoopback,
+  }
   if (raw.record_error) {
     throw new WindowsSandboxError(
       'wfp_verify_inconclusive',
@@ -1190,8 +1228,8 @@ export function interpretWindowsWfpVerify(r: {
           (raw.hint ??
             'the installed filter set has a different loopback mode') +
           `. Through this package: \`` +
-          windowsInstallCommandForLoopback(raw.allow_loopback === true) +
-          `\`, keeping your other install options.`,
+          windowsInstallCommand(session, true) +
+          `\`.`,
       )
     }
     // `hint` already names a repair; `reason` does not.
@@ -1203,7 +1241,9 @@ export function interpretWindowsWfpVerify(r: {
       'wfp_fence_outdated',
       `WFP egress fence cannot be used — ${why}.` +
         (raw.reason || !raw.hint
-          ? ` Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`
+          ? ` Re-run \`` +
+            windowsInstallCommand(session, raw.reinstall_needs_force === true) +
+            `\` (one UAC prompt).`
           : ''),
     )
   }
@@ -1233,8 +1273,9 @@ export function interpretWindowsWfpVerify(r: {
       'wfp_fence_inactive',
       `WFP egress fence is not active — ` +
         `${which.join(' and ') || 'a direct outbound connect'} was not ` +
-        `blocked [${summary}]. Re-run \`srt-win install\` (one UAC ` +
-        `prompt). (${r.stderr})`,
+        `blocked [${summary}]. Re-run \`` +
+        windowsInstallCommand(session, false) +
+        `\` (one UAC prompt). (${r.stderr})`,
     )
   }
   if (r.status !== 0) {
@@ -1320,6 +1361,8 @@ export function interpretWindowsWfpVerify(r: {
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
  * @param opts.allowLoopback the session's `network.allowLocalBinding`;
  *   `srt-win` compares it with the installed loopback mode.
+ * @param opts.sublayerGuid, opts.sandboxUser the session's install
+ *   options, named in the reinstall command an error suggests.
  * @param opts.anonymousEgress also make the off-loopback attempt under
  *   the anonymous token. It cannot change the result and can take
  *   seconds, so `initialize()` leaves it out; for diagnostics only.
@@ -1331,6 +1374,8 @@ export async function verifyWindowsWfpEgress(
     proxyPortRange?: readonly [number, number]
     allowLoopback?: boolean
     anonymousEgress?: boolean
+    sublayerGuid?: string
+    sandboxUser?: string
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -1386,7 +1431,12 @@ export async function verifyWindowsWfpEgress(
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
-    const result = interpretWindowsWfpVerify(r)
+    const result = interpretWindowsWfpVerify(r, {
+      sublayerGuid: opts.sublayerGuid,
+      proxyPortRange: opts.proxyPortRange,
+      sandboxUser: opts.sandboxUser,
+      allowLoopback: opts.allowLoopback,
+    })
     for (const w of result.warnings) {
       logForDebugging(`[Sandbox Windows] ${w}`, { level: 'warn' })
     }
@@ -2725,14 +2775,16 @@ export const WINDOWS_INSTALL_NETWORK_EFFECT =
  * Install instructions, surfaced verbatim in error messages.
  */
 export function windowsInstallInstructions(
-  sublayerGuid: string | undefined,
+  install: string | WindowsInstallContext | undefined,
+  force = false,
 ): string {
-  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+  const ctx = typeof install === 'string' ? { sublayerGuid: install } : install
+  const flags = windowsInstallFlags(ctx ?? {}, force)
   return (
     `Windows sandbox needs a one-time install (one UAC prompt):\n` +
-    `  npx sandbox-runtime windows-install\n` +
+    `  npx sandbox-runtime windows-install${flags}\n` +
     `  — or call installWindowsSandbox(), or run ` +
-    `\`srt-win.exe install${sl}\` directly.\n` +
+    `\`srt-win.exe install${flags}\` directly.\n` +
     `No logout is needed. ` +
     WINDOWS_INSTALL_NETWORK_EFFECT
   )
@@ -2757,11 +2809,11 @@ function settle<T>(fn: () => T): PromiseSettledResult<T> {
  * both probes concurrently and its thunk returns the settled result.
  */
 function interpretDependencyProbes(
-  sublayerGuid: string | undefined,
+  install: WindowsInstallContext,
   user: PromiseSettledResult<WindowsSandboxUserStatus>,
   getWfp: () => PromiseSettledResult<WindowsWfpStatusResult>,
-  allowLoopback?: boolean,
 ): SandboxDependencyCheck {
+  const { sublayerGuid, allowLoopback } = install
   const errors: string[] = []
   const warnings: string[] = []
   const mode = (open: boolean): string => (open ? 'open' : 'closed')
@@ -2776,7 +2828,7 @@ function interpretDependencyProbes(
     errors.push(
       `Sandbox user is not provisioned (user=${us.provisioned}, ` +
         `cred=${us.credPresent}). ` +
-        windowsInstallInstructions(sublayerGuid),
+        windowsInstallInstructions(install),
     )
   }
 
@@ -2800,7 +2852,10 @@ function interpretDependencyProbes(
     errors.push(
       `WFP filters under sublayer ${sublayerGuid ?? '(default)'} cannot ` +
         `be used: ${ws.reason ?? ws.hint ?? 'they are out of date'}. ` +
-        windowsInstallInstructions(sublayerGuid),
+        windowsInstallInstructions(
+          install,
+          allowLoopback !== undefined && ws.allowLoopback !== allowLoopback,
+        ),
     )
   } else if (ws.state !== 'installed') {
     // 'absent'. If the user is also not-provisioned, the user-state
@@ -2809,7 +2864,7 @@ function interpretDependencyProbes(
       errors.push(
         `WFP filters not installed under sublayer ` +
           `${sublayerGuid ?? '(default)'}. ` +
-          windowsInstallInstructions(sublayerGuid),
+          windowsInstallInstructions(install),
       )
     }
   } else if (ws.portRange) {
@@ -2836,9 +2891,8 @@ function interpretDependencyProbes(
         `match network.allowLocalBinding (installed: loopback ` +
         `${mode(ws.allowLoopback)}; configured: ` +
         `${mode(allowLoopback)}). Re-run the install for this ` +
-        `configuration, keeping your other install options ` +
-        `(one UAC prompt):\n  ` +
-        windowsInstallCommandForLoopback(allowLoopback),
+        `configuration (one UAC prompt):\n  ` +
+        windowsInstallCommand(install, true),
     )
   } else if (fenced && ws.allowLoopback) {
     // Not an error, and not to be read past: say what is open.
@@ -2859,13 +2913,11 @@ function interpretDependencyProbes(
  * @param opts.allowLoopback the configured `network.allowLocalBinding`:
  *   an install with the other loopback mode is an error. Omit it to
  *   skip the comparison.
+ * @param opts.proxyPortRange, opts.sandboxUser the configured install
+ *   options, named in the install command an error suggests.
  */
 export function checkWindowsDependencies(
-  opts: {
-    sublayerGuid?: string
-    srtWin?: SrtWinSpawn
-    allowLoopback?: boolean
-  } = {},
+  opts: WindowsInstallContext & { srtWin?: SrtWinSpawn } = {},
 ): SandboxDependencyCheck {
   // 1. Binary present. The argless `resolveSrtWin()` throws (no
   // implicit vendor fallback) — surfaced as a dependency error
@@ -2878,14 +2930,13 @@ export function checkWindowsDependencies(
   }
   logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
   return interpretDependencyProbes(
-    opts.sublayerGuid,
+    opts,
     settle(() => getWindowsSandboxUserStatus({ srtWin })),
     // Lazy: spawned only if user-status succeeded (short-circuit).
     () =>
       settle(() =>
         getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
       ),
-    opts.allowLoopback,
   )
 }
 
@@ -2895,11 +2946,7 @@ export function checkWindowsDependencies(
  * and never blocks the event loop.
  */
 export async function checkWindowsDependenciesAsync(
-  opts: {
-    sublayerGuid?: string
-    srtWin?: SrtWinSpawn
-    allowLoopback?: boolean
-  } = {},
+  opts: WindowsInstallContext & { srtWin?: SrtWinSpawn } = {},
 ): Promise<SandboxDependencyCheck> {
   let srtWin: SrtWinSpawn
   try {
@@ -2912,10 +2959,5 @@ export async function checkWindowsDependenciesAsync(
     getWindowsSandboxUserStatusAsync({ srtWin }),
     getWindowsWfpStatusAsync({ sublayerGuid: opts.sublayerGuid, srtWin }),
   ])
-  return interpretDependencyProbes(
-    opts.sublayerGuid,
-    user,
-    () => wfp,
-    opts.allowLoopback,
-  )
+  return interpretDependencyProbes(opts, user, () => wfp)
 }

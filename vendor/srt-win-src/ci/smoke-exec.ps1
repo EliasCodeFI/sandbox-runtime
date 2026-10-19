@@ -1481,6 +1481,17 @@ if ((Get-ItemProperty $regBase -ea Stop).AllowLoopback -ne 1) {
 }
 Write-Host "L1 ok: loopback opened: $($l1.filters) filters, reported by wfp status and status with the notice"
 
+# L1b: an out-of-date record names the reinstall for THIS session's loopback mode.
+$l1bSaved = (Get-ItemProperty $regBase -ea Stop).FenceRevisions
+Remove-ItemProperty $regBase -Name FenceRevisions -ea Stop
+$r = RExec @('--allow-loopback', '--', $cmd, '/c', 'echo L1b-RAN')
+Set-ItemProperty $regBase -Name FenceRevisions -Value $l1bSaved -Type MultiString
+if ($r.exit -ne 19 -or $r.raw -match 'L1b-RAN') { throw "L1b: exec on an out-of-date record expected exit 19, got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -notmatch 'srt-win install --allow-loopback`' -or $r.raw -match '--force') {
+  throw "L1b: the hint must name 'srt-win install --allow-loopback' without --force (the installed mode is already open). raw: $($r.raw)"
+}
+Write-Host 'L1b ok: the out-of-date hint carries the session''s loopback mode'
+
 $lb = @('--allow-loopback')
 
 # L2: wfp verify with loopback open, aimed as the library aims it: at a

@@ -885,7 +885,29 @@ pub fn outdated_reason(have: Option<u32>) -> String {
 
 /// `reason` followed by the one repair there is.
 pub fn repair_hint(reason: &str) -> String {
-    format!("{reason} — re-run `srt-win install` (one UAC prompt)")
+    repair_hint_for(reason, false, false)
+}
+
+/// [`repair_hint`] naming the install for a loopback mode, so that one
+/// run suffices. `force` when it changes the mode of a set that is in
+/// place: `install` refuses that without `--force` (exit 13).
+pub fn repair_hint_for(reason: &str, allow_loopback: bool, force: bool) -> String {
+    format!(
+        "{reason} — re-run `srt-win install{}{}` (one UAC prompt)",
+        if allow_loopback {
+            " --allow-loopback"
+        } else {
+            ""
+        },
+        if force { " --force" } else { "" },
+    )
+}
+
+/// Whether reinstalling over what is recorded (`have`, with loopback
+/// `recorded_open`) for a session with loopback `session_open` needs
+/// `--force`: a set is in place and its mode is the other one.
+pub fn reinstall_needs_force(have: Option<u32>, recorded_open: bool, session_open: bool) -> bool {
+    have != Some(FENCE_REVISION_REMOVED) && recorded_open != session_open
 }
 
 pub fn outdated_hint(have: Option<u32>) -> String {
@@ -992,6 +1014,11 @@ pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> Wfp
             ));
         }
         _ => {}
+    }
+    // A reinstall keeps the mode that is installed.
+    if let Some(reason) = &st.reason {
+        let open = st.allow_loopback || recorded == Some(true);
+        st.hint = Some(repair_hint_for(reason, open, false));
     }
     st.loopback_notice = st.allow_loopback.then(open_loopback_notice);
     st
@@ -1246,6 +1273,38 @@ mod tests {
         ordered
             && covered(0) == 0
             && (1..=u16::MAX).all(|p| covered(p) == usize::from(!floor.contains(&p)))
+    }
+
+    #[test]
+    fn the_repair_names_the_install_for_the_loopback_mode() {
+        let reason = outdated_reason(Some(3));
+        assert!(repair_hint(&reason).contains("`srt-win install` (one UAC prompt)"));
+        assert!(
+            repair_hint_for(&reason, true, false)
+                .contains("`srt-win install --allow-loopback` (one UAC prompt)")
+        );
+        assert!(
+            repair_hint_for(&reason, true, true)
+                .contains("`srt-win install --allow-loopback --force`")
+        );
+        assert!(repair_hint_for(&reason, false, true).contains("`srt-win install --force`"));
+        // --force only when a set in place has the other mode.
+        assert!(reinstall_needs_force(Some(3), false, true));
+        assert!(reinstall_needs_force(None, false, true));
+        assert!(reinstall_needs_force(Some(3), true, false));
+        assert!(!reinstall_needs_force(Some(3), true, true));
+        assert!(!reinstall_needs_force(Some(3), false, false));
+        assert!(!reinstall_needs_force(
+            Some(FENCE_REVISION_REMOVED),
+            false,
+            true
+        ));
+        // A status hint keeps the installed mode.
+        let mut st = status("outdated");
+        st.allow_loopback = true;
+        st.reason = Some(reason.clone());
+        let st = apply_recorded_loopback(st, Some(true));
+        assert_eq!(st.hint.unwrap(), repair_hint_for(&reason, true, false));
     }
 
     #[test]

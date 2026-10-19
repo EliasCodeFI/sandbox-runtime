@@ -1345,14 +1345,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 Ok(None) => false,
                 Ok(Some(Some(wfp::FENCE_REVISION_REMOVED))) => true,
                 Ok(Some(have)) => {
-                    let hint = wfp::outdated_hint(have);
+                    let reason = wfp::outdated_reason(have);
+                    let force = wfp::reinstall_needs_force(
+                        have,
+                        install::read_allow_loopback().unwrap_or(false),
+                        allow_loopback,
+                    );
+                    let hint = wfp::repair_hint_for(&reason, allow_loopback, force);
                     eprintln!("srt-win: error: wfp verify: {hint}");
                     finish(
                         json!({
                             "egress_probe": "not-run",
                             "target": target,
                             "outdated": true,
-                            "reason": wfp::outdated_reason(have),
+                            "allow_loopback": allow_loopback,
+                            "reinstall_needs_force": force,
+                            "reason": reason,
                             "hint": hint,
                         }),
                         probe::EXIT_FENCE_OUTDATED,
@@ -1850,11 +1858,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // The non-elevated broker cannot enumerate filters; the install
             // record's revision and loopback mode are what it can check.
             let refusal = match install::fence_gap().context("read the install record")? {
-                Some(have) => Some(json!({
-                    "code": "wfp_fence_outdated",
-                    "message": wfp::outdated_hint(have),
-                    "reason": wfp::outdated_reason(have),
-                })),
+                Some(have) => {
+                    let reason = wfp::outdated_reason(have);
+                    let force = wfp::reinstall_needs_force(
+                        have,
+                        install::read_allow_loopback().unwrap_or(false),
+                        allow_loopback,
+                    );
+                    Some(json!({
+                        "code": "wfp_fence_outdated",
+                        "message": wfp::repair_hint_for(&reason, allow_loopback, force),
+                        "reason": reason,
+                    }))
+                }
                 None => install::require_allow_loopback(allow_loopback)
                     .err()
                     .map(|hint| {
