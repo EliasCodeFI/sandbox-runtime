@@ -142,9 +142,8 @@ pub fn run_lockdown(
     //    not confined by the token built below, so a runner that
     //    cannot protect itself launches nothing.
     //
-    //    The runner's threads are separate objects with their own
-    //    DACLs and get the same treatment. This first sweep covers
-    //    the threads that exist now, against other sandboxed
+    //    The runner's threads have their own DACLs and get the same
+    //    treatment. This first sweep is against other sandboxed
     //    processes of the same account that are already running; the
     //    sweep that this launch's own child is held behind is in
     //    step 10.
@@ -312,17 +311,15 @@ pub fn run_lockdown(
             )
         });
     }
-    // Runner threads get the process's self-protect DACL before the
-    // child can run (it is still suspended). Two parts, in this
-    // order: first the runner token's default DACL, so any thread
-    // created from here on starts out protected; then a sweep over
-    // every thread that exists, which covers the ones started since
-    // the sweep in step 1. The default DACL is changed only now
-    // because it would otherwise also land on the child's process,
-    // thread and token objects, which the child must be able to
-    // open; after this point the runner creates no object at all.
-    // Either failing ends the launch: the `child` guard terminates
-    // the suspended child.
+    // Runner threads get the self-protect DACL while the child is
+    // still suspended. Order matters: first the runner token's
+    // default DACL, so any thread created from here on starts out
+    // protected; then a sweep over every thread that exists. The
+    // default DACL is changed only now because it would otherwise
+    // also land on the child's process, thread and token objects,
+    // which the child must be able to open; after this point the
+    // runner creates no object at all. Either failing ends the
+    // launch: the `child` guard terminates the suspended child.
     self_protect::protect_future_threads()
         .context("runner self-protect (default DACL for new threads)")?;
     let protected_threads = self_protect::protect_own_threads()

@@ -451,10 +451,9 @@ Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-prot
 # A thread object has its own DACL, separate from the process's. A
 # child that could open a runner thread for impersonation or
 # set-context would act with the runner's token, which carries none
-# of the child token's restrictions. The child lists the runner's
-# threads and tries every such right on each; one success fails the
-# row. CONTROL opens the child's OWN thread the same way, so a probe
-# that cannot open anything at all does not read as a pass.
+# of the child token's restrictions. CONTROL opens the child's OWN
+# thread the same way, so a probe that cannot open anything at all
+# does not read as a pass.
 $threadRights = 11
 $probeR9c = @'
 $sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
@@ -540,10 +539,9 @@ foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
 
 # ── T-rows: ordinary tools still start and behave ────────────────
 # The runner's self-protection changes security descriptors in the
-# runner. None of it may reach the child: these rows start the usual
-# tools and have a child open its own process and thread and a
-# grandchild's process, which a descriptor meant for the runner
-# landing on the child's objects would break.
+# runner. None of it may reach the child: a descriptor meant for the
+# runner landing on the child's objects would break a child opening
+# its own process and thread, or a grandchild's process.
 # ── T1: cmd ──
 $r = RExec @('--', $cmd, '/d', '/s', '/c', 'echo T1-CMD & ver')
 if ($r.exit -ne 0 -or $r.out -notmatch 'T1-CMD' -or $r.out -notmatch 'Windows') {

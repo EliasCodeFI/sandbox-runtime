@@ -40,15 +40,11 @@
 //! token's default DACL, which grants the account full access. A
 //! child running as the same account could open a runner thread for
 //! `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
-//! the runner's token, which is not locked down. The runner closes
-//! that on every launch with two pieces, both keyed on the same
-//! trustees as the process DACL:
-//!
-//!   - [`protect_own_threads`] rewrites the DACL of every thread the
-//!     runner has;
-//!   - [`protect_future_threads`] rewrites the runner token's default
-//!     DACL, so a thread created afterwards (by the runner, the
-//!     runtime or the thread pool) starts out with the same shape.
+//! the runner's token, which is not locked down. So
+//! [`protect_own_threads`] rewrites the DACL of every thread the
+//! runner has, and [`protect_future_threads`] rewrites the runner
+//! token's default DACL, so a thread created afterwards (by the
+//! runner, the runtime or the thread pool) starts out the same.
 //!
 //! Neither depends on how the child's token is restricted: the DACLs
 //! name neither the account's user SID nor a logon SID, and the
@@ -118,13 +114,9 @@ const THREAD_RIGHTS_HARMLESS: u32 = READ_CONTROL | SYNCHRONIZE | THREAD_QUERY_LI
 
 /// Every single access right of a thread object outside
 /// [`THREAD_RIGHTS_HARMLESS`] — the rights the sandbox account must
-/// not be able to open a runner thread with. Includes the ones that
-/// lend out the runner's identity or control (`THREAD_IMPERSONATE`,
-/// `THREAD_DIRECT_IMPERSONATION`, `THREAD_SET_THREAD_TOKEN`,
-/// `THREAD_SET_CONTEXT`, `THREAD_SET_INFORMATION`,
-/// `THREAD_SUSPEND_RESUME`, `THREAD_TERMINATE`) and the ones that
-/// would let the holder grant itself those (`WRITE_DAC`,
-/// `WRITE_OWNER`).
+/// not be able to open a runner thread with, `WRITE_DAC` and
+/// `WRITE_OWNER` (which would let the holder grant itself the rest)
+/// among them.
 fn withheld_thread_rights() -> impl Iterator<Item = u32> {
     (0..u32::BITS)
         .map(|bit| 1u32 << bit)
@@ -234,13 +226,7 @@ fn build_protected_acl(full: u32) -> Result<Vec<u8>> {
 
 /// Rewrite the DACL of every thread this process currently has to
 /// SYSTEM + Admins + `OWNER_RIGHTS:READ_CONTROL` — the same shape
-/// [`install_broker_dacl`] gives the process, for the same reason. A
-/// thread object carries its own security descriptor, taken from the
-/// creating token's default DACL, which grants the account full
-/// access; the process DACL does not cover it. Without this a child
-/// running as the same account can open a runner thread for
-/// `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
-/// the runner's token, which is not locked down.
+/// [`install_broker_dacl`] gives the process (see the module docs).
 ///
 /// Repeatable. A thread this process can no longer open for a DACL
 /// rewrite — one an earlier call already rewrote, one created after
@@ -334,18 +320,14 @@ fn openable_withheld_right(tid: u32) -> Result<Option<u32>> {
 /// Rewrite this process's token default DACL to SYSTEM + Admins +
 /// `OWNER_RIGHTS:READ_CONTROL`, so that a thread created from now on
 /// starts out with the DACL [`protect_own_threads`] gives the
-/// existing ones. Thread objects get their descriptor from the
-/// creating token's default DACL, and nothing announces a new thread
-/// (the runtime and the thread pool start them on their own), so a
-/// sweep alone cannot cover them.
+/// existing ones. Nothing announces a new thread (the runtime and
+/// the thread pool start them on their own), so a sweep alone cannot
+/// cover them.
 ///
 /// The default DACL also lands on every other object this process
 /// creates without an explicit descriptor — including a child
 /// process, its first thread and its token, which the child must be
-/// able to open. **Call it only once every such object exists**:
-/// [`crate::launch::run_lockdown`] calls it after the child has been
-/// created and before it is resumed, after which the runner creates
-/// nothing else.
+/// able to open. **Call it only once every such object exists.**
 ///
 /// Verifies the effect before returning: a thread started here must
 /// carry a DACL that passes [`dacl_shuts_out_account`], or the call
