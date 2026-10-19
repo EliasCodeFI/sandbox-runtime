@@ -621,9 +621,8 @@ fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::Wf
         .flatten()
         .map(|_| install::read_fence_revision().ok().flatten());
     let st = wfp::apply_recorded_revision(wfp::filter_status(sublayer)?, record);
-    // A recorded loopback mode that cannot be read is treated as no
-    // record: the non-elevated caller then reports closed, and `wfp
-    // verify` / `exec` — which do fail on it — say why.
+    // An unreadable recorded loopback mode is treated as no record here;
+    // `wfp verify` / `exec` fail on it and say why.
     let recorded_loopback = record.and_then(|_| install::read_allow_loopback().ok());
     Ok(wfp::apply_recorded_loopback(st, recorded_loopback))
 }
@@ -1069,12 +1068,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(17);
                 }
             }
-            // A changing loopback mode: mark the fence removed in the
-            // record BEFORE replacing the filters, so that a failure
-            // anywhere between here and the revision write below
-            // leaves a record `exec` refuses on, never a
-            // current-looking one beside filters with the other mode.
-            // An unreadable recorded mode counts as changing.
+            // A changing (or unreadable) loopback mode: mark the fence removed
+            // BEFORE replacing the filters, so no failure leaves a current record.
             if install::read_allow_loopback().ok() != Some(allow_loopback)
                 && let Err(e) = install::mark_fence_removed()
             {
@@ -1321,10 +1316,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
-            // The two attempts open loopback adds: a loopback
-            // listener held here for as long as the runner takes, and
-            // this machine's own off-loopback address at that port
-            // (nothing listens there).
+            // Held for as long as the runner takes; nothing listens at the
+            // off-loopback address with the same port.
             let open_listener = allow_loopback.then(probe::bind_open_loopback).flatten();
             let open_loopback_addr = open_listener.as_ref().and_then(|l| l.local_addr().ok());
             let open_loopback_target = open_loopback_addr.map(|a| a.to_string());
@@ -1427,8 +1420,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: warning: wfp verify: {notice}");
                 doc["loopback_notice"] = json!(notice);
             }
-            // The record and the session agree that loopback is open,
-            // and the broker's own loopback listener was still
+            // Recorded open, yet the broker's own loopback listener was
             // blocked: the filters in place are not the recorded ones.
             if verdict.exit == probe::EXIT_FENCE_OUTDATED {
                 let hint = wfp::loopback_closed_hint();
@@ -2156,9 +2148,7 @@ mod tests {
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 
-    /// `--allow-loopback` parses on the three commands that take it
-    /// and is off by default. Placement before `--` on `exec` (where
-    /// the TS wrapper puts it) is accepted.
+    /// On `exec` the flag goes before `--`, where the TS wrapper puts it.
     #[test]
     fn allow_loopback_flag_parses() {
         let cli = Cli::try_parse_from([

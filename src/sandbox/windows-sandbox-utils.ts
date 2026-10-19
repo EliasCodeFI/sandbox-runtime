@@ -92,9 +92,8 @@ export type WindowsSandboxErrorCode =
   | 'wfp_verify_inconclusive'
   /**
    * The installed filter set is not the one this session requires
-   * (`srt-win wfp verify` exit 19): it was written by an earlier
-   * `srt-win`, or its loopback mode (open or closed) is not what
-   * `network.allowLocalBinding` asks for — re-run the install.
+   * (`srt-win wfp verify` exit 19): an earlier revision, or a loopback
+   * mode that is not what `network.allowLocalBinding` asks for.
    */
   | 'wfp_fence_outdated'
   /** `srt-win` predates `--allow-loopback`; `network.allowLocalBinding` needs a newer one. */
@@ -172,23 +171,15 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
 ]
 
 /**
- * Loopback ports that stay blocked for sandboxed commands even with
- * `network.allowLocalBinding`: local services that hand whoever
- * connects to them control of the machine, of another account or of
- * another process, or that forward traffic off the machine. `srt-win`
- * owns the list (`LOOPBACK_FLOOR_PORTS` in
- * `vendor/srt-win-src/src/wfp.rs`); this copy is for describing it
- * and for aiming the fence probe.
+ * Loopback ports that stay blocked even with
+ * `network.allowLocalBinding`. `srt-win` owns the list
+ * (`LOOPBACK_FLOOR_PORTS` in `wfp.rs`); this copy aims the fence probe.
  */
 export const WINDOWS_LOOPBACK_FLOOR_PORTS: readonly number[] = [
   53, 1080, 2375, 2376, 3389, 5985, 5986, 9222, 9229, 47001,
 ]
 
-/**
- * What `network.allowLocalBinding` opens on Windows, in plain words.
- * Shown wherever the open-loopback install is offered, confirmed or
- * found in place.
- */
+/** What `network.allowLocalBinding` opens on Windows, in plain words. */
 export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
   `Loopback is open: sandboxed commands can connect to every TCP and ` +
   `UDP port on localhost (127.0.0.0/8 and ::1) except ` +
@@ -220,10 +211,8 @@ export interface WindowsWfpStatusResult {
   /** `[low, high]` for the loopback PERMIT, when known. */
   portRange?: [number, number]
   /**
-   * Whether the installed filter set opens loopback to sandboxed
-   * commands (`srt-win install --allow-loopback`; see
-   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}). Read off the filters by an
-   * elevated caller and off the install record by a non-elevated one.
+   * Whether the installed filter set opens loopback — see
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}.
    */
   allowLoopback: boolean
   /** Sandbox-user SID read from the first user-keyed filter tag. */
@@ -280,15 +269,9 @@ export interface WindowsWfpVerifyResult {
     lowIntegrityLoopback: WindowsWfpProbeOutcome
     untrustedIntegrity: WindowsWfpProbeOutcome
     untrustedIntegrityLoopback: WindowsWfpProbeOutcome
-    /**
-     * Own token, to a NON-loopback address of this machine at the
-     * port of `openLoopback`'s listener. Only with loopback open.
-     */
+    /** Own token, to an off-loopback address at `openLoopback`'s port. */
     openOffLoopback?: WindowsWfpProbeOutcome
-    /**
-     * Own token, to a loopback listener `srt-win` binds on an
-     * arbitrary port for the probe. Only with loopback open.
-     */
+    /** Own token, to a loopback listener `srt-win` binds for the probe. */
     openLoopback?: WindowsWfpProbeOutcome
   }
   /** Gaps the probe found open: NOT a clean pass when non-empty. */
@@ -482,11 +465,9 @@ export interface WindowsSandboxParams {
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
   /**
-   * The session's `network.allowLocalBinding`. Passed to `srt-win
-   * exec`, which launches nothing (exit 19) unless the install
-   * recorded the same loopback mode. When set, with a proxy, the
-   * child's `NO_PROXY` names the loopback hosts — see
-   * {@link WINDOWS_LOOPBACK_NO_PROXY}.
+   * The session's `network.allowLocalBinding`. `srt-win exec` launches
+   * nothing (exit 19) unless the install recorded the same mode. With a
+   * proxy, `NO_PROXY` then names the loopback hosts.
    */
   allowLoopback?: boolean
   /**
@@ -1060,10 +1041,8 @@ type RawWfpVerify = {
 }
 
 /**
- * The install command that gives the machine's filter set the
- * loopback mode `allowLoopback` asks for. `--force`: a different mode
- * is a configuration change, which the install refuses to make
- * silently.
+ * The install command for the loopback mode `allowLoopback` asks for.
+ * `--force`: the install refuses to change the mode silently.
  */
 function windowsInstallCommandForLoopback(allowLoopback: boolean): string {
   return (
@@ -1147,16 +1126,14 @@ export function interpretWindowsWfpVerify(r: {
     lowIntegrityLoopback: outcome(raw.low_integrity_loopback_probe),
     untrustedIntegrity: outcome(raw.untrusted_integrity_probe),
     untrustedIntegrityLoopback: outcome(raw.untrusted_integrity_loopback_probe),
-    // The two attempts open loopback adds.
     ...(raw.allow_loopback && {
       openOffLoopback: outcome(raw.open_off_loopback_probe),
       openLoopback: outcome(raw.open_loopback_probe),
     }),
   }
   const offLoopback = raw.anonymous_target ?? 'no target'
-  // With loopback open the lowered-integrity attempts' off-loopback
-  // half is aimed at a port that is open on loopback; `srt-win` says
-  // where.
+  // With loopback open `srt-win` aims the lowered-integrity attempts'
+  // off-loopback half at an open port, and says where.
   const loweredTarget = raw.lowered_integrity_target ?? raw.anonymous_target
   const loweredOffLoopback = loweredTarget ?? 'no target'
   const summary =
@@ -1778,13 +1755,9 @@ export interface WindowsInstallOptions {
    */
   proxyPortRange?: readonly [number, number]
   /**
-   * Open loopback to sandboxed commands — see
-   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. Must match what
-   * `SandboxRuntimeConfig.network.allowLocalBinding` will be set to.
-   * Default: false. Take it only from a source the machine's user or
-   * administrator controls, never from a project's own files.
-   * Changing it on an existing install is a configuration change and
-   * needs {@link force}.
+   * Open loopback ({@link WINDOWS_ALLOW_LOOPBACK_EFFECT}); must match
+   * `network.allowLocalBinding`. Take it only from a source the machine's
+   * user or administrator controls, never from a project's own files.
    */
   allowLoopback?: boolean
   /**
@@ -1939,8 +1912,7 @@ function throwOnInstallFailure(r: RunResult): void {
  *
  * @throws on user/WFP creation failure, if filters already exist
  *   under `sublayerGuid` with a different port range or loopback mode
- *   and `force` is not set, or (`srt_win_too_old`) if `allowLoopback`
- *   is set and `srt-win` predates it.
+ *   and `force` is not set, or if `srt-win` predates `allowLoopback`.
  */
 export function installWindowsSandbox(
   opts: WindowsInstallOptions = {},
@@ -2529,10 +2501,9 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * `NO_PROXY` for a sandboxed child when `network.allowLocalBinding`
- * is set: the loopback hosts, so proxy-aware clients connect to local
- * servers directly. Without it `NO_PROXY` is not set at all and
- * localhost requests go through the proxy.
+ * `NO_PROXY` for a sandboxed child with `network.allowLocalBinding`:
+ * the loopback hosts, so proxy-aware clients connect to local servers
+ * directly. Otherwise `NO_PROXY` is not set at all.
  */
 export const WINDOWS_LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1'
 
@@ -2596,12 +2567,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // SID, and is not fenced).
   delete generated.NO_PROXY
   delete generated.no_proxy
-  // With loopback open the fence does permit direct connects to
-  // loopback, so the loopback hosts — and nothing else of the POSIX
-  // list: the private-network entries are still fenced — go back into
-  // NO_PROXY. A proxy-aware client then connects directly to every
-  // localhost port, and one of the few ports that stay blocked is
-  // refused by the fence instead of being sent through the proxy.
+  // With loopback open the fence permits direct loopback connects, so the
+  // loopback hosts (only: private networks are still fenced) skip the proxy.
   if (p.allowLoopback && (p.httpProxyPort || p.socksProxyPort)) {
     generated.NO_PROXY = WINDOWS_LOOPBACK_NO_PROXY
     generated.no_proxy = WINDOWS_LOOPBACK_NO_PROXY
@@ -2801,9 +2768,7 @@ function interpretDependencyProbes(
   }
 
   // 4. The installed loopback mode is the configured one, in either
-  // direction. `undefined` = the caller did not say what is
-  // configured (nothing to compare). Both `installed` and
-  // `cannot-read` statuses report the mode.
+  // direction (`undefined`: the caller did not say what is configured).
   const fenced =
     us.provisioned &&
     us.credPresent &&
@@ -2838,10 +2803,8 @@ function interpretDependencyProbes(
  * `spawnSync`-blocks the event loop on two `srt-win.exe` spawns
  * (Windows Defender cold-scan can add seconds).
  *
- * @param opts.allowLoopback the configuration's
- *   `network.allowLocalBinding` (`false` when unset): an install with
- *   the other loopback mode is then an error. Omit to skip the
- *   comparison.
+ * @param opts.allowLoopback the configured `network.allowLocalBinding`:
+ *   an install with the other loopback mode is an error. Omit to skip.
  */
 export function checkWindowsDependencies(
   opts: {

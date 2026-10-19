@@ -6,9 +6,8 @@
 //! At install time we provision the dedicated `srt-sandbox` local
 //! user account ([`crate::user`]) and persist **one machine-wide**
 //! filter set — two filters at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4`
-//! and `_V6` (4 total), plus one more per layer when loopback is
-//! opened (6 total), all under one persistent sublayer
-//! ([`filter_specs`] is the list):
+//! and `_V6` (4 total, 6 with loopback open), all under one persistent
+//! sublayer:
 //!
 //!   - **PERMIT loopback** (weight [`W_LOOPBACK`]) —
 //!     `IP_REMOTE_ADDRESS` is `127.0.0.0/8` (v4) / `::1` (v6) **and**
@@ -19,17 +18,10 @@
 //!     the two proxy ports; this range is the closest Windows
 //!     analogue without per-`initialize()` admin.)
 //!
-//!   - **PERMIT loopback, open** (weight [`W_LOOPBACK`], optional) —
-//!     the same address condition as the PERMIT above, with the port
-//!     condition replaced by every port outside
-//!     [`LOOPBACK_FLOOR_PORTS`] ([`open_loopback_port_ranges`]).
-//!     Absent unless installed with `srt-win install
-//!     --allow-loopback`. It lets the sandboxed child connect directly
-//!     to local servers, over TCP and UDP alike (no filter of the set
-//!     has a protocol condition). It opens every listener on loopback,
-//!     whoever owns it, including any local forwarder that carries
-//!     traffic off the machine; the floor is the short list of ports
-//!     that stay blocked regardless.
+//!   - **PERMIT loopback, open** (weight [`W_LOOPBACK`], only with
+//!     `install --allow-loopback`) — the same address condition, and
+//!     every port outside [`LOOPBACK_FLOOR_PORTS`]. It opens EVERY
+//!     loopback listener, local forwarders off the machine included.
 //!
 //!   - **BLOCK sandbox user** (weight [`W_BLOCK`]) — `ALE_USER_ID` SD
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
@@ -106,14 +98,9 @@ pub const DEFAULT_PROXY_PORT_RANGE: (u16, u16) = (60080, 60089);
 /// that.
 pub const MAX_PROXY_PORT_RANGE_WIDTH: u16 = 64;
 
-/// Loopback ports that stay blocked for the sandbox account in every
-/// mode, `--allow-loopback` included: local services that hand whoever
-/// connects to them control of the machine, of another account, or of
-/// another process, and the two best-known local forwarders. A floor,
-/// not a guarantee: a service of either kind on any other port is
-/// reachable once loopback is open. Ascending. The TypeScript library
-/// carries the same ports (`WINDOWS_LOOPBACK_FLOOR_PORTS`) to describe
-/// them.
+/// Loopback ports that stay blocked even with `--allow-loopback`: local
+/// services that hand a client control of the machine, and forwarders.
+/// A floor, not a guarantee. Must stay ascending and match the TS copy.
 pub const LOOPBACK_FLOOR_PORTS: [(u16, &str); 10] = [
     (53, "local DNS forwarder"),
     (1080, "local SOCKS proxy"),
@@ -127,18 +114,13 @@ pub const LOOPBACK_FLOOR_PORTS: [(u16, &str); 10] = [
     (47001, "remote management (compatibility listener)"),
 ];
 
-/// Whether `port` is one of [`LOOPBACK_FLOOR_PORTS`].
 pub fn is_loopback_floor_port(port: u16) -> bool {
     LOOPBACK_FLOOR_PORTS.iter().any(|(p, _)| *p == port)
 }
 
-/// Every port from 1 to 65535 that is not in `floor`, as inclusive
-/// ranges in ascending order. `floor` must be ascending.
-///
-/// Port 0 is in no range. It is never the destination of a TCP or UDP
-/// connect, and for ICMP the engine presents the message code in the
-/// remote-port field, so leaving 0 out also keeps an echo request
-/// (code 0) from matching a port condition built from these ranges.
+/// Every port from 1 to 65535 not in `floor` (ascending), as inclusive
+/// ranges. Port 0 is left out: for ICMP the engine presents the message
+/// code as the remote port, and an echo request (code 0) must not match.
 pub(crate) fn port_ranges_outside(floor: &[u16]) -> Vec<(u16, u16)> {
     let mut ranges = Vec::new();
     let mut next: u32 = 1;
@@ -155,10 +137,8 @@ pub(crate) fn port_ranges_outside(floor: &[u16]) -> Vec<(u16, u16)> {
     ranges
 }
 
-/// The remote ports of the open-loopback PERMIT: everything but
-/// [`LOOPBACK_FLOOR_PORTS`]. A port condition takes a range, and
-/// conditions on one field are OR'ed, so "all but the floor" is the
-/// complement written out as ranges.
+/// The remote ports of the open-loopback PERMIT. Conditions on one
+/// field are OR'ed, so "all but the floor" is written out as ranges.
 pub(crate) fn open_loopback_port_ranges() -> Vec<(u16, u16)> {
     port_ranges_outside(&LOOPBACK_FLOOR_PORTS.map(|(p, _)| p))
 }
@@ -348,12 +328,9 @@ fn cond_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0
     }
 }
 
-/// The conditions of a loopback PERMIT at one ALE connect layer: the
-/// remote address is loopback (`127.0.0.0/8` or `::1`) AND the remote
-/// port is in one of `ranges` (conditions on the same field are
-/// OR'ed). Shared by the proxy-range PERMIT and the open-loopback
-/// PERMIT so the two can only differ in their ports. The caller keeps
-/// every referent alive until the filter is added.
+/// The conditions of a loopback PERMIT at one layer: remote address is
+/// loopback AND remote port is in one of `ranges` (same-field conditions
+/// are OR'ed). The caller keeps every referent alive until the add.
 fn loopback_permit_conditions(
     v4: bool,
     v4_loop: &mut FWP_V4_ADDR_AND_MASK,
@@ -387,8 +364,7 @@ pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// `permit-loopback-user` / `permit-loopback-open` /
-    /// `block-user`.
+    /// `permit-loopback-user` / `permit-loopback-open` / `block-user`.
     pub kind: String,
     /// `[low, high]` for `permit-loopback-user`; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -420,20 +396,13 @@ impl FilterTag {
 /// Tag kind of the PERMIT for the proxy port range. (The name is
 /// historical; the filter carries no user condition.)
 pub(crate) const KIND_PERMIT_PROXY: &str = "permit-loopback-user";
-/// Tag kind of the open-loopback PERMIT.
 pub(crate) const KIND_PERMIT_OPEN: &str = "permit-loopback-open";
 pub(crate) const KIND_BLOCK_USER: &str = "block-user";
 
-/// What one filter of the set matches and does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilterShape {
-    /// PERMIT: remote address is loopback AND remote port is in the
-    /// range.
     PermitLoopback((u16, u16)),
-    /// PERMIT: remote address is loopback AND remote port is in one
-    /// of [`open_loopback_port_ranges`].
     PermitLoopbackOpen,
-    /// BLOCK: the token is the sandbox account's.
     BlockUser,
 }
 
@@ -446,7 +415,6 @@ pub(crate) struct FilterSpec {
 }
 
 impl FilterSpec {
-    /// The port range recorded in the filter's tag.
     pub(crate) fn port_range(&self) -> Option<(u16, u16)> {
         match self.shape {
             FilterShape::PermitLoopback(r) => Some(r),
@@ -478,8 +446,7 @@ pub(crate) fn filter_specs(proxy_range: (u16, u16), allow_loopback: bool) -> Vec
     specs
 }
 
-/// Number of filters in the set: 2 per layer × v4/v6, plus one per
-/// layer when loopback is open.
+/// Number of filters in the set (one more per layer with loopback open).
 pub fn filter_count(allow_loopback: bool) -> usize {
     ALE_LAYERS.len() * filter_specs(DEFAULT_PROXY_PORT_RANGE, allow_loopback).len()
 }
@@ -503,10 +470,10 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 
 // Filter weights — kept below 2^60 so they stay in WFP's
 // "manual weight" class (top 4 bits are auto-classifier). The
-// loopback PERMITs must sit **above** the user-SID BLOCK so the
-// sandbox user can still reach the host proxies (and, when it is
-// open, the rest of loopback). Module-level so [`install_filters`]
-// and the const-asserts in `tests` share one source of truth.
+// loopback PERMIT must sit **above** the user-SID BLOCK so the
+// sandbox user can still reach the host proxies. Module-level so
+// [`install_filters`] and the const-asserts in `tests` share one
+// source of truth.
 pub(crate) const W_LOOPBACK: u64 = 0x0F80_0000_0000_0000;
 pub(crate) const W_BLOCK: u64 = 0x0F40_0000_0000_0000;
 
@@ -705,9 +672,8 @@ pub fn sddl_sandbox_user(sid: &str) -> String {
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
 /// — including legacy discriminator-group-keyed filters from a
-/// pre-separate-user install and an open-loopback PERMIT that is no
-/// longer asked for — are deleted first, then a fresh set is added,
-/// all inside one WFP transaction.
+/// pre-separate-user install — are deleted first, then a fresh set
+/// is added, all inside one WFP transaction.
 pub fn install_filters(
     sublayer: &GUID,
     sandbox_user_sid: &str,
@@ -853,9 +819,7 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
 
 /// Status of the WFP fence under `sublayer` — see
 /// [`classify_fence`] for `absent` / `installed` / `outdated`.
-/// `port_range` is read from the first `permit-loopback-user` tag;
-/// `allow_loopback` is whether the set carries a `permit-loopback-open`
-/// filter.
+/// `port_range` is read from the first `permit-loopback-user` tag.
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -868,12 +832,9 @@ pub struct WfpStatus {
     pub filters: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
-    /// Whether the installed set opens loopback. Read off the filters
-    /// by an elevated caller; a non-elevated one (`cannot-read`) gets
-    /// the install record's.
+    /// From the filters when elevated, else from the install record.
     pub allow_loopback: bool,
-    /// [`open_loopback_notice`], present exactly when `allow_loopback`
-    /// is true once the install record has been folded in.
+    /// [`open_loopback_notice`], present exactly when `allow_loopback`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loopback_notice: Option<String>,
     /// Sandbox-user SID read from the first user-keyed tag.
@@ -945,9 +906,8 @@ pub fn loopback_mismatch_hint(installed: bool, configured: bool) -> String {
     )
 }
 
-/// What to tell the operator when the install record and the session
-/// agree that loopback is open but a connect to a loopback listener
-/// was blocked: the filters in place are not the ones recorded.
+/// What to tell the operator when loopback is recorded open but a
+/// connect to a loopback listener was blocked.
 pub fn loopback_closed_hint() -> String {
     "the network fence on this machine does not open loopback (a \
      connect to a loopback listener was blocked) — re-run `srt-win \
@@ -984,15 +944,9 @@ pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
     }
 }
 
-/// Fold the install record's loopback mode into an enumerated
-/// status. `recorded` is `None` when the machine has no install
-/// record.
-///
-/// A non-elevated caller (`cannot-read`) has only the record, so it
-/// reports the record's mode. An elevated caller that enumerated an
-/// `installed` set whose mode differs from the record's reports
-/// `outdated`: the non-elevated broker would otherwise hold sessions
-/// to a mode the filters do not have.
+/// Fold the install record's loopback mode into an enumerated status:
+/// `cannot-read` reports the record's mode; an `installed` set whose
+/// mode differs from the record's becomes `outdated`.
 pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> WfpStatus {
     match (st.state, recorded) {
         ("cannot-read", Some(open)) => st.allow_loopback = open,
@@ -1186,7 +1140,6 @@ mod tests {
     const ALL_KINDS: [&str; 2] = ["permit-loopback-user", "block-user"];
     const REV2_KINDS: [&str; 3] = ["permit-loopback-user", "block-user", "block-anonymous"];
 
-    /// A current set plus the open-loopback PERMIT on both layers.
     fn set_with_open_loopback() -> Vec<(&'static str, FilterTag)> {
         let mut set = full_set(Some(FENCE_REVISION), &ALL_KINDS);
         for (_, layer) in ALE_LAYERS {
@@ -1218,21 +1171,16 @@ mod tests {
             ["permit-loopback-user", "permit-loopback-open", "block-user"]
         );
         assert_eq!(filter_count(true), 6);
-        // The added filter is a loopback PERMIT at the weight of the
-        // proxy PERMIT: above the BLOCKs.
         let added = open[1];
         assert_eq!(added.shape, FilterShape::PermitLoopbackOpen);
         assert_eq!(added.weight, W_LOOPBACK);
         assert!(added.weight > W_BLOCK);
-        // Everything else is the closed set, unchanged — the proxy
-        // PERMIT included.
         let rest: Vec<FilterSpec> = open
             .iter()
             .copied()
             .filter(|s| s.kind != KIND_PERMIT_OPEN)
             .collect();
         assert_eq!(rest, closed);
-        // The only PERMITs are the two loopback ones.
         for s in &open {
             assert_eq!(
                 s.weight == W_LOOPBACK,
@@ -1293,13 +1241,11 @@ mod tests {
     #[test]
     fn port_ranges_outside_handles_the_edges() {
         assert_eq!(port_ranges_outside(&[]), [(1, 65535)]);
-        // The first and last ports, alone and adjacent to another.
         assert_eq!(port_ranges_outside(&[1]), [(2, 65535)]);
         assert_eq!(port_ranges_outside(&[65535]), [(1, 65534)]);
         assert_eq!(port_ranges_outside(&[1, 2, 65534, 65535]), [(3, 65533)]);
         // Port 0 is never in a range, listed or not.
         assert_eq!(port_ranges_outside(&[0]), [(1, 65535)]);
-        // A repeated port changes nothing.
         assert_eq!(port_ranges_outside(&[80, 80]), [(1, 79), (81, 65535)]);
         for floor in [
             &[1u16, 3, 5][..],
@@ -1317,12 +1263,10 @@ mod tests {
     #[test]
     fn classify_fence_with_loopback_open() {
         assert_eq!(classify_fence(&set_with_open_loopback()), "installed");
-        // On one layer only.
         let mut half = set_with_open_loopback();
         let v6 = ALE_LAYERS[1].1;
         half.retain(|(l, t)| !(*l == v6 && t.kind == KIND_PERMIT_OPEN));
         assert_eq!(classify_fence(&half), "outdated");
-        // Written at another revision.
         let mut old = full_set(Some(FENCE_REVISION), &ALL_KINDS);
         for (_, layer) in ALE_LAYERS {
             old.push((layer, tag(KIND_PERMIT_OPEN, Some(FENCE_REVISION - 1))));
@@ -1342,28 +1286,24 @@ mod tests {
             allow_loopback: open,
             ..status(state)
         };
-        // Non-elevated: the record's mode is what gets reported.
         for open in [false, true] {
             let st = apply_recorded_loopback(with("cannot-read", false), Some(open));
             assert_eq!(st.state, "cannot-read");
             assert_eq!(st.allow_loopback, open);
             assert_eq!(st.loopback_notice.is_some(), open);
         }
-        // Elevated, filters and record agree.
         for open in [false, true] {
             let st = apply_recorded_loopback(with("installed", open), Some(open));
             assert_eq!(st.state, "installed");
             assert_eq!(st.allow_loopback, open);
             assert_eq!(st.loopback_notice.is_some(), open);
         }
-        // Elevated, they disagree — either way round.
         for open in [false, true] {
             let st = apply_recorded_loopback(with("installed", open), Some(!open));
             assert_eq!(st.state, "outdated", "filters {open}, record {}", !open);
             assert!(st.hint.unwrap().contains("srt-win install"));
             assert_eq!(st.allow_loopback, open);
         }
-        // No install record, or nothing installed: left alone.
         let st = apply_recorded_loopback(with("installed", true), None);
         assert_eq!(st.state, "installed");
         assert!(st.loopback_notice.is_some());
@@ -1387,8 +1327,6 @@ mod tests {
         assert!(loopback_closed_hint().contains("srt-win install --allow-loopback"));
     }
 
-    /// The notice says loopback is open, names every floor port, and
-    /// says that a local forwarder is a way off the machine.
     #[test]
     fn open_loopback_notice_is_plain() {
         let n = open_loopback_notice();

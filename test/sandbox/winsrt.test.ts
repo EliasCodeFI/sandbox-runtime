@@ -443,18 +443,14 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     const envArgs = envOf(
       wrapCommandWithSandboxWindows({ ...proxied, allowLoopback: true }).argv,
     )
-    // With loopback open the fence permits direct loopback connects,
-    // so proxy-aware clients are told to make them. The
-    // private-network entries of the POSIX list stay out: the fence
-    // still blocks those destinations.
+    // Only the loopback hosts: the private-network entries of the POSIX
+    // list stay out, as the fence still blocks those destinations.
     expect(WINDOWS_LOOPBACK_NO_PROXY).toBe('localhost,127.0.0.1,::1')
     expect(envArgs).toContain(`NO_PROXY=${WINDOWS_LOOPBACK_NO_PROXY}`)
     expect(envArgs).toContain(`no_proxy=${WINDOWS_LOOPBACK_NO_PROXY}`)
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
-    // Loopback closed: no NO_PROXY at all.
     const closed = envOf(wrapCommandWithSandboxWindows(proxied).argv)
     expect(closed.some(e => /^no_proxy=/i.test(e))).toBe(false)
-    // No proxy, nothing to bypass.
     const bare = wrapCommandWithSandboxWindows({
       command: 'x',
       allowLoopback: true,
@@ -1146,8 +1142,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     await SandboxManager.reset()
     await SandboxManager.initialize(withLoopback(true))
     expect(verify.mock.calls.length).toBe(0)
-    // The other mode, and back: each is a different fence to hold the
-    // install to.
+    // The other mode, and back: each is probed.
     await SandboxManager.reset()
     await SandboxManager.initialize(withLoopback())
     expect(verify.mock.calls.length).toBe(1)
@@ -1776,9 +1771,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       '--allow-loopback',
       '--force',
     ])
-    // Without the option (or with it false) the flag is absent: the
-    // install then leaves loopback closed, and closes it if it was
-    // open.
+    // Without the option (or with it false) the flag is absent.
     for (const off of [{}, { allowLoopback: false }]) {
       spawnSyncSpy.mockClear()
       installWindowsSandbox({ ...off, srtWin })
@@ -1917,8 +1910,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     // The caller did not say what is configured: nothing to compare.
     expect((await run(true)).errors).toEqual([])
     expect((await run(false)).errors).toEqual([])
-    // Found open: the warning says what that exposes. Found closed:
-    // nothing to say.
     expect((await run(true, true)).warnings).toContain(
       WINDOWS_ALLOW_LOOPBACK_EFFECT,
     )
@@ -2222,7 +2213,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       openOffLoopback: 'blocked',
       openLoopback: 'connected',
     })
-    // A clean pass still carries the plain statement of what is open.
     expect(r.warnings).toEqual([WINDOWS_ALLOW_LOOPBACK_EFFECT])
   })
 
@@ -2255,8 +2245,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
     // Every attempt the fence must refuse rejects whatever the exit
-    // code says: the off-loopback one at an open port, and the one at
-    // a port that stays blocked.
+    // code says.
     for (const leak of [
       { open_off_loopback_probe: 'connected' },
       { egress_probe: 'connected' },
@@ -2315,7 +2304,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       // Never an ephemeral port: with loopback open that one is
       // permitted, and a connect to it would read as a missing fence.
       expect(servers.asked).toEqual([first, second, third])
-      // Every listener is closed, the chosen one last.
       expect(servers.closed).toEqual([first, second, third])
     } finally {
       servers.spy.mockRestore()
@@ -2380,8 +2368,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // Configured closed while the install is open: the command that
-    // closes it. The session does not run on the open install.
+    // Configured closed while the install is open: the command that closes it.
     const closed = await runVerify(
       19,
       JSON.stringify({

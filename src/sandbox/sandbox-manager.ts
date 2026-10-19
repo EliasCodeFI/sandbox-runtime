@@ -202,9 +202,8 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// What IS config-scoped is the loopback mode the probe was run with
-// (`network.allowLocalBinding`): the value is that mode, and a session
-// configured with the other verifies again.
+// The value is the loopback mode (`network.allowLocalBinding`) the probe
+// was run with: a session configured with the other verifies again.
 let windowsWfpVerifiedFor: boolean | undefined
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -1011,9 +1010,6 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    // A session whose `network.allowLocalBinding` is not the loopback
-    // mode the install recorded is refused here too, with the install
-    // command that repairs it.
     const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
     if (windowsWfpVerifiedFor !== allowLoopback) {
       try {
@@ -2549,9 +2545,8 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
-      // `srt-win exec` launches nothing unless this is the loopback
-      // mode the install recorded, so one that differs — the session's
-      // or one command's — is refused, never silently ignored.
+      // `srt-win exec` launches nothing unless this is the loopback mode
+      // the install recorded: a difference is refused, never ignored.
       allowLoopback:
         (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
         true,

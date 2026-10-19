@@ -129,11 +129,9 @@ pub struct Report {
     pub low_integrity_loopback: Outcome,
     pub untrusted_integrity: Outcome,
     pub untrusted_integrity_loopback: Outcome,
-    /// Own token, to a non-loopback address on a port that is open on
-    /// loopback.
+    /// Own token, to an off-loopback address at a port open on loopback.
     pub open_off_loopback: Outcome,
-    /// Own token, to the broker's loopback listener on an arbitrary
-    /// port.
+    /// Own token, to the broker's own loopback listener.
     pub open_loopback: Outcome,
 }
 
@@ -838,8 +836,7 @@ mod tests {
         }
     }
 
-    /// An otherwise clean report with the two open-loopback attempts
-    /// set.
+    /// An otherwise clean report with the two open-loopback attempts set.
     fn opened(off_loopback: Outcome, loopback: Outcome) -> Report {
         Report {
             open_off_loopback: off_loopback,
@@ -879,7 +876,6 @@ mod tests {
 
     #[test]
     fn verdict_with_loopback_open() {
-        // Loopback is open and nothing else is.
         let v = verdict(&opened(Blocked, Connected));
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
@@ -901,15 +897,12 @@ mod tests {
         let mut r = opened(Blocked, Blocked);
         r.plain = Connected;
         assert_eq!(verdict(&r).exit, EXIT_NOT_FENCED);
-        // Anything else says nothing either way.
         for odd in [Unreachable, Error] {
             assert_eq!(verdict(&opened(odd, Connected)).exit, EXIT_INCONCLUSIVE);
         }
         for odd in [Refused, Unreachable, Error] {
             assert_eq!(verdict(&opened(Blocked, odd)).exit, EXIT_INCONCLUSIVE);
         }
-        // Residuals qualify a pass with loopback open as with it
-        // closed.
         let mut r = opened(Blocked, Connected);
         r.deny_only = Connected;
         assert_eq!(verdict(&r).residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);

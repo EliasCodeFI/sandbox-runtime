@@ -1228,23 +1228,13 @@ if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
 Write-Host 'U4 ok: reinstall restores the fence and removes the earlier revision''s anonymous filter; exec runs again'
 
 # ── L-rows: open loopback ────────────────────────────────────────
-# `install --allow-loopback` adds one PERMIT per layer: loopback
-# address AND any port but a short fixed list. The rows run the same
-# connects with loopback closed, then with it open, and show that a
-# session whose loopback mode differs from the installed one is not
-# launched, in either direction.
-#
-# The listeners sit clear of the proxy range, of every fixed port the
-# rows above listen on, and of the dynamic port range (49152 and up),
-# where Windows keeps its per-machine excluded ranges and hands out
-# ephemeral ports.
+# The listeners sit clear of the proxy range, the fixed ports used above
+# and the dynamic range (49152+), where Windows keeps its excluded ranges.
 $LbLo = 41000
-# Two of the ports that stay blocked with loopback open.
 $LbFloor = @(9229, 1080)
 
-# One raw TCP connect from inside the sandbox. Prints CONNECTED or
+# One raw TCP connect from inside the sandbox: CONNECTED, or
 # code=<SocketErrorCode> (AccessDenied = refused by a filter).
-# $ExecFlags are srt-win's own flags for this exec.
 function SbConnect {
   param([string] $Address, [int] $Port, [string[]] $ExecFlags = @())
   $new = if ($Address -match ':') {
@@ -1274,8 +1264,7 @@ function Assert-SbConnected {
   }
 }
 
-# Start a sandboxed command without waiting for it. Same argv shape
-# and environment as RExec; the caller reads .so/.se and waits on .p.
+# Start a sandboxed command without waiting; same argv and env as RExec.
 function RExecStart {
   param([string[]] $tail)
   $argv = @('exec',
@@ -1296,12 +1285,8 @@ function RExecStart {
   }
 }
 
-# A server started INSIDE the sandbox on 127.0.0.1:$Port, then one
-# connect to it from a second sandboxed command. The server prints
-# SERVED once a client is accepted, so a CONNECTED that reached
-# anything else does not pass. Returns the client's output and
-# whether the server accepted. Listening is not filtered, so the
-# server comes up whether or not loopback is open.
+# A server started INSIDE the sandbox, then one connect from a second
+# sandboxed command. It prints SERVED on accept: no other listener passes.
 function SbServerRoundTrip {
   param([string] $Row, [int] $Port, [string[]] $ExecFlags = @())
   $srv = RExecStart ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command',
@@ -1320,8 +1305,7 @@ function SbServerRoundTrip {
       Start-Sleep -Milliseconds 250
     }
     $client = SbConnect '127.0.0.1' $Port $ExecFlags
-    # A refused client leaves the server waiting; do not sit out its
-    # timeout.
+    # A refused client leaves the server waiting: do not sit out its timeout.
     $served = $false
     if ($client.out -match 'CONNECTED') {
       if (-not $srv.p.WaitForExit(60000)) { throw "${Row}: sandboxed server did not exit after a client connected" }
@@ -1333,8 +1317,7 @@ function SbServerRoundTrip {
   }
 }
 
-# A port that binds on this runner right now, for a listener that
-# some other process is about to open.
+# A port that binds right now, for a listener another process will open.
 function Free-LbPort {
   param([int[]] $Candidates)
   $l = Bind-Listener $Candidates
@@ -1343,9 +1326,8 @@ function Free-LbPort {
   return $port
 }
 
-# A UDP echo server on 127.0.0.1:$Port in a process of its own (this
-# account, not the sandbox): it answers one datagram and exits.
-# Returns once it is bound.
+# A UDP echo server in a process of this account (not the sandbox); it
+# answers one datagram and exits. Returns once it is bound.
 function Start-UdpEcho {
   param([string] $Row, [int] $Port)
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1368,9 +1350,8 @@ function Start-UdpEcho {
   return $p
 }
 
-# One UDP datagram from inside the sandbox to 127.0.0.1:$Port, and the
-# wait for its echo. Prints ECHO=<payload>, or code=<SocketErrorCode>
-# (AccessDenied = refused by a filter; TimedOut = no answer).
+# One UDP datagram from inside the sandbox: ECHO=<payload>, or
+# code=<SocketErrorCode> (AccessDenied = a filter; TimedOut = no answer).
 function SbUdpEcho {
   param([int] $Port, [string[]] $ExecFlags = @())
   $client =
@@ -1383,10 +1364,7 @@ function SbUdpEcho {
   return RExec ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command', $client))
 }
 
-# L0: loopback closed (the default install). Live listeners on
-# 127.0.0.1 and ::1, and on a non-loopback address of this runner;
-# every sandboxed connect is refused by a filter, over UDP too. The
-# proxy port range is still reachable.
+# L0: loopback closed (the default install): all refused but the proxy range.
 $l0v4 = Bind-Listener ($LbLo..($LbLo + 7))
 $l0v6 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
 try {
@@ -1422,9 +1400,7 @@ $l0proxy = Bind-Listener ($PortHi..$PortLo)
 try { Assert-SbConnected 'L0' '127.0.0.1' $l0proxy.LocalEndpoint.Port } finally { $l0proxy.Stop() }
 Write-Host 'L0 ok: with loopback closed, loopback (v4, v6, UDP), non-loopback and sandbox-to-sandbox connects are all refused; the proxy port range is reachable'
 
-# L0b: a session that expects loopback open on an install that has it
-# closed is refused (exit 19) by exec and by wfp verify, naming the
-# reinstall.
+# L0b: a session expecting loopback open on a closed install is refused (19).
 $r = RExec @('--allow-loopback', '--', $cmd, '/c', 'echo L0b-RAN')
 if ($r.exit -ne 19) { throw "L0b: exec expected exit 19 (loopback not open), got $($r.exit). raw: $($r.raw)" }
 if ($r.raw -match 'L0b-RAN') { throw "L0b: child RAN expecting open loopback on a closed install. raw: $($r.raw)" }
@@ -1440,8 +1416,7 @@ if (-not $lvDoc.outdated -or -not $lvDoc.allow_loopback_mismatch -or $lvDoc.hint
 }
 Write-Host 'L0b ok: a session expecting open loopback on a closed install is refused (exec 19, wfp verify 19)'
 
-# L1: opening loopback on an existing install is a config change:
-# refused (13) without --force, applied with it.
+# L1: opening loopback on an existing install: refused (13) without --force.
 & $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --allow-loopback 2>$null
 if ($LASTEXITCODE -ne 13) { throw "L1: install --allow-loopback without --force expected exit 13, got $LASTEXITCODE" }
 Run @('install',
@@ -1470,10 +1445,7 @@ Write-Host "L1 ok: loopback opened: $($l1.filters) filters, reported by wfp stat
 
 $lb = @('--allow-loopback')
 
-# L2: wfp verify with loopback open. The plain target is one of the
-# ports that stay blocked; srt-win's own loopback listener on an
-# arbitrary port connects; that port on a non-loopback address is
-# blocked; the result says loopback is open.
+# L2: wfp verify with loopback open.
 $l2Lsn = $null
 try { $l2Lsn = Bind-Listener $LbFloor } catch { Write-Host 'L2 note: no blocked port free to listen on; probing one without a listener' }
 $l2port = if ($l2Lsn) { $l2Lsn.LocalEndpoint.Port } else { $LbFloor[0] }
@@ -1495,8 +1467,7 @@ if ($l2.open_off_loopback_probe -eq 'skipped') {
 if ($l2.allow_loopback -ne $true -or $l2.loopback_notice -notmatch '(?i)loopback is open') {
   throw "L2: wfp verify output does not say loopback is open: $l2out"
 }
-# With loopback open, the lowered-integrity attempts' off-loopback
-# half is aimed at the open port too, and all four are still blocked.
+# The lowered-integrity attempts are aimed at the open port too.
 if ($l2.open_off_loopback_target -and $l2.lowered_integrity_target -ne $l2.open_off_loopback_target) {
   throw "L2: lowered_integrity_target expected $($l2.open_off_loopback_target), got '$($l2.lowered_integrity_target)'"
 }
@@ -1508,16 +1479,13 @@ foreach ($f in $loweredFields) {
     throw "L2: $f expected blocked with loopback open, got '$got'. out: $l2out"
   }
 }
-# A must-be-blocked target that open loopback permits is refused as a
-# usage error, not probed.
+# A target that open loopback permits is a usage error, not probed.
 & $Exe wfp verify --target "127.0.0.1:$LbLo" @lb 2>$null | Out-Null
 if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an open-loopback --target expected exit 1, got $LASTEXITCODE" }
 Write-Host 'L2 ok: wfp verify probes open loopback (listener connected, blocked port and off-loopback blocked), says it is open, and refuses an open target'
 
-# L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1. The
-# 127.0.0.1 ports are taken from four stretches between the ports that
-# stay blocked, so more than one of the PERMIT's port conditions is
-# exercised.
+# L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1.
+# Ports from four stretches between the blocked ones: several conditions.
 foreach ($slice in @((1100..1107), (8100..8107), ($LbLo..($LbLo + 7)), (48100..48107))) {
   $l3 = Bind-Listener $slice
   try {
@@ -1535,8 +1503,7 @@ try {
   $l4.Stop()
 }
 
-# L5: UDP on loopback works: a datagram reaches a local echo server
-# and its answer comes back.
+# L5: UDP on loopback works: a datagram is echoed back.
 $l5port = $LbLo + 32
 $l5 = Start-UdpEcho 'L5' $l5port
 try {
@@ -1549,8 +1516,7 @@ try {
 }
 Write-Host "L5 ok: UDP echo on 127.0.0.1:$l5port works"
 
-# L6: the ports that stay blocked are still refused, listener or not
-# (the filter answers before the destination does).
+# L6: the ports that stay blocked are still refused, listener or not.
 foreach ($port in $LbFloor) {
   $l6 = $null
   try { $l6 = Bind-Listener @($port) } catch { Write-Host "L6 note: port $port is taken on this runner; probing it as it is" }
@@ -1558,16 +1524,13 @@ foreach ($port in $LbFloor) {
 }
 Write-Host "L6 ok: loopback ports $($LbFloor -join ', ') still refused with loopback open"
 
-# L7: a port that is open on loopback is still refused on a
-# NON-loopback address of this machine — the PERMIT is for loopback
-# addresses only — and so is a connect off the machine.
+# L7: a port open on loopback is still refused off loopback, on and off this machine.
 if (-not $lanIp) {
   Write-Host 'L7 SKIPPED (non-loopback half): runner has no off-loopback IPv4 address'
 } else {
   $l7 = Bind-Listener (($LbLo + 16)..($LbLo + 23)) ([System.Net.IPAddress]::Parse($lanIp))
   $l7port = $l7.LocalEndpoint.Port
   try {
-    # The same port, listening on loopback as well.
     $l7lo = Bind-Listener @($l7port)
     try { Assert-SbConnected 'L7' '127.0.0.1' $l7port $lb } finally { $l7lo.Stop() }
     Assert-SbRefused 'L7' $lanIp $l7port $lb
@@ -1582,17 +1545,14 @@ if ($r.exit -eq 0) {
 }
 Write-Host "L7 ok: off-machine egress still blocked with loopback open (curl exit=$($r.exit))"
 
-# L8: a server started by one sandboxed command is reachable from a
-# second sandboxed command.
+# L8: a server started by one sandboxed command is reachable from another.
 $rt = SbServerRoundTrip 'L8' (Free-LbPort (($LbLo + 24)..($LbLo + 31))) $lb
 if ($rt.client.out -notmatch 'CONNECTED' -or -not $rt.served) {
   throw "L8: sandbox-started server not reached from a second sandboxed command (served=$($rt.served)). raw: $($rt.client.raw)"
 }
 Write-Host 'L8 ok: a sandbox-started server is reachable from a second sandboxed command'
 
-# L9: a session that expects loopback CLOSED on this install, which
-# has it open, is refused with the reinstall message and launches
-# nothing.
+# L9: a session expecting loopback CLOSED on this open install is refused.
 $r = RExec @('--', $cmd, '/c', 'echo L9-RAN')
 if ($r.exit -ne 19) { throw "L9: exec expecting closed loopback expected exit 19, got $($r.exit). raw: $($r.raw)" }
 if ($r.raw -match 'L9-RAN') { throw "L9: child RAN expecting closed loopback on an open install. raw: $($r.raw)" }
@@ -1610,10 +1570,7 @@ if (-not $l9doc.outdated -or -not $l9doc.allow_loopback_mismatch -or $l9doc.hint
 }
 Write-Host 'L9 ok: a session expecting closed loopback on an open install is refused (exec 19, wfp verify 19)'
 
-# L10: closing loopback is the install step again. The PERMIT goes
-# (the elevated status enumerates the sublayer's filters: the count is
-# back and none of them opens loopback), the record goes, and a
-# loopback listener is refused once more.
+# L10: closing loopback is the install step again; loopback is refused once more.
 Run @('install',
       '--sublayer-guid',$Sublayer,
       '--proxy-port-range',$PortRange,
