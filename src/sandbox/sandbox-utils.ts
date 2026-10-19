@@ -825,9 +825,7 @@ export function generateProxyEnvVars(
   // loopback-only under seatbelt), so a NO_PROXY match makes the client try
   // direct getaddrinfo() and fail. Routing .local hostnames through the proxy
   // lets the parent resolve them (e.g. Kubernetes *.svc.cluster.local).
-  //
-  // `[::1]` is for Node's `fetch`, which compares an entry with the host as
-  // the URL spells it, in brackets.
+  // `[::1]`: Node's `fetch` compares the host as the URL spells it.
   const noProxyAddresses = [
     'localhost',
     '127.0.0.1',
@@ -853,10 +851,8 @@ export function generateProxyEnvVars(
       // challenge and the URL-embedded password doesn't survive it).
       envVars.push(`GIT_CONFIG_PARAMETERS='http.proxyAuthMethod=basic'`)
     }
-    // Node's built-in clients (`fetch`, `http`, `https`) read the variables
-    // above only when this is set, and take no SOCKS URL. They match NO_PROXY
-    // by name and by single address, not by range, so a request to a private
-    // address goes to the proxy.
+    // Node's built-in clients read the proxy variables only when this is
+    // set. They match NO_PROXY by name and single address, not by range.
     envVars.push('NODE_USE_ENV_PROXY=1')
   }
 

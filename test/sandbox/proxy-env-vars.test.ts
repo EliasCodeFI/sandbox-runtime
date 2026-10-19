@@ -13,10 +13,7 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
-/**
- * Whether the `node` on PATH reads NODE_USE_ENV_PROXY for `http` as well as
- * for `fetch`: 22.21 on its line, and 24.5.
- */
+/** Whether `node` on PATH reads NODE_USE_ENV_PROXY (22.21+, 24.5+). */
 const nodeReadsProxyEnv = ((): boolean => {
   const r = spawnSync('node', ['-p', 'process.versions.node'], {
     encoding: 'utf8',
@@ -109,7 +106,6 @@ describe('generateProxyEnvVars', () => {
     })
 
     it('is not set with a SOCKS port alone, or with no proxy', () => {
-      // Those clients take no SOCKS URL, and HTTP_PROXY is not set either.
       for (const args of [
         [undefined, 1080],
         [undefined, 1080, undefined, 'tok'],
@@ -153,8 +149,7 @@ describe('generateProxyEnvVars', () => {
             filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
           })
 
-          // http.get asks the proxy for the URL. fetch opens a tunnel, which
-          // this proxy accepts and ends: only that it was asked is told.
+          // fetch opens a CONNECT tunnel, which this proxy accepts and ends.
           const wrapped = await SandboxManager.wrapWithSandbox(
             `node -e "require('http').get('http://srt-test.local:8080/', r => fetch('http://srt-test.local:8081/').catch(() => {}).then(() => process.exit(r.statusCode === 200 ? 0 : 1))).on('error', () => process.exit(2))"`,
           )
@@ -220,7 +215,6 @@ describe('generateProxyEnvVars', () => {
     })
 
     it('names the IPv6 loopback with and without brackets', () => {
-      // Node's fetch matches `[::1]`; curl and others match the bare form.
       const env = generateProxyEnvVars(3128, 1080)
       for (const name of ['NO_PROXY', 'no_proxy']) {
         const tokens = env
