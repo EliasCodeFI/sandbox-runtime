@@ -72,10 +72,7 @@ Run (@('install') + $isl + $pr)
 $iw = J (@('wfp', 'status') + $isl)
 # 4 = per ALE connect layer (v4, v6): loopback PERMIT, sandbox-user
 # BLOCK. Exactly 4: the count is of every srt-win filter under the
-# sublayer, so a fifth would be one this build must not install (a
-# BLOCK keyed on the anonymous token, say). `installed` (not
-# `outdated`) also says the BLOCK is present at this build's fence
-# revision on both layers.
+# sublayer, so a fifth would be one this build must not install.
 if ($iw.state -ne 'installed' -or $iw.filters -ne 4) {
   throw "install: wfp expected installed/4, got $($iw.state)/$($iw.filters)"
 }
@@ -369,9 +366,7 @@ if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
 # The install record must stop describing the removed filters as
-# current: `FenceRevision` is reset to 0 ("removed") in the same
-# step. That value is all a NON-elevated `wfp status` has to go by
-# (it cannot enumerate filters), and it maps 0 to `absent`; `exec`
+# current: `FenceRevision` is reset to 0 ("removed"), and `exec`
 # refuses on it (exit 19) instead of launching with no fence.
 $fr0 = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevision
 if ($fr0 -ne 0) {

@@ -12,50 +12,40 @@
 //!     that token (see the `wfp` module doc), so a connect here is
 //!     expected and is reported as the [`RESIDUAL_ANONYMOUS_EGRESS`]
 //!     residual.
-//!   - **anonymous, loopback** — while impersonating the anonymous
-//!     token, to the loopback probe target. Not covered either; a
-//!     connect here is reported as the
-//!     [`RESIDUAL_ANONYMOUS_LOOPBACK`] residual.
+//!   - **anonymous, loopback** — the same, to the loopback probe
+//!     target; reported as the [`RESIDUAL_ANONYMOUS_LOOPBACK`]
+//!     residual.
 //!   - **low integrity** and **untrusted integrity** — under a copy
-//!     of its own token whose integrity level has been lowered, to the
-//!     off-loopback target and to the loopback probe target. The copy
-//!     still carries the sandbox account's SID, so the sandbox-user
-//!     BLOCK must refuse all four. They are probed because an access
-//!     check applies the mandatory integrity rule before it reads a
-//!     descriptor's entries, and a process may lower the integrity
-//!     level of a copy of its own token without any privilege.
+//!     of its own token whose integrity level has been lowered (which
+//!     takes no privilege), to both targets. The copy still carries
+//!     the sandbox account's SID, so the sandbox-user BLOCK must
+//!     refuse all four. They are probed because an access check
+//!     applies the mandatory integrity rule before it reads a
+//!     descriptor's entries.
 //!   - **deny-only** — under a restricted copy of its own token whose
-//!     user SID is deny-only, to the loopback probe target. A
-//!     deny-only SID is matched by no ALLOW ACE, so the filters
-//!     cannot be made to refuse it; a connect here is reported as the
+//!     user SID is deny-only, to the loopback probe target. No ALLOW
+//!     ACE matches a deny-only SID; a connect here is reported as the
 //!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
 //!
 //! ## Two orderings per assumed identity
 //!
-//! Which token a connect is attributed to depends on when the socket
-//! was created. A socket the process creates under its own token and
-//! then connects while impersonating can be attributed to the
-//! process — and refused by the sandbox-user BLOCK — whatever the
-//! thread's token is at the connect. That ordering alone therefore
-//! says nothing about the assumed identity. Every attempt made under
-//! an assumed identity is run twice, on the one thread that holds the
-//! token ([`SocketOrder`]):
+//! A connect is attributed to the token in effect when its socket was
+//! created, so a socket created under the process token and connected
+//! while impersonating says nothing about the assumed identity. Every
+//! attempt made under an assumed identity is run twice, on the one
+//! thread that holds the token ([`SocketOrder`]):
 //!
 //!   - **socket after token** — assume the identity, create the
-//!     socket, connect. The socket itself belongs to the assumed
-//!     identity; this is the ordering a process trying to get out
-//!     would use.
+//!     socket, connect. The socket belongs to the assumed identity.
 //!   - **socket before token** — create the socket, assume the
 //!     identity, connect. Kept because an engine that attributes at
 //!     connect time would let this one through instead.
 //!
-//! In both, the thread's token is read back after the socket exists
-//! and the identity is assumed, immediately before the connect; an
-//! attempt whose token is not the one asked for is an `error`, never
-//! a `blocked`. Each ordering's own result is logged to stderr with
-//! the ordering named, and the attempt reports the WORSE of the two
-//! for the fence ([`Outcome::worse`]): one ordering getting through
-//! is the attempt getting through.
+//! In both, the thread's token is read back immediately before the
+//! connect; an attempt whose token is not the one asked for is an
+//! `error`, never a `blocked`. Each ordering's own result is logged
+//! to stderr, and the attempt reports the WORSE of the two for the
+//! fence ([`Outcome::worse`]).
 //!
 //! The runner's stdout is the broker's stdout, so the results
 //! travel back in the runner's exit code ([`Report::encode`]).
@@ -83,8 +73,7 @@ use windows::Win32::System::Threading::{
 
 /// Name of the residual reported when a connect to an off-loopback
 /// destination made while impersonating the anonymous token is not
-/// blocked. Expected on every machine with such a destination: the
-/// filter set has no filter for the anonymous token.
+/// blocked. Expected on every machine with such a destination.
 pub const RESIDUAL_ANONYMOUS_EGRESS: &str = "anonymous-egress";
 
 /// Name of the residual reported when a connect to a loopback
@@ -162,16 +151,10 @@ impl Outcome {
         matches!(self, Outcome::Connected | Outcome::Refused)
     }
 
-    /// How bad this outcome is for the fence; higher is worse.
-    ///
-    ///   - `Connected`, then `Refused`: the connect got past the
-    ///     filters.
-    ///   - `Error`, then `Unreachable`, then `Skipped`: nothing was
-    ///     learned. These rank above `Blocked` so that a block in one
-    ///     ordering cannot stand in for an ordering that was never
-    ///     measured.
-    ///   - `Blocked`: the only outcome that is good for the fence, so
-    ///     the combined result is `Blocked` only when every part was.
+    /// How bad this outcome is for the fence; higher is worse. The
+    /// outcomes that learned nothing rank above `Blocked` so that a
+    /// block in one ordering cannot stand in for an ordering that was
+    /// never measured.
     fn severity(self) -> u8 {
         match self {
             Outcome::Blocked => 0,
@@ -297,18 +280,14 @@ pub struct Verdict {
     pub residuals: Vec<&'static str>,
 }
 
-/// The plain and the four lowered-integrity attempts — the ones made
-/// under a token that still carries the sandbox account's SID —
-/// decide the exit code: any one getting
-/// past the filters is a missing fence, and any one that neither got
-/// past nor was blocked — the token could not be assumed, the connect
-/// timed out — leaves the probe inconclusive. An attempt at the
-/// off-loopback target that was skipped (the machine has no such
-/// address to aim at) does not fail the probe. The three remaining
-/// attempts — both anonymous ones and the deny-only one — never fail
-/// it, whatever their outcome: the filters do not refuse them. One
-/// that got through is reported as a residual instead of passing
-/// silently.
+/// The exit code is decided by the attempts made under a token that
+/// still carries the sandbox account's SID (the plain one and the
+/// four lowered-integrity ones): any one getting past the filters is
+/// a missing fence, and any one that was neither blocked nor — for an
+/// off-loopback target the machine lacks — skipped leaves the probe
+/// inconclusive. The anonymous and deny-only attempts never fail it:
+/// the filters do not refuse them. One that got through is reported
+/// as a residual.
 pub fn verdict(r: &Report) -> Verdict {
     let must = r.must_be_blocked();
     let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
@@ -336,10 +315,9 @@ pub fn verdict(r: &Report) -> Verdict {
     Verdict { exit, residuals }
 }
 
-/// An off-loopback destination on this machine for the anonymous
-/// and the lowered-integrity attempts: the address the machine would
-/// use as the source of an outbound connection, at `port`. Nothing needs to listen there —
-/// refused is as good an answer as connected.
+/// An off-loopback destination on this machine: the address it would
+/// use as the source of an outbound connection, at `port`. Nothing
+/// needs to listen there — refused is as good an answer as connected.
 ///
 /// Found by connecting a UDP socket to a documentation address, which
 /// selects a route and a source address without sending anything.
@@ -362,8 +340,6 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     }
     None
 }
-
-// ────────────────────── the attempts ──────────────────────
 
 /// Which token the connect is made under.
 #[derive(Debug, Clone, Copy)]
@@ -613,8 +589,6 @@ fn assume(id: Identity) -> Result<Option<Assumed>> {
                     )
                     .context("DuplicateTokenEx")?;
                 }
-                // Lowering a token's integrity level takes no
-                // privilege.
                 crate::token::set_il(imp, rid)?;
                 impersonate(imp, Some(rid))
             })();
@@ -926,8 +900,7 @@ mod tests {
 
     #[test]
     fn unrelated_exit_codes_do_not_decode() {
-        // 0 and 1 are the runner's ordinary exits; 2 and 3 were the
-        // whole contract of an earlier single-attempt probe.
+        // 0 and 1 are the runner's ordinary exits.
         for code in [
             0,
             1,

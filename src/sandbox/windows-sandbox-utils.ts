@@ -91,9 +91,8 @@ export type WindowsSandboxErrorCode =
   /** `srt-win wfp verify` was neither `blocked` nor `connected`. */
   | 'wfp_verify_inconclusive'
   /**
-   * The installed filter set was written by an earlier `srt-win` and
-   * lacks filters this one requires (`srt-win wfp verify` exit 19) —
-   * re-run the install.
+   * The installed filter set is not the one this `srt-win` requires
+   * (`srt-win wfp verify` exit 19) — re-run the install.
    */
   | 'wfp_fence_outdated'
   /** `srt-win user trust-ca` exited non-zero. */
@@ -221,18 +220,14 @@ export type WindowsWfpProbeOutcome =
  * does not close. The fence is active; these are what it leaves open.
  *
  * - `anonymous-egress` — a connect to an off-loopback destination
- *   made while impersonating the anonymous token is not blocked. This
- *   is expected on every machine that has such an address: no filter
- *   is keyed on the anonymous token, because one would apply to every
+ *   made while impersonating the anonymous token is not blocked.
+ *   Expected on every machine that has such an address: no filter is
+ *   keyed on the anonymous token, because one would apply to every
  *   process on the machine and not only to sandboxed ones.
- * - `anonymous-loopback` — a connect to a loopback destination made
- *   while impersonating the anonymous token is not blocked, so local
- *   listeners outside the proxy port range are reachable that way.
+ * - `anonymous-loopback` — the same to a loopback destination, so
+ *   local listeners outside the proxy port range are reachable.
  * - `deny-only-user-sid` — a connect made under a copy of the sandbox
  *   token whose user SID is deny-only is not blocked.
- *
- * Each is probed on a socket created before the token is assumed and
- * on one created after; the residual is named when either connects.
  */
 export type WindowsWfpResidual =
   | 'anonymous-egress'
@@ -279,9 +274,9 @@ export interface WindowsWfpVerifyResult {
    */
   residuals: WindowsWfpResidual[]
   /**
-   * Human-readable warnings: one per residual, plus one per attempt
-   * that was skipped (no off-loopback address to aim
-   * at). `initialize()` logs them.
+   * Human-readable warnings: one per residual, plus one when the
+   * off-loopback lowered-integrity attempts were skipped.
+   * `initialize()` logs them.
    */
   warnings: string[]
 }
@@ -1176,26 +1171,11 @@ export function interpretWindowsWfpVerify(r: {
  * outside the WFP loopback-permit range, then spawns `srt-win
  * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
  * attempt direct TCP connects under each token shape a sandboxed
- * process can present to the filtering engine:
- *
- * 1. its own token, to the listener;
- * 2. impersonating the anonymous token, to this machine's own
- *    off-loopback address (chosen by `srt-win`; nothing needs to
- *    listen there);
- * 3. impersonating the anonymous token, to the listener;
- * 4. a copy of its token with the user SID deny-only, to the
- *    listener;
- * 5. a copy of its token at low integrity, and one at untrusted
- *    integrity, each to the off-loopback address and to the
- *    listener.
- *
- * Attempts 2 to 5 each connect twice: on a socket created before the
- * token is assumed and on one created after. The filtering engine
- * attributes a connect to the token in effect when its socket was
- * created, so only the second is a connect by the assumed identity;
- * the first is kept in case that attribution differs. Each attempt
- * reports the worse of its two results, and `stderr` carries one line
- * per ordering.
+ * process can present to the filtering engine: its own token, the
+ * anonymous token, and copies of its own token with the user SID
+ * deny-only or the integrity level lowered — to the listener and,
+ * for some, to this machine's own off-loopback address (see
+ * {@link WindowsWfpVerifyResult}).
  *
  * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
  * leaves — so a fenced connect yields WSAEACCES immediately and an
@@ -1204,11 +1184,11 @@ export function interpretWindowsWfpVerify(r: {
  * required, so the synchronous `runSrtWin` is safe). Does not require
  * elevation and does not depend on any external host.
  *
- * Attempts 1 and 5 are what the fence must refuse: either getting
- * through throws. Attempts 2, 3 and 4 are shapes the filter set does
- * not refuse — attempt 2 is expected to get through; when they do,
- * the result names them in `residuals` (with `warnings`) rather than
- * passing silently — see {@link WindowsWfpResidual}.
+ * The own-token and lowered-integrity attempts are what the fence
+ * must refuse: one getting through throws. The anonymous and
+ * deny-only attempts are shapes the filter set does not refuse; one
+ * getting through is named in `residuals` (with `warnings`) — see
+ * {@link WindowsWfpResidual}.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed, or a filter
