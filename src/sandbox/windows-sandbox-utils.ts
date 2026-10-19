@@ -182,11 +182,8 @@ export type WindowsSandboxErrorCode =
    */
   | 'mapped_drive_cwd'
   /**
-   * The Windows Secondary Logon service (`seclogon`) is disabled or
-   * absent, so no sandboxed process can be launched until an
-   * administrator re-enables it. `srt-win exec` / `wfp verify` /
-   * `user trust-ca` exit **18**; parsed from the stderr JSON by
-   * {@link parseWindowsSandboxError} ({@link SeclogonDisabledError}).
+   * The Secondary Logon service (`seclogon`) is disabled or absent; `srt-win`
+   * launch subcommands exit **18** ({@link SeclogonDisabledError}).
    */
   | 'seclogon_disabled'
 
@@ -403,11 +400,9 @@ export interface WindowsWfpVerifyResult {
 }
 
 /**
- * Readiness of the Windows Secondary Logon service (`seclogon`),
- * which every sandboxed launch goes through. `ok` covers a stopped
- * Manual service (the launch demand-starts it); `disabled` and
- * `missing` mean no launch can succeed; `cannot-read` means the
- * service state could not be queried (not proof of a problem).
+ * Readiness of the Secondary Logon service every launch goes through. `ok`
+ * covers a stopped Manual service (the launch demand-starts it);
+ * `cannot-read` is not proof of a problem.
  */
 export type WindowsSeclogonState = 'ok' | 'disabled' | 'missing' | 'cannot-read'
 
@@ -1471,11 +1466,7 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
   }
 }
 
-/**
- * User-facing text for a disabled/absent Secondary Logon service.
- * One source for the dependency check and the launch-time fallback
- * (when `srt-win`'s own JSON carries no message).
- */
+/** User-facing text for a disabled/absent Secondary Logon service. */
 function seclogonDisabledMessage(state: 'disabled' | 'missing'): string {
   return state === 'missing'
     ? `The Windows Secondary Logon service (seclogon) is not present ` +
@@ -1490,10 +1481,8 @@ function seclogonDisabledMessage(state: 'disabled' | 'missing'): string {
 const SRT_WIN_EXIT_SECLOGON_DISABLED = 18
 
 /**
- * The typed `seclogon_disabled` error for an `srt-win` launch
- * subcommand's result, or `undefined` when the result is anything
- * else. Gated on the exit code first — see
- * {@link parseWindowsSandboxError}.
+ * The typed `seclogon_disabled` error for an `srt-win` launch result, if it
+ * is one. Gated on the exit code first: the child's own stderr could match.
  */
 function seclogonDisabledFrom(
   r: { status: number | null; stderr: string },
@@ -3215,12 +3204,7 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
   readonly drive?: string
 }
 
-/**
- * {@link WindowsSandboxError} narrowed to `seclogon_disabled`.
- * `state` says whether the Secondary Logon service is `disabled`
- * (an administrator must set its startup type to Manual) or
- * `missing` from the machine altogether.
- */
+/** {@link WindowsSandboxError} narrowed to `seclogon_disabled`. */
 export interface SeclogonDisabledError extends WindowsSandboxError {
   readonly code: 'seclogon_disabled'
   readonly state: 'disabled' | 'missing'
@@ -3252,11 +3236,7 @@ export function parseWindowsSandboxError(
   return parseSrtWinLaunchError(stderr, 'exec')
 }
 
-/**
- * {@link parseWindowsSandboxError} for any `srt-win` subcommand that
- * launches the runner (`exec`, `wfp verify`, `user trust-ca`);
- * `subcommand` lands on the error's `.subcommand`.
- */
+/** {@link parseWindowsSandboxError} for any runner-launching subcommand. */
 function parseSrtWinLaunchError(
   stderr: string,
   subcommand: string,
@@ -5369,17 +5349,14 @@ function interpretDependencyProbes(
     if (stale) errors.push(stale)
   }
 
-  // 2b. Secondary Logon service usable — every launch (including
-  // the `initialize()` egress probe) is CreateProcessWithLogonW.
-  // Reported alongside a not-provisioned error: both need an
-  // administrator. Field absent (older srt-win) → no opinion.
+  // 2b. Secondary Logon service usable: every launch goes through it.
+  // Field absent (older srt-win) → no opinion.
   if (us.seclogon === 'disabled' || us.seclogon === 'missing') {
     errors.push(seclogonDisabledMessage(us.seclogon))
   } else if (us.seclogon === 'cannot-read') {
-    warnings.push(
-      `Could not read the state of the Windows Secondary Logon ` +
-        `service (seclogon). If sandboxed commands fail to start, ` +
-        `check that the service is not disabled.`,
+    logForDebugging(
+      `[Sandbox Windows] Secondary Logon (seclogon) state cannot-read; ` +
+        `a launch will show whether it is usable`,
     )
   }
 

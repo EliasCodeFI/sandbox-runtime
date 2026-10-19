@@ -133,42 +133,43 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
 }
 
 /// Readiness of the Secondary Logon service (`seclogon`) that every
-/// `CreateProcessWithLogonW` routes through, as reported in the
-/// `seclogon` field of `srt-win user status` / `srt-win status`.
-/// Hardened fleets set the service's start type to Disabled, which
-/// makes every sandboxed launch fail before the runner exists.
+/// `CreateProcessWithLogonW` routes through, as `srt-win status` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeclogonState {
-    /// Launchable: running, or stopped with a start type the SCM
-    /// will demand-start (`CreateProcessWithLogonW` starts a
-    /// Manual service itself).
+    /// Running, or stopped with a start type the SCM will demand-start.
     Ok,
-    /// Start type is Disabled and the service is not running — the
-    /// SCM refuses the demand-start.
+    /// Start type is Disabled and the service is not running.
     Disabled,
     /// No `seclogon` service is registered on this machine.
     Missing,
-    /// The SCM or the service could not be opened/queried (access
-    /// denied under a tightened service DACL, RPC failure). Not
-    /// proof of a problem: the launch itself is the ground truth.
+    /// The SCM or the service could not be queried. Not proof of a problem:
+    /// the launch itself is the ground truth.
     CannotRead,
 }
 
-/// Pure half of [`seclogon_state`]: a service that is already
-/// running launches regardless of its start type (disabling a
-/// service does not stop it), so only "Disabled and not running" is
-/// [`SeclogonState::Disabled`].
+/// A running service launches regardless of its start type (disabling does
+/// not stop it), so only "Disabled and known not to run" is `Disabled`; with
+/// the status unreadable, a Disabled start type is `CannotRead`.
 fn classify_seclogon(
     start: SERVICE_START_TYPE,
     current: Option<SERVICE_STATUS_CURRENT_STATE>,
 ) -> SeclogonState {
-    if current == Some(SERVICE_RUNNING) {
-        SeclogonState::Ok
-    } else if start == SERVICE_DISABLED {
-        SeclogonState::Disabled
-    } else {
-        SeclogonState::Ok
+    match (start == SERVICE_DISABLED, current) {
+        (true, Some(SERVICE_RUNNING)) | (false, _) => SeclogonState::Ok,
+        (true, Some(_)) => SeclogonState::Disabled,
+        (true, None) => SeclogonState::CannotRead,
+    }
+}
+
+/// Whether a failed logon call is the Secondary Logon service being unusable:
+/// the probe says so, or the call failed with `ERROR_SERVICE_DISABLED` (which
+/// any service on the logon path can cause) and the probe did not read it `Ok`.
+fn logon_failure_is_seclogon(service_disabled_error: bool, state: SeclogonState) -> bool {
+    match state {
+        SeclogonState::Disabled | SeclogonState::Missing => true,
+        SeclogonState::Ok => false,
+        SeclogonState::CannotRead => service_disabled_error,
     }
 }
 
@@ -183,12 +184,8 @@ impl Drop for ScHandle {
     }
 }
 
-/// Read-only probe of the Secondary Logon service. Opens the SCM
-/// with `SC_MANAGER_CONNECT` and the service with
-/// `SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS` — rights the stock
-/// service DACL grants every interactive user, so this works from
-/// the non-elevated broker. Never starts, stops, or reconfigures
-/// the service. Infallible: any failure to read is
+/// Read-only probe of the Secondary Logon service, using rights the stock
+/// service DACL grants every interactive user. Any failure to read is
 /// [`SeclogonState::CannotRead`].
 pub fn seclogon_state() -> SeclogonState {
     let Ok(scm) = (unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) })
@@ -209,9 +206,8 @@ pub fn seclogon_state() -> SeclogonState {
         }
         Err(_) => return SeclogonState::CannotRead,
     };
-    // `QUERY_SERVICE_CONFIGW` is variable-length (the strings trail
-    // the struct); the documented maximum is 8K bytes. `u64`
-    // elements keep the buffer aligned for the struct's pointers.
+    // Variable-length struct, documented maximum 8K bytes. `u64` elements
+    // keep the buffer aligned for the struct's pointers.
     let mut buf = [0u64; 1024];
     let mut needed = 0u32;
     if unsafe {
@@ -227,8 +223,7 @@ pub fn seclogon_state() -> SeclogonState {
         return SeclogonState::CannotRead;
     }
     let start = unsafe { (*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType };
-    // A failed status query leaves `current` unknown; the start
-    // type alone then decides.
+    // A failed status query leaves the start type alone to decide.
     let mut st = SERVICE_STATUS::default();
     let current = unsafe { QueryServiceStatus(svc.0, &mut st) }
         .ok()
@@ -236,21 +231,15 @@ pub fn seclogon_state() -> SeclogonState {
     classify_seclogon(start, current)
 }
 
-/// Typed error for [`spawn_runner`] when the Secondary Logon
-/// service cannot be used: its start type is Disabled (`missing ==
-/// false`) or it is not registered at all (`missing == true`).
-/// `CreateProcessWithLogonW` then fails before the runner exists —
-/// an environment condition only an administrator can change, not
-/// a security block — typed so callers can present an actionable
-/// message instead of a bare HRESULT.
+/// Typed error for [`spawn_runner`]: the Secondary Logon service is Disabled
+/// (`missing == false`) or not registered (`missing == true`).
 #[derive(Debug)]
 pub struct SeclogonDisabled {
     pub missing: bool,
 }
 
 impl SeclogonDisabled {
-    /// The [`SeclogonState`] this error corresponds to — the same
-    /// value `srt-win status` reports in its `seclogon` field.
+    /// The [`SeclogonState`] this error corresponds to.
     pub fn state(&self) -> SeclogonState {
         if self.missing {
             SeclogonState::Missing
@@ -592,15 +581,8 @@ pub fn spawn_runner(
                 .unwrap_or_else(|| "<unknown>".into());
             return Err(MappedDriveCwd { drive }.into());
         }
-        // `ERROR_SERVICE_DISABLED` = the SCM refused to demand-start
-        // seclogon. The read-only probe is consulted as well so the
-        // typed error does not hinge on which code a given Windows
-        // build surfaces for a disabled or absent service: a failed
-        // launch with seclogon unusable has that as its cause.
         let state = seclogon_state();
-        if e.code() == ERROR_SERVICE_DISABLED.to_hresult()
-            || matches!(state, SeclogonState::Disabled | SeclogonState::Missing)
-        {
+        if logon_failure_is_seclogon(e.code() == ERROR_SERVICE_DISABLED.to_hresult(), state) {
             return Err(SeclogonDisabled {
                 missing: state == SeclogonState::Missing,
             }
@@ -919,19 +901,33 @@ mod tests {
     #[test]
     fn seclogon_disabled_only_when_not_running() {
         use SeclogonState as S;
-        // Manual + stopped is the stock configuration: the launch
-        // demand-starts it.
         let stopped = Some(SERVICE_STOPPED);
         let running = Some(SERVICE_RUNNING);
         assert_eq!(classify_seclogon(SERVICE_DEMAND_START, stopped), S::Ok);
         assert_eq!(classify_seclogon(SERVICE_AUTO_START, running), S::Ok);
         assert_eq!(classify_seclogon(SERVICE_DISABLED, stopped), S::Disabled);
-        // Status unreadable → the start type decides.
-        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::Disabled);
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::CannotRead);
         assert_eq!(classify_seclogon(SERVICE_DEMAND_START, None), S::Ok);
-        // Disabled after it was started: still launches until the
-        // service stops.
+        // Disabled after it was started: still launches until the service stops.
         assert_eq!(classify_seclogon(SERVICE_DISABLED, running), S::Ok);
+    }
+
+    #[test]
+    fn logon_failure_is_seclogon_only_when_the_probe_agrees() {
+        use SeclogonState as S;
+        for service_disabled_error in [true, false] {
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Disabled
+            ));
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Missing
+            ));
+            assert!(!logon_failure_is_seclogon(service_disabled_error, S::Ok));
+        }
+        assert!(logon_failure_is_seclogon(true, S::CannotRead));
+        assert!(!logon_failure_is_seclogon(false, S::CannotRead));
     }
 
     #[test]

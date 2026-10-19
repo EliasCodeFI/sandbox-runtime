@@ -2750,10 +2750,8 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(missing.errors.length).toBe(1)
     expect(missing.errors[0]).toMatch(/Secondary Logon service.*not present/)
 
-    const cannotRead = await run('cannot-read')
-    expect(cannotRead.errors).toEqual([])
-    expect(cannotRead.warnings.length).toBe(1)
-    expect(cannotRead.warnings[0]).toMatch(/Secondary Logon/)
+    // Unreadable proves nothing: the launch itself is the ground truth.
+    expect(await run('cannot-read')).toEqual({ errors: [], warnings: [] })
 
     expect(await run('ok')).toEqual({ errors: [], warnings: [] })
     // Field absent: an srt-win built before the probe existed.
@@ -2775,9 +2773,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect('seclogon' in getWindowsSandboxUserStatus({ srtWin })).toBe(false)
   })
 
-  // srt-win's typed launch failure: exit 18 + one JSON line on
-  // stderr, empty stdout. `stubSpawn` has no stderr, so these stub
-  // spawnSync / spawn directly.
+  // `stubSpawn` has no stderr, so these stub spawnSync / spawn directly.
   const SECLOGON_STDERR =
     'srt-win: launching runner\n' +
     '{"code":"seclogon_disabled","state":"disabled","message":"the sandbox cannot start: the Windows Secondary Logon service (seclogon) is disabled."}'
@@ -2792,8 +2788,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       })) as any,
     )
     spawnSpy = spyOn(child_process, 'spawn').mockImplementation((() => {
-      // Close on a timer so the stderr chunk (next tick of the
-      // check phase) lands first.
+      // Close on a timer so the stderr chunk lands first.
       const child = mkFakeChild('', status, 5)
       setImmediate(() => child.stderr.emit('data', stderr))
       return child
@@ -2825,9 +2820,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     spawnSyncSpy.mockRestore()
     spawnSpy.mockRestore()
 
-    // The exit code gates the parse: the same line under any other
-    // status, or exit 18 without the line, stays the generic
-    // failure. Every shape still throws (fail closed).
+    // The exit code gates the parse; every shape still throws.
     stubSpawnResult(1, SECLOGON_STDERR)
     expect((await thrownBy(verify)).code).toBe('wfp_verify_unparseable')
     spawnSyncSpy.mockRestore()
