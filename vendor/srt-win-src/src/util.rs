@@ -72,6 +72,33 @@ fn snapshot_has_entry(step: windows::core::Result<()>) -> anyhow::Result<bool> {
     }
 }
 
+/// The parent process ID recorded for `pid`; `None` when not in the snapshot.
+#[cfg(feature = "test-hooks")]
+pub fn parent_pid_of(pid: u32) -> anyhow::Result<Option<u32>> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = OwnedHandle(
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                .map_err(|e| anyhow::anyhow!("CreateToolhelp32Snapshot(processes): {e}"))?,
+        );
+        let mut pe = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snap.raw(), &mut pe).is_ok();
+        while more {
+            if pe.th32ProcessID == pid {
+                return Ok(Some(pe.th32ParentProcessID));
+            }
+            more = Process32NextW(snap.raw(), &mut pe).is_ok();
+        }
+    }
+    Ok(None)
+}
+
 /// UTF-8 → NUL-terminated UTF-16 buffer. Keep the returned `Vec`
 /// alive for as long as the resulting `PCWSTR` / `PWSTR` is in use.
 pub fn wstr(s: &str) -> Vec<u16> {

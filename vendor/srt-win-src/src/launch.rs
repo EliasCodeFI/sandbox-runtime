@@ -125,10 +125,16 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// passed through under one name each — so the broker's `PATH` + proxy vars
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
+///
+/// `write_restricted` selects the child's token. The runner's process and
+/// thread self-protect must succeed either way, because the runner's own
+/// token is never the child's restricted one.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
     env_overlay: &[(String, String)],
+    write_restricted: bool,
+    capability_sids: &[String],
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -146,8 +152,10 @@ pub fn run_lockdown(
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    let restricted =
-        OwnedHandle(token::make_sandbox_token(self_tok.raw()).context("make_sandbox_token")?);
+    let restricted = OwnedHandle(
+        token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
+            .context("make_sandbox_token")?,
+    );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
 
     // 3) Job. `breakaway_ok = false` — this is the load-bearing
