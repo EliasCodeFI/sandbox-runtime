@@ -1678,17 +1678,9 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   })
 })
 
-// ════════════════════════════════════════════════════════════════════
-// Release ordering — no deny restore unless the revoke completed
-// (pure, all platforms)
-// ════════════════════════════════════════════════════════════════════
-// These drive the real SandboxManager with the platform pinned to
-// Windows and both child_process entry points stubbed.
-
 describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
-  // For direct helper calls; spawnSync is stubbed, so any existing
-  // file does.
+  // spawnSync is stubbed, so any existing file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
   const RAW_USER = {
     user: {
@@ -1745,8 +1737,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     }),
   }
   type Revoke = [how: string, result: () => SyncResult]
-  // A revoke that exits 0 and lists one released path plus `path`
-  // with `status`.
   const reports = (status: string, path = 'p'): SyncResult =>
     exit(
       0,
@@ -1755,28 +1745,23 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         { path, status },
       ]),
     )
-  // The ways a revoke does not complete. (Thunks: `dir` exists only
-  // inside a test.)
+  // Thunks: `dir` exists only inside a test.
   const INCOMPLETE_REVOKES: Revoke[] = [
-    // Partial: srt-win lists the paths it did revoke and exits 1.
     ['exits non-zero', () => exit(1, '[{"path":"p","status":"revoked"}]')],
     ['times out', () => TIMED_OUT],
     ['prints unparseable output', () => exit(0, 'not json')],
     ['prints JSON that is not a list', () => exit(0, '{}')],
     ['lists an outcome with no status', () => exit(0, '[{"path":"p"}]')],
-    // Statuses outside the allow-list — the last one is a status this
-    // code has never heard of.
+    // The last status is one this code has never heard of.
     ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
       (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
     ),
-    // What an srt-win without "unreadable" says about a path it could
-    // not open.
+    // What an older srt-win says about a path it could not open.
     [
       'reports "missing" for a path that still exists',
       () => reports('missing', dir),
     ],
   ]
-  // The ways it does.
   const COMPLETE_REVOKES: Revoke[] = [
     ['releases nothing', () => exit(0, '[]')],
     ...['revoked', 'stillHeld', 'downgraded', 'relocated', 'noRow'].map(
@@ -1803,13 +1788,11 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      // The WFP probe binds a listener and is once-per-process; it is
-      // not what these tests are about.
+      // The WFP probe binds a listener and is once-per-process.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize().
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -1836,7 +1819,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         return child
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Sync spawns: every `acl` call.
       spyOn(child_process, 'spawnSync').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -1858,8 +1840,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
-  // external so initialize() binds nothing.
   const config = (): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -1897,11 +1877,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     return h[0] as () => unknown
   }
 
-  /**
-   * The listener registerCleanup() put on 'exit'. It is a function of
-   * its own, which starts with the handler the signals get and then
-   * removes what reset() only reaches after its first await.
-   */
+  /** The listener registerCleanup() put on 'exit'. */
   const exitListener = (): (() => unknown) => {
     const h = (process.listeners('exit') as unknown[]).filter(l =>
       /\bcleanupHandler\(\)/.test(String(l)),
@@ -1930,7 +1906,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     it(`initialize() failure cleanup: revoke ${how} → restore is not spawned`, async () => {
       aclResult.revoke = result()
       const e = await failingInitialize()
-      // Still rejects with the original failure.
       expect(e.code).toBe('acl_stamp_failed')
       expect(aclCalls).toEqual(NO_RESTORE)
       expect(SandboxManager.getConfig()).toBeUndefined()
@@ -1975,9 +1950,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     }
   }
 
-  // Once a revoke was incomplete, a later revoke that finds nothing
-  // wrong must not unlock the restore: the grant the first one left
-  // may no longer be recorded anywhere.
   describe('after one incomplete revoke in this process', () => {
     beforeEach(async () => {
       await SandboxManager.initialize(config())
