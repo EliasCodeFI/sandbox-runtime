@@ -52,12 +52,8 @@ pub enum RunnerCmd {
     /// (same as [`InstallCa`](Self::InstallCa)); the WFP filter
     /// keys on the user SID, which the runner already carries.
     ///
-    /// This is the probe for the **default** child token. With the
-    /// write-restricted token the child's token differs from the
-    /// runner's in a way the filter's access check can see, so `wfp
-    /// verify --write-restricted-token` does not use this command: it
-    /// sends an [`Exec`](Self::Exec) of `srt-win probe connect`, so
-    /// the connect is made by a process holding the child token.
+    /// Probes the **default** child token only; the write-restricted
+    /// verify sends an [`Exec`](Self::Exec) of `srt-win probe connect`.
     ProbeEgress { target: String },
 }
 
@@ -73,16 +69,12 @@ pub struct RunnerSpec {
     /// sandbox user's machine-only `PATH` while `USERPROFILE` /
     /// `TEMP` stay isolated. The proxy var set rides here too.
     pub env_overlay: Vec<(String, String)>,
-    /// Build the child token write-restricted (`srt-win exec
-    /// --write-restricted-token`; see [`crate::token`]). Off unless
-    /// the broker asks for it.
+    /// Build the child token write-restricted (see [`crate::token`]).
     #[serde(default)]
     pub write_restricted_token: bool,
-    /// Capability SIDs of the write roots this command's session was
-    /// given (`crate::persist`), looked up by the broker; they join
-    /// the child token's restricting SIDs. Only with
-    /// `write_restricted_token`; the runner accepts nothing here that
-    /// is not a capability SID.
+    /// Capability SIDs of the session's write roots (`crate::persist`),
+    /// added to the child token's restricting SIDs. Only with
+    /// `write_restricted_token`.
     #[serde(default)]
     pub capability_sids: Vec<String>,
 }

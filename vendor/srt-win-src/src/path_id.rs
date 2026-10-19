@@ -633,10 +633,9 @@ fn local_volume_roots() -> Vec<String> {
     out
 }
 
-/// A handle on the root of the volume with this serial number, if it
-/// is present and can be opened: looked for among the volumes of this
-/// machine and, unless `local_only`, the drive letters mapped to
-/// network shares (opening one of those contacts its server).
+/// A handle on the root of the volume with this serial, if present:
+/// among this machine's volumes and, unless `local_only`, drive letters
+/// mapped to shares (opening one of those contacts its server).
 fn open_volume(volume_serial: u64, local_only: bool) -> Option<OwnedHandle> {
     let remote = (b'A'..=b'Z')
         .map(|drive| format!(r"{}:\", drive as char))
@@ -651,25 +650,16 @@ fn open_volume(volume_serial: u64, local_only: bool) -> Option<OwnedHandle> {
         })
 }
 
-/// Whether the volume with this serial number is present on this
-/// machine now and can be opened — by a drive letter, at a folder, or
-/// with no mount point at all. A drive whose media is out, a locked
+/// Whether the volume with this serial is present on this machine and
+/// can be opened, mounted or not. A drive whose media is out, a locked
 /// encrypted volume and a network share are not.
 pub fn volume_mounted(volume_serial: u64) -> bool {
     open_volume(volume_serial, true).is_some()
 }
 
-/// Locate the CURRENT path of a file by its captured
-/// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
-/// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`.
-///
-/// [`Located::Gone`] is returned only when the volume itself answered
-/// that the id names no file (`ERROR_FILE_NOT_FOUND`, or
-/// `ERROR_INVALID_PARAMETER`, which is how NTFS rejects a stale file
-/// reference). Every other failure is [`Located::Unknown`]: a caller
-/// that is about to forget an ACE must not read "could not look" as
-/// "nothing there".
+/// Locate the current path of a file by `(volume_serial, file_id)`.
+/// [`Located::Gone`] only when the volume answered that the id names
+/// no file; every other failure is [`Located::Unknown`].
 pub fn locate_by_file_id(file_id: &FileId) -> Located {
     locate_on(file_id, false)
 }

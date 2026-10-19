@@ -60,10 +60,7 @@ if (-not (Test-Path $Exe)) {
 # (smoke-exec) / A-row (smoke-aces) / H-row (winsrt.test.ts) threw
 # mid-section before its `finally` ran.
 & $Exe acl recover --force
-# Write grants kept between sessions (smoke-write-restricted.ps1, the
-# winsrt.test.ts writeRestrictedToken rows): while one is recorded,
-# `srt-win exec` without --write-restricted-token is refused. Before
-# the uninstall below, which removes the group the grants name.
+# Before the uninstall below, which removes the group the kept write grants name.
 & $Exe acl forget --all
 # A profile read grant (smoke-profile-read.ps1, on its made-up profile
 # tree): the same refusal while one is recorded, and the same order.
@@ -75,15 +72,13 @@ if (-not (Test-Path $Exe)) {
 # smoke-write-restricted.ps1's scratch tree at the system-drive root.
 Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-wr-smoke-*' |
   Remove-Item -Recurse -Force
-# smoke-profile-read.ps1's scratch tree. Its junctions are removed as
-# links first, so nothing is deleted through them.
+# smoke-profile-read.ps1's scratch tree; junctions go first, as links.
 Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-pr-smoke-*' | ForEach-Object {
   Get-ChildItem $_.FullName -Recurse -Force -Attributes ReparsePoint |
     ForEach-Object { $_.Delete() }
   Remove-Item $_.FullName -Recurse -Force
 }
-# The record of write grants kept between sessions, if `acl forget
-# --all` above could not clear it.
+# The record of kept write grants, if `acl forget --all` above could not clear it.
 Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue

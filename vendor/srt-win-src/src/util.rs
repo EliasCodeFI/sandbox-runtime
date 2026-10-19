@@ -60,9 +60,7 @@ pub fn thread_ids_of(pid: u32) -> anyhow::Result<Vec<u32>> {
     Ok(out)
 }
 
-/// The parent process ID recorded for `pid`, from a Toolhelp
-/// snapshot. `None` when `pid` is not in the snapshot. Used only by
-/// the `test-hooks` parent-access probe.
+/// The parent process ID recorded for `pid`; `None` when not in the snapshot.
 #[cfg(feature = "test-hooks")]
 pub fn parent_pid_of(pid: u32) -> anyhow::Result<Option<u32>> {
     use windows::Win32::System::Diagnostics::ToolHelp::{

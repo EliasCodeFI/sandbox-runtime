@@ -19,20 +19,9 @@ use anyhow::{Context, Result, anyhow};
 use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
-/// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row, when `install` gains a step existing installs must pick
-/// up (v2: ambient write-deny stamps — `ambient.rs`), or when a
-/// broker built with the previous value must stop launching on a
-/// machine this one has set up (v3: write grants kept between
-/// sessions — `persist.rs`; such a grant lets the sandbox group write
-/// its root, which is safe only under the write-restricted token a
-/// v2 broker does not build). The broker compares this to the
-/// on-disk marker and refuses with a "re-run `srt-win install`"
-/// message on mismatch ([`check_marker`]) — in both directions: an
-/// older broker refuses a newer install, and this one refuses an
-/// older install, so it makes no kept grant where an older broker can
-/// still launch. `install` treats a marker of another version as an
-/// install to complete, and rewrites it.
+/// Bumped when the `sandbox_user` row changes, when `install` gains a
+/// step (v2: ambient stamps), or when an older broker must stop
+/// launching here (v3: kept write grants). See [`check_marker`].
 pub const SETUP_VERSION: u32 = 3;
 
 /// `Err` unless `marker_version` is the one this build was made with.
@@ -48,8 +37,7 @@ pub fn check_marker(marker_version: u32) -> Result<()> {
 }
 
 /// The install record, only if its marker is this build's
-/// ([`check_marker`]). What must hold before the sandbox account is
-/// launched or a grant is made that outlives the session.
+/// ([`check_marker`]): required before launching or keeping a grant.
 pub fn require_current_setup() -> Result<SetupInfo> {
     let info = read_setup()?.ok_or_else(|| {
         anyhow!(

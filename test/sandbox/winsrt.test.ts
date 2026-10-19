@@ -164,11 +164,7 @@ const NODE = sandboxReachable('node')
 const PYTHON = sandboxReachable('python')
 const CARGO = sandboxReachable('cargo')
 
-/**
- * Whether the `curl` Git Bash runs has an OpenSSL backend. On ARM64
- * the bundled build is Schannel only, which cannot complete a TLS
- * handshake under the default (write-restricted) child token.
- */
+/** Whether Git Bash's `curl` is OpenSSL (on ARM64 it is Schannel only). */
 const GIT_BASH_CURL_HAS_OPENSSL =
   isWindows &&
   existsSync(GIT_BASH) &&
@@ -182,14 +178,7 @@ const GIT_BASH_CURL_HAS_OPENSSL =
 /** System32 `curl.exe`: the Schannel build that ships with Windows. */
 const SYSTEM32_CURL = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
 
-/**
- * `node -e` source that requests `https://<host>/` through the
- * session's proxy and prints `STATUS:<code>`; exit 0 on 200. Node's
- * own clients do not read the proxy variables, so the tunnel is made
- * by hand: a CONNECT to the proxy named by `HTTPS_PROXY` (with its
- * token), then `https.get` over that socket. Node brings its own TLS
- * stack (OpenSSL), so this works under either child token.
- */
+/** `node -e` source: GET `https://<host>/` via a hand-made proxy CONNECT. */
 function nodeGetThroughProxy(host: string): string {
   return [
     `const u=new URL(process.env.HTTPS_PROXY);`,
@@ -209,18 +198,10 @@ function nodeGetThroughProxy(host: string): string {
   ].join('')
 }
 
-/**
- * Whether the runner has a client with its own TLS stack that the
- * sandbox account can launch: an OpenSSL curl, or node.
- */
+/** Whether the sandbox account can launch a client with its own TLS stack. */
 const HAS_OWN_TLS_CLIENT = OPENSSL_CURL !== undefined || NODE !== undefined
 
-/**
- * A sandboxed command that requests `https://<host>/` through the
- * proxy with such a client — the kind that works under the default
- * child token, where Schannel does not. Its output ends in `200` on
- * success ({@link got200}).
- */
+/** A sandboxed HTTPS request through the proxy with such a client. */
 function ownTlsGet(host: string): string {
   return OPENSSL_CURL !== undefined
     ? `"${OPENSSL_CURL}" -sS -m 15 -o NUL -w "%{http_code}" https://${host}/`
@@ -229,12 +210,7 @@ function ownTlsGet(host: string): string {
 const got200 = (r: { stdout: string }): boolean =>
   /(?:^|STATUS:)200$/.test(r.stdout.trim())
 
-/**
- * `cfg` with `windows.writeRestrictedToken: false`: a session under
- * the ordinary child token, with per-session grants. For the rows
- * that are about that token — Schannel clients, and the per-session
- * grant / revoke plumbing.
- */
+/** `cfg` with `windows.writeRestrictedToken: false` (the ordinary token). */
 function onOrdinaryToken(cfg: SandboxRuntimeConfig): SandboxRuntimeConfig {
   return { ...cfg, windows: { ...cfg.windows, writeRestrictedToken: false } }
 }
@@ -637,9 +613,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       writeRestrictedToken: false,
       srtWin,
     })
-    // Everything between the fixed head and `--`, with the --env
-    // values (which follow the host's PATH and the generated proxy
-    // set) reduced to their names.
+    // The --env values are reduced to their names.
     const dashes = argv.indexOf('--')
     const flags = argv
       .slice(0, dashes)
@@ -656,8 +630,6 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       'C:\\work\\repo\\.git\\hooks',
     ])
     expect(argv.slice(dashes)).toEqual(['--', 'C:\\sh.exe', '-c', 'git fetch'])
-    // No token flag, no write root, no git backend entry: two
-    // safe.directory entries and the two schannel knobs.
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
     expect(envArgs).toContain('GIT_CONFIG_COUNT=4')
     expect(envArgs.join(' ')).not.toContain('http.sslBackend')
@@ -679,16 +651,13 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       writeRestrictedToken: false,
     })
     const on = wrapCommandWithSandboxWindows(base)
-    // An srt-win option, so it must sit before `--`: after it the
-    // flag would be handed to the sandboxed command instead.
+    // Before `--`: after it the flag goes to the sandboxed command.
     const flagAt = on.argv.indexOf('--write-restricted-token')
     expect(flagAt).toBeGreaterThan(on.argv.indexOf('exec'))
     expect(flagAt).toBeLessThan(on.argv.indexOf('--'))
     expect(on.argv.filter(a => a === '--write-restricted-token')).toHaveLength(
       1,
     )
-    // The only differences from the ordinary-token argv: the flag, one
-    // more git config entry, and the count that covers it.
     const added = on.argv.filter(a => !off.argv.includes(a))
     expect(added.sort()).toEqual(
       [
@@ -724,8 +693,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       '--write-root',
       roots[1],
     ])
-    // srt-win options: before `--`, and the per-exec denies are
-    // still there, unchanged.
+    // srt-win options sit before `--`; the per-exec denies are unchanged.
     expect(at + 5).toBeLessThanOrEqual(on.argv.indexOf('--deny-write'))
     expect(on.argv.indexOf('--deny-write')).toBeLessThan(on.argv.indexOf('--'))
     // Nothing else changes.
@@ -895,8 +863,7 @@ describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
 
 describe('WindowsConfigSchema.writeRestrictedToken (pure, all platforms)', () => {
   it('is an optional boolean; unset means on, only false turns it off', () => {
-    // Left unset by the schema: the default is applied where the
-    // option is read, by one function.
+    // Left unset by the schema: the default is applied where it is read.
     const none = WindowsConfigSchema.parse({})
     expect(none.writeRestrictedToken).toBeUndefined()
     const enabled = winUtils.windowsWriteRestrictedTokenEnabled
@@ -995,7 +962,6 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     // Appended last, so every earlier entry keeps its index.
     expect(values(on)).toEqual([...values(off), 'http.sslBackend=openssl'])
     expect(on.GIT_CONFIG_COUNT).toBe(String(Number(off.GIT_CONFIG_COUNT) + 1))
-    // On its own (no safe dirs, no schannel knobs) it is still emitted.
     expect(buildGitConfigEnv({ safeDirs: [], opensslBackend: true })).toEqual({
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'http.sslBackend',
@@ -1021,9 +987,7 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
       srtWin,
     })
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    // safe.directory (dir + dir/*) for cwd + each allowWrite entry,
-    // the two schannel knobs (schannelCa keyed on caCertPath), then
-    // the OpenSSL backend the default child token needs.
+    // safe.directory entries, the schannel knobs, then the OpenSSL backend.
     expect(envArgs).toContain('GIT_CONFIG_COUNT=7')
     expect(envArgs).toContain('GIT_CONFIG_KEY_6=http.sslBackend')
     expect(envArgs).toContain('GIT_CONFIG_VALUE_6=openssl')
@@ -1046,9 +1010,7 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
       srtWin,
     })
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    // cwd (dir + dir/*) + gitSafeDirectories (dir + dir/*), no schannel
-    // knobs (no caCertPath), and the OpenSSL backend entry. The repo
-    // top-level reaches safe.directory without appearing in allowWrite.
+    // No schannel knobs (no caCertPath), and the OpenSSL backend entry.
     expect(envArgs).toContain('GIT_CONFIG_COUNT=5')
     expect(envArgs).toContain('GIT_CONFIG_KEY_4=http.sslBackend')
     expect(envArgs).toContain('GIT_CONFIG_KEY_0=safe.directory')
@@ -1340,13 +1302,7 @@ describe('rankWindowsFsAccess (pure, all platforms)', () => {
   })
 })
 
-// The manager's Windows path with the helper calls recorded, not made. Not on
-// Windows: the L-rows below make them there, and initialize() under a stub
-// would use up the one egress check a process makes.
-// Run once per child-token mode. The lists are ranked the same way in
-// both; what differs is the call that carries them: one `acl grant
-// --persistent` by default, a grant and a stamp with
-// `windows.writeRestrictedToken: false`.
+// Run once per child-token mode; not on Windows, where the L-rows make the calls.
 function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
   const spies: Array<ReturnType<typeof spyOn>> = []
   let granted: Pick<WindowsAclGrantOptions, 'read' | 'write'> | undefined
@@ -1447,9 +1403,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         expect(writeRestrictedToken).toBe(false)
         stamped = o
       }),
-      // The default: one call with all four lists. Recorded as the
-      // grant and the stamp it stands for, each only when it has
-      // something in it, as the two separate calls are made.
+      // One call with all four lists, recorded as the grant and stamp it stands for.
       spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(
         async o => {
           expect(writeRestrictedToken).toBeUndefined()
@@ -1864,8 +1818,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       denyRead: opts.denyRead,
       denyWrite: opts.denyWrite,
     })
-    // 2 = an input was skipped; 1 = a capability SID, a DACL read or
-    // a DACL write failed. Neither is a session.
+    // 2 = an input was skipped; 1 = a capability SID or DACL step failed.
     for (const status of [1, 2]) {
       spawnSyncSpy.mockRestore()
       spawnSpy.mockRestore()
@@ -1971,9 +1924,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
-    // 3 = the probe child connected (fence open for this token);
-    // 2 = unreachable; 1 = the probe child could not be created
-    // (e.g. the restricted token could not be built) → `error`.
+    // 3 = connected, 2 = unreachable, 1 = no probe child was created.
     for (const [status, probe, code] of [
       [3, 'connected', 'wfp_fence_inactive'],
       [2, 'unreachable', 'wfp_verify_inconclusive'],
@@ -2281,8 +2232,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(sync.errors[0]).not.toMatch(/not provisioned|one-time install/i)
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // The same version on both sides, and an srt-win that reports
-    // none: no error.
     for (const versions of [{ marker_version: 3, setup_version: 3 }, {}]) {
       const ok = JSON.stringify({ ...JSON.parse(RAW_USER), ...versions })
       stubSpawn(argv => ({
@@ -2312,18 +2261,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(maxInFlight).toBe(2)
   })
 })
-
-// ════════════════════════════════════════════════════════════════════
-// Release ordering — no deny restore unless the revoke completed
-// (pure, all platforms)
-// ════════════════════════════════════════════════════════════════════
-// Revoke takes the session's ALLOW grants off, restore takes its DENY
-// stamps off. Running the restore after a revoke that failed, timed
-// out, was only partial or reported a grant it could not release
-// would leave a grant on disk with the stamps gone — and once that
-// has happened, no later revoke in the process unlocks the restore.
-// These drive the real SandboxManager with the platform pinned to
-// Windows and both child_process entry points stubbed.
 
 describe('Windows write-restricted token, the default: write roots are granted once and kept (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
@@ -2469,8 +2406,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Write root `dir`, deny on `dir/secret`; both proxy ports external
-  // so initialize() binds nothing.
   const config = (writeRestrictedToken?: boolean): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -2516,8 +2451,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
       expect(stdin.denyRead).toHaveLength(1)
       expect(stdin.read).toEqual([])
       expect(stdin.denyWrite).toEqual([])
-      // The probe runs after the grant (the capability SIDs exist only
-      // then), under the token the commands get.
+      // The probe runs after the grant: the capability SIDs exist only then.
       expect(verifyCalls).toHaveLength(1)
       expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
       expect(verifyCalls[0]?.writeRoots).toEqual(stdin.write)
@@ -2591,8 +2525,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
         aclResult.grant = exit(status)
         const e = await rejection(config(opt))
         expect(e.code).toBe('acl_grant_failed')
-        // One grant attempt, then only the release of whatever was
-        // per-session.
         expect(subs().filter(s => s === 'grant')).toHaveLength(1)
         expect(subs()).not.toContain('stamp')
         expect(acl[0].argv).toContain('--persistent')
@@ -2681,8 +2613,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
       const granted = acl[0].stdin as Record<string, string[]>
       expect(Object.keys(granted).sort()).toEqual(['read', 'write'])
       expect(granted.write).toHaveLength(1)
-      // The fence is probed once per process for this token; whenever
-      // it is, it is with the ordinary token and no roots.
       for (const v of verifyCalls) {
         expect(v?.writeRestrictedToken).toBe(false)
         expect(v?.writeRoots).toBeUndefined()
@@ -2707,9 +2637,8 @@ describe('Windows write-restricted token, the default: write roots are granted o
       const dashes = argv.indexOf('--')
       expect(argv.slice(dashes)).toEqual(['--', 'C:\\sh.exe', '-c', 'echo x'])
       const between = argv.slice(6, dashes)
-      expect(between.filter((_, i) => i % 2 === 0)).toEqual(
-        between.filter((_, i) => i % 2 === 0).map(() => '--env'),
-      )
+      const flagSlots = between.filter((_, i) => i % 2 === 0)
+      expect(flagSlots).toEqual(flagSlots.map(() => '--env'))
       expect(argv.join(' ')).not.toContain('http.sslBackend')
       expect(argv).not.toContain('--write-restricted-token')
       expect(argv).not.toContain('--write-root')
@@ -2767,9 +2696,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
     })
   }
 
-  // An install made by a release with another setup version: srt-win
-  // would refuse to launch on it, so nothing may be granted — least of
-  // all a grant that is kept.
   for (const [mode, opt] of [...ON, ['option false', false]] as [
     string,
     boolean | undefined,
@@ -2787,8 +2713,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
       }
       // The dependency check reports it first.
       stale(await rejection(config(opt)))
-      // And initialize() holds on its own reading of the install, should
-      // the dependency check have seen another.
+      // initialize() holds on its own reading of the install too.
       const deps = spyOn(
         winUtils,
         'checkWindowsDependenciesAsync',
@@ -2816,10 +2741,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
   })
 })
 
-// Run once per child-token mode: the release at the end of a session
-// is the same revoke-then-restore in both. By default the session
-// starts with one `acl grant --persistent`; with
-// `windows.writeRestrictedToken: false`, with a grant and a stamp.
+// Run once per child-token mode: the release is the same in both.
 function restoreGatedOnACompletedRevoke(
   writeRestrictedToken: false | undefined,
 ): void {
@@ -2830,8 +2752,7 @@ function restoreGatedOnACompletedRevoke(
   const LAST_START_CALL = perSession ? 'stamp' : 'grant'
   const START_FAILED = perSession ? 'acl_stamp_failed' : 'acl_grant_failed'
   const SID = 'S-1-5-21-1'
-  // For direct helper calls; spawnSync is stubbed, so any existing
-  // file does.
+  // spawnSync is stubbed, so any existing file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
   const RAW_USER = {
     user: {
@@ -2891,8 +2812,6 @@ function restoreGatedOnACompletedRevoke(
     }),
   }
   type Revoke = [how: string, result: () => SyncResult]
-  // A revoke that exits 0 and lists one released path plus `path`
-  // with `status`.
   const reports = (status: string, path = 'p'): SyncResult =>
     exit(
       0,
@@ -2901,28 +2820,23 @@ function restoreGatedOnACompletedRevoke(
         { path, status },
       ]),
     )
-  // The ways a revoke does not complete. (Thunks: `dir` exists only
-  // inside a test.)
+  // Thunks: `dir` exists only inside a test.
   const INCOMPLETE_REVOKES: Revoke[] = [
-    // Partial: srt-win lists the paths it did revoke and exits 1.
     ['exits non-zero', () => exit(1, '[{"path":"p","status":"revoked"}]')],
     ['times out', () => TIMED_OUT],
     ['prints unparseable output', () => exit(0, 'not json')],
     ['prints JSON that is not a list', () => exit(0, '{}')],
     ['lists an outcome with no status', () => exit(0, '[{"path":"p"}]')],
-    // Statuses outside the allow-list — the last one is a status this
-    // code has never heard of.
+    // The last status is one this code has never heard of.
     ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
       (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
     ),
-    // What an srt-win without "unreadable" says about a path it could
-    // not open.
+    // What an older srt-win says about a path it could not open.
     [
       'reports "missing" for a path that still exists',
       () => reports('missing', dir),
     ],
   ]
-  // The ways it does.
   const COMPLETE_REVOKES: Revoke[] = [
     ['releases nothing', () => exit(0, '[]')],
     ...['revoked', 'stillHeld', 'downgraded', 'relocated', 'noRow'].map(
@@ -2949,14 +2863,11 @@ function restoreGatedOnACompletedRevoke(
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      // The WFP probe binds a listener and is once-per-process; it is
-      // not what these tests are about.
+      // The WFP probe binds a listener and is once-per-process.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize(), and
-      // the calls that can walk a tree, answered as the sync ones.
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -2984,7 +2895,6 @@ function restoreGatedOnACompletedRevoke(
         return child
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Sync spawns: every `acl` call.
       spyOn(child_process, 'spawnSync').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -3006,8 +2916,6 @@ function restoreGatedOnACompletedRevoke(
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
-  // external so initialize() binds nothing.
   const config = (): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -3048,11 +2956,7 @@ function restoreGatedOnACompletedRevoke(
     return h[0] as () => unknown
   }
 
-  /**
-   * The listener registerCleanup() put on 'exit'. It is a function of
-   * its own, which starts with the handler the signals get and then
-   * removes what reset() only reaches after its first await.
-   */
+  /** The listener registerCleanup() put on 'exit'. */
   const exitListener = (): (() => unknown) => {
     const h = (process.listeners('exit') as unknown[]).filter(l =>
       /\bcleanupHandler\(\)/.test(String(l)),
@@ -3126,9 +3030,6 @@ function restoreGatedOnACompletedRevoke(
     }
   }
 
-  // Once a revoke was incomplete, a later revoke that finds nothing
-  // wrong must not unlock the restore: the grant the first one left
-  // may no longer be recorded anywhere.
   describe('after one incomplete revoke in this process', () => {
     beforeEach(async () => {
       await SandboxManager.initialize(config())
@@ -3467,9 +3368,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
     })
-    // No option set. Runs `wfp verify --write-restricted-token` for
-    // real: a lockdown child holding the restricted token must be
-    // refused by the fence, or this throws.
     await SandboxManager.initialize(createTestConfig())
     try {
       const { argv, env } =
@@ -3490,8 +3388,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
-      // The session's token shape is the one the fence was verified
-      // for; a command cannot switch to the other one.
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
         SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
@@ -3501,8 +3397,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     } finally {
       await SandboxManager.reset()
     }
-    // The opt-out: the ordinary token, under which a Schannel client
-    // completes its handshake.
     await SandboxManager.initialize(onOrdinaryToken(createTestConfig()))
     try {
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
@@ -3533,8 +3427,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
     })
-    // Long-form paths: the sandbox account cannot resolve an 8.3
-    // component of the runner's profile.
+    // Long-form paths: the sandbox account cannot resolve an 8.3 component.
     const rootA = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-a-')))
     const rootB = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-b-')))
     // No option set: the default.
@@ -3564,8 +3457,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(kept()?.state).toBe('present')
       expect(kept()?.roots).toHaveLength(1)
 
-      // A session given only B: A still carries its grant, and this
-      // session cannot write there. It can read there.
+      // A session given only B cannot write A, which keeps its grant.
       await SandboxManager.initialize(withRoots([rootB]))
       expect(await write(join(rootB, 'own.txt'))).toBe(true)
       expect(await write(join(rootA, 'from-b.txt'))).toBe(false)
@@ -3573,8 +3465,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       await SandboxManager.reset()
       expect(kept()?.roots).toHaveLength(2)
 
-      // Opted out: the kept grants are removed before anything is
-      // granted, and A works as a per-session root again.
+      // Opted out: the kept grants are removed first.
       await SandboxManager.initialize(onOrdinaryToken(withRoots([rootA])))
       expect(kept()).toBeUndefined()
       expect(await write(join(rootA, 'off.txt'))).toBe(true)
@@ -3637,8 +3528,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         )
         await SandboxManager.reset()
       }
-      // srt-win holds the same line by itself: no grant is kept, and
-      // nothing is launched, under either token.
       const grant = spawnSync(
         TEST_SRT_WIN!.exe,
         [
@@ -3810,12 +3699,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   // first: the JS proxy's filter reads config.network.allowedDomains
   // live, so the allowlist changes without rebinding the proxies.
 
-  // The session runs under the default (write-restricted) child
-  // token, so the rows that must complete a TLS handshake use a client
-  // with its own TLS stack (`ownTlsGet`). System32 curl is Schannel:
-  // N1 pins that it does not get through under this token, and its
-  // working path under the ordinary token is covered by the opt-out
-  // row of the helpers describe and by the G8 / P3 rows.
+  // TLS rows use `ownTlsGet`: Schannel curl fails under the default token.
   it.skipIf(!HAS_OWN_TLS_CLIENT)(
     'B1: a client with its own TLS stack reaches an allowedDomains host → 200 via proxy',
     async () => {
@@ -3829,14 +3713,11 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   it('N1: System32 curl (Schannel) gets no response from an allowed host under the default token', async () => {
     SandboxManager.updateConfig(createTestConfig(['example.com']))
-    // The host is allowed and reachable: where there is one, a client
-    // with its own TLS stack gets its 200 from the same session first.
     if (HAS_OWN_TLS_CLIENT) {
       const ok = await runSandboxedUntil(ownTlsGet('example.com'), got200)
       expectStatus('N1 control', ok, [0])
     }
-    // Not retried, and judged on the outcome alone: curl fails and has
-    // no HTTP status to report. The error text is Windows' to choose.
+    // Not retried: curl fails with no HTTP status to report.
     const r = await runSandboxed(
       `"${SYSTEM32_CURL}" -sS -m 15 -o NUL -w "%{http_code}" https://example.com/`,
     )
@@ -3900,9 +3781,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it('C4: curl --noproxy "*" strips env → WFP still BLOCKS', async () => {
     // KEY: clearing the proxy env makes curl attempt direct egress;
     // WFP must still refuse it. Pairs with B5 as the "env-var bypass
-    // doesn't defeat WFP" proof. The refusal is of the TCP connect,
-    // which comes before any TLS handshake, so it is the fence's
-    // whichever TLS backend the curl on PATH has.
+    // doesn't defeat WFP" proof.
     SandboxManager.updateConfig(createTestConfig(['example.com']))
     const r = await runSandboxed(
       'curl --noproxy "*" -sS -m 5 https://example.com',
@@ -4029,10 +3908,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     'E1: git-bash curl to an allowed host → 200',
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
-      // HTTPS where Git Bash's curl has its own TLS stack. Where it is
-      // the Schannel build (ARM64), which the default child token
-      // leaves without a handshake, the same request over plain HTTP:
-      // the row is about the bash userland reaching the proxy.
+      // Plain HTTP where Git Bash's curl is the Schannel build (ARM64).
       const scheme = GIT_BASH_CURL_HAS_OPENSSL ? 'https' : 'http'
       console.error(`[winsrt E1] ${scheme}`)
       const r = await runSandboxedUntil(
@@ -4082,11 +3958,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     90_000,
   )
 
-  // `-O -`: the body goes to stdout, so the row does not depend on
-  // any output file. (An MSYS-runtime program handed the Win32 name
-  // `NUL` creates a FILE of that name in its working directory rather
-  // than opening the null device; the working directory is not one of
-  // this session's write roots. The Z-rows below pin the devices.)
+  // `-O -`: an MSYS program handed `NUL` creates a FILE of that name instead.
   it.skipIf(!existsSync(MSYS2_WGET))(
     'E3: msys2 wget to an allowed host → 200',
     async () => {
@@ -4104,17 +3976,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     90_000,
   )
 
-  // ════════════════════════════════════════════════════════════════
   // Group Z — the null device under the default child token
-  // ════════════════════════════════════════════════════════════════
-  // Discarding output must work for a command that can write nowhere:
-  // this session has no write roots and the working directory is not
-  // writable to it. Each row opens the null device for writing the way
-  // its shell or runtime does — cmd and PowerShell by the Win32 name,
-  // Git Bash and msys2 programs through the MSYS runtime's /dev/null —
-  // and must run to its last word. The same command is first run
-  // unsandboxed: a row whose command the shell itself rejects says
-  // nothing about the sandbox, and fails as such.
 
   /** Run `command` under `shell` in the sandbox; the output must be `want`. */
   async function nullDeviceRow(
@@ -4464,12 +4326,6 @@ describe.if(isWindows)(
           : 'files, default token',
         () => {
           // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
-          // The G-rows in smoke-exec.ps1 exercise the srt-win primitives
-          // directly; these check the SandboxManager plumbing on top, once
-          // per child token. By default: initialize() → one persistent grant
-          // carrying the denies → reset() → release of what was per-session,
-          // the write roots kept. With `writeRestrictedToken: false`:
-          // grant + stamp → reset() → revoke + restore.
           let hScratch: string
           let hSecret: string
           let hSibling: string
@@ -4553,9 +4409,7 @@ describe.if(isWindows)(
           }, 90_000)
 
           it('H7: no allowWrite — child has no rights on real-user file', async () => {
-            // A directory no session was ever given: under the default token
-            // H5's root keeps its grant after reset(), and a kept root is
-            // readable from any session.
+            // H5's root keeps its grant, and a kept root is readable.
             const never = mkdtempSync(join(tmpdir(), 'srt-h7-'))
             const file = join(never, 'mine.txt')
             writeFileSync(file, 'NEVER-GRANTED')
@@ -4672,9 +4526,7 @@ describe.if(isWindows)(
                     out.stdout,
                 )
               }
-              // The kept grant is recognisable by the identifier of its own
-              // that the root got (`S-1-0-1936880739-…`, which resolves to
-              // no name). Under the ordinary token there is none.
+              // A kept grant carries the root's own `S-1-0-1936880739-…` SID.
               expect(out.stdout.includes('S-1-0-1936880739-')).toBe(
                 !ordinaryToken,
               )
@@ -4769,11 +4621,7 @@ describe.if(isWindows)(
               })
             }
 
-            /**
-             * `run` in a session of these lists, which leaves no ACE for the
-             * sandbox user behind (what the default token keeps is granted to
-             * the sandbox group and to the root's own identifier).
-             */
+            /** `run` in a session of these lists. */
             async function inSession(
               fs: FsOverrides,
               files: CredentialFileConfig[],
@@ -5331,19 +5179,13 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
   }, 120_000)
 })
 
-// The rows of group G whose client is Schannel. Schannel hands no
-// credentials to the default (write-restricted) child token, so these
-// run in a session of their own with `writeRestrictedToken: false`:
-// the trust path they prove — the CA in the sandbox user's
-// `CurrentUser\Root`, revocation through the served CRL — is the one
-// a host that opts out gets.
+// Group G's Schannel clients, in a session with `writeRestrictedToken: false`.
 describe.if(isWindows)(
   'Windows sandbox: tlsTerminate, Schannel clients under the ordinary token (G8)',
   () => {
     beforeAll(async () => {
       console.error('[winsrt G8 beforeAll] start')
-      // G's afterAll uninstalled — re-provision and trust the fixture
-      // CA again (the trust went with the account's profile).
+      // G's afterAll uninstalled: re-provision and trust the fixture CA again.
       installWindowsSandbox({
         ...SUITE_INSTALL,
         sublayerGuid: TEST_SUBLAYER,
