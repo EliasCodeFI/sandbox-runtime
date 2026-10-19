@@ -1,18 +1,13 @@
 //! Write grants kept between sessions, for the write-restricted token.
-//!
 //! Each write root gets its own capability SID,
 //! `S-1-0-1936880739-<a>-<b>-<c>-<d>` (128 random bits; no account can
 //! hold it), and its ACEs ([`crate::acl::persistent_aces`]) allow
 //! writing only to a token with that SID among its restricting SIDs.
-//!
-//! A marker under `HKCU\Software\sandbox-runtime\PersistentGrants`
-//! lists every root that may carry a grant: added before the first ACE
-//! is written, removed only after the ACEs are. While it or the session
-//! database lists a root, nothing may run the sandbox account under
-//! the ordinary token ([`unrestricted_block_reason`]). A root whose
-//! volume cannot be reached becomes a pending strip there
-//! ([`PendingStrip`]). The profile read grant (`crate::profile`) is
-//! written through this module's converge.
+//! A marker under `HKCU\Software\sandbox-runtime\PersistentGrants` lists
+//! every root that may carry a grant. While it or the session database
+//! lists a root, nothing may run the sandbox account under the ordinary
+//! token ([`unrestricted_block_reason`]). A root whose volume is away
+//! becomes a [`PendingStrip`] there.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -72,15 +67,9 @@ const MARKER_PENDING: &str = "Pending";
 const MARKER_GROUP: &str = "GroupSid";
 const MARKER_PREVIOUS_GROUPS: &str = "PreviousGroupSids";
 
-/// Remember the sandbox group's SID beside the grants that name it,
-/// so they can still be recognised — and removed — after the install
-/// record that held it is gone (an uninstall whose removal of the
-/// grants did not finish).
-///
-/// A group SID that was recorded before and differs — the sandbox was
-/// reinstalled while grants of the old install were still recorded —
-/// is kept in a list beside it: entries naming it are still ours to
-/// remove (`PersistentTrustees::previous_group_sids`).
+/// Record the sandbox group's SID beside the grants that name it, so they
+/// can be removed after the install record is gone. A different SID
+/// recorded earlier is kept as a previous group, still ours to remove.
 pub(crate) fn marker_set_group_sid(group_sid: &str) -> Result<()> {
     let key = reg::Key::create_hkcu(MARKER_KEY)?;
     if let Some(old) = key.get_sz(MARKER_GROUP)?.filter(|s| !s.is_empty())
@@ -328,10 +317,6 @@ pub fn write_grant_block_reason() -> Option<String> {
 /// [`unrestricted_block_reason`] on what was read: `marker` as
 /// [`read_marker`] returned it, `db_roots` as [`db_roots_ro`] does.
 /// Every "could not read" refuses.
-///
-/// A pending strip refuses only while the volume it waits for is
-/// mounted (`mounted`): then its ACEs are reachable again and still on
-/// disk. On an absent volume nothing can be written.
 fn block_reason_from(
     marker: Result<Marker>,
     db_roots: impl FnOnce() -> Option<Vec<String>>,
@@ -417,17 +402,14 @@ pub struct Ids {
 impl Ids {
     pub fn load() -> Result<Self> {
         let setup = crate::install::read_setup()?;
-        // With the install record gone (an uninstall that removed the
-        // account before the grants were all taken off), the group the
-        // recorded grants name is still known from the marker.
+        // With the install record gone, the group the recorded grants name
+        // is still known from the marker.
         let marker = read_marker().unwrap_or_default();
         let group_sid = setup
             .as_ref()
             .map(|s| s.sandbox_group_sid.clone())
             .or_else(|| marker.group_sid.clone());
-        // Every other group the marker knows of: the one recorded
-        // with the grants, if the sandbox has been reinstalled since,
-        // and those before it.
+        // Every other group the marker knows of (earlier installs).
         let mut previous_group_sids: Vec<String> = marker
             .group_sid
             .into_iter()
@@ -583,8 +565,6 @@ fn denies_of_spec(spec: &str) -> Vec<AceView> {
 
 /// The denies the record lists for a path: those wanted now and those
 /// of its last write (`last_spec`; they may be on the object still).
-/// `None` when the path has no write record: its denies are then told
-/// by their shape ([`acl::is_persistent_ace`]).
 fn recorded_denies(want: &[AceView], last_spec: Option<&str>) -> Option<Vec<AceView>> {
     let last = last_spec?;
     let mut v: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
@@ -611,10 +591,7 @@ pub(crate) struct OpenObject {
 }
 
 /// [`converge`], reading and writing through `on` when given instead
-/// of opening `canon` by name. The profile read grant passes a handle
-/// it opened without following a link, so what is written is the
-/// object it looked at and never the target of a link put in its
-/// place. `canon` is still the key of the records.
+/// of opening `canon` by name.
 pub(crate) fn converge_on(
     conn: &Connection,
     ids: &Ids,
@@ -695,11 +672,7 @@ pub(crate) fn converge_on(
     )
     .context("record persistent write intent")?;
     // The walk of the tree is spared only where the write is seen to
-    // change nothing that is handed down. Not where the record cannot
-    // vouch for the tree: a write it says was begun and not finished,
-    // or an object that already carries the wanted entries with no
-    // completed write of them on record, may have them on the object
-    // and not on everything below it.
+    // change nothing that is handed down.
     let unfinished = matches!(&record, Some((_, _, 0)));
     let written = acl::write_persistent_aces_at(target, &t, &want, unfinished || same)?;
     if want.is_empty() {
@@ -733,12 +706,7 @@ pub(crate) fn converge_on(
 }
 
 /// After a [`converge_on`] that failed: whether the object itself
-/// carries exactly the wanted ACEs all the same. The system writes an
-/// object's own DACL first and then updates what is below it, so a
-/// failure further down (a descendant whose access list the caller
-/// may not change) leaves the object as wanted. The write record is
-/// then closed, so recovery does not repeat a write that cannot get
-/// further; `false` leaves it open.
+/// carries exactly the wanted ACEs all the same.
 pub(crate) fn settled_on_object(
     conn: &Connection,
     ids: &Ids,
@@ -1184,22 +1152,6 @@ fn forget_one_with(
 }
 
 /// Look at every pending strip again.
-///
-/// One on a volume of this machine is looked for by its file id among
-/// the volumes that are present: found, the ACEs come off the object
-/// wherever it is now, and only then the entry goes; the volume
-/// reporting that no such object exists, the entry goes; the volume
-/// still away, or the object not reachable, it stays. Nothing else
-/// removes an entry — a volume that will never return is given up
-/// only by [`drop_pending`], on request.
-///
-/// One on a network share is tried at its recorded path and, when
-/// that does not lead to it, looked for by its id on that share —
-/// only when `probe_network` is set (an explicit `forget` or
-/// uninstall), because either contacts the server: never at a session
-/// start.
-///
-/// Returns what is still pending.
 pub(crate) fn retry_pending(
     conn: &Connection,
     ids: &Ids,
@@ -1214,15 +1166,7 @@ pub(crate) fn retry_pending(
             if !probe_network {
                 return Located::VolumeAbsent;
             }
-            // On a share the recorded path is tried first. If it does
-            // not lead to the recorded object — nothing there, or
-            // another object — the object may have been renamed and
-            // still carry the grant: it is looked for by its id on
-            // that share. Found, it is stripped where it is. The
-            // share saying the id names nothing, the entry goes. The
-            // share not saying (it does not open files by id, or
-            // refused), the entry STAYS: only `--drop-pending` gives
-            // it up. A path that does not answer waits.
+            // On a share the recorded path is tried first.
             let elsewhere = || match path_id::locate_on_share(&p.path, &p.file_id) {
                 Located::Gone => {
                     eprintln!(
@@ -1297,21 +1241,9 @@ fn retry_pending_with(
     Ok((left, changed))
 }
 
-/// Give up the pending strips recorded for `paths`: the deliberate way
-/// to stop waiting for a volume that will not return (reformatted,
-/// discarded). Nothing is written anywhere but the list. The entries
-/// dropped are returned, so the caller can say what is being
-/// abandoned.
-///
-/// Only an entry whose volume really is absent can be given up. First
-/// everything that can be removed is ([`retry_pending`]); an entry
-/// that is then still pending while its volume is present, by the
-/// same enumeration of volumes everything else uses, is live on a
-/// reachable object: it is not dropped, and the call fails saying so.
-/// One on a share that is still pending is one whose path does not
-/// answer or whose object could not be found by its id there: it may
-/// be given up, and what that leaves behind is said. A path with no pending
-/// entry is an error too. Either way nothing is dropped.
+/// Give up the pending strips recorded for `paths`: the deliberate way to
+/// stop waiting for a volume that will not return (reformatted, discarded).
+/// Nothing is written anywhere but the list.
 pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Vec<PendingStrip>> {
     let pending = retry_pending(conn, ids, true)?;
     let names = |p: &PendingStrip, want: &str| {
@@ -1332,9 +1264,8 @@ pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Ve
         }
     }
     for p in pending.iter().filter(|p| named(p)) {
-        // What is left on a share after the retry above is a path
-        // that does not answer, or an object the share could not
-        // find by its id.
+        // What is still pending on a share is unreachable or could not be
+        // found by its id.
         let reachable = !on_network(&p.path) && path_id::volume_mounted(p.file_id.volume_serial);
         if reachable {
             bail!(
@@ -1347,9 +1278,8 @@ pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Ve
     }
     let (dropped, left): (Vec<_>, Vec<_>) = pending.into_iter().partition(named);
     for p in dropped.iter().filter(|p| on_network(&p.path)) {
-        // What is given up on a share, exactly: the object was not at
-        // its path and could not be found by its id — which is not
-        // the share saying it is gone.
+        // Not at its path and not found by id: which is not the share
+        // saying it is gone.
         eprintln!(
             "srt-win: giving up the kept grant recorded at '{}': the object is not at that \
              path and its share could not be asked where it is. If it still exists under \
@@ -1424,27 +1354,6 @@ pub fn forget_everything() -> Result<Forgotten> {
 
 /// What the half of `srt-win uninstall` that runs as the calling user
 /// does once the elevated half has returned.
-///
-/// The calling user's grants name the sandbox group, and their records
-/// are the calling user's own (their registry hive, their session
-/// database), which an elevated process running as another account
-/// cannot reach. So ONLY this half forgets them — the elevated step
-/// removes the machine-wide install and nothing else — and it does so
-/// by what is true afterwards, not by the elevated step's exit code
-/// alone:
-///
-/// - the install record is still there: the account and group were
-///   not removed (the prompt was declined, or the step failed before
-///   it got that far). The grants are still what a session runs on;
-///   nothing of the caller's is touched.
-/// - the install record is gone: the account and group are removed,
-///   whether or not the step then reported a failure of something
-///   else. The grants are forgotten, always — otherwise they would
-///   name a group that no longer exists, and after a reinstall would
-///   no longer be recognised by the new group's SID.
-///
-/// The group's SID is read before the hop, so its ACEs can still be
-/// recognised once the group is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterElevation {
     /// The install is gone: forget the caller's grants. `step_failed`
@@ -1611,11 +1520,7 @@ mod tests {
         assert_eq!(key(&denies_of_spec(&spec)), key(&wanted_denies));
         assert!(denies_of_spec("").is_empty());
         assert!(denies_of_spec("(A;OICI;0x1301bf;;;S-1-1-0)(nonsense").is_empty());
-        // No record for the path: nothing is listed, and a deny is
-        // told by its shape instead.
         assert!(recorded_denies(&want, None).is_none());
-        // A record: what is wanted now and what was last written —
-        // a deny that is no longer wanted is still ours to take off.
         let now: Vec<AceView> = want.iter().filter(|a| !a.deny).cloned().collect();
         let listed = recorded_denies(&now, Some(&spec)).unwrap();
         assert_eq!(key(&listed), key(&wanted_denies));
@@ -1629,7 +1534,6 @@ mod tests {
         for d in &wanted_denies {
             assert!(acl::is_persistent_ace(d, &t), "{}", d.sddl());
         }
-        // Someone else's fence on the same path is in no record.
         let fence = AceView {
             deny: true,
             inherited: false,
@@ -1700,9 +1604,6 @@ mod tests {
 
     #[test]
     fn uninstall_forgets_grants_only_after_the_elevated_removal_succeeded() {
-        // The install is gone: the grants are forgotten, whatever the
-        // elevated step's exit code — it removed the account, and may
-        // have failed at something after that.
         assert_eq!(
             after_elevation(0, false),
             AfterElevation::ForgetGrants { step_failed: None }
@@ -1715,16 +1616,12 @@ mod tests {
                 }
             );
         }
-        // The install is still there — a declined prompt (10), a step
-        // that failed before removing the account: nothing of the
-        // caller's is touched, and the code is passed on.
         for code in [10, 1, 2, -1, 259] {
             assert_eq!(
                 after_elevation(code, true),
                 AfterElevation::LeaveEverything(code)
             );
         }
-        // "Succeeded" with the account still there is not a removal.
         assert_eq!(after_elevation(0, true), AfterElevation::LeaveEverything(1));
     }
 
@@ -1752,18 +1649,14 @@ mod tests {
             })
         };
         let no_db = || -> Option<Vec<String>> { panic!("the database is not consulted") };
-        // Its volume is absent: no reason to refuse the ordinary token.
         assert_eq!(block_reason_from(marker(), no_db, |_| false), None);
-        // Another volume being mounted changes nothing.
         let serial = p.file_id.volume_serial;
         assert_eq!(
             block_reason_from(marker(), no_db, |s| s == serial + 1),
             None
         );
-        // Its volume is back: refused, exactly as a live kept grant.
         let why = block_reason_from(marker(), no_db, |s| s == serial).unwrap();
         assert!(why.contains(r"E:\work"), "{why}");
-        // A marker with only a pending strip is not "nothing recorded".
         assert!(!marker().unwrap().nothing_recorded());
         assert!(Marker::default().nothing_recorded());
     }
@@ -1780,9 +1673,6 @@ mod tests {
         };
         let all = || vec![entry(1), entry(2), entry(3), entry(4)];
         let stripped = RefCell::new(Vec::<String>::new());
-        // 1: volume still absent. 2: back, at a new path. 3: the
-        // volume is back and reports the object gone. 4: cannot be
-        // established.
         let locate = |p: &PendingStrip| match p.file_id.as_bytes()[0] {
             1 => Located::VolumeAbsent,
             2 => Located::At(r"\\?\F:\moved".to_owned()),
@@ -1796,25 +1686,20 @@ mod tests {
         .unwrap();
         assert!(changed);
         assert_eq!(left, vec![entry(1), entry(4)]);
-        // Stripped where the object is now, not where it was.
         assert_eq!(*stripped.borrow(), [r"\\?\E:\root2@\\?\F:\moved"]);
 
-        // A strip that fails keeps its entry: it goes on blocking.
         let (left, changed) =
             retry_pending_with(all(), locate, |_, _| Err(anyhow!("access denied"))).unwrap();
         assert_eq!(left, vec![entry(1), entry(2), entry(4)]);
         assert!(changed, "the gone one was dropped");
 
-        // Nothing to do: nothing rewritten.
         let (left, changed) =
             retry_pending_with(vec![entry(1)], locate, |_, _| unreachable!()).unwrap();
         assert_eq!((left, changed), (vec![entry(1)], false));
 
-        // The table: what removing a record's ACEs takes.
         use AtPath::{Another, Nothing, Recorded, Unavailable};
         let at = || Located::At("p".into());
         let cases: [(AtPath, Located, bool, Disposition); 16] = [
-            // The path leads to the object: nothing else is asked.
             (Recorded, Located::Unknown, false, Disposition::StripHere),
             (
                 Recorded,
@@ -1822,19 +1707,14 @@ mod tests {
                 true,
                 Disposition::StripHere,
             ),
-            // Not at its path, on a volume that is there: by file id.
             (Nothing, at(), false, Disposition::StripAt("p".into())),
             (Another, at(), false, Disposition::StripAt("p".into())),
             (Nothing, Located::Gone, false, Disposition::Drop),
             (Another, Located::Gone, true, Disposition::Drop),
             (Nothing, Located::Unknown, false, Disposition::Fail),
             (Another, Located::Unknown, false, Disposition::Fail),
-            // Its volume is not among those present: the drive letter
-            // names nothing, or another volume.
             (Nothing, Located::VolumeAbsent, false, Disposition::Pending),
             (Another, Located::VolumeAbsent, false, Disposition::Pending),
-            // The volume is there by name and cannot be reached: no
-            // media, locked, not connected, the server away.
             (
                 Unavailable,
                 Located::VolumeAbsent,
@@ -1849,8 +1729,6 @@ mod tests {
                 Disposition::Pending,
             ),
             (Unavailable, at(), false, Disposition::StripAt("p".into())),
-            // A share that answers, with the object not where it was:
-            // it cannot be looked for by id there.
             (Nothing, Located::VolumeAbsent, true, Disposition::Fail),
             (Another, Located::VolumeAbsent, true, Disposition::Fail),
         ];

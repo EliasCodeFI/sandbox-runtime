@@ -647,13 +647,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   } else { Fail "P3: a repeat session start on PA: exit=$($g.exit), DACL writes=$($g.writes) (want 0). raw: $($g.raw)" }
 
   # ── PF: someone else's deny for the sandbox group on a kept root ──
-  # An embedder may fence a write root for the sandbox group — "do
-  # not delete, rename or re-permission this folder" — with a deny on
-  # the folder alone. That deny is not this product's: it is not
-  # counted when a session start asks whether the root is current,
-  # it survives every write and the forget, and the root still works.
-  # The tree is a few thousand files, so the cost of a walk shows: the
-  # first grant makes one, a later one none.
   End-Session
   $pf = New-AclDir 'pf' @()
   foreach ($i in 0..39) {
@@ -843,8 +836,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $g = Grant-P @($pb)
   if ($g.exit -ne 0 -or -not (Has-Persistent $pb)) { Fail 'P11: setup — PB is not carrying a persistent grant' }
   else {
-    # The session over, its kept grant still there: uninstall refuses
-    # while a session is live.
     End-Session
     & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
     $left = @((Get-ItemProperty 'HKCU:\Software\sandbox-runtime\PersistentGrants' -ErrorAction SilentlyContinue).Roots |

@@ -230,9 +230,7 @@ fn lock_file_path() -> Result<PathBuf> {
 
 /// Say that the lock this process holds is held for a profile
 /// operation that is GOING AHEAD — called after the quiet check, so a
-/// command that takes the lock only to refuse never says so. Cleared
-/// when the lock is released; a holder that dies without clearing it
-/// leaves the pid of a dead process, which no waiter believes.
+/// command that takes the lock only to refuse never says so.
 pub fn mark_profile_operation() -> Result<()> {
     use std::os::windows::fs::FileExt;
     let mut word = [b'\n'; LOCK_WORD_LEN];
@@ -249,10 +247,7 @@ pub fn mark_profile_operation() -> Result<()> {
 }
 
 /// Whether the lock file's word names a profile operation of a
-/// process that is still running. Anything else — no word, a word of
-/// another shape (an older build writes none, or a bare one), the pid
-/// of a process that is gone — is not one, and the waiter waits as
-/// for any other holder.
+/// process that is still running.
 fn word_says_profile_operation(file: &std::fs::File) -> bool {
     use std::os::windows::fs::FileExt;
     let mut word = [0u8; LOCK_WORD_LEN];
@@ -280,9 +275,7 @@ fn pid_is_running(pid: u32) -> bool {
 }
 
 /// Whether a profile operation is running right now: the init lock is
-/// held, and held for one. For `profile status`, which takes no lock
-/// and would otherwise read a grant's half-written record as a run
-/// that was killed.
+/// held, and held for one.
 pub fn profile_operation_running() -> bool {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Storage::FileSystem::{
@@ -340,18 +333,14 @@ impl std::error::Error for ProfileBusy {}
 /// grant or forget held it.
 pub const EXIT_PROFILE_BUSY: i32 = 25;
 
-/// How long a caller waits for the init lock before it asks what the
-/// holder is doing: long enough for any session operation to finish,
-/// short enough that a session start during a profile grant fails at
-/// once, with the reason, instead of after a minute without one.
+/// How long a caller waits for the init lock before it asks whether the
+/// holder is a profile operation: longer than any session operation takes.
 const PROFILE_BUSY_AFTER_MS: u64 = 3_000;
 
 impl InitMutex {
     fn acquire() -> Result<Self> {
-        // Bounded, not infinite: crash-recovery under this lock is
-        // sub-second and real contention is a handful of concurrent
-        // acl ops for ONE user, so a minute means a wedged holder —
-        // fail the op loudly rather than hang.
+        // Bounded: recovery under this lock is sub-second, so a minute
+        // means a wedged holder.
         Self::acquire_within(PROFILE_BUSY_AFTER_MS, 60_000)
     }
 
@@ -370,9 +359,8 @@ impl InitMutex {
             .read(true)
             .write(true)
             .create(true)
-            // Never truncate: the first byte carries the kernel
-            // byte-range lock, and the bytes at `LOCK_WORD_AT` say
-            // when the holder is a profile operation.
+            // Never truncate: byte 0 carries the kernel byte-range lock, the
+            // bytes at `LOCK_WORD_AT` the holder's word.
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open init-lock file {}", path.display()))?;
@@ -392,9 +380,7 @@ impl InitMutex {
                 )
             };
             if r.is_ok() {
-                // A holder starts with no word: what a previous one
-                // left (it was killed before it could clear it) is
-                // not this one's.
+                // Clear what a holder that was killed left behind.
                 file.seek_write(&[b'\n'; LOCK_WORD_LEN], LOCK_WORD_AT)
                     .context("clear the init lock's word")?;
                 return Ok(Self { file });
@@ -426,13 +412,7 @@ pub fn acquire_session_lock() -> Result<impl Drop> {
 use crate::profile::is_access_denied;
 
 /// Every live holder of anything: `(process, kind, path)` of each
-/// holder row whose process is alive, except those of `except`. Call
-/// under the init lock, after crash recovery has dropped the rows of
-/// holders that are gone.
-///
-/// This is what a profile grant, a profile forget and an uninstall
-/// look at before they change anything: they run only on a quiet
-/// machine, where no session and no sandboxed command exists.
+/// holder row whose process is alive, except those of `except`.
 pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
     live_holders_with(db.conn(), except, alive_by_one_snapshot()?)
 }
@@ -461,20 +441,9 @@ fn live_holders_with(
         .collect())
 }
 
-/// The live process `pid`, if it is recorded as a session (a holder
-/// of the profile read grant: it registered at its start and has not
-/// released since) — as a handle that can be waited on, so that a
-/// command started for it ends with it.
-///
-/// `None` when it is not recorded, or is gone (its pid nobody's, or
-/// another process's now): the command then holds for itself, as one
-/// with no session behind it does. An error when it is recorded and
-/// alive and cannot be watched: nothing is started for a session
-/// whose end would go unnoticed.
-///
-/// Read from the database without the init lock: it decides only
-/// whether a command takes a hold of its own, and a wrong "no" costs
-/// one hold too many.
+/// A waitable handle on the live process `pid` if it is recorded as a
+/// session; `None` if it is not recorded or gone (the command then holds
+/// for itself); an error if it is recorded, alive and cannot be watched.
 pub fn watch_session(pid: u32) -> Result<Option<crate::util::OwnedHandle>> {
     let Ok(Some(conn)) = open_db_ro() else {
         return Ok(None);
@@ -602,31 +571,19 @@ pub fn open_db() -> Result<Connection> {
 /// Filter on `release_aces` for the deny-ACE lifecycle.
 pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", KIND_DENY_SATISFIED];
 /// A read deny the holder asked for that could not be written because
-/// the object's access list may not be changed, on an object whose
-/// own access list gave the sandbox account no read at the time. No
-/// ACE stands behind the row and no `working_aces` row: it is there so
-/// the deny is not invisible — it shows among the holder's holds, is
-/// released with them, and names the path to look at again.
+/// the object's access list may not be changed, on an object whose own
+/// access list gave the sandbox account no read at the time.
 pub const KIND_DENY_SATISFIED: &str = "deny_satisfied";
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
-/// Holder rows that record no ACE of the holder's own: that a session
-/// is RUNNING ON a grant kept between sessions — a kept write root
-/// (`kept_root`, by root path) or the profile read grant (`profile`,
-/// by profile directory). Nothing is written for them and they have
-/// no `working_aces` row. They exist so that removing a kept grant
-/// can first ask whether a live session depends on it
-/// ([`Locked::other_kept_holders`]); they go when the session
-/// releases its grants, or with its broker row when crash recovery
-/// finds the holder dead.
+/// Holder rows with no ACE behind them: a session is running on a kept
+/// write root (`kept_root`) or exists at all (`profile`). They go when the
+/// session releases, or when crash recovery finds the holder dead.
 pub const KIND_KEPT_ROOT: &str = "kept_root";
 pub const KIND_KEPT_PROFILE: &str = "profile";
 /// What a `profile` hold names. It is one resource — the calling
 /// user's profile read grant, whether or not one is recorded at the
-/// moment — and not a path. Every session, under either token, and
-/// every command with no session behind it holds it from its start:
-/// it is what says "a sandboxed process may exist", and the grant is
-/// made, refreshed or removed only while nobody holds it.
+/// moment — and not a path.
 pub const KEPT_PROFILE_PATH: &str = "(profile)";
 
 /// A live session, other than the caller's, running on a kept grant.
@@ -927,10 +884,7 @@ pub fn with_init_lock<R>(
 }
 
 /// [`with_init_lock`] WITHOUT crash recovery, for a command that only
-/// records its own hold. Recovery releases what dead holders left;
-/// when that happens is the business of the session commands (`acl
-/// grant`, `stamp`, `revoke`, `restore`, `recover`), not of every
-/// sandboxed command that starts.
+/// records its own hold.
 pub fn with_init_lock_unrecovered<R>(
     holder_pid: HolderPid,
     f: impl FnOnce(&mut Locked) -> Result<R>,
@@ -943,16 +897,8 @@ pub fn with_init_lock_unrecovered<R>(
     f(&mut locked)
 }
 
-/// [`with_init_lock`] for a profile grant or forget: the same lock, held for the whole run. Once `f` has
-/// found the machine quiet it calls [`mark_profile_operation`], and
-/// from then a session start or a command that needs the lock is told
-/// at once what it is waiting for ([`ProfileBusy`]) instead of
-/// waiting it out.
-///
-/// The profile's entries change only inside this: no session start,
-/// no stamp and no strip runs beside it, and `f` is expected to refuse
-/// if [`live_holders`] finds anyone. A session's view of the profile
-/// grant is therefore fixed from its start to its end.
+/// [`with_init_lock`] for a profile grant or forget: the same lock, held for
+/// the whole run.
 pub fn with_profile_lock<R>(f: impl FnOnce(&mut Locked) -> Result<R>) -> Result<R> {
     let (_mutex, conn, _report) = locked_recovered(false)?;
     let mut locked = Locked {
@@ -1052,14 +998,6 @@ impl Locked {
 
     /// Record a read deny of the holder that the object's own access
     /// list stands in for ([`KIND_DENY_SATISFIED`]).
-    ///
-    /// The attempt to write the deny recorded it first (a holder row
-    /// and a `working_aces` row, so that a crash between record and
-    /// write is recovered). Nothing of ours is on the object, so those
-    /// go: left behind, their release at session end would try the
-    /// same write, fail the same way, and keep the holder registered
-    /// for as long as it lives. What remains is this row alone, and
-    /// releasing it is a row delete.
     fn note_satisfied_deny(&self, canon: &str) -> Result<()> {
         delete_holder(&self.conn, Some(self.holder_pid.0 as i64), canon, "deny")?;
         self.conn
@@ -1176,12 +1114,7 @@ impl Locked {
 
     /// [`Self::apply_aces`], plus a read deny on each of `also`: the
     /// recorded paths of the profile read grant that a read deny among
-    /// `targets` has to be written on as well. They are held and
-    /// released like any other deny of the holder, and differ in two
-    /// ways: their parent gets no delete-child deny (nothing in the
-    /// profile is writable to begin with), and one that is no longer
-    /// there — removed since the grant recorded it — is passed over
-    /// instead of failing the batch.
+    /// `targets` has to be written on as well.
     pub fn apply_aces_and(
         &self,
         sandbox_sid: &str,
@@ -1197,15 +1130,8 @@ impl Locked {
                         witnesses.push(w);
                         true
                     }
-                    // A read deny that cannot be written on an object
-                    // whose own access list already gives the sandbox
-                    // account no read is what the deny asks for. One
-                    // that cannot be written where the account CAN
-                    // read fails the batch, as before.
-                    // Only where the access list may not be CHANGED
-                    // (access denied): every other refusal — a file
-                    // with other hard links, an object that is not the
-                    // recorded one — fails the batch as it always did.
+                    // Access denied on an object whose own access list already gives
+                    // the sandbox account no read: the deny is satisfied, not failed.
                     Err(e)
                         if ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
                             && is_access_denied(&e)
@@ -1247,9 +1173,7 @@ impl Locked {
                 match db.ensure_ace(canon, read_deny, sandbox_sid) {
                     Ok(w) => witnesses.push(w),
                     Err(e) if path_id::is_not_found(&e) => {}
-                    // Cannot be written, and its own access list
-                    // already gives the sandbox account no read:
-                    // recorded as such, not passed over.
+                    // As above: satisfied by the object's own access list.
                     Err(e) if is_access_denied(&e) && crate::profile::closed_to_sandbox(canon) => {
                         if let Err(e) = db.note_satisfied_deny(canon) {
                             eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
@@ -1912,24 +1836,18 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
         return true;
     }
     // Decided from the system's process list, which gives every
-    // process's creation time to any caller. Opening the process
-    // instead cannot tell a holder that died, whose pid now belongs to
-    // a process this user may not open, from a live one.
+    // process's creation time to any caller.
     match process_create_times() {
         Ok(all) => listed_alive(&all, pid, expected_create_filetime),
-        // No complete list: the process is asked directly, and
-        // whatever that cannot settle counts as alive — better a stale
-        // row than a live holder reaped and its files restored under
-        // it.
+        // No complete list: ask the process directly; what that cannot
+        // settle counts as alive (never reap a holder that may be live).
         Err(_) => is_process_alive_by_opening(pid, expected_create_filetime),
     }
 }
 
 /// The rule: a holder is DEAD only on positive evidence from a
 /// complete process list — its pid is not in it, or is in it with a
-/// creation time other than the one recorded. A holder recorded with
-/// no creation time (0) cannot be told from whoever has its pid now,
-/// and counts as alive while that pid exists.
+/// creation time other than the one recorded.
 fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i64) -> bool {
     match all.get(&pid) {
         None => false,
@@ -1938,13 +1856,8 @@ fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i
 }
 
 /// [`is_process_alive`] over ONE reading of the process list, for a
-/// query that judges a holder per row: a session with hundreds of
-/// rows is one reading, not hundreds.
-///
-/// These queries decide whether something may be removed or changed
-/// beside other sessions. Without a complete list they do not guess:
-/// the query fails, and the operation with it, saying why — it neither
-/// goes ahead nor names a process it cannot identify as a session.
+/// query that judges a holder per row: a session with hundreds of rows
+/// is one reading, not hundreds.
 fn alive_by_one_snapshot() -> Result<impl Fn(u32, i64) -> bool> {
     let all = process_create_times().context(
         "cannot tell which sandbox sessions are running (the system's process list could \
@@ -1968,8 +1881,7 @@ fn process_create_times() -> Result<std::collections::HashMap<u32, i64>> {
     const SYSTEM_PROCESS_INFORMATION: u32 = 5;
     const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
     // Of each entry: the offset of the next one (0 at the last), the
-    // creation time, the pid. The layout is the documented one and
-    // the same on every 64-bit Windows.
+    // creation time, the pid.
     const NEXT_AT: usize = 0;
     const CREATED_AT: usize = 32;
     const PID_AT: usize = 80;
@@ -2008,8 +1920,7 @@ fn process_create_times() -> Result<std::collections::HashMap<u32, i64>> {
 
 /// The list as pid → creation time, or `None` if it is not complete:
 /// an entry that does not fit in what was written, or a chain that
-/// does not end in a last entry. A list cut short would make every
-/// process after the cut look absent.
+/// does not end in a last entry.
 fn parse_process_list(
     bytes: &[u8],
     next_at: usize,
@@ -2266,29 +2177,20 @@ mod tests {
         (n("brokers"), n("ace_holders"), n("working_aces"))
     }
 
-    /// One lock for everything. A profile operation that is going
-    /// ahead says so, and a session start or a command gets
-    /// `ProfileBusy` after the short wait instead of waiting it out;
-    /// before it says so, after it has let go, and for a word that is
-    /// not a live profile operation's, it is an ordinary wait.
+    /// One lock for everything.
     #[test]
     fn a_profile_operation_going_ahead_is_named_to_those_it_keeps_out() {
         use std::os::windows::fs::FileExt;
         let busy = |r: Result<InitMutex>| r.err().is_some_and(|e| e.is::<ProfileBusy>());
         let held = InitMutex::acquire_within(100, 400).unwrap();
-        // Holding it only — as a command that takes it to refuse does.
         let r = InitMutex::acquire_within(100, 400);
         assert!(r.is_err() && !busy(r));
         assert!(!profile_operation_running());
-        // Going ahead.
         mark_profile_operation().unwrap();
         let started = std::time::Instant::now();
         assert!(busy(InitMutex::acquire_within(200, 5_000)));
         assert!(started.elapsed().as_millis() < 2_000, "told promptly");
         assert!(profile_operation_running());
-        // A word of another shape, or of a process that is gone, is
-        // not believed: an older build writes a bare word, a killed
-        // run leaves its own.
         let file = &held.file;
         for stale in [&b"profile\n"[..], b"profile 2147483646", b"session\n"] {
             let mut word = [b'\n'; LOCK_WORD_LEN];
@@ -2298,7 +2200,6 @@ mod tests {
             assert!(r.is_err() && !busy(r), "{stale:?}");
             assert!(!profile_operation_running());
         }
-        // Released: the word goes with the lock.
         mark_profile_operation().unwrap();
         drop(held);
         assert!(!profile_operation_running());
@@ -2309,10 +2210,8 @@ mod tests {
         drop(next);
     }
 
-    /// A holder is alive if the process list has its pid with the
-    /// recorded creation time: a pid that is absent, or that now
-    /// belongs to another process, is dead — whether or not this user
-    /// may open that process.
+    /// A holder is alive if the process list has its pid with the recorded
+    /// creation time; absent or another process's, it is dead.
     #[test]
     fn a_holder_is_judged_by_the_process_list() {
         let all = process_create_times().unwrap();
@@ -2321,14 +2220,11 @@ mod tests {
             all.get(&me).copied(),
             Some(process_create_time(unsafe { GetCurrentProcess() }).unwrap())
         );
-        // A system process this user may not open, under a creation
-        // time that is not its own: a recycled pid, dead.
         let (&other, &created) = all.iter().find(|&(&pid, _)| pid != me && pid > 4).unwrap();
         assert!(is_process_alive(other, created));
         assert!(!is_process_alive(other, created + 1));
         assert!(!is_process_alive(4, 1));
         assert!(!is_process_alive(0x7FFF_FFFE, 0));
-        // Entries are walked by their own offsets.
         let mut two = vec![0u8; 200];
         two[0..4].copy_from_slice(&100u32.to_le_bytes());
         two[32..40].copy_from_slice(&7i64.to_le_bytes());
@@ -2338,24 +2234,15 @@ mod tests {
         let parsed = parse_process_list(&two, 0, 32, 80, 88).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!((parsed[&11], parsed[&12]), (7, 9));
-        // A list cut short is no list: the second entry is announced
-        // and not all there, or not there at all. Nothing is concluded
-        // from it — least of all that process 12 is gone.
         assert!(parse_process_list(&two[..150], 0, 32, 80, 88).is_none());
         assert!(parse_process_list(&two[..100], 0, 32, 80, 88).is_none());
         assert!(parse_process_list(&two[..40], 0, 32, 80, 88).is_none());
         assert!(parse_process_list(&[], 0, 32, 80, 88).is_none());
-        // Dead only on positive evidence.
         assert!(listed_alive(&parsed, 11, 7));
         assert!(!listed_alive(&parsed, 11, 8), "its pid is another's now");
         assert!(!listed_alive(&parsed, 13, 7), "its pid is nobody's");
-        // Recorded without a creation time: not told apart from
-        // whoever has the pid, so not declared dead while it exists.
         assert!(listed_alive(&parsed, 11, 0));
         assert!(!listed_alive(&parsed, 13, 0));
-        // Every process this one can see directly is in the real list
-        // under the creation time it reports itself — the list and the
-        // recorded value are the same clock, to the tick.
         let mut child = std::process::Command::new("cmd")
             .args(["/c", "ping -n 3 127.0.0.1 >nul"])
             .spawn()
@@ -2363,9 +2250,6 @@ mod tests {
         let recorded = pid_create_time(child.id()).unwrap();
         assert!(is_process_alive(child.id(), recorded));
         assert!(alive_by_one_snapshot().unwrap()(child.id(), recorded));
-        // Gone, it is dead by the same list. An exited process stays
-        // listed until its last handle is closed, and may for a moment
-        // after, so the handle is dropped and the answer is awaited.
         let pid = child.id();
         child.kill().ok();
         child.wait().unwrap();
@@ -2388,7 +2272,6 @@ mod tests {
         with_mem_db(|db| {
             let canon = r"\\?\C:\Users\me\AppData\Local\Closed";
             let pid = db.holder_pid.0 as i64;
-            // What the failed attempt to write the deny recorded.
             seed(db.conn(), pid, canon, "deny", "denyRead");
             db.note_satisfied_deny(canon).unwrap();
             let kinds: Vec<String> = query_vec(
@@ -2429,25 +2312,17 @@ mod tests {
             let me = db.holder_pid.0 as i64;
             let (other, dead) = (me + 1, me + 2);
             let root = r"\\?\C:\work".to_owned();
-            // This session: a root and the profile grant.
             db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
                 .unwrap();
-            // Twice is once.
             db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
                 .unwrap();
             assert_eq!(counts(&db.conn), (1, 2, 0));
-            // Nothing held: no broker row is made for it.
             let alone = Locked {
                 conn: open_memory_db_for_tests(),
                 holder_pid: HolderPid(db.holder_pid.0),
             };
             alone.hold_kept(&[], None).unwrap();
             assert_eq!(counts(&alone.conn), (0, 0, 0));
-            // Another session, and one whose process has died, each
-            // with holds of their own; the other also has an ordinary
-            // session grant, which is not a kept-grant hold.
-            // A holder's liveness is its process's; here a creation
-            // time of 2 stands for a process that is gone.
             fn alive(_pid: u32, create_time: i64) -> bool {
                 create_time != 2
             }
@@ -2486,10 +2361,6 @@ mod tests {
                     },
                 ]
             );
-            // Everything live counts for an operation that needs a
-            // quiet machine: kept holds and an ordinary session grant
-            // alike, of every live holder — or of every one but the
-            // asker.
             let all = live_holders_with(&db.conn, None, alive).unwrap();
             assert_eq!(all.len(), 5, "{all:?}");
             assert!(all.iter().all(|h| i64::from(h.pid) != dead));
@@ -2499,12 +2370,9 @@ mod tests {
             );
             let but_me = live_holders_with(&db.conn, Some(me as u32), alive).unwrap();
             assert_eq!(but_me.len(), 3);
-            // Asked by the other session, it is this one that holds.
             let held = kept_holders_with(&db.conn, other, alive).unwrap();
             assert!(held.iter().all(|h| i64::from(h.pid) == me) && held.len() == 2);
 
-            // Crash recovery reaps the dead holder's holds and its
-            // broker row; the live ones stay.
             let disk = Disk { alive, ..OK_DISK };
             let report = recover_with(&db.conn, Some(SID), &disk).unwrap();
             assert_eq!(report.dead_brokers, 1);
@@ -2519,10 +2387,7 @@ mod tests {
             assert_eq!(left, 0);
             assert_eq!(kept_holders_with(&db.conn, me, alive).unwrap().len(), 2);
 
-            // A session that ends drops its own holds and nobody
-            // else's.
             db.release_kept().unwrap();
-            // With its last hold its broker row went too.
             let mine: i64 = db
                 .conn
                 .query_row(

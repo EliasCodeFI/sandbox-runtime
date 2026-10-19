@@ -208,9 +208,8 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
 let windowsFsSbUserSid: string | undefined
-// Whether initialize() registered this process with srt-win as a
-// session: always under the write-restricted token; under the
-// ordinary one only with an srt-win that says it keeps such records.
+// Whether initialize() registered this process with srt-win as a session
+// (under the ordinary token only if srt-win advertises `exec-holder`).
 let windowsSessionRegistered = false
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
@@ -227,11 +226,8 @@ let windowsWfpVerified = false
 // The child-token shape initialize() verified the fence for (the wrap
 // path uses it, not `config`); outside a session, the option's default.
 let windowsWriteRestrictedToken = true
-// Windows: the `srt-win` builds this process has seen report every
-// capability the library relies on (see
-// missingWindowsSrtWinCapability), by identity — windowsSrtWinIdentity.
-// Only a positive result is remembered: one that lacked a capability,
-// or could not be asked, is asked again the next time.
+// The `srt-win` builds, by identity, that reported every capability the
+// library relies on. Only a yes is remembered.
 const windowsCapableSrtWin = new Set<string>()
 
 /**
@@ -257,12 +253,8 @@ const WINDOWS_CAPABILITIES_WHY =
   `and kept grants are checked and removed there)`
 
 /**
- * For a per-command read deny: make sure the `srt-win` this command
- * will run through is one that has reported every capability the
- * library relies on. initialize() records the session's own; one
- * passed per command, or used with no session behind it, is asked
- * here — once per identity, and again every time while the answer is
- * not a yes.
+ * Make sure the `srt-win` this command runs through has reported every
+ * capability the library relies on; asked once per identity.
  */
 function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
   const id = windowsSrtWinIdentity(srtWin)
@@ -277,10 +269,7 @@ function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
 }
 
 // Windows: whether this session's commands read the user's profile
-// through the profile read grant. 'absent': no grant is recorded (it
-// was skipped at install, or forgotten) or the session runs under the
-// ordinary token — the sandbox works, the profile is not readable.
-// `undefined` outside a Windows session.
+// through the profile read grant.
 let windowsProfileRead: 'granted' | 'absent' | undefined
 // Windows: what the session has to tell its user about the profile
 // read grant it runs on (getWindowsProfileReadWarnings).
@@ -301,19 +290,6 @@ export interface WindowsProfileReadWarning {
  * What a session on this grant has to tell its user, from what
  * `srt-win` found — each message says what was established about its
  * paths and nothing more.
- *
- * - `profile_exclusion_unprotected`: exclusions that could not be
- *   denied and are readable to sandboxed commands — by their own
- *   access list, or, where that list could not be read, because YOU
- *   can read them without being able to see why (what admits you
- *   there is as a rule a group the sandbox account is in too).
- * - `profile_exclusion_unverifiable`: exclusions that could not be
- *   denied and could not be examined. No claim is made about them;
- *   the message says what is known: that you cannot read them either,
- *   or that the sandbox account's identity is not known, or that they
- *   were not looked at.
- * - `profile_stale_allow`: paths that are no longer to be readable and
- *   still carry an allow of an earlier run that could not be removed.
  */
 export function windowsProfileReadWarningsOf(
   grant: Pick<
@@ -1118,13 +1094,7 @@ async function startMuxProxyServer(
  */
 export interface SandboxInitializeOptions {
   /**
-   * Windows. `filesystem.allowRead` paths that may be granted although
-   * the read grant on the user's profile excludes them (a credential
-   * store, a browser profile, …): each entry admits the `allowRead`
-   * path that resolves to the same object, when that path is an
-   * excluded path or lies inside one. The store is then readable to
-   * the sandboxed commands of this session. An `allowRead` path that
-   * lies ABOVE an exclusion is refused whatever is listed here.
+   * Windows.
    */
   dangerouslyAllowReadOfProfileExclusions?: readonly string[]
 }
@@ -1308,19 +1278,7 @@ async function initializeSteps(
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
     // The read grant on the user's profile. It belongs to the
-    // write-restricted token (the default). The install applies it,
-    // grantWindowsProfileRead() refreshes it; this never writes or
-    // refreshes it. Whether one is recorded is the switch:
-    //  - none recorded (skipped at install, or forgotten): the session
-    //    runs as it would without the feature, and nothing in the
-    //    profile is readable;
-    //  - recorded and current: the session runs on it;
-    //  - recorded and not current (a run that did not finish, an older
-    //    exclusion list, a record that cannot be read or lacks its
-    //    lists): rejected — its allows are on disk, and what it must
-    //    keep excluded cannot be relied on.
-    // Under the ordinary token there is no grant: one that is found is
-    // removed before anything else is granted.
+    // write-restricted token (the default).
     windowsProfileRead = 'absent'
     windowsProfileReadWarnings = []
     let profileExclusions: Parameters<
@@ -1328,19 +1286,8 @@ async function initializeSteps(
     >[1] = { exclusions: [], ungrantedOnly: [] }
     try {
       if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
-        // Not from under another live session that reads the profile
-        // through it, or writes through a kept grant: srt-win checks
-        // its holder records under its lock and removes nothing then
-        // (`kept_grants_in_use`). That check is srt-win's, so it is
-        // asked for by name: with grants to remove and an srt-win that
-        // keeps no holder records, nothing is removed.
-        //
-        // That is the only capability this path needs, and only then.
-        // The ordinary token uses none of the others — no profile
-        // read grant exists under it, no kept root — so with no kept
-        // grant of either kind reported, a session with
-        // `writeRestrictedToken: false` runs against an srt-win that
-        // lists nothing, as it did before capabilities existed.
+        // Removing kept grants needs srt-win's holder check, so that capability
+        // is required here, and only when there is something to remove.
         if (
           (u.profileGrant || u.persistentGrants) &&
           !u.capabilities.includes(
@@ -1361,18 +1308,7 @@ async function initializeSteps(
           })
         }
       } else {
-        // The write-restricted token (the default). What this library
-        // hands srt-win on this path is only right if srt-win does its
-        // part, and the two are not always the same build: every
-        // capability the library relies on is required here, from the
-        // status already in hand, before anything is granted.
-        //
-        // Whether or not a grant is recorded. The capabilities belong
-        // to the build, not to the grant state: a grant can be made
-        // after this session started, and a status that shows none —
-        // because the field is missing, or was renamed — is not proof
-        // that none is on disk. A status with no `capabilities`, or
-        // one that is not a list, has none.
+        // The write-restricted token (the default).
         const missing = missingWindowsSrtWinCapability(u.capabilities)
         if (missing !== undefined) {
           throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
@@ -1525,27 +1461,7 @@ async function initializeSteps(
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
       // No path the session grants, in any form, may reach what the
-      // profile read grant excludes. Checked on what each path resolves
-      // to, over everything initialize() hands to srt-win — the read
-      // grants, the write roots (a write root grants read too, and its
-      // grant is kept), and the library's own trust-bundle directory —
-      // before anything is granted. srt-win makes the same check on
-      // its side.
-      //
-      //                 protected path        ungranted-only directory
-      //   the path      refused (*)           refused
-      //   inside it     refused (*)           allowed
-      //   above it      refused               refused
-      //
-      // (*) A READ path only: the embedder's explicit override admits
-      // it — the store is then read on purpose, for this session. A
-      // write root is never admitted. Nothing above an exclusion is: a
-      // grant there inherits, so a store created again beneath it
-      // would carry it, and for a write root that grant is kept
-      // between sessions.
-      //
-      // With no grant recorded the lists are empty and nothing is
-      // checked: nothing in the profile is readable by default then.
+      // profile read grant excludes.
       const ownRead = mitmCA ? [dirname(mitmCA.trustBundlePath)] : []
       const override = options?.dangerouslyAllowReadOfProfileExclusions ?? []
       const refused = [
@@ -1592,22 +1508,8 @@ async function initializeSteps(
             `neither is nor contains an excluded one.`,
         )
       }
-      // A read deny on or above a path the profile read grant made
-      // readable has to be on that path too, for the session: the
-      // path's own ALLOW would otherwise be met first. `srt-win` adds
-      // those from its record when it is handed the deny, so the deny
-      // is passed as it is, once, whatever it covers.
-      // The trust bundle the CA-trust env vars point at
-      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
-      // srt-sandbox child. It's written into the broker's %TEMP%,
-      // which the sandbox user has no inherent rights on, so it
-      // rides the same session-level `acl grant` read-set as the
-      // working tree. Granted on the mkdtemp DIR (not the file)
-      // so the (OI)(CI) ACE covers both the file open AND the
-      // parent-directory list that cmd's `type`/`FindFirstFile`
-      // does before opening. Mirrors the mac/linux
-      // `ownAllowWithinDeny` in wrapWithSandbox: it is not ranked
-      // against the config's lists, nor one of the config's grants.
+      // A read deny is passed once: `srt-win` adds the recorded profile paths it
+      // covers. The CA trust bundle's directory rides the session's read grants.
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
         : acc.grantRead
@@ -1657,15 +1559,7 @@ async function initializeSteps(
         })
       } else {
         // Grant FIRST so the sandbox user has working-tree access by
-        // the time the deny stamp runs. The two are independent
-        // refcounted state-DB sets keyed on the same holder PID.
-        //
-        // With an srt-win that records sessions it is made with
-        // nothing to grant too: the call is what records this process
-        // as one, and the profile read grant is not made or removed
-        // while one exists. An srt-win that does not say so is asked
-        // for nothing it was not asked for before: this token needs
-        // no capability of it.
+        // the time the deny stamp runs.
         if (
           registersUnderOrdinaryToken ||
           grantRead.length > 0 ||
@@ -1687,12 +1581,7 @@ async function initializeSteps(
           })
         }
       }
-      // Gates running revoke/restore at reset(). Recorded AFTER
-      // success — the catch below clears `config`, and a non-undefined
-      // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed. Recorded whenever something was applied or
-      // the session registered itself with srt-win, which it releases
-      // the same way.
+      // Gates running revoke/restore at reset().
       windowsSessionRegistered = writeRestricted || registersUnderOrdinaryToken
       if (anyApplied || windowsSessionRegistered) {
         windowsFsStampedSet = acc
@@ -3065,20 +2954,12 @@ async function wrapWithSandboxArgv(
         ],
         held: windowsFsStampedSet,
       })
-      // As at initialize(): a deny on or above a path of the profile
-      // read grant goes on that path too, for this command — added by
-      // `srt-win` from its record, not listed here, so the command
-      // line carries one `--deny-read` per deny however many recorded
-      // paths it covers.
+      // As at initialize(): `srt-win` expands a deny onto the recorded
+      // profile paths it covers.
       const denyRead = ranked.denyRead
       perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
-      // That holds whatever the grant state was at initialize(): the
-      // deny always goes in this one form, srt-win expands it from
-      // the record as it is when the command runs — so a grant made
-      // since is covered — and the srt-win it goes to is known to do
-      // so: the session's own was required to at initialize(), and
-      // one passed for this command, or used with no session, is
-      // asked now.
+      // srt-win expands the deny from the record as it is when the command
+      // runs, so a grant made since initialize() is covered.
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
@@ -3105,14 +2986,8 @@ async function wrapWithSandboxArgv(
           `at initialize(). Set it at the session level.`,
       )
     }
-    // Under the write-restricted token every command relies on its
-    // srt-win for more than running it: the read denies above, and
-    // being held (`--held-by`, or srt-win holding for the command
-    // itself). The session's own srt-win was required to do all of it
-    // at initialize(); one passed for this command, or used with no
-    // session behind it, is asked now — once per srt-win, so an older
-    // one is refused as outdated instead of failing on a flag it does
-    // not know.
+    // Asked once per srt-win, so an older one is refused as outdated
+    // instead of failing on a flag it does not know.
     if (writeRestrictedToken) {
       assertWindowsSrtWinCapable(
         customConfig?.windows?.srtWin
@@ -3133,11 +3008,8 @@ async function wrapWithSandboxArgv(
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
-      // The session's own grants beneath those denies keep their
-      // rank: srt-win leaves the recorded profile paths they cover
-      // out of what it denies for this command.
-      // (Under the ordinary token there is no profile grant and
-      // nothing to leave out; the flag is not sent.)
+      // The session's own grants beneath those denies keep their rank.
+      // Not sent under the ordinary token: there is no profile grant.
       denyReadExcept: writeRestrictedToken
         ? windowsGrantsBeneathDenies(
             [
@@ -3157,14 +3029,8 @@ async function wrapWithSandboxArgv(
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
       writeRestrictedToken,
-      // The session that holds the kept grants for this command:
-      // this process, once initialize() has registered it. srt-win
-      // checks that it really holds — an embedder that revoked the
-      // session's grants in the middle of it no longer does — and
-      // otherwise, as for a command with no session behind it, holds
-      // for the command itself. Named only where the session did
-      // register: under the ordinary token an srt-win that keeps no
-      // such records does not know the flag.
+      // srt-win verifies the holder and otherwise holds for the command
+      // itself. Named only where the session did register.
       heldBy:
         windowsSessionRegistered && windowsFsSbUserSid !== undefined
           ? process.pid
@@ -3730,17 +3596,13 @@ export interface ISandboxManager {
   getMitmCA(): MitmCA | undefined
   /**
    * Windows: whether the commands of the current session read the
-   * user's profile through the profile read grant. `'absent'` when no
-   * grant is recorded (skipped at install, or forgotten) or the
-   * session runs under the ordinary token: the sandbox works, the
-   * profile is not readable. `undefined` outside a Windows session.
+   * user's profile through the profile read grant.
    */
   getWindowsProfileRead(): 'granted' | 'absent' | undefined
   /**
    * Windows: what the current session has to tell its user about the
    * profile read grant — at present, excluded paths that sandboxed
-   * commands can read all the same. Empty when there is nothing, and
-   * outside a session. An embedding program shows these.
+   * commands can read all the same.
    */
   getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
   getSentinelRegistry(): SentinelRegistry

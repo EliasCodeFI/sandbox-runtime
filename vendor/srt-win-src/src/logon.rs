@@ -167,18 +167,9 @@ fn pump(src: HANDLE, dst: HANDLE) {
     }
 }
 
-/// Spawn `srt-win runner` as `username`, send `cmd` over stdin, and
-/// return its exit code. `cwd` is set as the runner's working
-/// directory; `None` inherits the broker's. `sb_sid` is the
-/// `srt-sandbox` user-SID string (for the desktop DACL and the
-/// `WinSta0` station grant). `quiet` suppresses the informational
-/// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
-/// checkpoints are gated separately on `dbg` and are unaffected.
-///
-/// `holder` is a waitable handle on the process whose session the
-/// command belongs to. The command does not outlive it: if that
-/// process ends first, the runner and everything it started are
-/// terminated and the call fails with [`HolderGone`].
+/// Spawn `srt-win runner` as `username`, send `cmd` over stdin, return its
+/// exit code. If `holder` (a waitable process handle) ends first, the runner
+/// and everything it started are terminated: [`HolderGone`].
 pub fn spawn_runner(
     username: &str,
     password: &str,
@@ -427,10 +418,7 @@ pub fn spawn_runner(
 
     if wait_for_child_or_holder(child.process(), holder) == Ended::HolderGone {
         // The whole tree, now: the runner (which takes its own job,
-        // and so the command, with it) and then this job. The output
-        // threads are not waited for — nothing the command or a
-        // process it left behind does with its end of a pipe delays
-        // this — and end with the process.
+        // and so the command, with it) and then this job.
         drop(child);
         drop(job);
         return Err(anyhow::Error::new(HolderGone));
@@ -469,12 +457,9 @@ enum Ended {
     HolderGone,
 }
 
-/// Wait until the runner has exited or the holder has gone, whichever
-/// is first. The runner is asked first: with both ended, the command
-/// ran to its end. Anything else the wait can say — the holder
-/// signalled, the wait failed, a handle that is no longer one —
-/// counts as the holder gone: a command is never left running on a
-/// holder that cannot be seen to be there.
+/// Wait for the runner or the holder, whichever ends first; the runner is
+/// asked first. Anything else the wait can say (signalled holder, failed
+/// wait, bad handle) counts as the holder gone.
 fn wait_for_child_or_holder(child: HANDLE, holder: Option<HANDLE>) -> Ended {
     let Some(holder) = holder else {
         let rc = unsafe { WaitForSingleObject(child, INFINITE) };
@@ -514,7 +499,6 @@ mod tests {
     #[test]
     fn the_wait_ends_with_the_child_or_with_the_holder() {
         use windows::Win32::System::Threading::{CreateEventW, SetEvent};
-        // Events stand in for the two processes: signalled is exited.
         let event =
             || crate::util::OwnedHandle(unsafe { CreateEventW(None, true, false, None) }.unwrap());
         let (child, holder) = (event(), event());
@@ -523,13 +507,11 @@ mod tests {
             super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
             super::Ended::HolderGone
         );
-        // Both ended: the command ran to its end.
         unsafe { SetEvent(child.raw()) }.unwrap();
         assert_eq!(
             super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
             super::Ended::Child
         );
-        // The child alone, with a holder and without one.
         let holder = event();
         assert_eq!(
             super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
@@ -539,14 +521,12 @@ mod tests {
             super::wait_for_child_or_holder(child.raw(), None),
             super::Ended::Child
         );
-        // A holder handle that is not one fails the wait: gone.
         let running = event();
         let closed = windows::Win32::Foundation::HANDLE::default();
         assert_eq!(
             super::wait_for_child_or_holder(running.raw(), Some(closed)),
             super::Ended::HolderGone
         );
-        // The holder ending while the wait is under way wakes it.
         let (child, holder) = (event(), event());
         let signal = holder.raw().0 as isize;
         let t = std::thread::spawn(move || {
