@@ -45,6 +45,9 @@ pub enum RunnerCmd {
         target: String,
         #[serde(default)]
         anonymous_target: Option<String>,
+        /// Also make the anonymous off-loopback attempt.
+        #[serde(default)]
+        anonymous_egress: bool,
         #[serde(default)]
         open_off_loopback_target: Option<String>,
         #[serde(default)]
@@ -131,11 +134,13 @@ pub fn run() -> Result<u32> {
         RunnerCmd::ProbeEgress {
             target,
             anonymous_target,
+            anonymous_egress,
             open_off_loopback_target,
             open_loopback_target,
         } => Ok(crate::probe::run(crate::probe::Targets {
             target: &target,
             anonymous: anonymous_target.as_deref(),
+            anonymous_egress,
             open_off_loopback: open_off_loopback_target.as_deref(),
             open_loopback: open_loopback_target.as_deref(),
         })?
@@ -177,6 +182,7 @@ mod tests {
         let probe = RunnerCmd::ProbeEgress {
             target: "127.0.0.1:49999".into(),
             anonymous_target: Some("192.0.2.7:49999".into()),
+            anonymous_egress: true,
             open_off_loopback_target: Some("192.0.2.7:3000".into()),
             open_loopback_target: Some("127.0.0.1:3000".into()),
         };
@@ -187,6 +193,7 @@ mod tests {
             RunnerCmd::ProbeEgress {
                 target,
                 anonymous_target,
+                anonymous_egress: true,
                 open_off_loopback_target,
                 open_loopback_target,
             }
@@ -195,13 +202,15 @@ mod tests {
                     && open_off_loopback_target.as_deref() == Some("192.0.2.7:3000")
                     && open_loopback_target.as_deref() == Some("127.0.0.1:3000")
         ));
-        // Every target but the first is optional on the wire.
+        // Every target but the first, and the anonymous-egress switch, are
+        // optional on the wire; the switch defaults to off.
         let back: RunnerCmd =
             serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
         assert!(matches!(
             back,
             RunnerCmd::ProbeEgress {
                 anonymous_target: None,
+                anonymous_egress: false,
                 open_off_loopback_target: None,
                 open_loopback_target: None,
                 ..

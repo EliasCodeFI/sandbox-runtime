@@ -222,6 +222,8 @@ export interface WindowsWfpStatusResult {
    * filters) and on `outdated` (how to repair it).
    */
   hint?: string
+  /** Why the set is not current, without the repair that `hint` adds. */
+  reason?: string
 }
 
 /**
@@ -246,11 +248,12 @@ export type WindowsWfpResidual =
   | 'anonymous-egress'
   | 'anonymous-loopback'
   | 'deny-only-user-sid'
+  | 'lowered-integrity-unprobed'
 
 /**
  * Result of `srt-win wfp verify` on success (exit 0); anything else
- * throws. Only `anonymous`, `anonymousLoopback` and `denyOnly` can have
- * got past the fence: one that did is named in `residuals`.
+ * throws. `plain` is `blocked`. A lowered-integrity attempt may be
+ * `error` (not set up), and the rest anything: see `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -887,6 +890,7 @@ type RawWfpStatus = {
   allow_loopback?: boolean
   user_sid?: string
   hint?: string
+  reason?: string
 }
 
 function wfpStatusArgs(sublayerGuid?: string): string[] {
@@ -903,6 +907,7 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
     allowLoopback: raw.allow_loopback === true,
     ...(raw.user_sid && { userSid: raw.user_sid }),
     ...(raw.hint && { hint: raw.hint }),
+    ...(raw.reason && { reason: raw.reason }),
   }
 }
 
@@ -1038,6 +1043,8 @@ type RawWfpVerify = {
   outdated?: boolean
   allow_loopback_mismatch?: boolean
   hint?: string
+  reason?: string
+  record_error?: string
 }
 
 /**
@@ -1082,6 +1089,9 @@ const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
   'deny-only-user-sid':
     'a connect made under a copy of the sandbox token whose user SID is ' +
     'deny-only is not blocked (the filters cannot match that token)',
+  'lowered-integrity-unprobed':
+    'a lowered-integrity copy of the sandbox token could not be set up on ' +
+    'this machine, so no connect under it was observed',
 }
 
 function isWfpResidual(s: string): s is WindowsWfpResidual {
@@ -1151,6 +1161,12 @@ export function interpretWindowsWfpVerify(r: {
         `open-loopback=${probes.openLoopback} ` +
         `(${raw.open_loopback_target ?? 'no listener'})`
       : '')
+  if (raw.record_error) {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — ${raw.record_error}.`,
+    )
+  }
   if (r.status === 19 || raw.outdated) {
     if (raw.allow_loopback_mismatch) {
       throw new WindowsSandboxError(
@@ -1163,12 +1179,17 @@ export function interpretWindowsWfpVerify(r: {
           `\`, keeping your other install options.`,
       )
     }
+    // `hint` already names a repair; `reason` does not.
+    const why =
+      raw.reason ??
+      raw.hint ??
+      'the installed filter set predates this version of srt-win'
     throw new WindowsSandboxError(
       'wfp_fence_outdated',
-      `WFP egress fence is out of date — ` +
-        (raw.hint ??
-          'the installed filter set predates this version of srt-win') +
-        `. Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`,
+      `WFP egress fence cannot be used — ${why}.` +
+        (raw.reason || !raw.hint
+          ? ` Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`
+          : ''),
     )
   }
   // The attempts the fence must refuse. One getting through rejects
@@ -1208,6 +1229,15 @@ export function interpretWindowsWfpVerify(r: {
         `${raw.target} was '${raw.egress_probe}' (exit ` +
         `${r.status}) [${summary}]. The fence may be absent. Re-run ` +
         `\`srt-win install\`. (${r.stderr})`,
+    )
+  }
+  // Exit 0 alone is not a pass: the plain attempt must say `blocked`.
+  if (raw.egress_probe !== 'blocked') {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — \`srt-win wfp verify\` ` +
+        `exited 0 but reported the plain attempt as ` +
+        `'${raw.egress_probe ?? 'missing'}' [${summary}]. (${r.stderr})`,
     )
   }
   const residuals = (raw.residuals ?? []).filter(isWfpResidual)
@@ -1274,6 +1304,9 @@ export function interpretWindowsWfpVerify(r: {
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
  * @param opts.allowLoopback the session's `network.allowLocalBinding`;
  *   `srt-win` compares it with the installed loopback mode.
+ * @param opts.anonymousEgress also make the off-loopback attempt under
+ *   the anonymous token. It cannot change the result and can take
+ *   seconds, so `initialize()` leaves it out; for diagnostics only.
  * @throws on any outcome other than exit 0.
  */
 export async function verifyWindowsWfpEgress(
@@ -1281,6 +1314,7 @@ export async function verifyWindowsWfpEgress(
     target?: string
     proxyPortRange?: readonly [number, number]
     allowLoopback?: boolean
+    anonymousEgress?: boolean
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -1338,6 +1372,7 @@ export async function verifyWindowsWfpEgress(
     }
   }
   const args = ['wfp', 'verify', '--target', target]
+  if (opts.anonymousEgress) args.push('--anonymous-egress')
   if (opts.allowLoopback) args.push('--allow-loopback')
   try {
     // 30s: first call after install may create the sandbox user's
@@ -2235,10 +2270,20 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
 }
 
 /**
+ * {@link WindowsSandboxError} narrowed to `wfp_fence_outdated`: `exec`
+ * launched nothing because the install record shows no current fence.
+ */
+export interface FenceOutdatedError extends WindowsSandboxError {
+  readonly code: 'wfp_fence_outdated'
+  readonly drive?: undefined
+}
+
+/**
  * Parse a structured `srt-win exec` error from its stderr. `exec`
  * emits typed launch failures as a single JSON line
  * `{"code":…,"message":…}` alongside a distinct exit code —
- * `mapped_drive_cwd` is exit **16**. Embedders that spawn the
+ * `mapped_drive_cwd` is exit **16**, `wfp_fence_outdated` exit **19**.
+ * Embedders that spawn the
  * `{argv, env}` from {@link wrapCommandWithSandboxWindows} call
  * this on non-zero exit to surface an actionable
  * {@link WindowsSandboxError} instead of a bare status.
@@ -2251,7 +2296,7 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  */
 export function parseWindowsSandboxError(
   stderr: string,
-): MappedDriveCwdError | undefined {
+): MappedDriveCwdError | FenceOutdatedError | undefined {
   for (const line of stderr.split(/\r?\n/)) {
     const t = line.trim()
     if (!t.startsWith('{') || !t.includes('"code"')) continue
@@ -2273,6 +2318,13 @@ export function parseWindowsSandboxError(
           ),
           { drive: j.drive },
         ) as MappedDriveCwdError
+      }
+      if (j.code === 'wfp_fence_outdated') {
+        return new WindowsSandboxError(
+          'wfp_fence_outdated',
+          j.message ?? 'the installed network fence is not current',
+          'exec',
+        ) as FenceOutdatedError
       }
     } catch {
       // not our line
@@ -2745,8 +2797,8 @@ function interpretDependencyProbes(
     // The sandbox would run without filters this version relies on, so
     // it is an error, not a warning.
     errors.push(
-      `WFP filters under sublayer ${sublayerGuid ?? '(default)'} are out ` +
-        `of date${ws.hint ? ` (${ws.hint})` : ''}. ` +
+      `WFP filters under sublayer ${sublayerGuid ?? '(default)'} cannot ` +
+        `be used: ${ws.reason ?? ws.hint ?? 'they are out of date'}. ` +
         windowsInstallInstructions(sublayerGuid),
     )
   } else if (ws.state !== 'installed') {

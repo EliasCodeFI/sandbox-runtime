@@ -15,6 +15,7 @@
 //! ([`provision_machine_store`]).
 
 use anyhow::{Context, Result, anyhow};
+use windows::core::GUID;
 
 use crate::state_db;
 use crate::{dpapi, logon, runner, user};
@@ -327,14 +328,18 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
-/// Registry value holding the [`crate::wfp::FENCE_REVISION`] the last
-/// completed install wrote, or
-/// [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall.
-const FENCE_REVISION_VALUE: &str = "FenceRevision";
+/// Registry value (MULTI_SZ): one `<sublayer guid>=<revision>` line per
+/// sublayer an install has written, [`crate::wfp::FENCE_REVISION_REMOVED`]
+/// once its filters were uninstalled.
+const FENCE_REVISIONS_VALUE: &str = "FenceRevisions";
 
 /// Registry value: 1 when the last completed `srt-win install` opened
 /// loopback (`--allow-loopback`); absent when it is closed.
 const ALLOW_LOOPBACK_VALUE: &str = "AllowLoopback";
+
+/// What the value holds while an install changes the mode. Not 1, so
+/// [`read_allow_loopback`] reports an error and nothing is launched.
+const LOOPBACK_MODE_CHANGING: u32 = 2;
 
 /// Record whether the committed filters open loopback (`false` deletes
 /// the value). Call BEFORE [`write_fence_revision`]: the revision is
@@ -375,54 +380,162 @@ pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), Strin
     }
 }
 
-/// Record the installed filter set's revision. Call only AFTER the WFP
-/// transaction commits, so it never claims filters that were not written.
-pub fn write_fence_revision(rev: u32) -> Result<()> {
-    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
-    base.set_dword(FENCE_REVISION_VALUE, rev)
-}
+/// The single DWORD an earlier build kept for the whole machine. It is
+/// read as the default sublayer's record while that sublayer has no line.
+const LEGACY_FENCE_REVISION_VALUE: &str = "FenceRevision";
 
-/// Reset the recorded revision to "removed" and drop the loopback mode.
-/// Every path that deletes filters, or changes their loopback mode,
-/// calls this FIRST, so no failure leaves a current record for them.
-pub fn mark_fence_removed() -> Result<()> {
-    match crate::reg::Key::open(crate::reg::BASE, true)? {
-        Some(base) => {
-            // Revision first: once it reads as removed, nothing
-            // consults the loopback mode.
-            base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED)?;
-            crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)
-        }
-        None => Ok(()),
-    }
-}
-
-/// Whether the record says "removed". A read error is "no".
-pub fn fence_marked_removed() -> bool {
-    matches!(
-        read_fence_revision(),
-        Ok(Some(crate::wfp::FENCE_REVISION_REMOVED))
+fn sublayer_key(sublayer: &GUID) -> String {
+    let d = sublayer.data4;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        sublayer.data1,
+        sublayer.data2,
+        sublayer.data3,
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7]
     )
 }
 
-/// The fence revision the last install recorded; it does not show that
-/// the filters are still there. `Ok(None)` with no install, or with one
-/// that predates the record.
-pub fn read_fence_revision() -> Result<Option<u32>> {
-    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
-        return Ok(None);
-    };
-    base.get_dword(FENCE_REVISION_VALUE)
+/// Parse the record lines; a malformed line is dropped.
+fn parse_fence_records(lines: &[String]) -> Vec<(String, u32)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.to_ascii_lowercase(), v.parse().ok()?))
+        })
+        .collect()
 }
 
-/// `Err` (operator-facing text) unless the record is at this build's revision.
-pub fn require_current_fence() -> std::result::Result<(), String> {
-    let have = read_fence_revision().map_err(|e| format!("read fence revision: {e:#}"))?;
-    if have == Some(crate::wfp::FENCE_REVISION) {
-        Ok(())
-    } else {
-        Err(crate::wfp::outdated_hint(have))
+/// `records` with `key` set to `rev`, as lines to store.
+fn fence_records_with(mut records: Vec<(String, u32)>, key: &str, rev: u32) -> Vec<String> {
+    match records.iter_mut().find(|(k, _)| k == key) {
+        Some(r) => r.1 = rev,
+        None => records.push((key.to_string(), rev)),
     }
+    records.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// Every sublayer's recorded revision, the legacy value included as the
+/// default sublayer's when that sublayer has no line of its own.
+fn fence_records_of(base: &crate::reg::Key) -> Result<Vec<(String, u32)>> {
+    let mut records = parse_fence_records(
+        &base
+            .get_multi_sz(FENCE_REVISIONS_VALUE)?
+            .unwrap_or_default(),
+    );
+    let default = sublayer_key(&crate::wfp::DEFAULT_SUBLAYER_GUID);
+    if !records.iter().any(|(k, _)| *k == default)
+        && let Some(rev) = base.get_dword(LEGACY_FENCE_REVISION_VALUE)?
+    {
+        records.push((default, rev));
+    }
+    Ok(records)
+}
+
+fn read_fence_records() -> Result<Vec<(String, u32)>> {
+    match crate::reg::Key::open(crate::reg::BASE, false)? {
+        Some(base) => fence_records_of(&base),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Record the revision of the filter set installed under `sublayer`.
+/// Call only AFTER the WFP transaction commits, so it never claims
+/// filters that were not written.
+pub fn write_fence_revision(sublayer: &GUID, rev: u32) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    let lines = fence_records_with(fence_records_of(&base)?, &sublayer_key(sublayer), rev);
+    base.set_multi_sz(FENCE_REVISIONS_VALUE, &lines)
+}
+
+/// Reset `sublayer`'s recorded revision to "removed"; other sublayers'
+/// records are untouched, and the loopback mode goes once none is current.
+/// Every path that deletes filters calls this FIRST.
+pub fn mark_fence_removed(sublayer: &GUID) -> Result<()> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, true)? else {
+        return Ok(());
+    };
+    let records = fence_records_of(&base)?;
+    let key = sublayer_key(sublayer);
+    if !records.iter().any(|(k, _)| *k == key) {
+        return Ok(());
+    }
+    let lines = fence_records_with(records, &key, crate::wfp::FENCE_REVISION_REMOVED);
+    base.set_multi_sz(FENCE_REVISIONS_VALUE, &lines)?;
+    // Revision first: once no set reads as current, nothing consults the mode.
+    if summarize_fence_records(&parse_fence_records(&lines)) != FenceRecord::Current {
+        crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)?;
+    }
+    Ok(())
+}
+
+/// Make the recorded loopback mode unreadable while an install replaces
+/// the filters with the other mode: until [`write_allow_loopback`], no
+/// session of either mode is launched on a record that no longer holds.
+pub fn mark_loopback_mode_changing() -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    base.set_dword(ALLOW_LOOPBACK_VALUE, LOOPBACK_MODE_CHANGING)
+}
+
+/// The revision recorded for `sublayer`; it does not show that the
+/// filters are still there. `Ok(None)` with no install under it, or
+/// with one that predates the record.
+pub fn read_fence_revision(sublayer: &GUID) -> Result<Option<u32>> {
+    let key = sublayer_key(sublayer);
+    Ok(read_fence_records()?
+        .into_iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, rev)| rev))
+}
+
+/// What the install record says about the fence, over every sublayer:
+/// the filters match the sandbox account under whichever one holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceRecord {
+    /// Some sublayer holds a set at [`crate::wfp::FENCE_REVISION`].
+    Current,
+    /// None is current, and every recorded set was uninstalled.
+    Removed,
+    /// None is current; the newest other revision recorded, if any.
+    Outdated(Option<u32>),
+}
+
+fn summarize_fence_records(records: &[(String, u32)]) -> FenceRecord {
+    let revs = || records.iter().map(|(_, r)| *r);
+    if revs().any(|r| r == crate::wfp::FENCE_REVISION) {
+        FenceRecord::Current
+    } else if let Some(other) = revs()
+        .filter(|r| *r != crate::wfp::FENCE_REVISION_REMOVED)
+        .max()
+    {
+        FenceRecord::Outdated(Some(other))
+    } else if records.is_empty() {
+        FenceRecord::Outdated(None)
+    } else {
+        FenceRecord::Removed
+    }
+}
+
+pub fn fence_record() -> Result<FenceRecord> {
+    Ok(summarize_fence_records(&read_fence_records()?))
+}
+
+/// What a launch finds in place of a current record: `None` when a set
+/// at this build's revision is recorded, else the revision to name
+/// ([`crate::wfp::FENCE_REVISION_REMOVED`] once every set was uninstalled).
+pub fn fence_gap() -> Result<Option<Option<u32>>> {
+    Ok(match fence_record()? {
+        FenceRecord::Current => None,
+        FenceRecord::Removed => Some(Some(crate::wfp::FENCE_REVISION_REMOVED)),
+        FenceRecord::Outdated(have) => Some(have),
+    })
 }
 
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
@@ -569,11 +682,77 @@ pub fn clear_setup() -> Result<()> {
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",
-            FENCE_REVISION_VALUE,
+            FENCE_REVISIONS_VALUE,
+            LEGACY_FENCE_REVISION_VALUE,
             ALLOW_LOOPBACK_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wfp::{DEFAULT_SUBLAYER_GUID, FENCE_REVISION, FENCE_REVISION_REMOVED};
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sublayer_key_is_the_lowercase_guid() {
+        assert_eq!(
+            sublayer_key(&DEFAULT_SUBLAYER_GUID),
+            "2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21"
+        );
+    }
+
+    #[test]
+    fn one_sublayer_changes_only_its_own_line() {
+        let a = "2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21";
+        let b = "11111111-2222-3333-4444-555555555555";
+        let both = lines(&[
+            &format!("{a}={FENCE_REVISION}"),
+            &format!("{b}={FENCE_REVISION}"),
+        ]);
+        let after = fence_records_with(parse_fence_records(&both), b, FENCE_REVISION_REMOVED);
+        assert_eq!(
+            parse_fence_records(&after),
+            [(a.to_string(), FENCE_REVISION), (b.to_string(), 0)]
+        );
+        // The other sublayer's set still makes the record current.
+        assert_eq!(
+            summarize_fence_records(&parse_fence_records(&after)),
+            FenceRecord::Current
+        );
+        // A sublayer with no line gets one; a malformed line is dropped.
+        let added = fence_records_with(parse_fence_records(&lines(&["junk", "x=y"])), a, 7);
+        assert_eq!(added, [format!("{a}=7")]);
+    }
+
+    #[test]
+    fn record_summary() {
+        let r = |v: &[u32]| -> Vec<(String, u32)> {
+            v.iter()
+                .enumerate()
+                .map(|(i, r)| (i.to_string(), *r))
+                .collect()
+        };
+        assert_eq!(
+            summarize_fence_records(&r(&[])),
+            FenceRecord::Outdated(None)
+        );
+        assert_eq!(summarize_fence_records(&r(&[0])), FenceRecord::Removed);
+        assert_eq!(summarize_fence_records(&r(&[0, 0])), FenceRecord::Removed);
+        assert_eq!(
+            summarize_fence_records(&r(&[0, FENCE_REVISION - 1])),
+            FenceRecord::Outdated(Some(FENCE_REVISION - 1))
+        );
+        assert_eq!(
+            summarize_fence_records(&r(&[0, FENCE_REVISION - 1, FENCE_REVISION])),
+            FenceRecord::Current
+        );
+    }
 }

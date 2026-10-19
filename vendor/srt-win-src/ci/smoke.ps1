@@ -274,6 +274,8 @@ function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE
   Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  # The exit code first: only 0, 2 and 3 come with a probe report to parse.
+  if ($ec -notin 0, 2, 3) { throw "wfp verify --target ${tgt} exited $ec without a probe report. stdout: $out" }
   return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
 }
 $v = WfpVerify $probeTgt
@@ -364,17 +366,17 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
-# `FenceRevision` is reset to 0 ("removed"), and `exec` refuses on it
-# (exit 19) instead of launching with no fence.
-$fr0 = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevision
-if ($fr0 -ne 0) {
-  throw "uninstall --keep-user: FenceRevision expected 0 (removed), got '$fr0'"
+# This sublayer's line in `FenceRevisions` is reset to 0 ("removed"), and
+# `exec` refuses on it (exit 19) instead of launching with no fence.
+$fr0 = @((Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevisions)
+if ($fr0 -notcontains "$($InstallSublayer.ToLower())=0") {
+  throw "uninstall --keep-user: FenceRevisions expected '$($InstallSublayer.ToLower())=0', got '$($fr0 -join ' ')'"
 }
 $x0 = & $Exe exec -- (Join-Path $env:SystemRoot 'System32\cmd.exe') /c 'echo KEEPUSER-RAN' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 19 -or $x0 -match 'KEEPUSER-RAN' -or $x0 -notmatch '(?i)srt-win install') {
   throw "uninstall --keep-user: exec expected exit 19 + install hint, got $LASTEXITCODE. out: $x0"
 }
-Write-Host 'uninstall --keep-user ok: FenceRevision reset to 0; exec refuses (exit 19)'
+Write-Host 'uninstall --keep-user ok: the sublayer''s fence record reset to 0; exec refuses (exit 19)'
 
 # ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
 # Filters were just removed (`uninstall --keep-user`) but the
@@ -390,11 +392,10 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
-# Control, recorded and not asserted: with no filters the lowered-integrity
-# attempts should connect too, so `blocked` above is the filter's doing.
-Write-Host ("wfp verify control (fence-inactive): " +
-            "low_integrity_loopback_probe=$($v.json.low_integrity_loopback_probe) " +
-            "untrusted_integrity_loopback_probe=$($v.json.untrusted_integrity_loopback_probe)")
+# The plain connect settles it: nothing else is attempted.
+if ($v.json.low_integrity_loopback_probe -ne 'skipped' -or $v.json.anonymous_loopback_probe -ne 'skipped') {
+  throw "wfp verify (fence-inactive): expected the remaining attempts skipped: $($v.json | ConvertTo-Json -Compress)"
+}
 $probeLsn.Stop()
 
 # Re-install to set up for the full uninstall below.

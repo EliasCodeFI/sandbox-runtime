@@ -610,21 +610,50 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// Remove `sublayer`'s filters: its record first, the filters second
+/// (`install::mark_fence_removed`). Returns how many were removed.
+fn remove_fence(sublayer: &windows::core::GUID) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    use srt_win::{install, wfp};
+    install::mark_fence_removed(sublayer).context("mark WFP fence removed")?;
+    let n = wfp::uninstall_filters(sublayer)?;
+    // A record written before records were per sublayer is read as the
+    // default sublayer's: reset it when that sublayer holds no filters.
+    let default = wfp::DEFAULT_SUBLAYER_GUID;
+    if install::read_fence_revision(&default).ok().flatten() == Some(wfp::FENCE_REVISION)
+        && wfp::filter_status(&default).is_ok_and(|st| st.state == "absent")
+    {
+        install::mark_fence_removed(&default).context("mark WFP fence removed")?;
+    }
+    Ok(n)
+}
+
 /// `wfp::filter_status` with the install record's fence revision
 /// folded in — the `wfp` object both status commands print.
 fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::WfpStatus> {
     use srt_win::{install, wfp};
-    // No install record → nothing to compare against. A record whose
-    // revision cannot be read is treated as carrying none.
-    let record = install::read_setup()
-        .ok()
-        .flatten()
-        .map(|_| install::read_fence_revision().ok().flatten());
-    let st = wfp::apply_recorded_revision(wfp::filter_status(sublayer)?, record);
+    let mut st = wfp::filter_status(sublayer)?;
+    // No install record → nothing to compare against.
+    if install::read_setup().ok().flatten().is_none() {
+        return Ok(wfp::apply_recorded_loopback(st, None));
+    }
+    let st = match install::read_fence_revision(sublayer) {
+        Ok(rev) => wfp::apply_recorded_revision(st, Some(rev)),
+        Err(e) => {
+            let unread = format!("could not read the install record's fence revision: {e:#}");
+            st.hint = Some(match st.hint.take() {
+                Some(hint) => format!("{hint}; {unread}"),
+                None => unread,
+            });
+            st
+        }
+    };
     // An unreadable recorded loopback mode is treated as no record here;
     // `wfp verify` / `exec` fail on it and say why.
-    let recorded_loopback = record.and_then(|_| install::read_allow_loopback().ok());
-    Ok(wfp::apply_recorded_loopback(st, recorded_loopback))
+    Ok(wfp::apply_recorded_loopback(
+        st,
+        install::read_allow_loopback().ok(),
+    ))
 }
 
 /// Install-time ambient write-deny state: the recorded paths (HKLM
@@ -773,6 +802,9 @@ enum WfpCmd {
     ///     change the exit code. `anonymous-egress` is expected
     ///     wherever the machine has an off-loopback address: no
     ///     filter is keyed on the anonymous token.
+    ///     `lowered-integrity-unprobed` is named when a
+    ///     lowered-integrity probe is `error`: that token shape could
+    ///     not be set up, so no connect under it was observed.
     ///
     /// Every probe but `egress_probe` and the two `open_*` ones
     /// (all three run under the runner's own token) makes its connect
@@ -786,14 +818,15 @@ enum WfpCmd {
     /// Every other probe but `open_loopback_probe` must be blocked:
     /// `egress_probe`, the four lowered-integrity
     /// ones, whose token still carries the sandbox account's SID, and
-    /// `open_off_loopback_probe`. Exits **0** (all of them were
-    /// blocked, or skipped for want of an off-loopback address or
-    /// with loopback closed, and `open_loopback_probe` connected or
-    /// was skipped = fence active), **3** (one got past the filters = fence
-    /// MISSING), **2** (one was inconclusive — `error` means no
-    /// connect was made under the token: it could not be assumed, or
-    /// did not read back as assumed once the socket existed, which is
-    /// not a block; treat as failure), **19** when the install record
+    /// `open_off_loopback_probe`. Exits **0** (`egress_probe` was
+    /// blocked; each lowered-integrity one was blocked, skipped for
+    /// want of an off-loopback address, or `error`;
+    /// `open_off_loopback_probe` was blocked or skipped; and
+    /// `open_loopback_probe` connected or was skipped = fence
+    /// active), **3** (one got past the filters = fence MISSING),
+    /// **2** (`egress_probe` or `open_off_loopback_probe` was not
+    /// blocked, or a lowered-integrity connect was made and got no
+    /// answer; treat as failure), **19** when the install record
     /// says the filter set predates this build or has the other
     /// loopback mode than `--allow-loopback` (or its absence) names,
     /// or when the open-loopback listener was blocked (`outdated:
@@ -835,6 +868,13 @@ enum WfpCmd {
         /// does. With no such address the attempt is skipped.
         #[arg(long)]
         anonymous_target: Option<String>,
+        /// Also make the off-loopback attempt under the anonymous
+        /// token (`anonymous_probe`, residual `anonymous-egress`).
+        /// No filter refuses it, so it never changes the exit code,
+        /// and it can wait on its destination; without this flag it
+        /// is `skipped`.
+        #[arg(long)]
+        anonymous_egress: bool,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -952,7 +992,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
-                    && install::require_current_fence().is_ok()
+                    && install::read_fence_revision(&sl).ok().flatten() == Some(wfp::FENCE_REVISION)
                     && install::require_allow_loopback(allow_loopback).is_ok()
                     && install::cred_present()
                     && ambient_ok()
@@ -1068,10 +1108,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(17);
                 }
             }
-            // A changing (or unreadable) loopback mode: mark the fence removed FIRST, or
-            // a failure could leave a current record beside filters of the other mode.
+            // A changing (or unreadable) loopback mode: make the record unusable FIRST,
+            // or a failure could leave a current one beside filters of the other mode.
             if install::read_allow_loopback().ok() != Some(allow_loopback)
-                && let Err(e) = install::mark_fence_removed()
+                && let Err(e) = install::mark_fence_removed(&sl)
+                    .and_then(|()| install::mark_loopback_mode_changing())
             {
                 eprintln!("srt-win: error: mark WFP fence removed: {e:#}");
                 std::process::exit(12);
@@ -1086,7 +1127,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: error: record loopback mode: {e:#}");
                 std::process::exit(12);
             }
-            if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
+            if let Err(e) = install::write_fence_revision(&sl, wfp::FENCE_REVISION) {
                 eprintln!("srt-win: error: record WFP fence revision: {e:#}");
                 std::process::exit(12);
             }
@@ -1126,9 +1167,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            // Record first, filters second (`install::mark_fence_removed`).
-            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
-            let n = wfp::uninstall_filters(&sl)?;
+            let n = remove_fence(&sl)?;
             // Read setup up front: the ambient cleanup and the
             // deprovision fallback both need the recorded name/SID
             // before clear_setup wipes them.
@@ -1244,6 +1283,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     target,
                     allow_loopback,
                     anonymous_target,
+                    anonymous_egress,
                 },
         } => {
             use srt_win::{install, logon, probe, runner};
@@ -1282,35 +1322,51 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             // A record that says the filters were REMOVED is not refused
             // here: the probe then shows the missing fence (exit 3).
-            if !install::fence_marked_removed() {
-                if let Err(hint) = install::require_current_fence() {
+            let removed = match install::fence_gap() {
+                Ok(None) => false,
+                Ok(Some(Some(wfp::FENCE_REVISION_REMOVED))) => true,
+                Ok(Some(have)) => {
+                    let hint = wfp::outdated_hint(have);
                     eprintln!("srt-win: error: wfp verify: {hint}");
                     finish(
                         json!({
                             "egress_probe": "not-run",
                             "target": target,
                             "outdated": true,
+                            "reason": wfp::outdated_reason(have),
                             "hint": hint,
                         }),
                         probe::EXIT_FENCE_OUTDATED,
                     );
                 }
-                // `allow_loopback_mismatch` tells the host that the repair
-                // is an install with THIS session's loopback mode.
-                if let Err(hint) = install::require_allow_loopback(allow_loopback) {
-                    eprintln!("srt-win: error: wfp verify: {hint}");
+                Err(e) => {
+                    let unread = format!("could not read the install record: {e:#}");
+                    eprintln!("srt-win: error: wfp verify: {unread}");
                     finish(
                         json!({
                             "egress_probe": "not-run",
                             "target": target,
-                            "outdated": true,
-                            "allow_loopback_mismatch": true,
-                            "allow_loopback": allow_loopback,
-                            "hint": hint,
+                            "record_error": unread,
                         }),
-                        probe::EXIT_FENCE_OUTDATED,
+                        probe::EXIT_INCONCLUSIVE,
                     );
                 }
+            };
+            // `allow_loopback_mismatch` tells the host that the repair
+            // is an install with THIS session's loopback mode.
+            if !removed && let Err(hint) = install::require_allow_loopback(allow_loopback) {
+                eprintln!("srt-win: error: wfp verify: {hint}");
+                finish(
+                    json!({
+                        "egress_probe": "not-run",
+                        "target": target,
+                        "outdated": true,
+                        "allow_loopback_mismatch": true,
+                        "allow_loopback": allow_loopback,
+                        "hint": hint,
+                    }),
+                    probe::EXIT_FENCE_OUTDATED,
+                );
             }
             let anonymous_target = anonymous_target.or_else(|| {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
@@ -1332,6 +1388,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                     anonymous_target: anonymous_target.clone(),
+                    anonymous_egress,
                     open_off_loopback_target: open_off_loopback_target.clone(),
                     open_loopback_target: open_loopback_target.clone(),
                 },
@@ -1386,6 +1443,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             "a connect to a loopback destination made while \
                              impersonating the anonymous token is not blocked \
                              (see the per-ordering lines above)",
+                        probe::RESIDUAL_LOWERED_INTEGRITY_UNPROBED =>
+                            "a lowered-integrity copy of the sandbox token \
+                             could not be set up, so no connect under it was \
+                             observed (see the per-ordering lines above)",
                         _ =>
                             "a connect made under a copy of the sandbox token \
                              whose user SID is deny-only is not blocked \
@@ -1439,8 +1500,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
-            let n = wfp::uninstall_filters(&sl)?;
+            let n = remove_fence(&sl)?;
             eprintln!("srt-win: removed {n} WFP filter(s)");
         }
 
@@ -1763,10 +1823,24 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
 
             // The non-elevated broker cannot enumerate filters; the install
             // record's revision and loopback mode are what it can check.
-            if let Err(hint) = install::require_current_fence()
-                .and_then(|()| install::require_allow_loopback(allow_loopback))
-            {
-                eprintln!("srt-win: error: {hint}");
+            let refusal = match install::fence_gap().context("read the install record")? {
+                Some(have) => Some(json!({
+                    "code": "wfp_fence_outdated",
+                    "message": wfp::outdated_hint(have),
+                    "reason": wfp::outdated_reason(have),
+                })),
+                None => install::require_allow_loopback(allow_loopback)
+                    .err()
+                    .map(|hint| {
+                        json!({
+                            "code": "wfp_fence_outdated",
+                            "message": hint,
+                            "allow_loopback_mismatch": true,
+                        })
+                    }),
+            };
+            if let Some(refusal) = refusal {
+                eprintln!("{refusal}");
                 std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
             }
 
