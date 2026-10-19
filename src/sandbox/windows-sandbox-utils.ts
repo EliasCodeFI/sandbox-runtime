@@ -2309,8 +2309,9 @@ const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
 
 /**
  * Merge environment layers ignoring case, as Windows reads names: a later
- * layer's entry replaces an earlier one, name and value. Two names that
- * differ only by case in one block make .NET's `Process.Start` throw.
+ * layer's entry replaces an earlier one, name and value; an `undefined`
+ * value sets nothing. Two names that differ only by case in one block make
+ * .NET's `Process.Start` throw.
  */
 export function mergeWindowsEnv(
   ...layers: Readonly<Record<string, string | undefined>>[]
@@ -2318,6 +2319,7 @@ export function mergeWindowsEnv(
   const byName = new Map<string, [name: string, value: string | undefined]>()
   for (const layer of layers) {
     for (const [name, value] of Object.entries(layer)) {
+      if (value === undefined) continue
       const folded = name.toUpperCase()
       const spelling =
         WINDOWS_PROXY_NAME_SPELLING.find(n => n.toUpperCase() === folded) ??

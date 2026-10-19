@@ -462,10 +462,19 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       Path: 'b',
       http_proxy: 'three',
       node_use_env_proxy: '0',
-      GONE: undefined,
+      Gone: 'x',
       RSYNC_PROXY: 'h:1',
       no_proxy: '',
     })
+  })
+
+  it('mergeWindowsEnv: an undefined value in a later layer erases nothing', () => {
+    const merged = mergeWindowsEnv(
+      { PATH: 'C:\\Windows', Kept: 'x' },
+      { Path: undefined, KEPT: undefined, Absent: undefined },
+    )
+    expect(merged).toEqual({ PATH: 'C:\\Windows', Kept: 'x' })
+    expect(Object.keys(merged)).toEqual(['PATH', 'Kept'])
   })
 })
 
