@@ -1,50 +1,15 @@
-//! Proof that the security descriptor on the WFP BLOCK filters
-//! matches the token shapes `wfp::install_filters` relies on it to
-//! match — and only those.
+//! Proof that the security descriptor on the WFP BLOCK filters matches
+//! the token shapes `wfp::install_filters` relies on — and only those.
 //!
 //! WFP's `ALE_USER_ID` `FWP_MATCH_EQUAL` condition runs `AccessCheck`
 //! on the token the connect is attributed to against the filter's
 //! SD; the filter matches iff the check grants. This test calls
-//! `AccessCheck` directly — no live WFP engine — so it pins the SD
-//! semantics independent of the network stack.
+//! `AccessCheck` directly, with the CALLING user standing in for the
+//! sandbox account.
 //!
-//! The sandbox account itself can't be exercised without
-//! provisioning it, so the CALLING user stands in for it: the
-//! sandbox-user SD is keyed on the caller's own SID wherever a row
-//! is about "a token of the sandbox account", and on a SID the
-//! caller does not carry wherever a row is about "some other user".
-//!
-//! | token                                   | sandbox-user SD |
-//! |-----------------------------------------|-----------------|
-//! | sandbox account, plain                  | match           |
-//! | another real user                       | no match        |
-//! | anonymous                               | no match        |
-//! | AppContainer of the sandbox account     | match           |
-//! | AppContainer of another real user       | no match        |
-//! | sandbox account, user SID deny-only     | no match        |
-//! | sandbox account, integrity lowered      | recorded        |
-//!
-//! The anonymous and deny-only rows are gaps the filter set leaves
-//! open (see the `wfp` module doc); they are asserted so the gaps
-//! stay visible.
-//!
-//! ## Integrity levels and the generic mapping
-//!
-//! An access check runs the mandatory integrity check before it reads
-//! the DACL. A token whose integrity level is below the descriptor's
-//! label (medium when the descriptor has none) keeps only the rights
-//! the caller's `GENERIC_MAPPING` files under read and execute. The
-//! mapping the filtering engine passes is not something this crate
-//! controls, so every row is evaluated under [`STRICT`], which files
-//! the requested right under nothing: a grant under it holds under
-//! any mapping.
-//!
-//! Each check prints one line to stderr (written past the test
-//! harness's capture, so it shows for passing tests too) with the
-//! answer under [`STRICT`] and under [`LENIENT`]. Denied under the
-//! first and granted under the second means the mandatory check, not
-//! the DACL, refused. A failure of the `AccessCheck` call itself is
-//! never read as "no match": it panics with the Win32 error.
+//! A token below the descriptor's integrity level keeps only what the
+//! caller's `GENERIC_MAPPING` allows, and the engine's mapping is
+//! unknown: rows are judged under [`STRICT`], which holds under any.
 
 #![cfg(windows)]
 
@@ -78,9 +43,8 @@ use srt_win::wfp::sddl_sandbox_user;
 /// only need a single bit; `AccessCheck` is asked for that bit.
 const DESIRED_ACCESS: u32 = 1;
 
-/// Files [`DESIRED_ACCESS`] under no category. A token whose
-/// integrity level is below the descriptor's label is then refused
-/// whatever the DACL says — the strictest answer any mapping gives.
+/// Files [`DESIRED_ACCESS`] under no category: a token below the
+/// descriptor's label is refused whatever the DACL says.
 const STRICT: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericRead: GENERIC_READ.0,
     GenericWrite: GENERIC_WRITE.0,
@@ -88,10 +52,9 @@ const STRICT: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericAll: GENERIC_ALL.0,
 };
 
-/// Files [`DESIRED_ACCESS`] under execute, which a no-write-up label
-/// leaves to a token of lower integrity. Diagnostic only: a pair
-/// denied under [`STRICT`] and granted under this one was refused by
-/// the mandatory integrity check, not by the DACL.
+/// Files [`DESIRED_ACCESS`] under execute. Diagnostic only: denied
+/// under [`STRICT`] and granted under this one means the mandatory
+/// integrity check, not the DACL, refused.
 const LENIENT: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericRead: 0,
     GenericWrite: 0,
@@ -99,21 +62,16 @@ const LENIENT: GENERIC_MAPPING = GENERIC_MAPPING {
     GenericAll: DESIRED_ACCESS,
 };
 
-/// The low mandatory level.
 const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
 
-/// `SE_GROUP_INTEGRITY`: marks a SID as a token's integrity level.
 const SE_GROUP_INTEGRITY: u32 = 0x20;
 
-/// A well-formed RID under `BUILTIN` that maps to nothing — a SID no
-/// token here carries.
+/// A well-formed SID that maps to nothing: no token here carries it.
 const FOREIGN_SID: &str = "S-1-5-32-9999";
 
-/// A well-formed AppContainer package SID. It names no installed
-/// package; a lowbox token only needs the SID to be of this form.
+/// A package SID; a lowbox token only needs it to be of this form.
 const PACKAGE_SID: &str = "S-1-15-2-1111-2222-3333-4444-5555-6666-7777";
 
-/// `OBJECT_ATTRIBUTES`, for the one call below that takes it.
 #[repr(C)]
 struct ObjectAttributes {
     length: u32,
@@ -124,9 +82,8 @@ struct ObjectAttributes {
     security_quality_of_service: *const c_void,
 }
 
-// The system call that derives an AppContainer token from an
-// existing one. `raw-dylib` so the test links without an import
-// library for it.
+// Derives an AppContainer token from an existing one. `raw-dylib`:
+// no import library is needed to link.
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
     fn NtCreateLowBoxToken(
@@ -174,22 +131,17 @@ fn into_impersonation(token: HANDLE) -> HANDLE {
     imp
 }
 
-/// The calling process's own token.
 fn own_token() -> HANDLE {
     into_impersonation(own_primary_token())
 }
 
-/// The anonymous token: what a thread's effective token is after
-/// `ImpersonateAnonymousToken`. It is used as opened — an
-/// impersonation token already, and `TOKEN_QUERY` is all
-/// `AccessCheck` and [`describe`] need.
+/// The anonymous token, as opened off an impersonating thread.
 fn anonymous_token() -> HANDLE {
     let mut tok = HANDLE::default();
     unsafe {
         ImpersonateAnonymousToken(GetCurrentThread()).expect("ImpersonateAnonymousToken");
-        // open_as_self: the open is checked against the process
-        // token, not the anonymous one the thread now carries (which
-        // would be refused).
+        // open_as_self: checked against the process token, not the
+        // anonymous one the thread now carries.
         let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut tok);
         RevertToSelf().expect("RevertToSelf");
         opened.expect("OpenThreadToken(anonymous)");
@@ -220,8 +172,6 @@ fn low_integrity_token() -> HANDLE {
     tok
 }
 
-/// An AppContainer (lowbox) token derived from the calling process's
-/// token, with no capabilities.
 fn appcontainer_token() -> HANDLE {
     let package = LocalPsid::from_string(PACKAGE_SID).expect("package SID");
     let attrs = ObjectAttributes {
@@ -252,8 +202,6 @@ fn appcontainer_token() -> HANDLE {
     into_impersonation(lowbox)
 }
 
-/// A restricted copy of the calling process's token whose user SID
-/// is deny-only.
 fn deny_only_user_token(me: &str) -> HANDLE {
     let user = LocalPsid::from_string(me).expect("own SID");
     let disable = [SID_AND_ATTRIBUTES {
@@ -277,7 +225,6 @@ fn deny_only_user_token(me: &str) -> HANDLE {
     into_impersonation(restricted)
 }
 
-/// One `u32`-sized token property, or the error reading it.
 fn token_u32(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<u32, String> {
     let mut value = 0u32;
     let mut len = 0u32;
@@ -294,8 +241,6 @@ fn token_u32(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<u32, Strin
     .map_err(|e| format!("<{e}>"))
 }
 
-/// The token's integrity level as a string SID, or the error reading
-/// it.
 fn token_integrity(token: HANDLE) -> Result<String, String> {
     // u64 elements: the buffer starts with a struct holding a pointer.
     let mut buf = [0u64; 16];
@@ -314,10 +259,6 @@ fn token_integrity(token: HANDLE) -> Result<String, String> {
     }
 }
 
-/// The token properties an access check depends on besides its SIDs:
-/// type (1 primary, 2 impersonation), impersonation level and
-/// integrity level. A property that cannot be read is shown as its
-/// error.
 fn describe(token: HANDLE) -> String {
     let show = |r: Result<String, String>| r.unwrap_or_else(|e| e);
     let level = token_u32(token, TokenImpersonationLevel).map(|l| {
@@ -338,12 +279,10 @@ fn describe(token: HANDLE) -> String {
     )
 }
 
-/// What one `AccessCheck` call answered.
 struct Verdict {
     granted: bool,
     mask: u32,
-    /// The Win32 status the call left behind: the reason, when it
-    /// did not grant.
+    /// The Win32 status the call left: the reason, when not granted.
     status: u32,
 }
 
@@ -358,11 +297,8 @@ impl fmt::Display for Verdict {
 }
 
 /// `AccessCheck(token, SD-from-sddl, DESIRED_ACCESS)` under `mapping`.
-///
-/// "Did not grant" and "the call failed" are different answers. The
-/// first is returned. The second — a token that is not an
-/// impersonation token or is below identification level, a
-/// descriptor with no owner or group — panics with the Win32 error.
+/// "Did not grant" is returned; a failure of the call itself (not an
+/// impersonation token, no owner or group) panics instead.
 fn access_check(row: &str, token: HANDLE, sddl: &str, mapping: &GENERIC_MAPPING) -> Verdict {
     let w = wstr(sddl);
     let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -444,11 +380,8 @@ fn plain_tokens() {
         check("plain / sandbox-user SD", tok, &sddl_sandbox_user(&me)),
         "sandbox-user SD keyed on own user SID must match own token"
     );
-    // SD keyed on a SID this token does NOT carry → DENY (i.e. the
-    // BLOCK does NOT match the broker / services / any other user →
-    // falls through to default-permit). The package ACEs on the SD
-    // must not change that: a token outside an AppContainer carries
-    // neither package SID.
+    // A SID this token does NOT carry → DENY; the package ACEs on the
+    // SD must not change that.
     assert!(
         !check(
             "plain / sandbox-user SD of another user",
@@ -529,18 +462,15 @@ fn lowered_integrity_token_of_the_sandbox_account() {
     let tok = low_integrity_token();
     let me = srt_win::sid::current_user_sid().unwrap();
 
-    // Logged, not asserted. The sandbox-user SD has no label, so for
-    // a token below medium integrity the answer is the mandatory
-    // check's and turns on the generic mapping, which is the
-    // filtering engine's to choose and this test cannot observe.
+    // Logged, not asserted: below medium integrity the answer turns on
+    // the engine's generic mapping, which this test cannot observe.
     let _ = check(
         "low integrity / sandbox-user SD",
         tok,
         &sddl_sandbox_user(&me),
     );
 
-    // This holds under any mapping: the DACL does not name this
-    // token.
+    // Holds under any mapping: the DACL does not name this token.
     assert!(
         !check(
             "low integrity / sandbox-user SD of another user",

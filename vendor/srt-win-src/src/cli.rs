@@ -833,9 +833,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // stamping step below (env reads + a stat per entry).
             let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
-            // An `outdated` set (written by an earlier build) takes
-            // the same conflict check but never the early-out: it
-            // falls through and is replaced.
+            // An `outdated` set takes the same conflict check but never
+            // the early-out: it falls through and is replaced.
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && matches!(st.state, "installed" | "outdated")
@@ -878,9 +877,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // missing/undecryptable Cred\Blob with a healthy
                 // marker must fall through and be rewritten rather
                 // than early-outing on "already installed".
-                // So is the fence: the enumerated set and the
-                // install record must both be at this build's
-                // revision.
+                // So is the fence: both the enumerated set and the
+                // install record must be at this build's revision.
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
@@ -1004,9 +1002,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
-            // Only now that the filters are committed: record their
-            // revision for the non-elevated broker, which cannot
-            // enumerate them.
+            // Only now that the filters are committed: the non-elevated
+            // broker goes by this record, as it cannot enumerate them.
             if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
                 eprintln!("srt-win: error: record WFP fence revision: {e:#}");
                 std::process::exit(12);
@@ -1042,8 +1039,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            // Record first, filters second — see
-            // `install::mark_fence_removed` for why that order.
+            // Record first, filters second (`install::mark_fence_removed`).
             srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
             let n = wfp::uninstall_filters(&sl)?;
             // Read setup up front: the ambient cleanup and the
@@ -1163,12 +1159,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 },
         } => {
             use srt_win::{install, logon, probe, runner};
-            // A BLOCK fires at ALE_AUTH_CONNECT before any packet
-            // leaves, so a fenced connect gives WSAEACCES (~0ms); a
-            // MISSING fence lets it through. The host passes a local
-            // loopback listener bound outside the WFP permit range
-            // so fence-missing is distinguishable from fence-active
-            // without depending on any external host.
+            // A BLOCK fires at ALE_AUTH_CONNECT before any packet leaves:
+            // a fenced connect gives WSAEACCES, a MISSING fence connects.
             let r = install::read_cred().and_then(|c| {
                 let s = install::read_setup()?
                     .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
@@ -1183,16 +1175,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             };
             fn finish(doc: serde_json::Value, exit: i32) -> ! {
                 println!("{doc}");
-                // `process::exit`'s rt::cleanup flushes stdout, but
-                // be explicit — this arm prints to stdout and then
+                // Explicit flush: this arm prints to stdout and then
                 // `process::exit`s instead of returning Ok(()).
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 std::process::exit(exit)
             }
-            // Checked before probing so that an out-of-date filter
-            // set is refused by name, with the repair. A record that
-            // says the filters were REMOVED is not refused here: the
-            // probe then shows the missing fence itself (exit 3).
+            // A record that says the filters were REMOVED is not refused
+            // here: the probe then shows the missing fence (exit 3).
             if !install::fence_marked_removed()
                 && let Err(hint) = install::require_current_fence()
             {
@@ -1224,9 +1213,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             )
             .context("spawn runner for egress probe")?;
             let Some(report) = probe::Report::decode(code) else {
-                // 1 is the runner's own anyhow `Err` path (`main()`
-                // → `eprintln!` + `exit(1)`); anything else is an
-                // unmapped runner state. Neither is a probe result.
+                // Exit 1 (the runner's `Err` path) or an unmapped state.
                 finish(
                     json!({
                         "egress_probe": "error",
@@ -1613,16 +1600,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })
                 .ok();
 
-            // No filter enumeration here: BFE enumeration is
-            // admin-gated, so a non-elevated broker can't read it.
-            // What the broker CAN read is the install record's fence
-            // revision, so a filter set that is not the one this
-            // build requires is refused before anything is launched.
-            // That the filters a current record describes are still
-            // in place is verified BEHAVIORALLY by `srt-win wfp
-            // verify` at the host's `initialize()`. Standalone
-            // `srt-win exec` callers should run `srt-win wfp verify`
-            // once per session.
+            // The non-elevated broker cannot enumerate filters; the install
+            // record's fence revision is what it can check before launching.
             if let Err(hint) = install::require_current_fence() {
                 eprintln!("srt-win: error: {hint}");
                 std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
