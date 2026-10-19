@@ -2158,6 +2158,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             for s in &report.skipped {
                 eprintln!("srt-win: profile grant: skipped '{}': {}", s.path, s.reason);
             }
+            for v in &report.env_ignored {
+                eprintln!(
+                    "srt-win: profile grant: {v} is a relative path and names no store to \
+                     protect; ignored"
+                );
+            }
             for (what, items) in [
                 ("not granted", &report.not_granted),
                 (

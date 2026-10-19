@@ -1408,26 +1408,37 @@ fn env_path(v: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_owned())
 }
 
-/// The paths the calling user's environment (`own_env`) says hold a
-/// protected store ([`ENV_STORES`]), as the variables give them.
-/// Whether each lies inside the profile is the caller's to decide.
-pub fn env_exclusions(own_env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
-    let mut out = Vec::new();
+/// Whether `p` names a place whatever the current directory is: a
+/// drive path (`X:\…`) or a UNC or device path (`\\…`).
+fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.starts_with(r"\\") || (b.len() >= 3 && b[0].is_ascii_alphabetic() && &b[1..3] == b":\\")
+}
+
+/// The absolute paths the calling user's environment (`own_env`) says
+/// hold a protected store ([`ENV_STORES`]), and the relative values it
+/// ignored as `VAR=value`: a relative path names nothing fixed.
+pub fn env_exclusions(own_env: &dyn Fn(&str) -> Option<String>) -> (Vec<String>, Vec<String>) {
+    let (mut out, mut ignored) = (Vec::new(), Vec::new());
     for (var, moved) in ENV_STORES {
         let Some(value) = own_env(var) else {
             continue;
         };
-        match moved {
-            Moved::Beneath(rel) => {
-                if let Some(dir) = env_path(&value) {
-                    out.extend(rel.iter().map(|r| format!("{dir}\\{r}")));
-                }
+        let values: Vec<String> = match moved {
+            Moved::List => value.split(';').filter_map(env_path).collect(),
+            _ => env_path(&value).into_iter().collect(),
+        };
+        for v in values {
+            if !is_absolute(&v) {
+                ignored.push(format!("{var}={v}"));
+            } else if let Moved::Beneath(rel) = moved {
+                out.extend(rel.iter().map(|r| format!("{v}\\{r}")));
+            } else {
+                out.push(v);
             }
-            Moved::Itself => out.extend(env_path(&value)),
-            Moved::List => out.extend(value.split(';').filter_map(env_path)),
         }
     }
-    out
+    (out, ignored)
 }
 
 /// Whether both credential files of the cargo home `dir` are among the
@@ -2701,7 +2712,7 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            env_exclusions(&env),
+            env_exclusions(&env).0,
             [
                 r"C:\Users\me\tools\cargo\credentials",
                 r"C:\Users\me\tools\cargo\credentials.toml",
@@ -2712,7 +2723,26 @@ mod tests {
                 r"D:\k\b.yaml",
             ]
         );
-        assert!(env_exclusions(&|_| None).is_empty());
+        assert!(env_exclusions(&|_| None).0.is_empty());
+        // A relative value names nothing fixed: ignored, and said.
+        let relative = |var: &str| match var {
+            "KUBECONFIG" => Some(r"kubeconfig;C:\k\a.yaml;.kube\b".to_owned()),
+            "CARGO_HOME" => Some("cargo".to_owned()),
+            "NETRC" => Some(r"C:netrc".to_owned()),
+            "GNUPGHOME" => Some(r"\\srv\share\gnupg".to_owned()),
+            _ => None,
+        };
+        let (kept, ignored) = env_exclusions(&relative);
+        assert_eq!(kept, [r"\\srv\share\gnupg", r"C:\k\a.yaml"]);
+        assert_eq!(
+            ignored,
+            [
+                "CARGO_HOME=cargo",
+                "NETRC=C:netrc",
+                "KUBECONFIG=kubeconfig",
+                r"KUBECONFIG=.kube\b"
+            ]
+        );
         for (var, _) in ENV_STORES {
             assert!(!["RUSTUP_HOME", "PIP_CONFIG_FILE", "NPM_CONFIG_USERCONFIG"].contains(var));
         }

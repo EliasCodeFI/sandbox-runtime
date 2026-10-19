@@ -1286,6 +1286,9 @@ pub struct Report {
     /// DACLs written by this run, and paths found as wanted.
     pub writes: usize,
     pub unchanged: usize,
+    /// `VAR=value` settings of the calling user's environment that were not
+    /// followed because the value is a relative path.
+    pub env_ignored: Vec<String>,
     /// Of this run's DACL writes: those that walked a tree, and those made on
     /// an object alone.
     pub tree_walks: usize,
@@ -1777,7 +1780,8 @@ pub fn grant(
         .map(|x| plan::split_path(x))
         .filter(|x| !x.is_empty())
         .collect();
-    for named in plan::env_exclusions(&|var| layout.own(var)) {
+    let (named_by_env, env_ignored) = plan::env_exclusions(&|var| layout.own(var));
+    for named in named_by_env {
         for x in resolve_extra(profile, &[named]).unwrap_or_default() {
             if !env_extra.contains(&x) {
                 env_extra.push(x);
@@ -1799,6 +1803,7 @@ pub fn grant(
         profile: profile.to_owned(),
         list_version: plan::LIST_VERSION,
         complete: true,
+        env_ignored,
         ..Default::default()
     };
     let mut planned: Vec<(String, &Node)> = Vec::new();
