@@ -648,12 +648,7 @@ pub(crate) fn converge_on(
         && acl::persistent_layout_ok(&aces, &t);
     // Settled: no write is outstanding for this path, and (with ACEs
     // wanted) a write of exactly this list completed on this object.
-    let settled = match &record {
-        None => want.is_empty(),
-        Some((id, s, done)) => {
-            *done == 1 && (want.is_empty() || (*s == spec && id.as_slice() == cur.as_bytes()))
-        }
-    };
+    let settled = is_settled(record.as_ref(), want.is_empty(), &spec, cur.as_bytes());
     if same && settled {
         if want.is_empty() {
             conn.execute(
@@ -703,6 +698,33 @@ pub(crate) fn converge_on(
         );
     }
     Ok(true)
+}
+
+/// Whether the write record vouches for a path: no write is outstanding
+/// and, with ACEs wanted, a write of exactly `spec` completed on `cur`.
+fn is_settled(
+    record: Option<&(Vec<u8>, String, i64)>,
+    want_empty: bool,
+    spec: &str,
+    cur: &[u8],
+) -> bool {
+    match record {
+        None => want_empty,
+        Some((id, s, done)) => *done == 1 && (want_empty || (s == spec && id.as_slice() == cur)),
+    }
+}
+
+/// Put on record, outside any transaction, that the strip of `root` and
+/// of the deny targets kept with it has begun. A strip that is killed
+/// mid-walk then reads as unfinished and is walked again.
+fn mark_strip_begun(conn: &Connection, root: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE persistent_writes SET done = 0 WHERE canonical_path = ?1 \
+         OR canonical_path IN (SELECT canonical_path FROM persistent_denies WHERE root = ?1)",
+        params![root],
+    )
+    .context("record the strip as begun")?;
+    Ok(())
 }
 
 /// After a [`converge_on`] that failed: whether the object itself
@@ -1080,6 +1102,9 @@ fn forget_one_with(
             granted.push(r.file_id);
         }
     }
+    // Durable before the walk: the transaction below takes its own
+    // writes back if the process is killed, the object's DACL stays.
+    mark_strip_begun(conn, canon)?;
     let tx = conn.unchecked_transaction().context("begin forget tx")?;
     let denies: Vec<(String, Vec<u8>)> = {
         let mut s = tx.prepare(
@@ -1497,6 +1522,56 @@ fn unrecorded_grant_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strip that was begun stays on record when its transaction is
+    /// rolled back, and such a record does not vouch for the tree.
+    #[test]
+    fn a_strip_that_was_begun_is_unfinished_until_it_completes() {
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (root, target, other) = (r"\\?\C:\w", r"\\?\C:\w\deny.txt", r"\\?\C:\other");
+        let id = [7u8; 24];
+        for p in [root, target, other] {
+            conn.execute(
+                "INSERT INTO persistent_writes (canonical_path, file_id, spec, done) \
+                 VALUES (?1, ?2, 'spec', 1)",
+                params![p, id.as_slice()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO persistent_denies (canonical_path, root, kind, mask, file_id) \
+             VALUES (?1, ?2, 'deny', 'denyWrite', ?3)",
+            params![target, root, id.as_slice()],
+        )
+        .unwrap();
+        let done = |p: &str| -> i64 {
+            conn.query_row(
+                "SELECT done FROM persistent_writes WHERE canonical_path = ?1",
+                params![p],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        mark_strip_begun(&conn, root).unwrap();
+        // What the forget does next is undone when the process dies.
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("DELETE FROM persistent_denies", []).unwrap();
+        tx.execute("UPDATE persistent_writes SET done = 1", [])
+            .unwrap();
+        drop(tx);
+        assert_eq!((done(root), done(target), done(other)), (0, 0, 1));
+        // Nothing wanted and nothing of ours on the object any more is
+        // settled only if no strip is outstanding.
+        let rec = |d: i64| (id.to_vec(), "spec".to_owned(), d);
+        assert!(!is_settled(Some(&rec(0)), true, "", &id));
+        assert!(is_settled(Some(&rec(1)), true, "", &id));
+        assert!(is_settled(None, true, "", &id));
+        // With ACEs wanted: a completed write of that list on that object.
+        assert!(is_settled(Some(&rec(1)), false, "spec", &id));
+        assert!(!is_settled(Some(&rec(1)), false, "other", &id));
+        assert!(!is_settled(Some(&rec(1)), false, "spec", &[8u8; 24]));
+        assert!(!is_settled(None, false, "spec", &id));
+    }
 
     /// The denies a write record lists are read back from its text:
     /// what tells a deny of ours from someone else's on the same
