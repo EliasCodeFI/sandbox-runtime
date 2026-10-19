@@ -224,11 +224,15 @@ fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
 ///
 /// There is no fallback: if any step fails the launch fails.
 fn make_stdin_pipe() -> Result<PipePair> {
+    make_stdin_pipe_named(&fresh_stdin_pipe_name()?)
+}
+
+fn fresh_stdin_pipe_name() -> Result<String> {
     let mut rand = [0u8; 16];
     unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
         .ok()
         .context("BCryptGenRandom (stdin pipe name)")?;
-    make_stdin_pipe_named(&stdin_pipe_name(std::process::id(), &rand))
+    Ok(stdin_pipe_name(std::process::id(), &rand))
 }
 
 fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
@@ -636,11 +640,7 @@ mod tests {
     /// joined by a second client.
     #[test]
     fn stdin_pipe_runner_end_is_a_client_end() {
-        let mut rand = [0u8; 16];
-        unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
-            .ok()
-            .unwrap();
-        let name = stdin_pipe_name(std::process::id(), &rand);
+        let name = fresh_stdin_pipe_name().unwrap();
         let pipe = make_stdin_pipe_named(&name).unwrap();
 
         // A client end cannot impersonate.
