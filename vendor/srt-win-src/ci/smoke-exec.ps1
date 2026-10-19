@@ -96,8 +96,11 @@ Write-Host "R: sandbox user provisioned (sid=$sbSid)"
 # the product path — `verifyWindowsWfpEgress` does this in TS).
 $v1Lsn = Bind-Listener (49990..49999)
 $v1Tgt = "127.0.0.1:$($v1Lsn.LocalEndpoint.Port)"
-$vout = & $Exe wfp verify --target $v1Tgt
+$vout = & $Exe wfp verify --target $v1Tgt --anonymous-egress
 $vexit = $LASTEXITCODE
+# V1d: without the flag (the session-start form) that attempt is not made.
+$v1dOut = & $Exe wfp verify --target $v1Tgt
+$v1dExit = $LASTEXITCODE
 $v1Lsn.Stop()
 Write-Host "V1: wfp verify --target $v1Tgt exit=$vexit stdout='$vout'"
 $v = $vout | ConvertFrom-Json
@@ -159,6 +162,16 @@ foreach ($pair in @(@('anonymous_probe','anonymous-egress'), @('anonymous_loopba
 }
 # Kept for the in-sandbox rows below, which print these beside theirs.
 $verify = $v
+
+if ($v1dExit -ne 0) { throw "V1d: wfp verify without --anonymous-egress expected exit 0, got $v1dExit. stdout: $v1dOut" }
+$v1d = $v1dOut | ConvertFrom-Json
+if ($v1d.anonymous_probe -ne 'skipped' -or $v1d.residuals -contains 'anonymous-egress') {
+  throw "V1d: without --anonymous-egress expected anonymous_probe=skipped and no anonymous-egress residual: $v1dOut"
+}
+if ($v1d.egress_probe -ne 'blocked' -or $v1d.anonymous_loopback_probe -eq 'skipped') {
+  throw "V1d: the other attempts must still be made: $v1dOut"
+}
+Write-Host 'V1d ok: wfp verify makes the anonymous off-loopback attempt only with --anonymous-egress'
 Write-Host "V1b ok: anonymous_probe=$($v.anonymous_probe) target=$($v.anonymous_target); residuals=[$($v.residuals -join ',')]"
 
 # Exec helper. Same .exit/.raw/.out shape as before. The broker
@@ -1261,4 +1274,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0/U0b-U5)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c/V1d, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0/U0b-U5)'

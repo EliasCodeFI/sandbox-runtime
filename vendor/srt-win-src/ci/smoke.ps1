@@ -390,11 +390,10 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
-# Control, recorded and not asserted: with no filters the lowered-integrity
-# attempts should connect too, so `blocked` above is the filter's doing.
-Write-Host ("wfp verify control (fence-inactive): " +
-            "low_integrity_loopback_probe=$($v.json.low_integrity_loopback_probe) " +
-            "untrusted_integrity_loopback_probe=$($v.json.untrusted_integrity_loopback_probe)")
+# The plain connect settles it: nothing else is attempted.
+if ($v.json.low_integrity_loopback_probe -ne 'skipped' -or $v.json.anonymous_loopback_probe -ne 'skipped') {
+  throw "wfp verify (fence-inactive): expected the remaining attempts skipped: $($v.json | ConvertTo-Json -Compress)"
+}
 $probeLsn.Stop()
 
 # Re-install to set up for the full uninstall below.

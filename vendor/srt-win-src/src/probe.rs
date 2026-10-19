@@ -187,6 +187,21 @@ impl Report {
         })
     }
 
+    /// The report when the plain attempt already showed the fence is not
+    /// blocking: the verdict is settled, so nothing else was attempted.
+    fn unfenced_at_plain(plain: Outcome) -> Self {
+        Self {
+            plain,
+            anonymous: Outcome::Skipped,
+            anonymous_loopback: Outcome::Skipped,
+            deny_only: Outcome::Skipped,
+            low_integrity: Outcome::Skipped,
+            low_integrity_loopback: Outcome::Skipped,
+            untrusted_integrity: Outcome::Skipped,
+            untrusted_integrity_loopback: Outcome::Skipped,
+        }
+    }
+
     /// The lowered-integrity attempts, which the filters must refuse like
     /// the plain one, each with whether it may have been skipped (a
     /// machine can lack an off-loopback target).
@@ -718,8 +733,10 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     worst
 }
 
-/// Run every attempt; with no `anonymous_target` the off-loopback ones skip.
-pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
+/// Run the attempts; with no `anonymous_target` the off-loopback ones
+/// skip. The anonymous off-loopback one, which no filter refuses and
+/// which can wait on its destination, runs only with `anonymous_egress`.
+pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool) -> Result<Report> {
     let parse = |s: &str| -> Result<SocketAddr> {
         s.parse()
             .with_context(|| format!("runner: ProbeEgress target '{s}'"))
@@ -743,9 +760,20 @@ pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
     };
     let low = Identity::LoweredIntegrity(IL_LOW);
     let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
+    let plain = attempt("plain", Identity::Own, &target);
+    if plain.passed_fence() {
+        eprintln!("srt-win: runner: egress probe: the plain connect was not blocked; stopping");
+        return Ok(Report::unfenced_at_plain(plain));
+    }
+    let anonymous = if anonymous_egress {
+        off_loopback("anonymous", Identity::Anonymous)
+    } else {
+        eprintln!("srt-win: runner: egress probe [anonymous]: SKIPPED (not requested)");
+        Outcome::Skipped
+    };
     Ok(Report {
-        plain: attempt("plain", Identity::Own, &target),
-        anonymous: off_loopback("anonymous", Identity::Anonymous),
+        plain,
+        anonymous,
         anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target),
         deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target),
         low_integrity: off_loopback("low integrity", low),
@@ -980,6 +1008,19 @@ mod tests {
             let mut l = [Blocked; 4];
             l[loopback] = Skipped;
             assert_eq!(verdict(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
+        }
+    }
+
+    #[test]
+    fn a_plain_attempt_past_the_fence_settles_the_verdict_alone() {
+        for through in [Connected, Refused] {
+            let r = Report::unfenced_at_plain(through);
+            assert_eq!(r.plain, through);
+            assert!(r.fields()[1..].iter().all(|o| *o == Skipped));
+            let v = verdict(&r);
+            assert_eq!(v.exit, EXIT_NOT_FENCED);
+            assert!(v.residuals.is_empty());
+            assert_eq!(Report::decode(r.encode()), Some(r));
         }
     }
 

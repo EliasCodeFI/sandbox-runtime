@@ -805,6 +805,13 @@ enum WfpCmd {
         /// does. With no such address the attempt is skipped.
         #[arg(long)]
         anonymous_target: Option<String>,
+        /// Also make the off-loopback attempt under the anonymous
+        /// token (`anonymous_probe`, residual `anonymous-egress`).
+        /// No filter refuses it, so it never changes the exit code,
+        /// and it can wait on its destination; without this flag it
+        /// is `skipped`.
+        #[arg(long)]
+        anonymous_egress: bool,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -1181,6 +1188,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 WfpCmd::Verify {
                     target,
                     anonymous_target,
+                    anonymous_egress,
                 },
         } => {
             use srt_win::{install, logon, probe, runner};
@@ -1248,6 +1256,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                     anonymous_target: anonymous_target.clone(),
+                    anonymous_egress,
                 },
                 false,
             )

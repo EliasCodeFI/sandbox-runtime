@@ -1161,12 +1161,16 @@ export function interpretWindowsWfpVerify(r: {
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
+ * @param opts.anonymousEgress also make the off-loopback attempt under
+ *   the anonymous token. It cannot change the result and can take
+ *   seconds, so `initialize()` leaves it out; for diagnostics only.
  * @throws on any outcome other than exit 0.
  */
 export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    anonymousEgress?: boolean
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -1198,11 +1202,13 @@ export async function verifyWindowsWfpEgress(
       )
     }
   }
+  const args = ['wfp', 'verify', '--target', target]
+  if (opts.anonymousEgress) args.push('--anonymous-egress')
   try {
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner bounds each of its connects (probe.rs).
-    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+    const r = runSrtWin(args, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })

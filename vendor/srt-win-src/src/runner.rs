@@ -45,6 +45,9 @@ pub enum RunnerCmd {
         target: String,
         #[serde(default)]
         anonymous_target: Option<String>,
+        /// Also make the anonymous off-loopback attempt.
+        #[serde(default)]
+        anonymous_egress: bool,
     },
 }
 
@@ -127,7 +130,10 @@ pub fn run() -> Result<u32> {
         RunnerCmd::ProbeEgress {
             target,
             anonymous_target,
-        } => Ok(crate::probe::run(&target, anonymous_target.as_deref())?.encode()),
+            anonymous_egress,
+        } => {
+            Ok(crate::probe::run(&target, anonymous_target.as_deref(), anonymous_egress)?.encode())
+        }
     }
 }
 
@@ -165,22 +171,25 @@ mod tests {
         let probe = RunnerCmd::ProbeEgress {
             target: "127.0.0.1:49999".into(),
             anonymous_target: Some("192.0.2.7:49999".into()),
+            anonymous_egress: true,
         };
         let bytes = encode_cmd(&probe).unwrap();
         let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back,
-            RunnerCmd::ProbeEgress { target, anonymous_target }
+            RunnerCmd::ProbeEgress { target, anonymous_target, anonymous_egress: true }
                 if target == "127.0.0.1:49999"
                     && anonymous_target.as_deref() == Some("192.0.2.7:49999")
         ));
-        // The off-loopback target is optional on the wire.
+        // The off-loopback target and the anonymous-egress switch are
+        // optional on the wire; the switch defaults to off.
         let back: RunnerCmd =
             serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
         assert!(matches!(
             back,
             RunnerCmd::ProbeEgress {
                 anonymous_target: None,
+                anonymous_egress: false,
                 ..
             }
         ));

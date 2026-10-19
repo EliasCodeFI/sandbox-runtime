@@ -1630,6 +1630,23 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(r.warnings).toEqual([])
   })
 
+  it('verifyWindowsWfpEgress: the anonymous off-loopback attempt is asked for only on request', async () => {
+    stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+    await verifyWindowsWfpEgress({
+      target: '127.0.0.1:49999',
+      anonymousEgress: true,
+      srtWin: resolveSrtWin({ path: process.execPath }),
+    })
+    expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'wfp',
+      'verify',
+      '--target',
+      '127.0.0.1:49999',
+      '--anonymous-egress',
+    ])
+  })
+
   it('verifyWindowsWfpEgress: residuals resolve, named, each with a warning — never a silent pass', async () => {
     const r = await runVerify(
       0,
