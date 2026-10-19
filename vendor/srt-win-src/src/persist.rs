@@ -1,71 +1,15 @@
-//! Write grants that are kept between sessions, for the
-//! write-restricted token (`srt-win exec --write-restricted-token`).
+//! Write grants kept between sessions, for the write-restricted token.
 //!
-//! An inheriting ACE on a directory is copied by Windows to every
-//! file and directory below it, so granting a project root costs time
-//! linear in the tree, and so does taking the grant back. The
-//! per-session model (`acl grant` / `acl revoke`) pays that twice per
-//! session. Here it is paid once per root: the grant stays on disk
-//! and a later session start only reads the root's own DACL.
+//! Each write root gets its own capability SID,
+//! `S-1-0-1936880739-<a>-<b>-<c>-<d>` (128 random bits; no account can
+//! hold it), and its ACEs ([`crate::acl::persistent_aces`]) allow
+//! writing only to a token with that SID among its restricting SIDs.
 //!
-//! A grant that stays must not let a session of one project write
-//! another. So it is not given to the sandbox user SID (every
-//! session has that). Each write root gets its own **capability
-//! SID**, and the root's ACEs ([`crate::acl::persistent_aces`]) allow
-//! writing only to a token that carries that SID among its
-//! restricting SIDs — which the broker puts there only for the roots
-//! of the session it launches ([`crate::token`]).
-//!
-//! ## Capability SIDs
-//!
-//! `S-1-0-1936880739-<a>-<b>-<c>-<d>`: 128 random bits from the
-//! system CSPRNG in four sub-authorities, under the Null identifier
-//! authority (0) and a fixed first sub-authority (`"srtc"` as a
-//! number). Windows issues account, group, domain, service, package
-//! and logon SIDs under authorities 5, 11, 12 and 15, and the only
-//! well-known SID under authority 0 is `S-1-0-0`, with a single
-//! sub-authority. A five-sub-authority SID under authority 0 is
-//! therefore one no account or well-known principal can have, no
-//! lookup resolves, and — unlike a made-up `S-1-5-21-…` domain SID —
-//! none is tried against a domain controller. The fixed
-//! sub-authority lets an ACE for a capability SID be recognised on
-//! disk without the state database ([`is_capability_sid`]).
-//!
-//! The SID is not a secret. A process cannot add a restricting SID to
-//! its token: restricting an already restricted token again yields
-//! the intersection of the two lists.
-//!
-//! ## State, and what is trusted for what
-//!
-//! - The session database (`state_db`, in a directory whose DACL
-//!   admits only the real user, SYSTEM and administrators and denies
-//!   the sandbox group) maps a root's canonical path and file id to
-//!   its capability SID, records the deny ACEs kept with a root, and
-//!   holds one write record per path: written before a DACL write
-//!   with `done = 0`, set to `done = 1` after the call returned.
-//!   Crash recovery replays a record left at 0.
-//! - A marker in the real user's registry hive
-//!   (`HKCU\Software\sandbox-runtime\PersistentGrants`) lists every
-//!   root that may carry a persistent grant, with its file id. A root
-//!   is added before its first ACE is written and removed only after
-//!   its ACEs were removed. The hive is writable by the real user and
-//!   administrators only, so not by the sandbox account, and it does
-//!   not live in the database directory: deleting or resetting the
-//!   database loses neither the list nor the means to find each
-//!   root's object again.
-//!
-//! ## Running without the write-restricted token
-//!
-//! A persistent root allows the sandbox GROUP to write. Under the
-//! write-restricted token that is half of what is needed; under the
-//! ordinary token it is all of it. So nothing may run the sandbox
-//! account under the ordinary token while a persistent grant exists:
-//! [`unrestricted_block_reason`] refuses when the marker cannot be
-//! read, when it or the database lists a root, or when persistent
-//! grants were ever made and the database is missing or unreadable;
-//! and `acl grant` without `--persistent` also reads the DACL of each
-//! path it is about to grant ([`clear_for_unrestricted_grant`]).
-//! `acl forget` is what removes the grants.
+//! A marker under `HKCU\Software\sandbox-runtime\PersistentGrants`
+//! lists every root that may carry a grant: added before the first ACE
+//! is written, removed only after the ACEs are. While it or the session
+//! database lists a root, nothing may run the sandbox account under
+//! the ordinary token ([`unrestricted_block_reason`]).
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -226,13 +170,9 @@ fn db_roots_ro() -> Option<Vec<String>> {
     all_root_paths(&conn).ok()
 }
 
-/// Why a command that runs the sandbox account WITHOUT the
-/// write-restricted token must not run now; `None` when it may.
-///
-/// The marker is read first and is enough on its own to refuse. The
-/// database is consulted only once persistent grants were ever made,
-/// and then both a root it records and its absence refuse: "nothing
-/// recorded" is accepted only from a store that is there to be read.
+/// Why a command must not run the sandbox account WITHOUT the
+/// write-restricted token now; `None` when it may. "Nothing recorded"
+/// is accepted only from a store that is there to be read.
 pub fn unrestricted_block_reason() -> Option<String> {
     let m = match read_marker() {
         Ok(m) => m,
@@ -403,28 +343,17 @@ fn spec_of(want: &[AceView]) -> String {
 
 // ─── Converge ───────────────────────────────────────────────────────
 
-/// Bring `canon`'s persistent ACEs to what the rows say, writing only
-/// if needed. Returns whether it wrote.
-///
-/// It reads `canon`'s own DACL and nothing below it. The write is
-/// skipped when the persistent ACEs on disk are exactly the wanted
-/// ones (trustee, mask, inheritance flags, order) AND the write
-/// record says a write of exactly that list completed on this file
-/// id. The record is what makes the first test sufficient: a write
-/// interrupted part-way has already put the ACEs on the root while
-/// some descendants still lack them.
-///
-/// Otherwise: write record with `done = 0`, the DACL write, then
-/// `done = 1`. Any failure is returned; nothing is assumed written.
+/// Bring `canon`'s persistent ACEs to what the rows say; returns
+/// whether it wrote. The write is skipped only when the ACEs on disk
+/// match AND the write record says that exact write completed.
 fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     let (cur, _links, is_dir) = path_id::capture_id_and_links(canon)?;
     let want = wanted(conn, ids, canon, cur)?;
     let aces = acl::read_aces(canon).with_context(|| format!("read the DACL of '{canon}'"))?;
     let is_root = want.iter().any(|a| is_capability_sid(&a.sid));
     if is_root {
-        // An ALLOW for the sandbox user SID (a non-persistent grant
-        // of a running session, here or on a directory above) would
-        // pass both access checks of every session's token.
+        // An ALLOW for the sandbox user SID would pass both access
+        // checks of every session's token.
         if let Some(sb) = &ids.sandbox_user_sid
             && acl::allows_more_than_read(&aces, sb)
         {
@@ -452,10 +381,8 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
         .optional()
         .context("SELECT persistent_writes")?;
     let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir);
-    // Settled: no write is outstanding for this path. With ACEs
-    // wanted, that takes a completed write of exactly this list on
-    // this object; with none wanted, only that no write was left
-    // unfinished.
+    // Settled: no write is outstanding for this path, and (with ACEs
+    // wanted) a write of exactly this list completed on this object.
     let settled = match &record {
         None => want.is_empty(),
         Some((id, s, done)) => {
@@ -502,10 +429,8 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
 }
 
 /// Crash recovery: finish every DACL write whose record was left at
-/// `done = 0`. A record whose path is gone, or now names another
-/// object, is dropped (the object it was for is found again through
-/// the marker by `acl forget`). A failure is logged and the record
-/// kept; the session start that needs the path fails on it then.
+/// `done = 0`. A record whose path is gone or names another object is
+/// dropped; a failure is logged and the record kept.
 pub(crate) fn replay_pending(conn: &Connection) {
     let read = || -> Result<Vec<(String, Vec<u8>)>> {
         let mut s =
@@ -575,9 +500,8 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
         }
         prior => {
             if prior.is_some() {
-                // The path names another object than the one granted
-                // before. Take the grant off that one, wherever it is
-                // now, before this one gets a SID of its own.
+                // The path names another object than the one granted:
+                // take the grant off that one first.
                 forget_one(conn, ids, canon)?;
             }
             let sid = new_capability_sid()?;
@@ -629,21 +553,9 @@ fn record_deny(conn: &Connection, canon: &str, ace: SbAce, root: &str) -> Result
     Ok(())
 }
 
-/// Session start with the write-restricted token: record `roots`
-/// (canonical write roots) and the deny targets under any persistent
-/// root, then converge every path involved — roots first — reading
-/// one DACL per path and writing only where needed.
-///
-/// Deny targets under a persistent root are stamped for the sandbox
-/// group and kept with the root: this adds and widens, and never
-/// removes; `acl forget` removes them with the grant. A deny target
-/// (not a placeholder directory on the way to one) also gets the
-/// delete-child deny on its parent. Targets under no persistent root
-/// are returned for the caller to stamp per session as before.
-///
-/// Every failure is returned: no capability SID, no marker entry, an
-/// unreadable DACL, a failed write. Nothing falls back to a
-/// per-session grant.
+/// Session start with the write-restricted token: record `roots` and
+/// the deny targets under them, then converge every path, roots
+/// first. Deny targets under no root are returned for per-session use.
 pub fn apply(
     db: &Locked,
     ids: &Ids,
@@ -694,10 +606,9 @@ pub fn apply(
     Ok((out, per_session))
 }
 
-/// The capability SIDs of `roots` (as given on `exec --write-root`),
-/// for the child token. Reads the database only. A root with no
-/// capability SID recorded for the object now at its path is an
-/// error: the command must not run with a shorter list than asked.
+/// The capability SIDs of `roots`, for the child token. A root with
+/// none recorded for the object now at its path is an error: the
+/// command must not run with a shorter list than asked.
 pub fn capability_sids_for(roots: &[String]) -> Result<Vec<String>> {
     if roots.is_empty() {
         return Ok(Vec::new());
@@ -747,16 +658,9 @@ impl Forgot {
     }
 }
 
-/// Remove `canon`'s persistent grant: its ACEs from the object at the
-/// path and from the object it was granted on if that has moved, the
-/// deny ACEs kept with it, its capability SID, and its marker entry.
-/// Returns whether any ACE was on disk.
-///
-/// Rows and ACEs go together: the row deletions commit only after
-/// every DACL write succeeded, and the marker entry is removed after
-/// that. An object that can be neither found at its path nor located
-/// by file id fails the call, so the root stays listed — "could not
-/// look" is not "nothing there".
+/// Remove `canon`'s persistent grant; returns whether any ACE was on
+/// disk. The rows are deleted only after every DACL write succeeded,
+/// and an object that cannot be located fails the call.
 fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     let here = match path_id::capture_file_id(canon) {
         Ok(id) => Some(id),
@@ -814,13 +718,9 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     Ok(removed)
 }
 
-/// `acl forget`: remove the persistent grants of `roots` (canonical
-/// paths, or paths as recorded when they no longer resolve), or with
-/// `all` of every root the marker or the database lists. One DACL
-/// write — one walk of the tree — per root that carries a grant.
-///
-/// With `all`, once no root is left listed, the marker's
-/// `EverEnabled` is cleared too.
+/// `acl forget`: remove the persistent grants of `roots`, or with
+/// `all` of every root the marker or the database lists; then the
+/// marker's `EverEnabled` is cleared once no root is left listed.
 pub fn forget(
     db: &Locked,
     ids: &Ids,
@@ -875,14 +775,9 @@ pub fn forget_everything() -> Result<(usize, usize)> {
     Ok((out.len(), failed))
 }
 
-/// `acl grant` without `--persistent` is about to give the sandbox
-/// USER SID access to `targets` (canonical), for sessions that run
-/// under the ordinary token. Refuse while a persistent grant is
-/// recorded anywhere ([`unrestricted_block_reason`]) — and, because
-/// the records may be gone while ACEs remain, look at each target's
-/// own DACL too: a persistent ALLOW written on the target itself is
-/// removed (one walk), one inherited from a directory above cannot be
-/// removed from here and refuses.
+/// For `acl grant` without `--persistent`: refuse while a persistent
+/// grant is recorded, and remove a persistent ALLOW found on a target's
+/// own DACL (an inherited one refuses), since records may be gone.
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
     if let Some(why) = unrestricted_block_reason() {
         bail!(
@@ -932,8 +827,6 @@ mod tests {
         assert!(sid.starts_with(CAPABILITY_SID_PREFIX));
         assert_eq!(CAPABILITY_TAG.to_be_bytes(), *b"srtc");
         assert!(is_capability_sid(&sid));
-        // The system parses it as a SID with five sub-authorities
-        // under authority 0, and renders it back unchanged.
         let p = crate::sid::LocalPsid::from_string(&sid).unwrap();
         let b = p.as_bytes();
         assert_eq!((b[0], b[1]), (1, 5));

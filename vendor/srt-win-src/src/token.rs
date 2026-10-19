@@ -27,50 +27,15 @@
 //!
 //! ## Opt-in: write-restricted token
 //!
-//! With `write_restricted` set, [`make_sandbox_token`] adds the
-//! `WRITE_RESTRICTED` flag and the restricting-SID list
-//! [`restricting_sid_list`] = `[<capability SIDs of this session's
-//! write roots>, <sandbox user SID>, Everyone, RESTRICTED]`;
-//! everything above is unchanged. A restricted token is
-//! access-checked twice — once against its ordinary groups, once
-//! against the restricting list — and both must grant. With
-//! `WRITE_RESTRICTED` the second check applies to write-class access
-//! only, so reads behave as before, while a write must be granted to
-//! a SID in the list. The sandbox account is a member of
-//! `BUILTIN\Users` and `Authenticated Users`; neither is in the
-//! list, so write access those groups hold anywhere on the machine
-//! stops reaching the child.
-//!
-//! Why each SID is in the list:
-//!   - **The capability SIDs** — one per write root the session was
-//!     given (`crate::persist`). A root whose grant is kept between
-//!     sessions allows writing to its capability SID, not to the
-//!     sandbox user SID, so only a token that lists that SID passes
-//!     the second check there: a session of one project cannot write
-//!     another's root. The list may be empty.
-//!   - **The sandbox user SID** — every per-session ACE the broker
-//!     writes for the sandbox (read grants, deny stamps, the
-//!     window-station / desktop / `BaseNamedObjects` grants, the
-//!     default DACL below, the account's own profile) is keyed on
-//!     it, so those keep satisfying both checks with no change to
-//!     the ACL code. It is also what keeps the WFP egress BLOCK
-//!     matching — see [`crate::wfp::sddl_sandbox_user`]. **Removing
-//!     it from the list would silently disable the network fence.**
-//!   - **Everyone** and **RESTRICTED** — system objects a process
-//!     needs write-class access to in order to start and run
-//!     (named-object directories, ALPC ports, devices) grant one of
-//!     these; without them the CLR and most non-trivial programs do
-//!     not start.
-//!
-//! What stays writable under the option: anything that grants write
-//! to the sandbox user SID, to Everyone or to RESTRICTED, and
-//! objects the sandbox account owns (an owner is implicitly allowed
-//! to rewrite the DACL, and the owner is in the list).
-//!
-//! Cost: Schannel refuses to acquire credentials for a restricted
-//! token, so TLS clients built on it (System32 `curl.exe`, git's
-//! schannel backend, .NET / PowerShell web requests) fail inside the
-//! sandbox. OpenSSL-based clients are unaffected.
+//! `write_restricted` adds the `WRITE_RESTRICTED` flag and the
+//! restricting SIDs [`restricting_sid_list`]: a write must then also
+//! be granted to a SID in that list, which `BUILTIN\Users` and
+//! `Authenticated Users` are not in. The sandbox user SID must stay
+//! in the list — the WFP egress BLOCK matches through it
+//! ([`crate::wfp::sddl_sandbox_user`]) — and Everyone and RESTRICTED
+//! are what a process needs write-class access through to start.
+//! The capability SIDs of the session's write roots (`crate::persist`)
+//! lead the list: a kept root allows writing to its capability SID only.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
@@ -118,12 +83,9 @@ pub fn restricted_token_flags(write_restricted: bool) -> CREATE_RESTRICTED_TOKEN
     }
 }
 
-/// The restricting-SID list of the write-restricted token, in the
-/// order it is passed to `CreateRestrictedToken`: the session's
-/// capability SIDs (duplicates dropped), then the three fixed SIDs.
-/// `user_sid` is the sandbox account's own SID and **must** stay in
-/// the list: the WFP egress BLOCK and every per-session sandbox ACE
-/// key on it (module doc).
+/// The restricting-SID list of the write-restricted token, in order:
+/// the capability SIDs (duplicates dropped), then the three fixed
+/// SIDs. `user_sid` must stay in it: the WFP egress BLOCK keys on it.
 pub fn restricting_sid_list(user_sid: &str, capability_sids: &[String]) -> Vec<String> {
     let mut v: Vec<String> = Vec::with_capacity(capability_sids.len() + 3);
     for c in capability_sids {
@@ -223,20 +185,9 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-/// Build the restricted child token from `base`. The caller
-/// duplicates the result to a primary token via [`to_primary`].
-///
-/// `write_restricted` adds the `WRITE_RESTRICTED` flag and the
-/// [`restricting_sid_list`] (module doc) built from
-/// `capability_sids`. It fails closed: if the token cannot be created
-/// with the list, or the created token does not report exactly that
-/// list and flag, this returns an error — there is no fallback to the
-/// ordinary token, nor to a shorter list.
-///
-/// `capability_sids` must be empty without `write_restricted`, and
-/// each must be a capability SID (`crate::persist`): the list arrives
-/// in the launch spec, and nothing else is accepted from it as a
-/// restricting SID.
+/// Build the restricted child token from `base` (non-primary; see
+/// [`to_primary`]). `write_restricted` fails closed: an error unless
+/// the created token reports exactly the requested list and flag.
 pub fn make_sandbox_token(
     base: HANDLE,
     write_restricted: bool,
@@ -501,8 +452,7 @@ mod tests {
     fn restricted_token_builds() {
         let base = open_self_token().expect("open_self_token");
         let r = make_sandbox_token(base, false, &[]);
-        // Capability SIDs are refused without the flag, and so is
-        // anything that is not one with it.
+        // Capability SIDs are refused without the flag; other SIDs with it.
         let cap = crate::persist::new_capability_sid().unwrap();
         assert!(make_sandbox_token(base, false, std::slice::from_ref(&cap)).is_err());
         assert!(make_sandbox_token(base, true, &[SID_BUILTIN_ADMINS.to_owned()]).is_err());
@@ -531,8 +481,6 @@ mod tests {
             restricting_sid_list("S-1-5-21-1-2-3-1005", &[]),
             ["S-1-5-21-1-2-3-1005", "S-1-1-0", "S-1-5-12"]
         );
-        // Capability SIDs lead, once each, in the order given; the
-        // three fixed SIDs always follow.
         let (a, b) = (
             "S-1-0-1936880739-1-2-3-4".to_owned(),
             "S-1-0-1936880739-5-6-7-8".to_owned(),
@@ -549,10 +497,7 @@ mod tests {
         );
     }
 
-    /// The kernel reports the token that was asked for: the
-    /// capability SIDs and the three fixed SIDs, the write-restricted
-    /// flag, and it survives the duplicate to a primary token that
-    /// `CreateProcessAsUserW` is given.
+    /// The kernel reports the requested list and flag, also after `to_primary`.
     #[test]
     fn write_restricted_token_reports_exact_list() {
         let caps = [

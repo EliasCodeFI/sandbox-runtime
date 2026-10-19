@@ -57,10 +57,7 @@ if (-not (Test-Path $Exe)) {
 # (smoke-exec) / A-row (smoke-aces) / H-row (winsrt.test.ts) threw
 # mid-section before its `finally` ran.
 & $Exe acl recover --force
-# Write grants kept between sessions (smoke-write-restricted.ps1, the
-# winsrt.test.ts writeRestrictedToken rows): while one is recorded,
-# `srt-win exec` without --write-restricted-token is refused. Before
-# the uninstall below, which removes the group the grants name.
+# Before the uninstall below, which removes the group the kept write grants name.
 & $Exe acl forget --all
 # Sandbox user + credential/marker rows in state.db — `srt-win
 # install` provisions these; `uninstall` (no --keep-user) removes
@@ -69,8 +66,7 @@ if (-not (Test-Path $Exe)) {
 # smoke-write-restricted.ps1's scratch tree at the system-drive root.
 Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-wr-smoke-*' |
   Remove-Item -Recurse -Force
-# The record of write grants kept between sessions, if `acl forget
-# --all` above could not clear it.
+# The record of kept write grants, if `acl forget --all` above could not clear it.
 Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue

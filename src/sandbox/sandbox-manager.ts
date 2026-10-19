@@ -206,15 +206,11 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the default child token only. The WFP block filter
-// matches by an access check of the connecting token, and the
-// write-restricted token differs per session (it carries the
-// capability SIDs of the session's write roots), so with
-// `windows.writeRestrictedToken` every initialize() probes.
+// That holds for the default child token only: the write-restricted
+// token differs per session, so with it every initialize() probes.
 let windowsWfpVerified = false
-// The child-token shape initialize() verified the fence for. The wrap
-// path uses this rather than `config`, which updateConfig() swaps
-// live without re-verifying.
+// The child-token shape initialize() verified the fence for; the wrap
+// path uses this, not `config`, which updateConfig() swaps live.
 let windowsWriteRestrictedToken = false
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -1086,17 +1082,12 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    // The probe runs under the token shape this session's commands
-    // will get. With `writeRestrictedToken` that token carries the
-    // capability SIDs of this session's write roots, which exist only
-    // once the roots are granted — so that probe runs below, after
-    // the grant, on every initialize().
+    // With `writeRestrictedToken` the probe runs below, after the
+    // grant: the capability SIDs exist only once the roots are granted.
     const writeRestricted = runtimeConfig.windows?.writeRestrictedToken === true
     if (!writeRestricted) {
-      // Write grants kept by sessions that had the option on let the
-      // sandbox account write those trees under the ordinary token
-      // this session uses. Remove them before anything is granted or
-      // run; if that fails, no session.
+      // Kept write grants let the sandbox account write those trees
+      // under the ordinary token: remove them first, or no session.
       if (u.persistentGrants) {
         try {
           forgetWindowsPersistentGrants({ srtWin })
@@ -1218,9 +1209,8 @@ async function initializeSteps(
         acc.denyRead.length > 0 ||
         acc.denyWrite.length > 0
       if (writeRestricted) {
-        // One call: the write roots are granted persistently (kept at
-        // reset()), the denies under them are converged with them,
-        // and the rest is per-session as below. A failure throws.
+        // One call: write roots are granted persistently (kept at
+        // reset()); the rest is per-session. A failure throws.
         if (anyApplied) {
           grantWindowsAclPersistent({
             sandboxUserSid: sb,
@@ -2916,14 +2906,9 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
-  // Windows: release this session's sandbox-user ACEs. Best-effort
-  // — log anomalies rather than throw, so teardown always
-  // completes. ACEs still recorded for this process are released by
-  // srt-win's crash recovery once it has exited.
-  // With `windows.writeRestrictedToken` the write roots and the
-  // denies under them were granted persistently and are not this
-  // process's to release: the same two calls take off only what was
-  // per-session (read grants, denies outside every root).
+  // Windows: release this session's sandbox-user ACEs. Best-effort:
+  // log anomalies rather than throw, so teardown always completes.
+  // Persistent write roots and the denies under them are not released.
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps

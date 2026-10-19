@@ -700,9 +700,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
-        // Whether the ordinary token may be used: `state` is `none`
-        // unless persistent write grants exist or cannot be ruled
-        // out (`srt_win::persist`).
+        // `none` unless persistent write grants exist or cannot be ruled out.
         "persistent_grants": srt_win::persist::status_json(),
     }))
 }
@@ -1094,13 +1092,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Persistent write grants go with the account. Before the
-            // elevation hop: the records are the CALLING user's, and
-            // the elevated process may be another user. They name the
-            // sandbox group, so this also precedes its removal. A
-            // root that cannot be completed stays recorded and does
-            // not stop the uninstall: once the group is gone its ACEs
-            // match no token.
+            // Before the elevation hop: the records are the CALLING
+            // user's. And before the group the grants name is removed.
             if !keep_user {
                 match srt_win::persist::forget_everything() {
                     Ok((0, _)) => {}
@@ -1259,10 +1252,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Write-restricted: the runner launches `probe connect` as a
             // lockdown child, so the connect is made under the child token.
             let cmd = if write_restricted_token {
-                // The probe child's restricting SIDs are the ones a
-                // command of this session gets. A root with no
-                // capability SID fails the verify (exit 1, nothing on
-                // stdout) — never a probe under a shorter list.
+                // A root with no capability SID fails the verify — never
+                // a probe under a shorter list.
                 let capability_sids = srt_win::persist::capability_sids_for(&write_root)
                     .context("wfp verify --write-root")?;
                 let exe = std::env::current_exe().context("current_exe")?;
@@ -1475,9 +1466,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .collect();
                     let (kept, per_session_denies) =
                         persist::apply(db, &ids, &roots, &denies.targets)?;
-                    // Per session, for the sandbox user SID as without
-                    // the flag: the read grants, and the denies under
-                    // no persistent root.
+                    // Per session, for the sandbox user SID: the read
+                    // grants, and the denies under no persistent root.
                     let mut rest: Vec<(String, acl::SbAce)> = at
                         .targets
                         .iter()
@@ -1786,11 +1776,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 }
             };
 
-            // Token shape. With the flag: the capability SIDs of the
-            // session's write roots — every one of them, or no exec.
-            // Without it: nothing may run while a persistent grant
-            // exists, since its sandbox-group ACE is all the ordinary
-            // token needs to write that tree.
+            // Without the flag nothing may run while a persistent grant
+            // exists: its sandbox-group ACE is all the ordinary token needs.
             let capability_sids = if write_restricted_token {
                 srt_win::persist::capability_sids_for(&write_root).context("exec --write-root")?
             } else if let Some(why) = srt_win::persist::unrestricted_block_reason() {
@@ -2289,8 +2276,6 @@ mod tests {
                 }
             }
         ));
-        // --write-root: repeatable, on exec and on wfp verify, and
-        // only with the token flag.
         let roots = Cli::try_parse_from([
             "srt-win",
             "exec",
@@ -2414,9 +2399,7 @@ mod tests {
         assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
     }
 
-    /// `probe token` and `probe parent-access` are CI smoke hooks:
-    /// they parse only in a `test-hooks` build, so a default (shipped)
-    /// binary does not have them at all.
+    /// `probe token` / `probe parent-access` parse only in a `test-hooks` build.
     #[test]
     fn probe_test_hooks_follow_the_feature() {
         for sub in ["token", "parent-access"] {

@@ -238,11 +238,9 @@ export interface WindowsSandboxUserStatus {
   /** PEM-encoded install-time CA certificate, when present. */
   caCertPem?: string
   /**
-   * Set when write grants kept by `windows.writeRestrictedToken`
-   * sessions exist (`present`, with their roots) or cannot be ruled
-   * out (`unknown`). While it is set, `srt-win` refuses to run a
-   * command under the ordinary token; `initialize()` without the
-   * option removes the grants first.
+   * Set when write grants kept between sessions exist (`present`) or
+   * cannot be ruled out (`unknown`); `srt-win` then refuses to run a
+   * command under the ordinary token.
    */
   persistentGrants?: {
     state: 'present' | 'unknown'
@@ -489,11 +487,9 @@ export interface WindowsSandboxParams {
    */
   writeRestrictedToken?: boolean
   /**
-   * With {@link writeRestrictedToken}: the session's write roots, as
-   * granted by {@link grantWindowsAclPersistent}. Each is passed as
-   * `--write-root`, which puts the root's capability SID in the
-   * child token — without it the child cannot write the root.
-   * Ignored without the token option.
+   * With {@link writeRestrictedToken}: the session's write roots. Each
+   * is passed as `--write-root`, which puts the root's capability SID
+   * in the child token; without it the child cannot write the root.
    */
   writeRoots?: readonly string[]
   /**
@@ -2242,19 +2238,8 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 
 /**
  * Session start for `windows.writeRestrictedToken`: one `srt-win acl
- * grant --persistent` carrying the grants and the deny lists.
- *
- * Each `write` path becomes a persistent root: its ACEs name the
- * sandbox group and a capability SID of its own (not the sandbox
- * user) and are KEPT when the session ends —
- * {@link forgetWindowsPersistentGrants} removes them,
- * {@link revokeWindowsAclChecked} does not. Deny targets under a
- * persistent root are kept with it; `read` grants and deny targets
- * elsewhere are per-session. Pass `write` to
- * {@link wrapCommandWithSandboxWindows} as `writeRoots`.
- *
- * @throws on exit ≠ 0, including exit 2 (an input was skipped).
- *   Nothing falls back to a per-session grant.
+ * grant --persistent`. Grants on the `write` roots are KEPT at session
+ * end; {@link forgetWindowsPersistentGrants} removes them.
  */
 export function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
@@ -2297,15 +2282,9 @@ export function grantWindowsAclPersistent(
 }
 
 /**
- * Remove every write grant kept by `windows.writeRestrictedToken`
- * sessions (`srt-win acl forget --all`): one walk per root.
- *
- * A session WITHOUT the option must run this before it grants
- * anything, whenever {@link WindowsSandboxUserStatus.persistentGrants}
- * is set: a kept grant lets the sandbox account write its tree under
- * the ordinary token.
- *
- * @throws if any grant could not be removed.
+ * Remove every write grant kept between sessions (`srt-win acl forget
+ * --all`). A session without `windows.writeRestrictedToken` must run
+ * this first: a kept grant is writable under the ordinary token.
  */
 export function forgetWindowsPersistentGrants(
   opts: { srtWin?: SrtWinSpawn } = {},

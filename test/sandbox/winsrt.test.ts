@@ -427,8 +427,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       '--write-root',
       roots[1],
     ])
-    // srt-win options: before `--`, and the per-exec denies are
-    // still there, unchanged.
+    // srt-win options sit before `--`; the per-exec denies are unchanged.
     expect(at + 5).toBeLessThanOrEqual(on.argv.indexOf('--deny-write'))
     expect(on.argv.indexOf('--deny-write')).toBeLessThan(on.argv.indexOf('--'))
     // Nothing else changes.
@@ -1477,8 +1476,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       denyRead: opts.denyRead,
       denyWrite: opts.denyWrite,
     })
-    // 2 = an input was skipped; 1 = a capability SID, a DACL read or
-    // a DACL write failed. Neither is a session.
+    // 2 = an input was skipped; 1 = a capability SID or DACL step failed.
     for (const status of [1, 2]) {
       spawnSyncSpy.mockRestore()
       spawnSpy.mockRestore()
@@ -1843,13 +1841,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   })
 })
 
-// ════════════════════════════════════════════════════════════════════
-// Release ordering — no deny restore unless the revoke completed
-// (pure, all platforms)
-// ════════════════════════════════════════════════════════════════════
-// These drive the real SandboxManager with the platform pinned to
-// Windows and both child_process entry points stubbed.
-
 describe('Windows writeRestrictedToken: write roots are granted once and kept (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
   const RAW_USER = {
@@ -1982,8 +1973,6 @@ describe('Windows writeRestrictedToken: write roots are granted once and kept (p
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Write root `dir`, deny on `dir/secret`; both proxy ports external
-  // so initialize() binds nothing.
   const config = (writeRestrictedToken?: boolean): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -2022,8 +2011,7 @@ describe('Windows writeRestrictedToken: write roots are granted once and kept (p
     expect(stdin.denyRead).toHaveLength(1)
     expect(stdin.read).toEqual([])
     expect(stdin.denyWrite).toEqual([])
-    // The probe runs after the grant (the capability SIDs exist only
-    // then), under the token the commands get.
+    // The probe runs after the grant: the capability SIDs exist only then.
     expect(verifyCalls).toHaveLength(1)
     expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
     expect(verifyCalls[0]?.writeRoots).toEqual(stdin.write)
@@ -2078,8 +2066,6 @@ describe('Windows writeRestrictedToken: write roots are granted once and kept (p
       aclResult.grant = exit(status)
       const e = await rejection(config(true))
       expect(e.code).toBe('acl_grant_failed')
-      // One grant attempt, then only the release of whatever was
-      // per-session.
       expect(subs().filter(s => s === 'grant')).toHaveLength(1)
       expect(subs()).not.toContain('stamp')
       expect(acl[0].argv).toContain('--persistent')
@@ -2762,8 +2748,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
     })
-    // Long-form paths: the sandbox account cannot resolve an 8.3
-    // component of the runner's profile.
+    // Long-form paths: the sandbox account cannot resolve an 8.3 component.
     const rootA = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-a-')))
     const rootB = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-b-')))
     const withOption = (roots: string[]): SandboxRuntimeConfig => {
@@ -2789,16 +2774,14 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(kept()?.state).toBe('present')
       expect(kept()?.roots).toHaveLength(1)
 
-      // A session given only B: A still carries its grant, and this
-      // session cannot write there.
+      // A session given only B cannot write A, which keeps its grant.
       await SandboxManager.initialize(withOption([rootB]))
       expect(await write(join(rootB, 'own.txt'))).toBe(true)
       expect(await write(join(rootA, 'from-b.txt'))).toBe(false)
       await SandboxManager.reset()
       expect(kept()?.roots).toHaveLength(2)
 
-      // Option off: the kept grants are removed before anything is
-      // granted, and A works as a per-session root again.
+      // Option off: the kept grants are removed first.
       const off = createTestConfig()
       off.filesystem.allowWrite = [rootA]
       await SandboxManager.initialize(off)
