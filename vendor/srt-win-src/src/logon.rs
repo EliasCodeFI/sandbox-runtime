@@ -148,9 +148,7 @@ fn classify_seclogon(
     start: SERVICE_START_TYPE,
     current: Option<SERVICE_STATUS_CURRENT_STATE>,
 ) -> SeclogonState {
-    if current == Some(SERVICE_RUNNING) {
-        SeclogonState::Ok
-    } else if start == SERVICE_DISABLED {
+    if start == SERVICE_DISABLED && current != Some(SERVICE_RUNNING) {
         SeclogonState::Disabled
     } else {
         SeclogonState::Ok
