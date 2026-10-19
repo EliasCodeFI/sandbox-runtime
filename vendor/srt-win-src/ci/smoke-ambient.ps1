@@ -110,9 +110,8 @@ try {
   if ($st2.ambient.paths.Count -lt 3) {
     throw "AM4: only $($st2.ambient.paths.Count) ambient rows survive --keep-user uninstall"
   }
-  # Asserted on the ACEs themselves, not through a sandboxed write:
-  # with this sublayer's filters removed the install record says the
-  # fence is gone, and `exec` refuses to launch anything (exit 19).
+  # Asserted on the ACEs, not through a sandboxed write: with the
+  # filters removed `exec` refuses to launch anything (exit 19).
   $gone = @($st2.ambient.paths | Where-Object { -not $_.present })
   if ($gone.Count -gt 0) {
     throw "AM4: ambient deny lost after --keep-user uninstall: $($gone.path -join ', ')"

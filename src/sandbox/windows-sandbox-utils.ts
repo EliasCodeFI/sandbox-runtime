@@ -203,12 +203,9 @@ export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
  * is access-denied (it is admin-gated). The non-elevated readiness
  * check is {@link verifyWindowsWfpEgress}, not this enum.
  *
- * `outdated` means a filter set is installed but was written by an
- * earlier `srt-win` and is not the set the current one installs; the
- * sandbox refuses to run until the install is re-run. It is reported
- * to elevated and non-elevated callers alike. An elevated caller also
- * gets it when the loopback mode of the filters is not the one the
- * install recorded.
+ * `outdated`: a filter set is installed but is not the one this
+ * `srt-win` installs, or (elevated callers) its loopback mode is not
+ * the recorded one; the sandbox refuses to run until re-installed.
  */
 export type WindowsWfpStatus =
   | 'absent'
@@ -232,20 +229,16 @@ export interface WindowsWfpStatusResult {
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
-   * Populated on `cannot-read` (BFE enumeration is admin-gated; a
-   * non-elevated caller can't read it — the non-elevated readiness
-   * check is {@link verifyWindowsWfpEgress}, not this enum) and on
-   * `outdated` (what is out of date and how to repair it).
+   * Populated on `cannot-read` (a non-elevated caller cannot enumerate
+   * filters) and on `outdated` (how to repair it).
    */
   hint?: string
 }
 
 /**
- * Result of one connect attempt made by `srt-win wfp verify`.
- * `blocked` is a filter refusing the connect. `connected` and
- * `refused` both mean the connect got past the filters (a refusal
- * comes from the destination). `unreachable` and `error` say nothing
- * about the fence; `skipped` means the attempt was not made.
+ * Result of one connect attempt by `srt-win wfp verify`. `connected`
+ * and `refused` both mean the connect got past the filters;
+ * `unreachable` and `error` say nothing about the fence.
  */
 export type WindowsWfpProbeOutcome =
   | 'blocked'
@@ -257,17 +250,8 @@ export type WindowsWfpProbeOutcome =
 
 /**
  * A gap {@link verifyWindowsWfpEgress} observed that the filter set
- * does not close. The fence is active; these are what it leaves open.
- *
- * - `anonymous-egress` — a connect to an off-loopback destination
- *   made while impersonating the anonymous token is not blocked.
- *   Expected on every machine that has such an address: no filter is
- *   keyed on the anonymous token, because one would apply to every
- *   process on the machine and not only to sandboxed ones.
- * - `anonymous-loopback` — the same to a loopback destination, so
- *   local listeners outside the proxy port range are reachable.
- * - `deny-only-user-sid` — a connect made under a copy of the sandbox
- *   token whose user SID is deny-only is not blocked.
+ * does not close. `anonymous-egress` is expected on every machine with
+ * an off-loopback address: no filter is keyed on the anonymous token.
  */
 export type WindowsWfpResidual =
   | 'anonymous-egress'
@@ -275,38 +259,26 @@ export type WindowsWfpResidual =
   | 'deny-only-user-sid'
 
 /**
- * Result of `srt-win wfp verify` on success (exit 0) — see
- * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
- * return path `probes.plain` and the two lowered-integrity loopback
- * attempts are always `blocked`, the two lowered-integrity
- * off-loopback attempts are `blocked` or `skipped`, and — with
- * loopback open — `probes.openOffLoopback` is `blocked` or `skipped`
- * and `probes.openLoopback` is `connected` or `skipped`. The remaining
- * three (`anonymous`, `anonymousLoopback`, `denyOnly`) can be anything:
- * the filters do not cover them, and one that got through is named in
- * `residuals`.
+ * Result of `srt-win wfp verify` on success (exit 0); anything else
+ * throws. Only `anonymous`, `anonymousLoopback` and `denyOnly` can have
+ * got past the fence: one that did is named in `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
   /** Runner's stderr (carries one diagnostic line per attempt). */
   stderr: string
-  /** Each attempt's own result. */
+  /**
+   * One per attempt. `anonymous`, `lowIntegrity` and `untrustedIntegrity`
+   * go to an off-loopback target, the rest to the loopback one.
+   */
   probes: {
-    /** The sandbox account's own token, to the loopback target. */
     plain: WindowsWfpProbeOutcome
-    /** Impersonating the anonymous token, to an off-loopback target. */
     anonymous: WindowsWfpProbeOutcome
-    /** Impersonating the anonymous token, to the loopback target. */
     anonymousLoopback: WindowsWfpProbeOutcome
-    /** The sandbox token with its user SID deny-only, to the loopback target. */
     denyOnly: WindowsWfpProbeOutcome
-    /** The sandbox token at low integrity, to an off-loopback target. */
     lowIntegrity: WindowsWfpProbeOutcome
-    /** The sandbox token at low integrity, to the loopback target. */
     lowIntegrityLoopback: WindowsWfpProbeOutcome
-    /** The sandbox token at untrusted integrity, to an off-loopback target. */
     untrustedIntegrity: WindowsWfpProbeOutcome
-    /** The sandbox token at untrusted integrity, to the loopback target. */
     untrustedIntegrityLoopback: WindowsWfpProbeOutcome
     /**
      * Own token, to a NON-loopback address of this machine at the
@@ -319,17 +291,11 @@ export interface WindowsWfpVerifyResult {
      */
     openLoopback?: WindowsWfpProbeOutcome
   }
-  /**
-   * Gaps the probe found open. NOT a clean pass when non-empty: the
-   * fence blocks what it is built to block, and these named shapes
-   * get past it. Empty when none were observed.
-   */
+  /** Gaps the probe found open: NOT a clean pass when non-empty. */
   residuals: WindowsWfpResidual[]
   /**
-   * Human-readable warnings: one per residual, one per attempt that
-   * was skipped (no off-loopback address to aim at, or no loopback
-   * port to listen on), and — with loopback open —
-   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. `initialize()` logs them.
+   * Warnings for residuals, skipped attempts and open loopback;
+   * `initialize()` logs them.
    */
   warnings: string[]
 }
@@ -1036,10 +1002,9 @@ export async function checkWindowsSandboxStatusAsync(
 
 /**
  * Query the WFP filter set under the given sublayer via live BFE
- * enumeration. `installed` means the srt-win-tagged BLOCK filters
- * this version requires are all present on both connect layers;
- * `outdated` means a set is there but was written by an earlier
- * version (see {@link WindowsWfpStatus}). Detection is **tag-based**
+ * enumeration. `installed` means the BLOCK filters this version
+ * requires are present on both connect layers (`outdated`: see
+ * {@link WindowsWfpStatus}). Detection is **tag-based**
  * (providerData JSON); filters installed by other tooling without the
  * tag are not counted.
  *
@@ -1071,7 +1036,6 @@ export async function getWindowsWfpStatusAsync(
   )
 }
 
-/** Shape of `srt-win wfp verify` stdout. */
 type RawWfpVerify = {
   egress_probe: string
   target: string
@@ -1146,25 +1110,9 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
 }
 
 /**
- * Turn one `srt-win wfp verify` run into a result or a typed error.
- * Pure — the spawn and the listener live in
- * {@link verifyWindowsWfpEgress}.
- *
- * - an `srt-win` that does not know `--allow-loopback` →
- *   `srt_win_too_old`.
- * - exit 19 → `wfp_fence_outdated` (the install predates this build,
- *   or its loopback mode is not the one the session is configured
- *   with).
- * - exit 3, or any attempt the fence must refuse reported as having
- *   got past the filters → `wfp_fence_inactive`. Those attempts are
- *   the plain one, the four made under a copy of the sandbox token
- *   with its integrity level lowered, and — with loopback open — the
- *   off-loopback one at the port of a loopback listener. The attempts
- *   made while impersonating the anonymous token are not among them.
- * - any other non-zero exit → `wfp_verify_inconclusive`.
- * - exit 0 → the result, with any residuals and their warnings. A
- *   residual never throws: the filters do not close it, so refusing
- *   to start would refuse every machine.
+ * Turn one `srt-win wfp verify` run into a result or a typed error
+ * (pure). An attempt the fence must refuse that got through rejects
+ * whatever the exit code says; a residual never throws.
  */
 export function interpretWindowsWfpVerify(r: {
   status: number | null
@@ -1177,10 +1125,8 @@ export function interpretWindowsWfpVerify(r: {
     raw = JSON.parse(r.stdout) as RawWfpVerify
   } catch {
     if (rejectsAllowLoopback(r)) throw srtWinTooOld(r.stderr)
-    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
-    // this parse; status=null here means an external signal.
-    // Include signal + stderr so the CI log self-explains instead
-    // of just `exited null with unparseable output ""`.
+    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before this
+    // parse; status=null here means an external signal.
     throw new WindowsSandboxError(
       'wfp_verify_unparseable',
       `WFP egress fence could not be verified — \`srt-win wfp ` +
@@ -1327,53 +1273,31 @@ export function interpretWindowsWfpVerify(r: {
  * sandbox user. Binds a local listener on an ephemeral loopback port
  * outside the WFP loopback-permit range, then spawns `srt-win
  * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
- * attempt direct TCP connects under each token shape a sandboxed
- * process can present to the filtering engine: its own token, the
- * anonymous token, and copies of its own token with the user SID
- * deny-only or the integrity level lowered — to the listener and,
- * for some, to this machine's own off-loopback address (see
- * {@link WindowsWfpVerifyResult}).
+ * attempt direct TCP connects, one per token shape a sandboxed
+ * process can present. The WFP block-user filter
+ * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
+ * active fence yields WSAEACCES immediately and a missing fence lets
+ * the connect through (the kernel completes the handshake against
+ * the listening socket's backlog; no event-loop tick required, so
+ * the synchronous `runSrtWin` is safe). Does not require elevation
+ * and does not depend on any external host.
  *
- * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
- * leaves — so a fenced connect yields WSAEACCES immediately and an
- * unfenced one goes through (the kernel completes the handshake
- * against the listening socket's backlog; no event-loop tick
- * required, so the synchronous `runSrtWin` is safe). Does not require
- * elevation and does not depend on any external host.
- *
- * With `opts.allowLoopback` (the session's `network.allowLocalBinding`)
- * loopback is open, so the listener is bound on one of
- * {@link WINDOWS_LOOPBACK_FLOOR_PORTS} — the loopback ports that stay
- * blocked — and the probe makes two more attempts under its own
- * token: to this machine's own off-loopback address at a port that is
- * open on loopback (loopback is open for loopback addresses only),
- * and to a loopback listener `srt-win` itself binds for the probe
- * (loopback must actually be open). The off-loopback
- * lowered-integrity attempts are aimed at that same port.
- *
- * The own-token attempts at the blocked targets and the
- * lowered-integrity attempts are what the fence must refuse: one
- * getting through throws. So does the probe's own loopback listener
- * being blocked, and a loopback mode that is not the one the install
- * recorded (`wfp_fence_outdated`, before anything is probed). The
- * anonymous and deny-only attempts are shapes the filter set does not
- * refuse; one getting through is named in `residuals` (with
- * `warnings`) — see {@link WindowsWfpResidual}.
+ * With `opts.allowLoopback` the listener is bound on one of
+ * {@link WINDOWS_LOOPBACK_FLOOR_PORTS} (the loopback ports that stay
+ * blocked), and `srt-win` also probes that loopback is open.
  *
  * `initialize()` calls this once per session, so a stale install
- * (sandbox user provisioned but filters since removed, or a filter
- * set from an earlier version) fails closed at session start instead
- * of running every exec with full egress.
+ * (sandbox user provisioned but filters since removed) fails closed
+ * at session start instead of running every exec with full egress.
  *
  * @param opts.target overrides the probe target (skips the local
  *   listener bind).
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @param opts.allowLoopback the session's `network.allowLocalBinding`.
+ * @param opts.allowLoopback the session's `network.allowLocalBinding`;
  *   `srt-win` compares it with the installed loopback mode.
- * @throws on any outcome other than exit 0 — see
- *   {@link interpretWindowsWfpVerify}.
+ * @throws on any outcome other than exit 0.
  */
 export async function verifyWindowsWfpEgress(
   opts: {
@@ -2772,10 +2696,7 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 // Dependency / readiness check
 // ────────────────────────────────────────────────────────────────────
 
-/**
- * What the install changes for the rest of the machine's network, in
- * one sentence. Shown wherever the install is offered or confirmed.
- */
+/** What the install changes for the rest of the machine's network. */
 export const WINDOWS_INSTALL_NETWORK_EFFECT =
   `The WFP filters key on the dedicated \`srt-sandbox\` account's SID, ` +
   `so your own network is unaffected.`
@@ -2854,9 +2775,8 @@ function interpretDependencyProbes(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
     )
   } else if (ws.state === 'outdated') {
-    // A filter set from an earlier version: the sandbox would run
-    // without filters this version relies on, so it is an error, not
-    // a warning. The repair is the same one-time install.
+    // The sandbox would run without filters this version relies on, so
+    // it is an error, not a warning.
     errors.push(
       `WFP filters under sublayer ${sublayerGuid ?? '(default)'} are out ` +
         `of date${ws.hint ? ` (${ws.hint})` : ''}. ` +

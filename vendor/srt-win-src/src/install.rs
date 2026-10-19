@@ -327,22 +327,17 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
-/// Registry value holding the [`crate::wfp::FENCE_REVISION`] of the
-/// filter set the last completed `srt-win install` wrote, or
-/// [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall removed
-/// the filters.
+/// The [`crate::wfp::FENCE_REVISION`] the last completed install
+/// wrote, or [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall.
 const FENCE_REVISION_VALUE: &str = "FenceRevision";
 
-/// Registry value recording that the last completed `srt-win install`
-/// opened loopback (`--allow-loopback`): 1. Absent when the installed
-/// filter set leaves loopback closed.
+/// Registry value: 1 when the last completed `srt-win install` opened
+/// loopback (`--allow-loopback`); absent when it is closed.
 const ALLOW_LOOPBACK_VALUE: &str = "AllowLoopback";
 
-/// Record whether the filters just committed open loopback (`false`
-/// deletes the value). Called by the elevated install after the WFP
-/// transaction commits and BEFORE [`write_fence_revision`]: the
-/// revision is the commit point, so a record that reads as current
-/// always carries the mode of the filters it describes.
+/// Record whether the committed filters open loopback (`false` deletes
+/// the value). Call BEFORE [`write_fence_revision`]: the revision is
+/// what makes the record current.
 pub fn write_allow_loopback(open: bool) -> Result<()> {
     let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
     if open {
@@ -352,10 +347,9 @@ pub fn write_allow_loopback(open: bool) -> Result<()> {
     }
 }
 
-/// Whether the install record says loopback is open. `Ok(false)` when
-/// no install has run or the installed filter set leaves it closed. A
-/// value other than 1 is an error, never "closed": the broker must not
-/// guess what the filters open.
+/// Whether the install record says loopback is open; `Ok(false)` with
+/// no install. A value other than 1 is an error, never "closed": the
+/// broker must not guess what the filters open.
 pub fn read_allow_loopback() -> Result<bool> {
     let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
         return Ok(false);
@@ -369,12 +363,8 @@ pub fn read_allow_loopback() -> Result<bool> {
     }
 }
 
-/// `Err` with the operator-facing explanation unless the loopback mode
-/// this session is configured with is the one the install record says
-/// the filters have. Either difference is refused: a session that
-/// expects loopback closed must not run with every local service
-/// reachable, and one that expects it open would find its local
-/// servers unreachable.
+/// `Err` (operator-facing text) unless the session's loopback mode is
+/// the one the install record has; a difference either way is refused.
 pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
     let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
     if installed == configured {
@@ -384,33 +374,16 @@ pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), Strin
     }
 }
 
-/// Record that the filter set at `rev` is installed. Called by the
-/// elevated install only AFTER the WFP transaction commits, so the
-/// value never claims filters that were not written.
+/// Record the installed filter set's revision. Call only AFTER the WFP
+/// transaction commits, so it never claims filters that were not written.
 pub fn write_fence_revision(rev: u32) -> Result<()> {
     let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
     base.set_dword(FENCE_REVISION_VALUE, rev)
 }
 
-/// Record that the filters are being removed: the value is reset to
-/// [`crate::wfp::FENCE_REVISION_REMOVED`], and the recorded loopback
-/// mode goes with it. No-op when the machine has no install record.
-///
-/// The elevated install also calls this before it replaces a filter
-/// set whose loopback mode is changing, so that no failure between
-/// the WFP commit and the record update can leave a record that reads
-/// as current beside filters with the other mode.
-///
-/// Every path that deletes filters calls this FIRST and deletes the
-/// filters only if it succeeded. The record and the filters share no
-/// transaction; this order (and install's opposite one — filters
-/// first, record second) makes the only possible disagreement
-/// "filters present, record says removed or older", never a current
-/// record for a fence that is not there.
-///
-/// The record is machine-wide: removing the filters of one sublayer
-/// marks the fence removed even if another sublayer still holds a
-/// set.
+/// Reset the recorded revision to "removed" and drop the loopback mode.
+/// Every path that deletes filters, or changes their loopback mode,
+/// calls this FIRST, so no failure leaves a current record for them.
 pub fn mark_fence_removed() -> Result<()> {
     match crate::reg::Key::open(crate::reg::BASE, true)? {
         Some(base) => {
@@ -423,8 +396,7 @@ pub fn mark_fence_removed() -> Result<()> {
     }
 }
 
-/// Whether the record says an uninstall removed the filters. A read
-/// error is "no".
+/// Whether the record says "removed". A read error is "no".
 pub fn fence_marked_removed() -> bool {
     matches!(
         read_fence_revision(),
@@ -432,11 +404,8 @@ pub fn fence_marked_removed() -> bool {
     )
 }
 
-/// The recorded fence revision. `Ok(None)` when no install has run,
-/// or when the install that ran predates the record.
-///
-/// It says which filter set the last install wrote, not that the
-/// filters are still there — `srt-win wfp verify` shows that.
+/// What the last install recorded, not that the filters are still
+/// there. `Ok(None)` with no install, or one that predates the record.
 pub fn read_fence_revision() -> Result<Option<u32>> {
     let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
         return Ok(None);
@@ -444,8 +413,7 @@ pub fn read_fence_revision() -> Result<Option<u32>> {
     base.get_dword(FENCE_REVISION_VALUE)
 }
 
-/// `Err` with the operator-facing explanation unless the recorded
-/// fence revision is the one this build requires.
+/// `Err` (operator-facing text) unless the record is at this build's revision.
 pub fn require_current_fence() -> std::result::Result<(), String> {
     let have = read_fence_revision().map_err(|e| format!("read fence revision: {e:#}"))?;
     if have == Some(crate::wfp::FENCE_REVISION) {

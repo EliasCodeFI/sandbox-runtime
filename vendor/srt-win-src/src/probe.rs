@@ -1,82 +1,14 @@
-//! The behavioural fence probe behind `srt-win wfp verify`.
+//! The behavioural fence probe behind `srt-win wfp verify`: the runner
+//! (a process of the sandbox account) makes TCP connects under each
+//! token shape a sandboxed process can present to the filtering
+//! engine, and returns the results in its exit code
+//! ([`Report::encode`]) — its stdout is the broker's.
 //!
-//! The runner — a process of the sandbox account — makes TCP connects
-//! under each token shape a sandboxed process can present to the
-//! filtering engine, and reports one result per shape and
-//! destination:
-//!
-//!   - **plain** — its own token, to the loopback probe target: a
-//!     loopback port outside the proxy port range and, when loopback
-//!     is open, one of the ports that stay blocked
-//!     ([`crate::wfp::LOOPBACK_FLOOR_PORTS`]). The sandbox-user BLOCK
-//!     must refuse it.
-//!   - **anonymous** — while impersonating the anonymous token, to an
-//!     off-loopback target. No filter covers a socket created under
-//!     that token (see the `wfp` module doc), so a connect here is
-//!     expected and is reported as the [`RESIDUAL_ANONYMOUS_EGRESS`]
-//!     residual.
-//!   - **anonymous, loopback** — the same, to the loopback probe
-//!     target; reported as the [`RESIDUAL_ANONYMOUS_LOOPBACK`]
-//!     residual.
-//!   - **low integrity** and **untrusted integrity** — under a copy
-//!     of its own token whose integrity level has been lowered (which
-//!     takes no privilege), to both targets. The copy still carries
-//!     the sandbox account's SID, so the sandbox-user BLOCK must
-//!     refuse all four. They are probed because an access check
-//!     applies the mandatory integrity rule before it reads a
-//!     descriptor's entries.
-//!   - **deny-only** — under a restricted copy of its own token whose
-//!     user SID is deny-only, to the loopback probe target. No ALLOW
-//!     ACE matches a deny-only SID; a connect here is reported as the
-//!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
-//!
-//! With loopback open (`wfp verify --allow-loopback`) it makes two
-//! more, one connect each under its own token, which show that the
-//! open-loopback PERMIT opens what it says and no more:
-//!
-//!   - **open, off-loopback** — to a NON-loopback address of this
-//!     machine, on the port of the listener below. The PERMIT is for
-//!     loopback addresses only, so the sandbox-user BLOCK must refuse
-//!     it.
-//!   - **open, loopback** — to a loopback listener the broker itself
-//!     bound on an arbitrary port for the duration of the probe. It
-//!     must connect; a block here means the filters in place do not
-//!     open loopback.
-//!
-//! It also aims the off-loopback half of the lowered-integrity
-//! attempts at that port ([`lowered_off_loopback`]): the address is
-//! the same, and the attempts then also show that the PERMIT stays
-//! closed off loopback for a lowered token. (Ten three-bit results
-//! fill the runner's exit code, so this check has no result of its
-//! own.)
-//!
-//! A pass with loopback open says that DIRECT connections off the
-//! machine are blocked. It does not say that nothing on localhost
-//! forwards traffic off it: `wfp verify` prints
-//! [`crate::wfp::open_loopback_notice`] with every such result.
-//!
-//! ## Two orderings per assumed identity
-//!
-//! A connect is attributed to the token in effect when its socket was
-//! created, so a socket created under the process token and connected
-//! while impersonating says nothing about the assumed identity. Every
-//! attempt made under an assumed identity is run twice, on the one
-//! thread that holds the token ([`SocketOrder`]):
-//!
-//!   - **socket after token** — assume the identity, create the
-//!     socket, connect. The socket belongs to the assumed identity.
-//!   - **socket before token** — create the socket, assume the
-//!     identity, connect. Kept because an engine that attributes at
-//!     connect time would let this one through instead.
-//!
-//! In both, the thread's token is read back immediately before the
-//! connect; an attempt whose token is not the one asked for is an
-//! `error`, never a `blocked`. Each ordering's own result is logged
-//! to stderr, and the attempt reports the WORSE of the two for the
-//! fence ([`Outcome::worse`]).
-//!
-//! The runner's stdout is the broker's stdout, so the results
-//! travel back in the runner's exit code ([`Report::encode`]).
+//! A connect is attributed to the token in effect when its SOCKET was
+//! created, so every attempt under an assumed identity runs twice
+//! ([`SocketOrder`]) and reports the worse result. The thread's token
+//! is read back before each connect: one that is not the token asked
+//! for is an `error`, never a `blocked`.
 
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
@@ -99,52 +31,35 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-/// Name of the residual reported when a connect to an off-loopback
-/// destination made while impersonating the anonymous token is not
-/// blocked. Expected on every machine with such a destination.
+/// Residual: an off-loopback connect made while impersonating the
+/// anonymous token was not blocked. Expected wherever one can be aimed.
 pub const RESIDUAL_ANONYMOUS_EGRESS: &str = "anonymous-egress";
 
-/// Name of the residual reported when a connect to a loopback
-/// destination made while impersonating the anonymous token is not
-/// blocked.
 pub const RESIDUAL_ANONYMOUS_LOOPBACK: &str = "anonymous-loopback";
 
-/// The user SID of the anonymous token (`ANONYMOUS LOGON`).
 const ANONYMOUS_SID: &str = "S-1-5-7";
 
-/// The low mandatory level, as the last part of `S-1-16-<n>`.
 const IL_LOW: u32 = 0x1000;
-/// The untrusted mandatory level — the lowest.
 const IL_UNTRUSTED: u32 = 0;
 
-/// How long one connect may take. A refused or filtered connect
-/// returns at once; the bound only matters for a destination that
-/// does not answer.
+/// A refused or filtered connect returns at once; this bounds the rest.
 const CONNECT_TIMEOUT_SECS: i32 = 4;
 
-/// Result of one connect attempt.
-///
-/// No outcome is numbered zero, so an exit code whose field bits are
-/// all clear is not a report of "everything blocked".
+/// Result of one connect attempt. None is numbered zero, so an exit
+/// code whose field bits are all clear is not a report of "everything
+/// blocked".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// `WSAEACCES` — a BLOCK filter refused the connect.
     Blocked = 1,
-    /// The connect completed.
     Connected = 2,
-    /// `WSAECONNREFUSED` — nothing was listening, which the
-    /// destination can only say once the connect got past the
-    /// filters. For the fence this is the same answer as
-    /// [`Outcome::Connected`].
+    /// `WSAECONNREFUSED` — the destination answered, so the connect
+    /// got past the filters: for the fence, the same as `Connected`.
     Refused = 3,
-    /// Timed out or failed some other way; says nothing about the
-    /// fence.
     Unreachable = 4,
-    /// The attempt was not made (no target for it).
     Skipped = 5,
-    /// No connect was made under the token shape: it could not be
-    /// assumed, a socket could not be created under it, or the
-    /// thread's token read back as something else.
+    /// No connect was made under the token shape (it could not be
+    /// assumed, or did not read back as assumed).
     Error = 6,
 }
 
@@ -174,15 +89,13 @@ impl Outcome {
         }
     }
 
-    /// Whether the connect got past the filters.
     pub fn passed_fence(self) -> bool {
         matches!(self, Outcome::Connected | Outcome::Refused)
     }
 
-    /// How bad this outcome is for the fence; higher is worse. The
-    /// outcomes that learned nothing rank above `Blocked` so that a
-    /// block in one ordering cannot stand in for an ordering that was
-    /// never measured.
+    /// Higher is worse for the fence. The outcomes that learned nothing
+    /// rank above `Blocked`, so a block in one ordering cannot stand in
+    /// for an ordering that was never measured.
     fn severity(self) -> u8 {
         match self {
             Outcome::Blocked => 0,
@@ -194,7 +107,6 @@ impl Outcome {
         }
     }
 
-    /// The worse of two outcomes for the fence ([`Self::severity`]).
     pub fn worse(self, other: Self) -> Self {
         if other.severity() > self.severity() {
             other
@@ -204,21 +116,18 @@ impl Outcome {
     }
 }
 
-/// Every attempt's result. The two `open_*` attempts are
-/// [`Outcome::Skipped`] when loopback is closed.
+/// One result per attempt. `anonymous`, `low_integrity`,
+/// `untrusted_integrity` and `open_off_loopback` are aimed off
+/// loopback, the rest at a loopback target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub plain: Outcome,
     pub anonymous: Outcome,
     pub anonymous_loopback: Outcome,
     pub deny_only: Outcome,
-    /// Low integrity, to the off-loopback target.
     pub low_integrity: Outcome,
-    /// Low integrity, to the loopback target.
     pub low_integrity_loopback: Outcome,
-    /// Untrusted integrity, to the off-loopback target.
     pub untrusted_integrity: Outcome,
-    /// Untrusted integrity, to the loopback target.
     pub untrusted_integrity_loopback: Outcome,
     /// Own token, to a non-loopback address on a port that is open on
     /// loopback.
@@ -230,15 +139,10 @@ pub struct Report {
 
 const BITS: u32 = 3;
 const MASK: u32 = (1 << BITS) - 1;
-/// Number of [`Outcome`] fields in a [`Report`].
 const FIELDS: u32 = 10;
 /// Marks a runner exit code as an encoded [`Report`]: the bit just
-/// above the fields. Above every code the runner exits with for
-/// another reason (0, and 1 for its own error path), so an unrelated
-/// exit never decodes. With ten three-bit fields this is bit 30 of
-/// the 32 an exit code has; a decoded code also has bit 31 clear, so
-/// the `0xC000_0000` failure codes a killed process exits with never
-/// decode. There is room for no further field at this width.
+/// above the fields (bit 30: there is room for no further field), which
+/// the runner's other exits (0, and 1 for its own error path) never set.
 const REPORT_BASE: u32 = 1 << (FIELDS * BITS);
 
 impl Report {
@@ -285,10 +189,8 @@ impl Report {
         })
     }
 
-    /// The attempts the filters are built to refuse, each with
-    /// whether it may have been skipped (the ones aimed at the
-    /// off-loopback target, which a machine can lack, and the one
-    /// made only with loopback open).
+    /// The attempts the filters must refuse, each with whether it may
+    /// have been skipped (no off-loopback target, or loopback closed).
     fn must_be_blocked(&self) -> [(Outcome, bool); 6] {
         [
             (self.plain, false),
@@ -301,47 +203,23 @@ impl Report {
     }
 }
 
-/// `wfp verify` exit code: the fence refused everything it is built
-/// to refuse.
 pub const EXIT_FENCED: i32 = 0;
-/// `wfp verify` exit code: the probe could not tell.
 pub const EXIT_INCONCLUSIVE: i32 = 2;
-/// `wfp verify` exit code: a connect the fence must refuse got past
-/// it.
 pub const EXIT_NOT_FENCED: i32 = 3;
-/// `wfp verify` / `exec` exit code: the installed filter set is not
-/// the one this session requires — the install record says it was
-/// written by an earlier build, removed by an uninstall (`exec`
-/// only) or installed with the other loopback mode, or the probe
-/// found loopback closed where it is recorded open. The repair is
-/// always to re-run the install.
+/// `wfp verify` / `exec` exit code: the installed filter set is not the
+/// one this session requires (revision or loopback mode).
 pub const EXIT_FENCE_OUTDATED: i32 = 19;
 
-/// What `wfp verify` concludes from a [`Report`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub exit: i32,
-    /// Named gaps the probe observed that the filters do not close.
-    /// Only meaningful with [`EXIT_FENCED`]: the fence is active, and
-    /// these are what it leaves open.
+    /// Gaps the filters do not close; only set with [`EXIT_FENCED`].
     pub residuals: Vec<&'static str>,
 }
 
-/// The exit code is decided by the attempts made under a token that
-/// still carries the sandbox account's SID (the plain one, the four
-/// lowered-integrity ones and the off-loopback one at a port open on
-/// loopback): any one getting past the filters is a missing fence
-/// ([`EXIT_NOT_FENCED`]), and any one that was neither blocked nor
-/// skipped where it may be (no off-loopback address to aim at, or
-/// loopback is closed) leaves the probe inconclusive.
-///
-/// With those settled, the attempt at the broker's own loopback
-/// listener must connect. Blocked means the filters do not open
-/// loopback ([`EXIT_FENCE_OUTDATED`]); skipped (loopback is closed, or
-/// no listener could be bound) does not fail the probe.
-///
-/// The anonymous and deny-only attempts never fail it: the filters do
-/// not refuse them. One that got through is reported as a residual.
+/// The plain, lowered-integrity and `open_off_loopback` attempts decide
+/// the exit code; then `open_loopback` must connect, or the filters do not
+/// open loopback ([`EXIT_FENCE_OUTDATED`]). The rest only add residuals.
 pub fn verdict(r: &Report) -> Verdict {
     let must = r.must_be_blocked();
     let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
@@ -373,13 +251,9 @@ pub fn verdict(r: &Report) -> Verdict {
     Verdict { exit, residuals }
 }
 
-/// An off-loopback destination on this machine: the address it would
-/// use as the source of an outbound connection, at `port`. Nothing
-/// needs to listen there — refused is as good an answer as connected.
-///
-/// Found by connecting a UDP socket to a documentation address, which
-/// selects a route and a source address without sending anything.
-/// `None` when the machine has no route off loopback.
+/// This machine's outbound source address, at `port` (found with a
+/// connected UDP socket, which sends nothing). Nothing needs to
+/// listen there: refused is as good an answer as connected.
 pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     use std::net::UdpSocket;
     for (bind, toward) in [("0.0.0.0:0", "192.0.2.1:9"), ("[::]:0", "[2001:db8::1]:9")] {
@@ -399,13 +273,9 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     None
 }
 
-/// A loopback listener on a port the open-loopback PERMIT covers:
-/// whatever port the system hands out, tried again (with the earlier
-/// ones held) if that is one of the floor. The caller holds it until
-/// the runner has reported; a pending connection completes against
-/// the listen backlog, so nothing needs to accept. `None` when none
-/// could be bound: the probe never aims that attempt at a listener it
-/// does not own.
+/// A loopback listener on a port the open-loopback PERMIT covers (never
+/// one of the floor). The caller holds it until the runner has reported;
+/// nothing needs to accept: a connect completes against the backlog.
 pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
     let mut on_floor = Vec::new();
     for _ in 0..4 {
@@ -418,38 +288,30 @@ pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
     None
 }
 
-/// Whether `target` cannot serve as the probe's must-be-blocked
-/// loopback target with loopback open: a loopback port outside the
-/// floor is PERMITted by an intact fence, so a connect there would
-/// read as a missing one.
+/// Whether `target` is a loopback port that open loopback PERMITs: a
+/// connect there succeeds behind an intact fence, so it cannot be the
+/// probe's must-be-blocked target.
 pub fn target_is_open_loopback(target: &SocketAddr) -> bool {
     target.ip().is_loopback() && !crate::wfp::is_loopback_floor_port(target.port())
 }
 
-/// Which token the connect is made under.
 #[derive(Debug, Clone, Copy)]
 enum Identity {
     Own,
     Anonymous,
     DenyOnlyUser,
-    /// A copy of the own token at this mandatory level.
     LoweredIntegrity(u32),
 }
 
-/// When the socket is created, relative to assuming the identity. See
-/// the module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketOrder {
-    /// Create the socket, assume the identity, connect.
     BeforeToken,
-    /// Assume the identity, create the socket, connect.
     AfterToken,
 }
 
 impl SocketOrder {
     const BOTH: [SocketOrder; 2] = [SocketOrder::BeforeToken, SocketOrder::AfterToken];
 
-    /// The name used in the stderr line for this ordering.
     fn label(self) -> &'static str {
         match self {
             SocketOrder::BeforeToken => "socket before token",
@@ -458,19 +320,16 @@ impl SocketOrder {
     }
 }
 
-/// What the thread's token must read back as while an identity is
-/// assumed.
+/// What the thread's token must read back as under an identity.
 #[derive(Debug, Clone, Copy)]
 enum Expect {
     /// The anonymous token: its user is `ANONYMOUS LOGON`.
     Anonymous,
-    /// The token object that was set on the thread, and the mandatory
-    /// level it was given, if one was.
+    /// The token object set on the thread, and its mandatory level.
     Token { id: LUID, integrity: Option<u32> },
 }
 
-/// An identity in effect on this thread. Reverts to the process
-/// token on drop.
+/// An identity in effect on this thread; reverts on drop.
 struct Assumed {
     expect: Expect,
 }
@@ -482,8 +341,7 @@ impl Drop for Assumed {
     }
 }
 
-/// Room for a token property struct and the SID it points to.
-/// u64 elements: these structs hold pointers.
+/// u64 elements: the token property structs hold pointers.
 type TokenInfoBuf = [u64; 16];
 
 /// Read a token property into `buf` and return a view of it. `T`
@@ -509,8 +367,7 @@ unsafe fn token_info<'a, T>(
     }
 }
 
-/// The identity of a token object, which a thread keeps when the
-/// token is set on it.
+/// A token object's identity; a thread keeps it when the token is set.
 fn token_id(token: HANDLE) -> Result<LUID> {
     let mut buf = TokenInfoBuf::default();
     let stats = unsafe {
@@ -520,10 +377,8 @@ fn token_id(token: HANDLE) -> Result<LUID> {
 }
 
 /// Check that the thread carries the token `expect` describes, at
-/// impersonation level. Setting a thread token can succeed and still
-/// leave the thread with less than was asked for, and a call made in
-/// between can drop the impersonation; a connect made then would say
-/// nothing about the token shape under test.
+/// impersonation level: setting a thread token can succeed and still
+/// leave the thread with less than was asked for.
 fn confirm_thread_token(expect: Expect) -> Result<()> {
     let mut tok = HANDLE::default();
     // open_as_self: checked against the process token, not the one
@@ -581,7 +436,6 @@ fn confirm_thread_token(expect: Expect) -> Result<()> {
     Ok(())
 }
 
-/// Put `imp` on the thread and confirm it took.
 fn impersonate(imp: HANDLE, integrity: Option<u32>) -> Result<Assumed> {
     let id = token_id(imp)?;
     unsafe { SetThreadToken(None, Some(imp)) }.context("SetThreadToken")?;
@@ -594,8 +448,7 @@ fn impersonate(imp: HANDLE, integrity: Option<u32>) -> Result<Assumed> {
     Ok(assumed)
 }
 
-/// Assume `id` on the current thread. `None` for the process's own
-/// token, which needs nothing.
+/// Assume `id` on the current thread; `None` for the process token.
 fn assume(id: Identity) -> Result<Option<Assumed>> {
     match id {
         Identity::Own => Ok(None),
@@ -621,8 +474,7 @@ fn assume(id: Identity) -> Result<Option<Assumed>> {
                         &mut own,
                     )
                     .context("OpenProcessToken")?;
-                    // The user SID in the disable list becomes
-                    // deny-only in the new token.
+                    // A SID in the disable list becomes deny-only.
                     let disable = [SID_AND_ATTRIBUTES {
                         Sid: user.as_psid(),
                         Attributes: 0,
@@ -711,9 +563,8 @@ fn classify_error(code: i32) -> Outcome {
     }
 }
 
-/// Non-blocking connect on an existing socket, waited for up to
-/// [`CONNECT_TIMEOUT_SECS`]. Returns the outcome and the Winsock
-/// error code behind it (0 for a completed connect).
+/// Non-blocking connect, waited for up to [`CONNECT_TIMEOUT_SECS`].
+/// Returns the outcome and the Winsock error behind it (0 if none).
 fn connect_bounded(sock: &Sock, addr: &SocketAddr) -> (Outcome, i32) {
     let rc = unsafe {
         match addr {
@@ -803,8 +654,7 @@ fn connect_bounded(sock: &Sock, addr: &SocketAddr) -> (Outcome, i32) {
     }
 }
 
-/// A non-blocking TCP socket for `target`'s address family, created
-/// under whatever token the calling thread carries.
+/// A non-blocking TCP socket, created under the thread's current token.
 fn new_socket(target: &SocketAddr) -> Result<Sock> {
     let af = match target {
         SocketAddr::V4(_) => AF_INET,
@@ -823,10 +673,7 @@ fn new_socket(target: &SocketAddr) -> Result<Sock> {
     Ok(sock)
 }
 
-/// One connect under `id`, with the socket created before or after
-/// the identity is assumed. Everything runs on the calling thread,
-/// which is the one that holds the assumed token. Returns the outcome
-/// and what is behind it.
+/// One connect under `id`; returns the outcome and what is behind it.
 fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome, String) {
     let error = |what: &str, e: anyhow::Error| (Outcome::Error, format!("{what}: {e:#}"));
     let (sock, assumed) = match order {
@@ -865,9 +712,6 @@ fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome
     (o, format!("winsock error {code}"))
 }
 
-/// One attempt. Under the process's own token that is one connect;
-/// under an assumed identity it is one per [`SocketOrder`], each
-/// logged, and the result is the worse of the two for the fence.
 fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     // stderr, never stdout: the runner's stdout is the broker's, and
     // the broker prints its own JSON there.
@@ -896,12 +740,9 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     worst
 }
 
-/// The off-loopback target of the lowered-integrity attempts: the
-/// one at a port open on loopback when there is one, else the
-/// anonymous attempt's. Both are the same address; the open port is
-/// the stricter destination, since it is one a PERMIT names. Shared
-/// by the runner, which aims the attempts, and the broker, which
-/// reports where they went.
+/// Off-loopback target of the lowered-integrity attempts: the one at a
+/// port open on loopback when there is one (the stricter destination),
+/// else the anonymous attempt's. Shared by runner and broker.
 pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
     open_off_loopback.or(anonymous)
 }
@@ -911,19 +752,15 @@ pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T
 pub struct Targets<'a> {
     /// The loopback probe target: a port no PERMIT covers.
     pub target: &'a str,
-    /// Off-loopback, for the attempt made while impersonating the
-    /// anonymous token — and for the lowered-integrity attempts when
+    /// Off-loopback; also the lowered-integrity attempts' target when
     /// `open_off_loopback` is `None`.
     pub anonymous: Option<&'a str>,
-    /// Off-loopback, at a port that is open on loopback. Also where
-    /// the lowered-integrity attempts' off-loopback half goes
-    /// ([`lowered_off_loopback`]).
+    /// Off-loopback, at a port that is open on loopback.
     pub open_off_loopback: Option<&'a str>,
     /// The broker's loopback listener on an arbitrary port.
     pub open_loopback: Option<&'a str>,
 }
 
-/// Run every attempt.
 pub fn run(targets: Targets<'_>) -> Result<Report> {
     let parse = |s: &str| -> Result<SocketAddr> {
         s.parse()
@@ -973,9 +810,8 @@ pub fn run(targets: Targets<'_>) -> Result<Report> {
 mod tests {
     use super::*;
 
-    /// A report with loopback closed: the four lowered-integrity
-    /// attempts blocked, the two open-loopback attempts skipped, the
-    /// rest as given.
+    /// Loopback closed: the lowered-integrity attempts blocked, the
+    /// open-loopback ones skipped, the rest as given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
         Report {
             plain: p,
@@ -991,8 +827,7 @@ mod tests {
         }
     }
 
-    /// `r` with the four lowered-integrity attempts replaced, in
-    /// field order.
+    /// `r` with the lowered-integrity attempts replaced, in field order.
     fn lowered(r: Report, l: [Outcome; 4]) -> Report {
         Report {
             low_integrity: l[0],
@@ -1024,11 +859,8 @@ mod tests {
             for a in Outcome::ALL {
                 for al in Outcome::ALL {
                     for d in Outcome::ALL {
-                        // The four lowered-integrity fields take the
-                        // same values in a different order, so every
-                        // field sees every outcome beside differing
-                        // neighbours; the two open-loopback fields take
-                        // every pair.
+                        // Reordered, so every field sees every outcome beside
+                        // differing neighbours; the `open_*` fields take every pair.
                         for ro in Outcome::ALL {
                             for rl in Outcome::ALL {
                                 let r = Report {
@@ -1138,7 +970,6 @@ mod tests {
 
     #[test]
     fn unrelated_exit_codes_do_not_decode() {
-        // 0 and 1 are the runner's ordinary exits.
         for code in [
             0,
             1,
@@ -1173,8 +1004,6 @@ mod tests {
 
     #[test]
     fn worse_ranks_outcomes_for_the_fence() {
-        // Worst first. Each one beats everything after it, whichever
-        // side it is on.
         let ranked = [Connected, Refused, Error, Unreachable, Skipped, Blocked];
         assert_eq!(ranked.len(), Outcome::ALL.len());
         for (i, a) in ranked.iter().enumerate() {
@@ -1188,16 +1017,13 @@ mod tests {
 
     #[test]
     fn worse_of_two_orderings() {
-        // One ordering getting through is the attempt getting through.
         assert!(Blocked.worse(Connected).passed_fence());
         assert!(Refused.worse(Blocked).passed_fence());
         // A block in one ordering does not stand in for an ordering
         // that was not measured.
         assert_eq!(Blocked.worse(Error), Error);
         assert_eq!(Unreachable.worse(Blocked), Unreachable);
-        // Blocked only when both were.
         assert_eq!(Blocked.worse(Blocked), Blocked);
-        // A leak is not hidden by the other ordering failing.
         assert_eq!(Error.worse(Connected), Connected);
     }
 
@@ -1255,8 +1081,6 @@ mod tests {
         }
     }
 
-    /// The off-loopback connect under the anonymous token is expected
-    /// to get through. Whatever it does, it is never a probe failure.
     #[test]
     fn verdict_anonymous_egress_is_a_residual_never_a_failure() {
         for through in [Connected, Refused] {

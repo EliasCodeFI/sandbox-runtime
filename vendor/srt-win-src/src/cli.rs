@@ -895,9 +895,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // stamping step below (env reads + a stat per entry).
             let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
-            // An `outdated` set (written by an earlier build) takes
-            // the same conflict check but never the early-out: it
-            // falls through and is replaced.
+            // An `outdated` set takes the same conflict check but never
+            // the early-out: it falls through and is replaced.
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && matches!(st.state, "installed" | "outdated")
@@ -948,10 +947,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // missing/undecryptable Cred\Blob with a healthy
                 // marker must fall through and be rewritten rather
                 // than early-outing on "already installed".
-                // So is the fence: the enumerated set and the
-                // install record must both be at this build's
-                // revision, and the record must carry the loopback
-                // mode the enumerated set has.
+                // So is the fence: the enumerated set and the install record
+                // must be at this build's revision and agree on the loopback mode.
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
@@ -1088,10 +1085,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
-            // Only now that the filters are committed: record what
-            // they open and their revision for the non-elevated
-            // broker, which cannot enumerate them. The revision is
-            // written last — it is what makes the record current.
+            // Only now that the filters are committed. The revision is
+            // written last: it is what makes the record current.
             if let Err(e) = install::write_allow_loopback(allow_loopback) {
                 eprintln!("srt-win: error: record loopback mode: {e:#}");
                 std::process::exit(12);
@@ -1136,8 +1131,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            // Record first, filters second — see
-            // `install::mark_fence_removed` for why that order.
+            // Record first, filters second (`install::mark_fence_removed`).
             srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
             let n = wfp::uninstall_filters(&sl)?;
             // Read setup up front: the ambient cleanup and the
@@ -1270,12 +1264,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      of the ports that stay blocked"
                 ));
             }
-            // A BLOCK fires at ALE_AUTH_CONNECT before any packet
-            // leaves, so a fenced connect gives WSAEACCES (~0ms); a
-            // MISSING fence lets it through. The host passes a local
-            // loopback listener bound on a port no PERMIT covers
-            // so fence-missing is distinguishable from fence-active
-            // without depending on any external host.
+            // A BLOCK fires at ALE_AUTH_CONNECT before any packet leaves:
+            // a fenced connect gives WSAEACCES, a MISSING fence connects.
             let r = install::read_cred().and_then(|c| {
                 let s = install::read_setup()?
                     .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
@@ -1290,18 +1280,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             };
             fn finish(doc: serde_json::Value, exit: i32) -> ! {
                 println!("{doc}");
-                // `process::exit`'s rt::cleanup flushes stdout, but
-                // be explicit — this arm prints to stdout and then
+                // Explicit flush: this arm prints to stdout and then
                 // `process::exit`s instead of returning Ok(()).
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 std::process::exit(exit)
             }
-            // Checked before probing so that an out-of-date filter
-            // set, or one whose loopback mode is not the one this
-            // session is configured with, is refused by name, with
-            // the repair. A record that says the filters were REMOVED
-            // is not refused here: the probe then shows the missing
-            // fence itself (exit 3).
+            // A record that says the filters were REMOVED is not refused
+            // here: the probe then shows the missing fence (exit 3).
             if !install::fence_marked_removed() {
                 if let Err(hint) = install::require_current_fence() {
                     eprintln!("srt-win: error: wfp verify: {hint}");
@@ -1315,9 +1300,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         probe::EXIT_FENCE_OUTDATED,
                     );
                 }
-                // `allow_loopback_mismatch` tells the host that the
-                // repair is an install with THIS session's loopback
-                // mode (`allow_loopback`).
+                // `allow_loopback_mismatch` tells the host that the repair
+                // is an install with THIS session's loopback mode.
                 if let Err(hint) = install::require_allow_loopback(allow_loopback) {
                     eprintln!("srt-win: error: wfp verify: {hint}");
                     finish(
@@ -1369,9 +1353,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 anonymous_target.as_ref(),
             );
             let Some(report) = probe::Report::decode(code) else {
-                // 1 is the runner's own anyhow `Err` path (`main()`
-                // → `eprintln!` + `exit(1)`); anything else is an
-                // unmapped runner state. Neither is a probe result.
+                // Exit 1 (the runner's `Err` path) or an unmapped state.
                 finish(
                     json!({
                         "egress_probe": "error",
@@ -1786,21 +1768,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })
                 .ok();
 
-            // No filter enumeration here: BFE enumeration is
-            // admin-gated, so a non-elevated broker can't read it.
-            // What the broker CAN read is the install record's fence
-            // revision, so a filter set that is not the one this
-            // build requires is refused before anything is launched.
-            // That the filters a current record describes are still
-            // in place is verified BEHAVIORALLY by `srt-win wfp
-            // verify` at the host's `initialize()`. Standalone
-            // `srt-win exec` callers should run `srt-win wfp verify`
-            // once per session.
-            //
-            // The same record says whether the filters open loopback.
-            // A session configured the other way — in either
-            // direction — is refused here too: it would otherwise run
-            // behind a fence it was not told about.
+            // The non-elevated broker cannot enumerate filters; the install
+            // record's revision and loopback mode are what it can check.
             if let Err(hint) = install::require_current_fence()
                 .and_then(|()| install::require_allow_loopback(allow_loopback))
             {

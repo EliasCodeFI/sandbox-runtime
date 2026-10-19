@@ -38,22 +38,9 @@ pub enum RunnerCmd {
     /// `srt-win uninstall` deletes the profile. Exit non-zero on
     /// failure.
     InstallCa { der: crate::cert_store::CertDer },
-    /// `wfp verify` probe: attempt direct TCP connects **as the
-    /// sandbox user**, one per token shape a sandboxed process can
-    /// present to the filtering engine — see [`crate::probe`].
-    /// `target` (`host:port`) is the loopback probe target;
-    /// `anonymous_target` the off-loopback one (`None` skips the
-    /// attempts aimed at it). With loopback open,
-    /// `open_loopback_target` is the broker's own loopback listener
-    /// and `open_off_loopback_target` an off-loopback address at its
-    /// port (`None` skips each).
-    ///
-    /// The runner exits with the results encoded
-    /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
-    /// the runner's own anyhow `Err` path, and never decodes as a
-    /// report. No desk/grants/lockdown — the probe runs as the bare
-    /// runner (same as [`InstallCa`](Self::InstallCa)); the filters
-    /// key on the token, which the runner already carries.
+    /// `wfp verify` probe ([`crate::probe`]), run as the bare runner:
+    /// no desk/grants/lockdown. Exits with the results encoded; exit 1
+    /// stays the runner's own error path and never decodes as a report.
     ProbeEgress {
         target: String,
         #[serde(default)]
