@@ -1799,9 +1799,6 @@ fn quoted_list<S: std::fmt::Display>(paths: &[S]) -> String {
 mod tests {
     use super::*;
 
-    /// Two deny targets under one placeholder directory (and a
-    /// nested chain) list each ancestor once, first occurrence kept,
-    /// order otherwise untouched.
     #[test]
     fn placeholder_ancestors_listed_once_per_call() {
         use srt_win::acl::{DenyMask, SbAce};

@@ -1517,15 +1517,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 })
 
 // ════════════════════════════════════════════════════════════════════
-// Session ACL operations — non-blocking, ordered, generous timeout
-// (pure, all platforms)
 // ════════════════════════════════════════════════════════════════════
-// `acl grant` / `stamp` / `revoke` / `restore` walk the granted tree,
-// so initialize() and reset() run them through the async spawn. These
-// drive the real SandboxManager with the platform pinned to Windows
-// and both child_process entry points stubbed: every `acl` spawn
-// returns a child the test completes by hand, which is what lets a
-// test observe "grant still pending" as a state.
 
 describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
@@ -1574,8 +1566,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   let aclSyncCalls: { sub: string; timeout: number }[]
   // spawnSync result for a sync `acl <sub>`; default exit 0, `[]`.
   let aclSyncResult: (sub: string) => Record<string, unknown> | undefined
-  // Subcommands whose async child stays open until the test finishes
-  // it; everything else exits 0 on the next tick.
   let hold: Set<string>
   let spies: { mockRestore(): void }[]
   let dir: string
@@ -1615,8 +1605,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      // The WFP probe binds a listener and is once-per-process; it is
-      // not what these tests are about.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1677,8 +1665,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   })
 
   afterEach(async () => {
-    // Nothing may stay pending into reset(); stubs are still live so
-    // its revoke/restore go to the fake.
     hold.clear()
     for (const c of aclSpawns) c.finish()
     await SandboxManager.reset()
@@ -1687,8 +1673,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
-  // external so initialize() binds nothing.
   const config = (
     windows: Partial<NonNullable<SandboxRuntimeConfig['windows']>> = {},
   ): SandboxRuntimeConfig => ({
@@ -1740,11 +1724,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     expect(h.length).toBe(1)
     return h[0] as () => unknown
   }
-  /**
-   * The listener registerCleanup() put on 'exit': it runs the handler
-   * above, then removes the library's temp objects. Told from other
-   * modules' listeners by the one call only it makes.
-   */
   const exitListener = (): (() => void) => {
     const h = (process.listeners('exit') as unknown[]).filter(l =>
       String(l).includes('disposeMitmCASync'),
@@ -1799,8 +1778,7 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any)
     spies.push(syncSpy)
-    // runSrtWinAsync arms its own timer rather than passing spawn a
-    // `timeout`, so the budget is observed on setTimeout.
+    // runSrtWinAsync arms its own timer: the budget is seen on setTimeout.
     const delays: unknown[] = []
     const realSetTimeout = globalThis.setTimeout
     const timerSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
@@ -1862,9 +1840,7 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     const rv = revokeWindowsAclAsync(o)
     ;(await spawned(3)).finish(1, '[{"path":"p","status":"failed"}]')
     expect(await rv).toEqual([{ path: 'p', status: 'failed' }])
-    // Unparseable output → undefined, not a throw. (Another holder:
-    // a restore for the holder whose revoke just failed is refused
-    // without a spawn.)
+    // Another holder: a restore after that holder's failed revoke is refused.
     const rs = restoreWindowsAclAsync({ ...o, holderPid: process.pid + 1 })
     ;(await spawned(4)).finish(1, 'boom')
     expect(await rs).toBeUndefined()
@@ -1949,8 +1925,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     const revoke = await spawned(2)
     expect(grant.killed).toBe(true)
     expect(revoke.sub).toBe('revoke')
-    // Cleanup is strictly ordered too, and initialize() is still
-    // pending while it runs.
     await tick(20)
     expect(subs()).toEqual(['grant', 'revoke'])
     expect(initState.done).toBe(false)
@@ -1965,8 +1939,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     expect(e).toBeInstanceOf(WindowsSandboxError)
     expect(e.code).toBe('srt_win_timeout')
     expect(e.message).toMatch(/acl grant .*timed out after 40ms/)
-    // Fail closed: stamp never ran, nothing is recorded as applied,
-    // and the session config is gone.
     expect(subs()).toEqual(['grant', 'revoke', 'restore'])
     expect(SandboxManager.getConfig()).toBeUndefined()
     expect(aclSyncCalls).toEqual([])
@@ -2019,9 +1991,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   })
 
   it("initialize() retried after a failed one waits for that one's revoke/restore", async () => {
-    // A failure AFTER the ACL phase makes initialize() fire reset()
-    // without awaiting it. The retry shares this process's holder
-    // PID, so a grant racing that release would be stripped by it.
     spies.push(
       spyOn(javaProxyAgent, 'getJavaProxyAgentJarPathAsync')
         .mockRejectedValueOnce(new Error('network phase failed'))
@@ -2053,9 +2022,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   })
 
   // ── Release ordering: no deny restore unless the revoke completed ──
-  // Restore takes the DENY stamps off; if an ALLOW grant may still be
-  // on disk (revoke failed / partial / timed out) that would open the
-  // deny targets to the shared sandbox account.
 
   it('reset(): revoke exits non-zero → restore is not spawned', async () => {
     await SandboxManager.initialize(config())
@@ -2131,8 +2097,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     const wrapState = settled(wrap)
     const wrapErr = rejection(wrap)
     stamp.finish(2, '')
-    // Grant is on disk, stamp is not: nothing is handed out while
-    // the cleanup revoke/restore are still running.
     const revoke = await spawned(3)
     await tick(20)
     expect(wrapState.done).toBe(false)
@@ -2178,9 +2142,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   })
 
   it('exit/signal handler: releases synchronously, then reset() has nothing left', async () => {
-    // Exit must stay bounded: the handler's sync release has its own
-    // 60 s per-call bound, whatever windows.aclTimeoutMs says —
-    // larger or smaller.
     await SandboxManager.initialize(config({ aclTimeoutMs: 900_000 }))
     const done = cleanupHandler()()
     // Both spawnSync calls happened inside the handler call itself.
@@ -2222,10 +2183,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   })
 
   // ── Release ordering: what counts as a completed revoke ──
-  // Exit 0 with parseable JSON is not enough: every outcome must show
-  // its grant released. Checked at each release site — reset() and
-  // initialize()'s failure cleanup (async), the exit/signal handler
-  // (sync).
 
   type Revoke = [how: string, stdout: () => string]
   // Revoke output listing one released path plus `path` with `status`.
@@ -2234,18 +2191,13 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
       { path: 'released', status: 'revoked' },
       { path, status },
     ])
-  // Exit-0 revokes that are NOT complete. (Thunks: `dir` exists only
-  // inside a test.)
+  // Thunks: `dir` exists only inside a test.
   const INCOMPLETE_REVOKES: Revoke[] = [
     ['prints JSON that is not a list', () => '{}'],
     ['lists an outcome with no status', () => '[{"path":"p"}]'],
-    // Statuses outside the allow-list — the last one is a status this
-    // code has never heard of.
     ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
       (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
     ),
-    // What an srt-win without "unreadable" says about a path it could
-    // not open.
     [
       'reports "missing" for a path that still exists',
       () => reports('missing', dir),
@@ -2263,8 +2215,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
   ]
   const NO_RESTORE = ['grant', 'stamp', 'revoke']
   const WITH_RESTORE = ['grant', 'stamp', 'revoke', 'restore']
-  // For direct helper calls; the spawns are stubbed, so any existing
-  // file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
 
   /** A session whose reset()'s revoke exits 0 printing `stdout`. */
@@ -2334,9 +2284,6 @@ describe('Windows session ACLs: async, ordered, timeout (pure, all platforms)', 
     })
   }
 
-  // Once a revoke was incomplete, a later revoke that finds nothing
-  // wrong must not unlock the restore: the grant the first one left
-  // may no longer be recorded anywhere.
   describe('after one incomplete revoke in this process', () => {
     let first: number
 

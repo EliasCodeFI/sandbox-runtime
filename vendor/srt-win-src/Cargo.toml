@@ -14,9 +14,8 @@ name = "srt-win"
 path = "src/main.rs"
 
 [features]
-# Test-only fault injection for the CI smokes (the write-intent
-# journal's kill-before-DACL-write hook in `state_db.rs`). OFF by
-# default and never enabled for a shipped binary.
+# Test-only fault injection for the CI smokes. OFF by default and never
+# enabled for a shipped binary.
 test-hooks = []
 
 [target.'cfg(windows)'.dependencies]

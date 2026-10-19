@@ -43,52 +43,16 @@
 //! between leaves a row whose ACE hasn't been written; the next
 //! call re-derives and reapplies.
 //!
-//! ## One converge per path per batch
+//! ## Batches, journal, release order
 //!
-//! `SetNamedSecurityInfoW` on a directory re-propagates to every
-//! unprotected descendant, so a converge of a granted project root
-//! costs a walk of the whole tree. One batch routinely touches the
-//! same path several times (every deny target adds a `deny_fdc` row
-//! on its parent), so the batch loops ([`Locked::apply_aces`],
-//! [`release_batch`]) run every per-row step in order (capture,
-//! guards, identity gate, row writes) and defer only the
-//! [`recompose_at`] to the path's LAST touch in the batch
-//! ([`last_touches`]). `recompose_at` reads the rows as they then
-//! stand; a row still always precedes its write.
-//!
-//! The converge itself skips the write when the path's DACL is
-//! already the composed one AND `converged_dacls` records that our
-//! last write of exactly that DACL ran to completion
-//! ([`ConvergedLedger`]). That table only ever lowers trust: it can
-//! veto a skip the live DACL comparison would allow, never grant
-//! one, and a missing, stale or unreadable row means "write".
-//!
-//! ## Write-intent journal
-//!
-//! Record-first covers a killed APPLY: the row outlives the unwritten
-//! ACE. A killed RELEASE is the mirror case and rows cannot cover it:
-//! release drops its `working_aces` row first and walks the tree
-//! second, so a broker killed mid-propagation leaves descendants
-//! still carrying the inherited sandbox ACE with no row for recovery
-//! to find. So every real DACL write is bracketed by a
-//! `write_intents` row ([`record_write_intent`] before the write,
-//! [`clear_write_intent`] once it has returned), and crash recovery
-//! re-runs the converge, forced, for each intent that survived
-//! ([`recover_write_intents`]).
-//!
-//! The journal covers a write that STARTED. A release that fails
-//! before or without one must not lose its rows either, so a release
-//! establishes where the ACE is before it changes any row
-//! ([`AceRelease::Unreadable`] changes none), and a converge that
-//! returns an error has the rows of every hold it was owed for put
-//! back ([`Undo`], [`AceRelease::Failed`]).
-//!
-//! ## Release order: grants before denies
-//!
-//! A holder's DENY rows protect targets under trees its GRANT rows
-//! open up, and the sandbox account is shared between sessions. So a
-//! holder's deny rows are never released while one of its grants may
-//! still be on disk; [`recover_with`] has the order.
+//! - One converge per path per batch: a directory DACL write re-propagates
+//!   to every descendant, so a batch defers [`recompose_at`] to the path's
+//!   last touch ([`last_touches`]). A row still precedes its write.
+//! - Every real DACL write is bracketed by a `write_intents` row: a release
+//!   drops its row BEFORE the tree walk, so a kill mid-walk would otherwise
+//!   leave inherited ACEs that no row records ([`recover_write_intents`]).
+//! - A holder's deny rows are never released while one of its grants may
+//!   still be on disk ([`recover_with`]).
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -204,15 +168,12 @@ pub struct RecoveryReport {
     pub dead_brokers: u32,
     /// Orphaned `working_aces` rows whose ACE was revoked.
     pub aces_revoked: u32,
-    /// Interrupted DACL writes (`write_intents` rows) whose converge
-    /// was re-run to completion.
+    /// Interrupted DACL writes whose converge was re-run to completion.
     pub writes_resumed: u32,
-    /// `write_intents` rows still present after this pass (converge
-    /// failed or path unreadable — retried by the next pass).
+    /// `write_intents` rows still present after this pass.
     pub writes_pending: u32,
-    /// Grant paths of dead holders (or holderless rows) that could
-    /// not be released this pass. Their rows — and the same holder's
-    /// deny rows — are kept for the next recovery.
+    /// Grant paths that could not be released this pass; their rows, and the
+    /// same holder's deny rows, are kept.
     pub grants_pending: Vec<String>,
 }
 
@@ -748,11 +709,8 @@ impl Locked {
     /// `(path, kind, pid)` dedupes within one holder; refcount
     /// handles cross-holder).
     ///
-    /// Every entry is recorded in order ([`Self::record_ace`]); each
-    /// PATH is converged once, when its last entry in the batch has
-    /// been recorded (module doc, "One converge per path per
-    /// batch"). A failed converge fails every entry recorded on that
-    /// path.
+    /// Each PATH is converged once, after its last entry in the batch; a
+    /// failed converge fails every entry recorded on that path.
     ///
     /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
     pub fn apply_aces(
@@ -763,9 +721,8 @@ impl Locked {
         self.with_broker_registration(sandbox_sid, |db| {
             let plan = plan_ace_ops(targets);
             let last = last_touches(plan.iter().map(|op| op.canon.as_str()));
-            // `done[i]`: op `i` recorded (and, once its path has
-            // converged, written). A witness leaves its slot for the
-            // caller only as `Some` — i.e. only once converged.
+            // `done[i]`: op `i` recorded; its witness is `Some` only once
+            // its path has converged.
             let mut done: Vec<Option<AceWitness>> = Vec::new();
             done.resize_with(plan.len(), || None);
             // Recorded, converge still owed: path → op indices.
@@ -806,14 +763,9 @@ impl Locked {
         })
     }
 
-    /// The record half of a single-ACE converge: capture the path's
-    /// identity, run the guards, then the record-first upserts
-    /// (holder row plus `working_aces` row). The caller OWES a
-    /// [`recompose_at`] on `canon` before its batch ends — a crash
-    /// in between leaves a row whose ACE hasn't been written; the
-    /// next call re-derives and reapplies. The returned witness is
-    /// only handed out of [`Self::apply_aces`] once that converge
-    /// has succeeded.
+    /// The record half of a single-ACE converge: identity capture, guards,
+    /// then the record-first upserts. The caller OWES a [`recompose_at`] on
+    /// `canon` before its batch ends.
     fn record_ace(&self, canon: &str, want: SbAce) -> Result<AceWitness> {
         let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
@@ -948,10 +900,9 @@ impl Locked {
     /// Release every ACE hold of `self.holder_pid` for the given
     /// `kinds` ([`KIND_GRANT`] for `acl revoke`; [`KIND_DENY`] for
     /// `acl restore --sandbox-user-sid`) and unregister if no holds
-    /// of any kind remain. Per-path catch-and-continue
-    /// ([`release_batch`]): a hold whose release errored is reported
-    /// as [`AceRelease::Failed`] (and counted in the second tuple
-    /// field); its rows are still held.
+    /// of any kind remain. A hold whose release errored is reported as
+    /// [`AceRelease::Failed`] (counted in the second tuple field); its rows
+    /// are kept.
     pub fn release_aces(
         &self,
         sandbox_sid: &str,
@@ -1025,8 +976,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     recompose(conn, canon, sandbox_sid, false)
 }
 
-/// [`recompose_at`], optionally with the write FORCED (never skipped
-/// as already-converged) — the journal recovery's form.
+/// [`recompose_at`], optionally with the write FORCED (journal recovery).
 fn recompose(conn: &Connection, canon: &str, sandbox_sid: &str, force_write: bool) -> Result<()> {
     let rows: Vec<(String, String)> = query_vec(
         conn,
@@ -1059,9 +1009,8 @@ fn recompose(conn: &Connection, canon: &str, sandbox_sid: &str, force_write: boo
         conn,
         canon,
         file_id: path_id::capture_file_id(canon).ok(),
-        // A path left with no sandbox ACE needs no record (and the
-        // table must not grow with every path ever stamped): it is
-        // withdrawn by the write and not restored.
+        // A path left with no sandbox ACE needs no record: the table must
+        // not grow with every path ever stamped.
         keep: !set.is_empty(),
         force_write,
     };
@@ -1069,14 +1018,11 @@ fn recompose(conn: &Connection, canon: &str, sandbox_sid: &str, force_write: boo
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 
-/// [`acl::WriteLedger`] over `converged_dacls` for one path — see
-/// that trait for why the write-skip needs a completion record, and
-/// the table comment for its lifecycle.
+/// [`acl::WriteLedger`] over `converged_dacls` for one path.
 struct ConvergedLedger<'a> {
     conn: &'a Connection,
     canon: &'a str,
-    /// The path's current identity; `None` (unreadable) never
-    /// matches and is never recorded.
+    /// The path's current identity; `None` never matches, is never recorded.
     file_id: Option<FileId>,
     /// Whether a completed write is worth recording.
     keep: bool,
@@ -1122,9 +1068,8 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
             );
         };
         record_write_intent(self.conn, self.canon, &id)?;
-        // Never on the recovery replay (`force_write`): a recovery
-        // run with the variable still set must be able to finish
-        // the write the hook interrupted.
+        // Never on the recovery replay (`force_write`), which must be able
+        // to finish the write the hook interrupted.
         #[cfg(feature = "test-hooks")]
         if !self.force_write {
             debug_kill_before_write(self.canon);
@@ -1133,9 +1078,8 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
     }
 
     fn complete(&self, dacl: &[u8]) {
-        // The write returned: retire its journal row. Best-effort — a
-        // row that outlives its write only costs one redundant
-        // forced converge at the next recovery.
+        // Best-effort: a row that outlives its write only costs one
+        // redundant forced converge at the next recovery.
         let Some(id) = self.file_id else {
             return;
         };
@@ -1154,9 +1098,7 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
 
 // ─── Write-intent journal ───────────────────────────────────────────
 
-/// Journal a DACL write about to start on the object `id` at `canon`
-/// (see the `write_intents` table comment). Autocommitted before the
-/// write, like every other row here; idempotent.
+/// Journal a DACL write about to start on object `id` at `canon`; idempotent.
 fn record_write_intent(conn: &Connection, canon: &str, id: &FileId) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO write_intents (canonical_path, file_id) \
@@ -1167,8 +1109,7 @@ fn record_write_intent(conn: &Connection, canon: &str, id: &FileId) -> Result<()
     Ok(())
 }
 
-/// Retire the journal row for `(canon, id)` — its write returned, or
-/// recovery has dealt with it.
+/// Retire the journal row for `(canon, id)`.
 fn clear_write_intent(conn: &Connection, canon: &str, id: &[u8]) -> Result<()> {
     conn.execute(
         "DELETE FROM write_intents \
@@ -1179,15 +1120,9 @@ fn clear_write_intent(conn: &Connection, canon: &str, id: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Test hook for the journal's smoke row — compiled ONLY under the
-/// off-by-default `test-hooks` cargo feature, so no shipped broker
-/// contains it. With `SANDBOX_RUNTIME_WIN_DEBUG` set AND
-/// `SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE` naming a path
-/// suffix, exit hard (no unwinding, like a kill) right after the
-/// intent row for a matching path is committed and before its DACL
-/// write — the state a broker killed at the start of a propagation
-/// leaves behind. Fires at most once per process (it exits) and
-/// never on the recovery replay (see the call site).
+/// Test hook, compiled ONLY under the off-by-default `test-hooks` feature:
+/// exit hard right after the intent row for a path matching
+/// `SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE` is committed.
 #[cfg(feature = "test-hooks")]
 fn debug_kill_before_write(canon: &str) {
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_none() {
@@ -1204,21 +1139,9 @@ fn debug_kill_before_write(canon: &str) {
     }
 }
 
-/// Finish every DACL write the journal shows as started and not
-/// returned: re-run the path's converge from the rows that exist NOW
-/// (after a killed release: none, so the sandbox ACEs come off the
-/// whole subtree), with the write forced. The row goes only once that
-/// converge has returned, so a pass that is itself killed, or whose
-/// converge fails, leaves it for the next one; re-running a completed
-/// converge changes nothing, so the pass is idempotent.
-///
-/// Path-anchored and fail-closed, as release is: when `canon` is gone
-/// or now names a different object the journal row is dropped and
-/// nothing is touched — the moved object is NOT chased by file_id
-/// (the journal does not know whether a deny was involved, and
-/// converging a relocated deny target from its new path's rows would
-/// strip the deny). A path that cannot be opened keeps its row for a
-/// later pass unless `force` drops it.
+/// Finish every DACL write the journal shows as started and not returned, by
+/// re-running the path's converge, forced, from the rows that exist now. A
+/// path that is gone or names a different object is dropped, never chased.
 fn recover_write_intents(
     conn: &Connection,
     sandbox_sid: &str,
@@ -1272,28 +1195,24 @@ fn recover_write_intents(
     Ok(())
 }
 
-/// Journal rows outstanding — DACL writes started and not yet seen
-/// to return.
+/// Journal rows outstanding: DACL writes started and not seen to return.
 fn count_write_intents(conn: &Connection) -> Result<u32> {
     conn.query_row("SELECT count(*) FROM write_intents", [], |r| r.get(0))
         .context("count write_intents")
 }
 
-/// Whether a row change still needs its path converged on disk
-/// ([`recompose_at`]) by the caller — see [`release_row`].
+/// Whether a row change still needs its path converged by the caller.
 #[derive(Debug)]
 enum Converge {
     /// Rows changed and the identity gate matched; the caller must
-    /// `recompose_at` the path (once per path per batch suffices),
-    /// and put the rows back ([`Undo::restore`]) if that fails.
+    /// `recompose_at` the path and [`Undo::restore`] the rows if that fails.
     Owed(Undo),
     /// Nothing left to do on disk at this path.
     Done,
 }
 
-/// The rows one release changed, as they were — so that a converge
-/// which then returns an error does not leave the ACE on disk with
-/// nothing recording it.
+/// The rows one release changed, as they were: put back when the converge
+/// that follows returns an error.
 #[derive(Debug)]
 struct Undo {
     canon: String,
@@ -1326,12 +1245,8 @@ impl Undo {
     }
 }
 
-/// For a batch that touches `paths[i]` at step `i`: `out[i]` is true
-/// iff no LATER step touches the same path — the step after which
-/// that path's deferred converge runs (module doc, "One converge per
-/// path per batch"). Exactly one `true` per distinct path, so each
-/// path is converged once however often the batch touches it.
-/// Paths are compared as the DB keys them: exact canonical strings.
+/// `out[i]` is true iff no LATER step touches `paths[i]`: the step after
+/// which that path's deferred converge runs. Paths compare as exact strings.
 fn last_touches<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<bool> {
     let paths: Vec<&str> = paths.into_iter().collect();
     let mut seen = HashSet::new();
@@ -1345,17 +1260,13 @@ fn last_touches<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<bool> {
 struct PlannedAce {
     canon: String,
     ace: SbAce,
-    /// `Some(i)`: this is the parent-FDC entry implied by step `i`
-    /// (a `Deny`/`DenyDelete` target) and is skipped when step `i`
-    /// did not go through.
+    /// `Some(i)`: the parent-FDC entry implied by step `i`, skipped when
+    /// step `i` did not go through.
     implied_by: Option<usize>,
 }
 
-/// Expand `targets` into the batch's steps, in order: each target,
-/// followed — for a `Deny`/`DenyDelete` target with a stampable
-/// parent — by the implied `(parent, DenyFdc)`. Repeats are kept:
-/// every step still runs its own capture, guards and upserts; only
-/// the per-path converge is shared.
+/// Expand `targets` into the batch's steps, in order: each target, followed
+/// by the `(parent, DenyFdc)` a deny implies. Repeats are kept.
 fn plan_ace_ops(targets: &[(String, SbAce)]) -> Vec<PlannedAce> {
     let mut plan = Vec::with_capacity(targets.len());
     for (canon, ace) in targets {
@@ -1409,20 +1320,15 @@ pub enum AceRelease {
     /// `file_id` mismatch — row deleted, ACE on the foreign object
     /// not touched.
     Mismatch,
-    /// The object is positively gone — the path is not found AND,
-    /// for a grant, its volume reports no file with the recorded
-    /// `file_id`. Row deleted.
+    /// Positively gone: the path is not found AND, for a grant, its volume
+    /// reports no file with the recorded `file_id`. Row deleted.
     Missing,
     /// Holder row removed but no `working_aces` row found.
     NoRow,
-    /// Where the ACE is now could not be established (the path could
-    /// not be opened for a reason other than not-found, or a moved
-    /// grant could not be located by `file_id`). Nothing was changed:
-    /// the holder row and the `working_aces` row are kept, and the
-    /// ACE may still be on disk.
+    /// Where the ACE is now could not be established. Nothing was changed:
+    /// the rows are kept, and the ACE may still be on disk.
     Unreadable,
-    /// The release errored (row update or converge). The rows are as
-    /// they were before it; the ACE may still be on disk.
+    /// The release errored; the rows are as they were, the ACE may be on disk.
     Failed,
 }
 
@@ -1450,9 +1356,8 @@ impl AceRelease {
 /// A `(canonical_path, kind)` pair naming one ACE row.
 type Hold = (String, String);
 
-/// The filesystem and process probes a release or recovery performs.
-/// Injectable so the row bookkeeping can be unit-tested without real
-/// ACLs or processes.
+/// The filesystem and process probes a release or recovery performs
+/// (injectable for the unit tests).
 struct Disk {
     gate: fn(&str, FileId) -> IdGate,
     locate: fn(&FileId) -> path_id::Located,
@@ -1483,25 +1388,9 @@ fn effective_ace(conn: &Connection, canon: &str, kind: &str) -> Result<Option<Sb
         .transpose()
 }
 
-/// Release `holder`'s hold on `(canon, kind)` (`None`: a row that
-/// has no holder left); recompute the effective ACE from the
-/// remaining holders (downgrade if this holder was the one that
-/// escalated it; revoke when zero remain).
-///
-/// Where the ACE is now is established BEFORE any row changes. If
-/// the path now resolves to a different `file_id` (or is not found),
-/// the ACE on the foreign object is NOT touched — except for `grant`,
-/// where the ALLOW ACE travelled with the object, so it is chased by
-/// `file_id` and revoked at the moved path (before the row goes). A
-/// failed open is not evidence of absence — the sandboxed process can
-/// provoke one — so anything short of a positive answer returns
-/// [`AceRelease::Unreadable`] with nothing changed.
-///
-/// The row half only: when the identity gate matches, the on-disk
-/// converge of `canon` is left to the caller ([`Converge::Owed`]) so
-/// a batch can run it once per path. The reported [`AceRelease`] is
-/// then provisional on that converge succeeding; if it does not, the
-/// caller restores the rows from the [`Undo`].
+/// Release `holder`'s hold on `(canon, kind)`: the row half only; the caller
+/// owes the converge ([`Converge::Owed`]). Where the ACE is now is established
+/// BEFORE any row changes: a failed open is not evidence of absence.
 fn release_row(
     conn: &Connection,
     holder: Option<i64>,
@@ -1549,11 +1438,8 @@ fn release_row(
             );
             return Ok((AceRelease::Unreadable, Converge::Done));
         }
-        // The granted object moved (or its path was swapped). The
-        // ALLOW ACE travels with the object → the sandbox user still
-        // has access at the new path. Chase by file_id and revoke
-        // there (then re-converge if the new path happens to be
-        // tracked too).
+        // The granted object moved, and the ALLOW ACE travelled with it:
+        // chase by file_id and revoke there.
         IdGate::Mismatch if kind == "grant" => match (disk.locate)(&want_id) {
             path_id::Located::At(at) => Site::Moved(at),
             path_id::Located::Gone => Site::Gone,
@@ -1566,12 +1452,10 @@ fn release_row(
                 return Ok((AceRelease::Unreadable, Converge::Done));
             }
         },
-        // DENY/FDC are left in place on the moved object
-        // (fail-closed).
+        // DENY/FDC are left in place on the moved object (fail-closed).
         IdGate::Mismatch => Site::Foreign,
     };
-    // A relocated grant is converged here, at the path it moved to —
-    // whose rows this release does not touch — and before the row
+    // A relocated grant is converged at the path it moved to, before the row
     // goes, so an error leaves the row for a retry.
     if let Site::Moved(at) = &site {
         eprintln!(
@@ -1644,15 +1528,9 @@ fn release_row(
     })
 }
 
-/// Release `holds` of `holder` (`None`: rows with no holder left), one
-/// outcome per hold, in order.
-///
-/// Every hold's rows are released in order ([`release_row`], identity
-/// gate included); each PATH is converged once, after its last hold in
-/// the batch (module doc, "One converge per path per batch"). A failed
-/// converge fails every hold released on that path: their rows are
-/// put back and they are reported [`AceRelease::Failed`], as is a
-/// hold whose row step errored.
+/// Release `holds` of `holder` (`None`: rows with no holder left), one outcome
+/// per hold, in order. Each PATH is converged once, after its last hold; a
+/// failed converge puts back the rows of every hold released on that path.
 fn release_batch(
     conn: &Connection,
     holder: Option<i64>,
@@ -1705,21 +1583,16 @@ fn release_batch(
     released
 }
 
-/// Release the holds of dead brokers, then prune them. `force` drops
-/// journal rows whose path cannot be opened
-/// ([`recover_write_intents`]).
+/// Release the holds of dead brokers, then prune them. `force` drops journal
+/// rows whose path cannot be opened.
 fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
-    // Identity comes from the VALIDATED machine-store read (name↔SID
-    // + sandbox-group membership against SAM), never from raw rows:
-    // the session DB is user-writable, and this SID is about to be
-    // written into DACLs. No valid identity → no disk work (the
-    // session rows stay put for a later recovery).
+    // Identity comes from the VALIDATED machine-store read, never from raw
+    // rows: the session DB is user-writable, and this SID goes into DACLs.
     let sb = crate::install::read_setup()?.map(|s| s.sandbox_user_sid);
     recover_with(conn, sb.as_deref(), force, &DISK)
 }
 
-/// Release `holds` for recovery ([`release_batch`]) and account for
-/// them in `report`. Returns whether every one was released.
+/// Release `holds` for recovery, accounting in `report`; true if all released.
 fn recover_batch(
     conn: &Connection,
     holder: Option<i64>,
@@ -1746,31 +1619,13 @@ fn recover_batch(
     all
 }
 
-/// Crash recovery proper, with the sandbox identity and the disk
-/// probes passed in.
-///
-/// Order (module doc, "Release order: grants before denies"):
-///
-/// 1. Each dead broker's GRANT holds, while its holder rows still say
-///    whose they are — deleting the broker first would CASCADE them
-///    away and leave no way to tell which deny rows belong with which
-///    grants.
-/// 2. Holderless GRANT rows (a holder row lost without its release).
-/// 3. Interrupted DACL writes (module doc, "Write-intent journal"). A
-///    converge in steps 1–2 that completes on a journaled path
-///    retires that journal row itself.
-/// 4. The deny, deny-delete and parent delete-child rows — of a dead
-///    broker only if every one of its grants was released, of no
-///    holder only if no grant at all is pending, and of nobody while
-///    an interrupted write is still pending (the journal does not say
-///    whose write it was, or whether it was taking a grant off).
-/// 5. Prune every dead broker that holds nothing any more. One with a
-///    hold that could not be released stays, dead, for the next pass.
-///
-/// Each hold's rows and converge are committed independently, so a
-/// failure on path Y leaves path X's release durable. A path carrying
-/// both a grant and a deny row is converged in step 1 and again in
-/// step 4.
+/// Crash recovery, in this order:
+/// 1. each dead broker's GRANT holds (before its rows CASCADE away);
+/// 2. holderless GRANT rows;
+/// 3. interrupted DACL writes;
+/// 4. deny rows: a dead broker's only if all its grants were released, and
+///    none while an interrupted write is pending;
+/// 5. prune dead brokers that hold nothing.
 fn recover_with(
     conn: &Connection,
     sb: Option<&str>,
@@ -1888,9 +1743,8 @@ enum IdGate {
 /// `(path, file_id)` identity check. `path` not found
 /// (ERROR_FILE/PATH_NOT_FOUND) or different inode → `Mismatch`;
 /// any other open error → `Unreadable` (retryable, not a
-/// mismatch). `Mismatch` says only that the recorded object is not
-/// at `path` — renaming an ancestor or swapping a component produces
-/// it while the object, and its ACE, live on elsewhere.
+/// mismatch). `Mismatch` says only that the recorded object is not at `path`;
+/// it, and its ACE, may live on elsewhere.
 fn identity_gate(path: &str, expect: FileId) -> IdGate {
     match path_id::capture_file_id(path) {
         Ok(cur) if cur == expect => IdGate::Match,
@@ -2068,14 +1922,10 @@ mod tests {
         });
     }
 
-    /// Exactly one converge per distinct path, placed at the path's
-    /// final touch — so it sees every row the batch recorded there.
     #[test]
     fn last_touches_marks_one_final_touch_per_path() {
         assert_eq!(last_touches([]), Vec::<bool>::new());
         assert_eq!(last_touches(["a"]), [true]);
-        // root touched three times (grant-root FDC from two denied
-        // children + a placeholder): only the third converges it.
         assert_eq!(
             last_touches(["f1", "root", "f2", "root", "ph", "root"]),
             [true, false, true, false, true, true],
@@ -2092,11 +1942,6 @@ mod tests {
         }
     }
 
-    /// Batch composition for the session-init shape: a root-level
-    /// deny plus a deny under a placeholder directory. The root is
-    /// touched twice (parent-FDC of the deny, parent-FDC of the
-    /// placeholder) but is converged once, last — after every row
-    /// destined for it has been recorded.
     #[test]
     fn plan_ace_ops_implies_parent_fdc_and_coalesces_root() {
         use acl::{DenyMask, GrantMask};
@@ -2135,9 +1980,6 @@ mod tests {
         assert_eq!(top.len(), 1);
     }
 
-    /// The completion record vouches for one (path, object, DACL)
-    /// triple, is withdrawn by `begin`, and is not kept for a path
-    /// left without sandbox ACEs.
     #[test]
     fn converged_ledger_records_only_completed_writes() {
         use acl::WriteLedger;
@@ -2160,8 +2002,6 @@ mod tests {
             assert!(!l.completed(b"X"), "begun, not completed");
             l.complete(b"X");
             assert!(l.completed(b"X"));
-            // Another DACL, another object at the path, another
-            // path, or an unreadable identity: not completed.
             assert!(!l.completed(b"Y"));
             assert!(!ledger(a, 2, true).completed(b"X"));
             assert!(!ledger(b, 1, true).completed(b"X"));
@@ -2170,8 +2010,6 @@ mod tests {
                 ..ledger(a, 1, true)
             };
             assert!(!blind.completed(b"X"));
-            // The next write withdraws it; killed before `complete`,
-            // it stays withdrawn.
             l.begin().unwrap();
             assert!(!l.completed(b"X"));
             // A converge to "no sandbox ACEs" leaves no row behind.
@@ -2201,9 +2039,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Journal bookkeeping: the row appears at `begin`, survives
-    /// until `complete`, is keyed by (path, object), and a forced
-    /// ledger never reports completion.
     #[test]
     fn write_intent_brackets_the_write() {
         use acl::WriteLedger;
@@ -2220,8 +2055,6 @@ mod tests {
                 force_write,
             };
             assert!(intents(db).is_empty());
-            // A release-to-empty write (`keep: false`): journaled all
-            // the same — it is the case rows cannot cover.
             let l = ledger(1, false, false);
             l.begin().unwrap();
             l.begin().unwrap(); // idempotent
@@ -2230,8 +2063,6 @@ mod tests {
                 [(r"\\?\C:\a".to_string(), id(1).as_bytes().to_vec())],
                 "killed here → the intent is what recovery finds",
             );
-            // Another object at the same path journals separately and
-            // its completion does not retire the first row.
             let other = ledger(2, true, false);
             other.begin().unwrap();
             assert_eq!(intents(db).len(), 2);
@@ -2251,11 +2082,6 @@ mod tests {
         });
     }
 
-    /// Recovery over real paths: a surviving intent on a live
-    /// directory is re-converged from the (empty) rows — stripping
-    /// the sandbox ACE a killed release left — and retired; an intent
-    /// whose path is gone or substituted is dropped untouched; a
-    /// second pass finds nothing.
     #[test]
     fn recover_write_intents_finishes_a_killed_release() {
         const FAKE_SB_SID: &str = "S-1-5-32-546";
@@ -2288,8 +2114,6 @@ mod tests {
         with_mem_db(|db| {
             let live_id = path_id::capture_file_id(&live).unwrap();
             record_write_intent(&db.conn, &live, &live_id).unwrap();
-            // `swapped` journaled under another object's identity;
-            // `gone` does not exist.
             record_write_intent(&db.conn, &swapped, &live_id).unwrap();
             record_write_intent(&db.conn, &gone, &live_id).unwrap();
 
@@ -2352,8 +2176,6 @@ mod tests {
     const SECRET: &str = r"\\?\C:\tree\secret";
     const SID: &str = "S-1-5-21-1";
 
-    /// Every probe answers "all good": the object is at its path,
-    /// the converge succeeds, every broker is dead.
     const OK_DISK: Disk = Disk {
         gate: |_, _| IdGate::Match,
         locate: |_| path_id::Located::Gone,
@@ -2371,8 +2193,6 @@ mod tests {
         ..OK_DISK
     };
 
-    /// One hold of `pid` on `(canon, kind)`, with its broker and
-    /// working row.
     fn seed(conn: &Connection, pid: i64, canon: &str, kind: &str, mask: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO brokers (pid, process_create_time, started_at) \
@@ -2429,8 +2249,6 @@ mod tests {
         with_mem_db(|db| {
             let c = &db.conn;
             let me = db.holder_pid.0 as i64;
-            // A wider holder (me) and a narrower one on the grant,
-            // plus two deny kinds that share one path's converge.
             seed(c, 7, TREE, "grant", "read");
             seed(c, me, TREE, "grant", "modify");
             seed(c, me, SECRET, "deny_delete", "delete");
@@ -2483,8 +2301,6 @@ mod tests {
             let me = db.holder_pid.0 as i64;
             seed(&db.conn, me, TREE, "grant", "modify");
             let holds = [hold(TREE, "grant")];
-            // Not at its path, and the chase by file id could not
-            // answer: the ACE may be anywhere → keep the rows.
             let disk = Disk {
                 gate: |_, _| IdGate::Mismatch,
                 locate: |_| path_id::Located::Unknown,
@@ -2528,8 +2344,6 @@ mod tests {
 
             let rep = recover_with(c, Some(SID), false, &TREE_UNREADABLE).unwrap();
             assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
-            // 42 fully released and pruned; 41 untouched, still
-            // registered so the next pass knows whose rows these are.
             assert_eq!(rep.dead_brokers, 1);
             assert_eq!(rep.aces_revoked, 2);
             assert_eq!(counts(c), (1, 3, 3));
@@ -2580,8 +2394,6 @@ mod tests {
     fn recovery_keeps_denies_while_an_interrupted_write_is_pending() {
         with_mem_db(|db| {
             let c = &db.conn;
-            // The killed grant release's residue: its rows are gone,
-            // the journal row is not — and the path cannot be opened.
             record_write_intent(c, TREE, &FileId::from_bytes(&[0u8; 24]).unwrap()).unwrap();
             seed(c, 41, SECRET, "deny", "denyWrite");
 
@@ -2610,8 +2422,6 @@ mod tests {
             )
             .unwrap();
             let rep = recover_with(c, None, false, &OK_DISK).unwrap();
-            // The hold-less dead broker is pruned; the one with a
-            // hold stays until its ACE can be released.
             assert_eq!(rep.dead_brokers, 1);
             assert_eq!(counts(c), (1, 1, 1));
         });

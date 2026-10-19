@@ -20,15 +20,9 @@
 //! path keeps its severed inheritance). The single chokepoint is
 //! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
 //! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
-//! Given a [`WriteLedger`] ([`converge_sandbox_aces`] — the state
-//! DB's converges), its final `SetNamedSecurityInfoW` is skipped
-//! when the DACL just read from disk already IS the composed target
-//! ([`aces_converged`]) AND the ledger shows our last write of that
-//! exact DACL ran to completion: the call re-propagates to every
-//! unprotected descendant, a full tree walk. Any doubt — a differing
-//! ACE, an unreadable ACL, no completion record (a write killed
-//! mid-propagation leaves the object itself looking converged) —
-//! falls through to the write.
+//! Given a [`WriteLedger`], the final `SetNamedSecurityInfoW` (a full tree
+//! walk on a directory) is skipped when the DACL on disk already is the
+//! composed one AND the ledger shows the last write of it completed.
 //!
 //! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
 //! callers are the ONE remaining `PROTECTED` consumer — they
@@ -460,11 +454,8 @@ pub(crate) fn ace_sid_is(body: &[u8], sid_bytes: &[u8]) -> bool {
     body.get(ACE_FIXED..ACE_FIXED + sid_bytes.len()) == Some(sid_bytes)
 }
 
-/// Every ACE of `acl` as its own byte string (`AceSize` bytes:
-/// header — type, flags, size — then mask and SID), in ACL order.
-/// The owned copy is what [`aces_converged`] compares, so the
-/// comparison never depends on either ACL's buffer layout
-/// (`AclSize`, trailing slack) — only on the ACEs themselves.
+/// Every ACE of `acl` as its own byte string, in ACL order: an owned copy, so
+/// [`aces_converged`] never depends on either ACL's buffer layout.
 fn ace_bytes(acl: *const ACL) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     filter_aces(acl, |_, body| {
@@ -474,22 +465,9 @@ fn ace_bytes(acl: *const ACL) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
-/// Whether writing the composed ACE list `want` over an object whose
-/// DACL currently holds `on_disk` would change nothing — the
-/// [`converge_sandbox_aces`] write-skip predicate, on plain bytes
-/// (see [`ace_bytes`]).
-///
-/// The write stores `want` (explicit ACEs only), in order, then
-/// (unprotected DACL) appends the ACEs it re-derives from the
-/// parent. So the disk already matches iff:
-///
-/// - its leading `want.len()` ACEs equal `want` byte for byte, in
-///   order, none of them inherited;
-/// - everything after that is an `INHERITED_ACE`;
-/// - on a `protected` DACL there is no tail at all.
-///
-/// Anything else — including an ACE too short to carry a header —
-/// is "not converged": the caller writes.
+/// Whether writing `want` over a DACL holding `on_disk` would change nothing:
+/// the leading ACEs equal `want` byte for byte and everything after is
+/// inherited (nothing after, on a `protected` DACL). Any doubt → `false`.
 fn aces_converged(on_disk: &[Vec<u8>], want: &[Vec<u8>], protected: bool) -> bool {
     let inherited = |ace: &Vec<u8>| ace.get(1).map(|flags| flags & INHERITED_ACE != 0);
     if want.iter().any(|a| inherited(a) != Some(false)) {
@@ -503,12 +481,9 @@ fn aces_converged(on_disk: &[Vec<u8>], want: &[Vec<u8>], protected: bool) -> boo
         && (tail.is_empty() || !protected)
 }
 
-/// [`aces_converged`] over the two live ACLs, plus the ACL revision
-/// (a differing revision is a differing DACL). A NULL on-disk DACL
-/// ("everyone, everything") is never converged, and a walk error on
-/// either side reads as "not converged" — every uncertain answer
-/// here must fall toward the unconditional write, never toward
-/// trusting that the disk is already right.
+/// [`aces_converged`] over the two live ACLs, plus the ACL revision. A NULL
+/// on-disk DACL or a walk error reads as "not converged": every uncertain
+/// answer must fall toward the unconditional write.
 fn dacl_converged(on_disk: *const ACL, want: &BuiltAcl, protected: bool) -> bool {
     if on_disk.is_null() {
         return false;
@@ -520,10 +495,8 @@ fn dacl_converged(on_disk: *const ACL, want: &BuiltAcl, protected: bool) -> bool
     }
 }
 
-/// What [`WriteLedger`] records for a composed DACL: its protection
-/// state and revision, then every ACE's bytes in order (each ACE
-/// carries its own size, so the concatenation is unambiguous).
-/// `None` when the ACL cannot be walked — no fingerprint, no skip.
+/// What [`WriteLedger`] records for a composed DACL: protection state,
+/// revision, then every ACE's bytes. `None` when the ACL cannot be walked.
 fn dacl_fingerprint(want: &BuiltAcl, protected: bool) -> Option<Vec<u8>> {
     let aces = ace_bytes(want.as_ptr()).ok()?;
     let rev = unsafe { (*want.as_ptr()).AclRevision };
@@ -532,38 +505,24 @@ fn dacl_fingerprint(want: &BuiltAcl, protected: bool) -> Option<Vec<u8>> {
     Some(print)
 }
 
-/// Completion record for one path's DACL writes — the second half of
-/// the [`converge_sandbox_aces`] write-skip, held by the caller (the
-/// state DB) because it must outlive this process.
-///
-/// Comparing the on-disk DACL to the composed one proves only that
-/// the OBJECT is converged: a broker killed while
-/// `SetNamedSecurityInfoW` walks the subtree leaves the directory
-/// converged over descendants that never received the inherited
-/// ACE — for a deny, files the sandbox can still reach. So a write
-/// is skipped only against positive evidence that the last write of
-/// this exact DACL RETURNED: [`Self::begin`] drops the record before
-/// every write, [`Self::complete`] stores it after, and anything in
-/// between (crash, kill, error, lost DB) reads as "not completed".
+/// Completion record for one path's DACL writes, kept by the caller across
+/// processes. An object DACL that looks converged does not prove the subtree
+/// walk finished, so a write is skipped only if the last one RETURNED.
 pub(crate) trait WriteLedger {
     /// Whether the last completed write on this path wrote exactly
     /// `dacl` (a [`dacl_fingerprint`]). Any doubt → `false`.
     fn completed(&self, dacl: &[u8]) -> bool;
-    /// A write is about to start: forget the completion record. An
-    /// error aborts the converge — writing under a record that
-    /// could not be withdrawn would let an interrupted write pass
-    /// for a completed one.
+    /// A write is about to start: forget the completion record. An error
+    /// aborts the converge, or an interrupted write could pass for a
+    /// completed one.
     fn begin(&self) -> Result<()>;
     /// The write returned success: record `dacl` as completed.
     /// Best-effort — a lost record only costs the next skip.
     fn complete(&self, dacl: &[u8]);
 }
 
-/// `SANDBOX_RUNTIME_WIN_DEBUG` trace of [`converge_sandbox_aces`]'s
-/// write decision: `dacl write '<path>'` when the DACL was rewritten
-/// (and, on a directory, re-propagated), `dacl unchanged '<path>'`
-/// when the write was skipped. One line per converge, so the smokes
-/// can count DACL writes per path instead of timing them.
+/// `SANDBOX_RUNTIME_WIN_DEBUG` trace of the write decision: `dacl write
+/// '<path>'` or `dacl unchanged '<path>'`, one line per converge.
 fn debug_dacl(event: &str, canonical_path: &str) {
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
         eprintln!("srt-win: debug: dacl {event} '{canonical_path}'");
@@ -929,9 +888,7 @@ impl SbAceSet {
 /// root's `Authenticated Users:(M)`) would durably re-open a path its
 /// admin had locked down.
 ///
-/// This form ALWAYS writes (and so always re-propagates a directory
-/// DACL); the state DB's converges go through
-/// [`converge_sandbox_aces`], which can skip a redundant write.
+/// This form ALWAYS writes; [`converge_sandbox_aces`] can skip a redundant one.
 ///
 /// `SetEntriesInAclW(REVOKE_ACCESS)` is NOT used: per MSDN it
 /// removes `ACCESS_ALLOWED_ACE`/`SYSTEM_AUDIT_ACE` for the trustee,
@@ -946,17 +903,9 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     converge_sandbox_aces(canonical_path, sandbox_sid, set, None)
 }
 
-/// [`apply_sandbox_aces`] with an optional [`WriteLedger`]. With one,
-/// the final write is skipped when BOTH hold: the DACL read in step
-/// 1 already equals the composed one ([`dacl_converged`]), and the
-/// ledger shows the last write of that exact DACL completed. The
-/// read, the filter and the compose always run. Without a ledger —
-/// or on any mismatch or doubt — the write is unconditional.
-///
-/// The skip also forgoes the re-propagation's side effect of
-/// re-syncing descendants whose inherited ACEs went stale (a file
-/// MOVED into the tree keeps its old ones); those are refreshed by
-/// the next converge that actually changes this DACL.
+/// [`apply_sandbox_aces`] with an optional [`WriteLedger`]: the final write is
+/// skipped when the DACL on disk equals the composed one AND the ledger shows
+/// the last write of that exact DACL completed. Any doubt → write.
 pub(crate) fn converge_sandbox_aces(
     canonical_path: &str,
     sandbox_sid: &str,
@@ -981,10 +930,8 @@ pub(crate) fn converge_sandbox_aces(
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
     let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
-    // 4. Already converged AND last written to completion →
-    //    nothing to write (see doc comment). `protected` is the
-    //    state the write would preserve, so an equal ACE list means
-    //    an equal DACL.
+    // 4. Already converged AND last written to completion → nothing to
+    //    write. `protected` is the state the write would preserve.
     let print = ledger.and_then(|_| dacl_fingerprint(&new, protected));
     if let (Some(ledger), Some(print)) = (ledger, &print)
         && dacl_converged(old, &new, protected)
@@ -996,9 +943,8 @@ pub(crate) fn converge_sandbox_aces(
     // 5. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
     //    parent, PROTECTED when inheritance was severed before we
-    //    touched the path (see doc comment). The completion record
-    //    is withdrawn first and restored only once the write has
-    //    returned.
+    //    touched the path (see doc comment). The completion record is
+    //    withdrawn first and restored only once the write has returned.
     let prot = if protected {
         Protection::Protected
     } else {
@@ -1157,8 +1103,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A raw ACE: header (type, flags, LE size) + mask + a stand-in
-    /// SID — the byte shape [`ace_bytes`] yields.
     fn raw_ace(ty: u8, flags: u8, mask: u32, sid: &[u8]) -> Vec<u8> {
         let mut a = vec![ty, flags];
         a.extend(((ACE_FIXED + sid.len()) as u16).to_le_bytes());
@@ -1167,9 +1111,6 @@ mod tests {
         a
     }
 
-    /// The write-skip predicate compares ACE content in order — not
-    /// counts, not lengths — and tolerates ONLY a kernel-derived
-    /// inherited tail on an unprotected DACL.
     #[test]
     fn aces_converged_is_exact_and_ordered() {
         const ALLOW: u8 = 0;
@@ -1187,8 +1128,6 @@ mod tests {
         assert!(aces_converged(&want, &want, true));
         let with_tail = [want.clone(), vec![inh.clone(), inh.clone()]].concat();
         assert!(aces_converged(&with_tail, &want, false));
-        // …but a PROTECTED DACL has no re-derived tail: a stray
-        // inherited-flagged entry there means the write is due.
         assert!(!aces_converged(&with_tail, &want, true));
         // Empty target (revoke) on a path with only inherited ACEs.
         assert!(aces_converged(std::slice::from_ref(&inh), &[], false));
@@ -1197,8 +1136,6 @@ mod tests {
         // Same ACEs, different order.
         let swapped = vec![grant.clone(), deny.clone(), other.clone()];
         assert!(!aces_converged(&swapped, &want, false));
-        // Same count and same byte length, one field different:
-        // mask, flags, type, SID.
         let variants = [
             raw_ace(ALLOW, oici, Mask::FILE_READ_EXEC.bits(), &sb),
             raw_ace(ALLOW, 0, Mask::MODIFY_NO_FDC.bits(), &sb),
@@ -1210,8 +1147,6 @@ mod tests {
             let disk = vec![deny.clone(), v, other.clone()];
             assert!(!aces_converged(&disk, &want, false));
         }
-        // Missing ACE; extra EXPLICIT ACE (leading, trailing, or
-        // wedged before the inherited tail).
         assert!(!aces_converged(&want[..2], &want, false));
         assert!(!aces_converged(&[], &want, false));
         let extra_tail = [want.clone(), vec![other.clone()]].concat();
@@ -1220,8 +1155,6 @@ mod tests {
         assert!(!aces_converged(&extra_head, &want, false));
         let wedged = [want.clone(), vec![inh.clone(), other.clone()]].concat();
         assert!(!aces_converged(&wedged, &want, false));
-        // An on-disk sandbox ACE that is merely INHERITED does not
-        // stand in for the explicit one the converge wants.
         let inh_grant = raw_ace(ALLOW, oici | INHERITED_ACE, Mask::MODIFY_NO_FDC.bits(), &sb);
         assert!(!aces_converged(
             std::slice::from_ref(&inh_grant),
@@ -1234,9 +1167,6 @@ mod tests {
         assert!(!aces_converged(inh_only, inh_only, false));
     }
 
-    /// End-to-end over real ACLs: a second identical converge finds
-    /// the DACL converged (and must leave it byte-identical); any
-    /// change to the wanted set does not.
     #[test]
     fn dacl_converged_tracks_on_disk_state() {
         const FAKE_SB_SID: &str = "S-1-5-32-546";
@@ -1292,8 +1222,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// In-memory [`WriteLedger`]: the record plus a count of writes
-    /// begun.
     #[derive(Default)]
     struct MemLedger {
         record: std::cell::RefCell<Option<Vec<u8>>>,
@@ -1313,10 +1241,6 @@ mod tests {
         }
     }
 
-    /// The write is skipped only when the disk is converged AND the
-    /// ledger holds a completion record for that exact DACL: an
-    /// interrupted write (record withdrawn, never restored), a
-    /// foreign record, or no ledger at all each force the rewrite.
     #[test]
     fn converge_skips_only_a_completed_identical_write() {
         const FAKE_SB_SID: &str = "S-1-5-32-546";
@@ -1340,16 +1264,12 @@ mod tests {
         converge(grant);
         assert_eq!(ledger.writes.get(), 1, "identical repeats are skipped");
 
-        // Disk converged by a ledger-less writer, no record: the
-        // object looks right but nothing vouches for its subtree.
         apply_sandbox_aces(path, FAKE_SB_SID, grant_fdc).unwrap();
         converge(grant_fdc);
         assert_eq!(ledger.writes.get(), 2, "stale record → rewrite");
         converge(grant_fdc);
         assert_eq!(ledger.writes.get(), 2);
 
-        // A write killed mid-propagation: record withdrawn by
-        // `begin`, `complete` never reached, object already converged.
         ledger.record.replace(None);
         converge(grant_fdc);
         assert_eq!(ledger.writes.get(), 3, "no completion record → rewrite");

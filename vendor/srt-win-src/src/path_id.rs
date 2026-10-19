@@ -495,9 +495,8 @@ pub enum Located {
     /// Positively gone: its volume was found and the volume reported
     /// that no file has this id.
     Gone,
-    /// Could not be established either way — the volume is not
-    /// mounted, or the open-by-id or path query failed for a reason
-    /// other than "no such file". The object may still exist.
+    /// Could not be established either way (volume not mounted, or the
+    /// lookup failed for another reason). The object may still exist.
     Unknown,
 }
 
@@ -506,12 +505,8 @@ pub enum Located {
 /// `OpenFileById` with an `ExtendedFileId` descriptor, then
 /// `GetFinalPathNameByHandleW`.
 ///
-/// [`Located::Gone`] is returned only when the volume itself answered
-/// that the id names no file (`ERROR_FILE_NOT_FOUND`, or
-/// `ERROR_INVALID_PARAMETER`, which is how NTFS rejects a stale file
-/// reference). Every other failure is [`Located::Unknown`]: a caller
-/// that is about to forget an ACE must not read "could not look" as
-/// "nothing there".
+/// [`Located::Gone`] only when the volume itself answered that the id names
+/// no file; every other failure is [`Located::Unknown`].
 pub fn locate_by_file_id(file_id: &FileId) -> Located {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{
