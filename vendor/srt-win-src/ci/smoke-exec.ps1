@@ -448,12 +448,6 @@ Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-prot
 # ── R9c: child cannot open any THREAD of the runner ──────────────
 # ── R9d: the same after a wait (a thread the runner started after
 #        the launch must be closed to the child too)
-# A thread object has its own DACL, separate from the process's. A
-# child that could open a runner thread for impersonation or
-# set-context would act with the runner's token, which carries none
-# of the child token's restrictions. CONTROL opens the child's OWN
-# thread the same way, so a probe that cannot open anything at all
-# does not read as a pass.
 $threadRights = 11
 $probeR9c = @'
 $sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
@@ -521,8 +515,7 @@ foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
     throw "$($row.id): child opened a runner thread " +
           "(runner thread self-protect ineffective — sandbox escape). raw: $($r.raw)"
   }
-  # A thread that ended between the listing and the open reports 87;
-  # anything else is not a refusal the row can rely on.
+  # 87: the thread ended between the listing and the open.
   $odd = $r.out -split "`r?`n" |
     Where-Object { $_ -match "^OTHER:$($row.pass) " -and $_ -notmatch ' le=87$' }
   if ($odd) { throw "$($row.id): unexpected OpenThread result: $($odd -join '; '). raw: $($r.raw)" }
@@ -538,10 +531,6 @@ foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
 }
 
 # ── T-rows: ordinary tools still start and behave ────────────────
-# The runner's self-protection changes security descriptors in the
-# runner. None of it may reach the child: a descriptor meant for the
-# runner landing on the child's objects would break a child opening
-# its own process and thread, or a grandchild's process.
 # ── T1: cmd ──
 $r = RExec @('--', $cmd, '/d', '/s', '/c', 'echo T1-CMD & ver')
 if ($r.exit -ne 0 -or $r.out -notmatch 'T1-CMD' -or $r.out -notmatch 'Windows') {
@@ -610,8 +599,6 @@ if ($node) {
 }
 
 # ── T6: git-bash (when installed) starts and forks ───────────────
-# An MSYS fork has the parent open and write into the new process,
-# and a pipeline and a subshell each fork.
 $bash = @("$env:ProgramFiles\Git\bin\bash.exe") +
   @(Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {
       Join-Path (Split-Path (Split-Path $_.Source)) 'bin\bash.exe' }) |

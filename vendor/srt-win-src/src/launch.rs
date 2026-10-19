@@ -138,15 +138,8 @@ pub fn run_lockdown(
     //    `extra_allow = None` — we run as `srt-sandbox`; an
     //    `srt-sandbox:FA` ACE here would match the child and undo the
     //    protection. First so the protection holds on every later
-    //    error path. Required: a child that can open the runner is
-    //    not confined by the token built below, so a runner that
-    //    cannot protect itself launches nothing.
-    //
-    //    The runner's threads have their own DACLs and get the same
-    //    treatment. This first sweep is against other sandboxed
-    //    processes of the same account that are already running; the
-    //    sweep that this launch's own child is held behind is in
-    //    step 10.
+    //    error path. Required: a runner that cannot protect itself launches
+    //    nothing. Its threads get the same treatment, here and in step 10.
     self_protect::install_broker_dacl(None).context("runner self-protect (process)")?;
     self_protect::protect_own_threads().context("runner self-protect (threads)")?;
 
@@ -311,15 +304,8 @@ pub fn run_lockdown(
             )
         });
     }
-    // Runner threads get the self-protect DACL while the child is
-    // still suspended. Order matters: first the runner token's
-    // default DACL, so any thread created from here on starts out
-    // protected; then a sweep over every thread that exists. The
-    // default DACL is changed only now because it would otherwise
-    // also land on the child's process, thread and token objects,
-    // which the child must be able to open; after this point the
-    // runner creates no object at all. Either failing ends the
-    // launch: the `child` guard terminates the suspended child.
+    // Order matters: the default DACL first (new threads start protected), then
+    // the sweep. Only now, or it would also land on the child's own objects.
     self_protect::protect_future_threads()
         .context("runner self-protect (default DACL for new threads)")?;
     let protected_threads = self_protect::protect_own_threads()
