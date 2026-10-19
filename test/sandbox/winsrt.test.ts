@@ -1512,7 +1512,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(missing.errors.length).toBe(1)
     expect(missing.errors[0]).toMatch(/Secondary Logon service.*not present/)
 
-    // Unreadable is not a finding: the launch itself is the ground truth.
+    // Unreadable proves nothing: the launch itself is the ground truth.
     expect(await run('cannot-read')).toEqual({ errors: [], warnings: [] })
 
     expect(await run('ok')).toEqual({ errors: [], warnings: [] })
