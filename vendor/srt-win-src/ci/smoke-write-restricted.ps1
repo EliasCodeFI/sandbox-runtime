@@ -920,7 +920,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
     & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
     $left = @((Get-ItemProperty 'HKCU:\Software\sandbox-runtime\PersistentGrants' -ErrorAction SilentlyContinue).Roots |
       Where-Object { $_ })
-    if ((Sddl $pb) -match [regex]::Escape($CapPrefix) -or (Sddl $pb) -match [regex]::Escape($script:grpSid)) {
+    if (Has-Persistent $pb) {
       Fail "P11: PB still carries persistent ACEs after uninstall: $(Sddl $pb)"
     } elseif ($left.Count -gt 0) { Fail "P11: the marker still lists roots after uninstall: $($left -join ', ')" }
     else { Ok 'P11: uninstall removed the persistent grant and its record' }

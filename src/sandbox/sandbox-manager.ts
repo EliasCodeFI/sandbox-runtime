@@ -212,7 +212,7 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // SIDs of the session's write roots — a different token per session.
 // So with `windows.writeRestrictedToken` every initialize() probes,
 // with that session's token, and nothing is remembered.
-const windowsWfpVerified = { defaultToken: false }
+let windowsWfpVerified = false
 // The child-token shape initialize() verified the fence for, captured
 // like `srtWinSpawn` so the wrap path uses it rather than `config`:
 // updateConfig() swaps `config` live without re-verifying, and a
@@ -1113,7 +1113,7 @@ async function initializeSteps(
           throw e
         }
       }
-      if (!windowsWfpVerified.defaultToken) {
+      if (!windowsWfpVerified) {
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1123,7 +1123,7 @@ async function initializeSteps(
           config = undefined
           throw e
         }
-        windowsWfpVerified.defaultToken = true
+        windowsWfpVerified = true
       }
     }
     windowsWriteRestrictedToken = writeRestricted
