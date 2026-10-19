@@ -919,7 +919,7 @@ impl Locked {
     }
 
     /// Release this holder's `holds` — see [`release_batch`].
-    fn release_holds(&self, holds: &[(String, String)], sandbox_sid: &str) -> Vec<AceRelease> {
+    fn release_holds(&self, holds: &[Hold], sandbox_sid: &str) -> Vec<AceRelease> {
         release_batch(
             &self.conn,
             Some(self.holder_pid.0 as i64),
@@ -1136,12 +1136,13 @@ impl acl::WriteLedger for ConvergedLedger<'_> {
         // The write returned: retire its journal row. Best-effort — a
         // row that outlives its write only costs one redundant
         // forced converge at the next recovery.
-        if let Some(id) = self.file_id {
-            let _ = clear_write_intent(self.conn, self.canon, &id.as_bytes());
-        }
-        let (true, Some(id)) = (self.keep, self.file_id) else {
+        let Some(id) = self.file_id else {
             return;
         };
+        let _ = clear_write_intent(self.conn, self.canon, &id.as_bytes());
+        if !self.keep {
+            return;
+        }
         // Best-effort: without the row the next converge just writes.
         let _ = self.conn.execute(
             "INSERT OR REPLACE INTO converged_dacls \
@@ -1655,7 +1656,7 @@ fn release_row(
 fn release_batch(
     conn: &Connection,
     holder: Option<i64>,
-    holds: &[(String, String)],
+    holds: &[Hold],
     sandbox_sid: &str,
     disk: &Disk,
 ) -> Vec<AceRelease> {
@@ -1722,7 +1723,7 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
 fn recover_batch(
     conn: &Connection,
     holder: Option<i64>,
-    holds: &[(String, String)],
+    holds: &[Hold],
     sb: &str,
     disk: &Disk,
     report: &mut RecoveryReport,
@@ -1777,7 +1778,7 @@ fn recover_with(
     disk: &Disk,
 ) -> Result<RecoveryReport> {
     let mut report = RecoveryReport::default();
-    let is_grant = |(_, kind): &(String, String)| kind == "grant";
+    let is_grant = |(_, kind): &Hold| kind == "grant";
 
     let dead: Vec<i64> = query_vec(
         conn,
@@ -1795,7 +1796,7 @@ fn recover_with(
         let mut denies: Vec<(Option<i64>, Vec<Hold>)> = Vec::new();
         // 1.
         for &pid in &dead {
-            let holds: Vec<(String, String)> = query_vec(
+            let holds: Vec<Hold> = query_vec(
                 conn,
                 "SELECT canonical_path, kind FROM ace_holders \
                  WHERE pid = ?1 ORDER BY canonical_path, kind",
@@ -1815,7 +1816,7 @@ fn recover_with(
             }
         }
         // 2.
-        let orphans: Vec<(String, String)> = query_vec(
+        let orphans: Vec<Hold> = query_vec(
             conn,
             "SELECT g.canonical_path, g.kind \
              FROM working_aces g \

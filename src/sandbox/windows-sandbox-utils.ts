@@ -2213,20 +2213,6 @@ function mapAclRestore(r: {
     : [...(r.json.paths ?? []), ...(r.json.parents ?? [])]
 }
 
-function mapAclRevoke(r: {
-  ok: boolean
-  json: WindowsAclAceOutcome[]
-  stderr: string
-}): WindowsAclAceOutcome[] {
-  if (!r.ok) {
-    logForDebugging(
-      `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
-      { level: 'error' },
-    )
-  }
-  return r.json
-}
-
 // Teardown helpers must not throw — the caller's reset() must
 // complete. Only spawn-fail / timeout / unparseable output lands
 // here → log and return undefined.
@@ -2409,7 +2395,12 @@ function toRevokeResult(r: {
   json: WindowsAclAceOutcome[]
   stderr: string
 }): WindowsAclRevokeResult {
-  mapAclRevoke(r)
+  if (!r.ok) {
+    logForDebugging(
+      `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
+      { level: 'error' },
+    )
+  }
   return windowsAclRevokeResult(r.ok, r.json, r.stderr)
 }
 

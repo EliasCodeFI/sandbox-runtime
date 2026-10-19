@@ -1338,11 +1338,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     "acl revoke: {} grant(s) could not be released \
                      and may still be on disk (rows kept for retry): {}",
                     pending.len(),
-                    pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&pending),
                 ));
             }
         }
@@ -1428,12 +1424,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      and may still be on disk (rows, and their \
                      holders' deny ACEs, kept for retry): {}",
                     report.grants_pending.len(),
-                    report
-                        .grants_pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&report.grants_pending),
                 ));
             }
         }
@@ -1794,6 +1785,14 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
     // code (the wait already proved the process exited), not the
     // still-running sentinel.
     Ok(Some(code as i32))
+}
+
+fn quoted_list<S: std::fmt::Display>(paths: &[S]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
