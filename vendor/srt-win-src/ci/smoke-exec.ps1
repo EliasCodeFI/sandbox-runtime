@@ -446,8 +446,7 @@ if ($r.out -notmatch 'DENIED:runner') {
 Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-protect holds)'
 
 # ── R9c: child cannot open any THREAD of the runner ──────────────
-# ── R9d: the same after a wait (a thread the runner started after
-#        the launch must be closed to the child too)
+# ── R9d: the same sweep again after a wait ───────────────────────
 $threadRights = 11
 $probeR9c = @'
 $sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
@@ -529,6 +528,143 @@ foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
   }
   Write-Host "$($row.id) ok: child refused every right on the runner's threads ($($row.pass): threads=$nThreads refusals=$nDenied)"
 }
+
+# ── R9e: a sandboxed process that is already running cannot open a
+#        runner started after it, at any point of that runner's life
+$probeR9e = @'
+$src = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class RunnerPoll {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct PROCESSENTRY32W { public uint dwSize; public uint cntUsage; public uint th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID; public uint cntThreads; public uint th32ParentProcessID; public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szExeFile; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct THREADENTRY32 { public uint dwSize; public uint cntUsage; public uint th32ThreadID; public uint th32OwnerProcessID; public int tpBasePri; public int tpDeltaPri; public uint dwFlags; }
+  [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint f, uint pid);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32FirstW(IntPtr s, ref PROCESSENTRY32W e);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32NextW(IntPtr s, ref PROCESSENTRY32W e);
+  [DllImport("kernel32.dll")] static extern bool Thread32First(IntPtr s, ref THREADENTRY32 e);
+  [DllImport("kernel32.dll")] static extern bool Thread32Next(IntPtr s, ref THREADENTRY32 e);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a, bool b, uint p);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenThread(uint a, bool b, uint t);
+  [DllImport("kernel32.dll")] static extern uint GetProcessIdOfThread(IntPtr h);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr h, uint f, StringBuilder n, ref uint len);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  // An id can be reused between the snapshot and the open: a handle counts
+  // unless what it names is positively not a runner.
+  static bool StillRunner(uint pid) {
+    IntPtr q = OpenProcess(0x1000, false, pid);
+    if (q == IntPtr.Zero) { return true; }
+    var name = new StringBuilder(1024); uint len = 1024;
+    bool ok = QueryFullProcessImageNameW(q, 0, name, ref len);
+    CloseHandle(q);
+    return !ok || name.ToString().EndsWith("srt-win.exe", StringComparison.OrdinalIgnoreCase);
+  }
+  static bool StillThreadOf(uint tid, HashSet<uint> runners) {
+    IntPtr q = OpenThread(0x0800, false, tid);
+    if (q == IntPtr.Zero) { return true; }
+    uint owner = GetProcessIdOfThread(q);
+    CloseHandle(q);
+    return owner == 0 || runners.Contains(owner);
+  }
+  public static string Run(int seconds) {
+    var seen = new HashSet<uint>();
+    var opened = new List<string>();
+    long iterations = 0;
+    // One right at a time: CREATE_THREAD, VM_OPERATION, VM_READ, VM_WRITE,
+    // DUP_HANDLE, CREATE_PROCESS, WRITE_DAC.
+    uint[] processRights = { 0x0002, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080, 0x00040000 };
+    // SUSPEND_RESUME, SET_CONTEXT, SET_INFORMATION, SET_THREAD_TOKEN,
+    // IMPERSONATE, DIRECT_IMPERSONATION, WRITE_DAC.
+    uint[] threadRights = { 0x0002, 0x0010, 0x0020, 0x0080, 0x0100, 0x0200, 0x00040000 };
+    DateTime end = DateTime.UtcNow.AddSeconds(seconds);
+    while (DateTime.UtcNow < end) {
+      IntPtr s = CreateToolhelp32Snapshot(0x2 | 0x4, 0);
+      if (s == new IntPtr(-1)) { continue; }
+      iterations++;
+      var runners = new HashSet<uint>();
+      var pe = new PROCESSENTRY32W();
+      pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+      for (bool ok = Process32FirstW(s, ref pe); ok; ok = Process32NextW(s, ref pe)) {
+        if (String.Equals(pe.szExeFile, "srt-win.exe", StringComparison.OrdinalIgnoreCase)) {
+          runners.Add(pe.th32ProcessID);
+          seen.Add(pe.th32ProcessID);
+        }
+      }
+      foreach (uint pid in runners) {
+        foreach (uint a in processRights) {
+          IntPtr h = OpenProcess(a, false, pid);
+          if (h == IntPtr.Zero) { continue; }
+          CloseHandle(h);
+          if (StillRunner(pid) && opened.Count < 20) { opened.Add("OPENED process pid=" + pid + " access=0x" + a.ToString("x")); }
+        }
+      }
+      var te = new THREADENTRY32();
+      te.dwSize = (uint)Marshal.SizeOf(typeof(THREADENTRY32));
+      for (bool ok = Thread32First(s, ref te); ok; ok = Thread32Next(s, ref te)) {
+        if (!runners.Contains(te.th32OwnerProcessID)) { continue; }
+        foreach (uint a in threadRights) {
+          IntPtr h = OpenThread(a, false, te.th32ThreadID);
+          if (h == IntPtr.Zero) { continue; }
+          CloseHandle(h);
+          if (StillThreadOf(te.th32ThreadID, runners) && opened.Count < 20) { opened.Add("OPENED thread tid=" + te.th32ThreadID + " pid=" + te.th32OwnerProcessID + " access=0x" + a.ToString("x")); }
+        }
+      }
+      CloseHandle(s);
+    }
+    return "POLL iterations=" + iterations + " seen=" + seen.Count + " opened=" + opened.Count + "\n" + String.Join("\n", opened.ToArray());
+  }
+}
+"@
+Add-Type -TypeDefinition $src
+'POLL-READY'
+[RunnerPoll]::Run(30)
+'@
+$psi9e = [System.Diagnostics.ProcessStartInfo]::new()
+$psi9e.FileName               = $Exe
+$psi9e.UseShellExecute        = $false
+$psi9e.RedirectStandardOutput = $true
+$psi9e.RedirectStandardError  = $true
+foreach ($a in @('exec', '--env', "PATH=$($env:PATH)", '--env', "PATHEXT=$($env:PATHEXT)",
+                 '--', $pwsh, '-NoProfile', '-Command', $probeR9e)) {
+  $null = $psi9e.ArgumentList.Add($a)
+}
+$poll9e    = [System.Diagnostics.Process]::Start($psi9e)
+$poll9eErr = $poll9e.StandardError.ReadToEndAsync()
+$poll9eOut = ''
+try {
+  $ready = $false
+  while ($true) {
+    $lineTask = $poll9e.StandardOutput.ReadLineAsync()
+    if (-not $lineTask.Wait(120000) -or $null -eq $lineTask.Result) { break }
+    if ($lineTask.Result -match 'POLL-READY') { $ready = $true; break }
+  }
+  if (-not $ready) { throw "R9e: the polling process did not start. stderr: $($poll9eErr.Result)" }
+  # New runners in every mode while the poll runs: exec, then the egress probe.
+  foreach ($i in 1..3) {
+    $r = RExec @('--', $cmd, '/c', 'echo R9E-LAUNCH')
+    if ($r.out -notmatch 'R9E-LAUNCH') { throw "R9e: a launch during the poll failed. raw: $($r.raw)" }
+  }
+  $null = & $Exe wfp verify --target $v1Tgt
+  $rest9e = $poll9e.StandardOutput.ReadToEndAsync()
+  if (-not $poll9e.WaitForExit(120000)) { throw 'R9e: the polling process did not finish' }
+  $poll9eOut = $rest9e.Result
+} finally {
+  if (-not $poll9e.HasExited) { try { $poll9e.Kill($true) } catch { } }
+}
+Write-Host "R9e poll output: $($poll9eOut.Trim())"
+if ($poll9eOut -notmatch 'POLL iterations=(\d+) seen=(\d+) opened=(\d+)') {
+  throw "R9e: the poll did not report. stderr: $($poll9eErr.Result)"
+}
+$n9eSeen = [int]$Matches[2]; $n9eOpened = [int]$Matches[3]
+if ($n9eOpened -ne 0) {
+  throw "R9e: a sandboxed process opened a runner or one of its threads (sandbox escape): $($poll9eOut.Trim())"
+}
+# Its own broker and runner are two; a new launch adds at least two more.
+if ($n9eSeen -lt 4) { throw "R9e: the poll saw no new launch (seen=$n9eSeen) — test invalid" }
+Write-Host "R9e ok: $n9eSeen srt-win processes seen during launches, none openable"
 
 # ── T-rows: ordinary tools still start and behave ────────────────
 # ── T1: cmd ──
@@ -900,4 +1036,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b/R9c/R9d, T1-T6, R11, R12, G1-G6/G3b)'
+Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b/R9c/R9d/R9e, T1-T6, R11, R12, G1-G6/G3b)'
