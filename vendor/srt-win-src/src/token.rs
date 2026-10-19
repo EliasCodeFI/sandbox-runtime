@@ -39,7 +39,7 @@
 //! ([`crate::wfp::sddl_sandbox_user`]) — and Everyone and RESTRICTED
 //! are what a process needs write-class access through to start.
 //! The capability SIDs of the session's write roots (`crate::persist`)
-//! lead the list: a kept root allows writing to its capability SID only.
+//! lead the list: a kept root passes this check only through its own.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;

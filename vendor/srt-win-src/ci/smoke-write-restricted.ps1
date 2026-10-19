@@ -185,7 +185,7 @@ function DaclOf { param([string] $sd)
   return "$prot $($aces -join '')"
 }
 function Dacl { param([string] $p) DaclOf (Sddl $p) }
-# Not icacls: what `/inheritance:r` leaves of inherited ACEs differs between Windows versions.
+# Written directly, not with icacls: what `/inheritance:r` leaves of inherited ACEs differs between Windows versions.
 function Set-OnlyAces { param([string] $d, [string[]] $aces)
   $want = "D:PAI$($aces -join '')"
   $sec = [System.Security.AccessControl.DirectorySecurity]::new()
