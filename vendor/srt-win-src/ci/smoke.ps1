@@ -70,12 +70,8 @@ if ($pre.state -ne 'absent') {
 
 Run (@('install') + $isl + $pr)
 $iw = J (@('wfp', 'status') + $isl)
-# 4 = per ALE connect layer (v4, v6): loopback PERMIT, sandbox-user
-# BLOCK. Exactly 4: the count is of every srt-win filter under the
-# sublayer, so a fifth would be one this build must not install (a
-# BLOCK keyed on the anonymous token, say). `installed` (not
-# `outdated`) also says the BLOCK is present at this build's fence
-# revision on both layers.
+# Exactly 4 (PERMIT + BLOCK per ALE layer): the count is of every srt-win
+# filter under the sublayer, so a fifth is one this build must not install.
 if ($iw.state -ne 'installed' -or $iw.filters -ne 4) {
   throw "install: wfp expected installed/4, got $($iw.state)/$($iw.filters)"
 }
@@ -377,11 +373,8 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
-# The install record must stop describing the removed filters as
-# current: `FenceRevision` is reset to 0 ("removed") in the same
-# step. That value is all a NON-elevated `wfp status` has to go by
-# (it cannot enumerate filters), and it maps 0 to `absent`; `exec`
-# refuses on it (exit 19) instead of launching with no fence.
+# `FenceRevision` is reset to 0 ("removed"), and `exec` refuses on it
+# (exit 19) instead of launching with no fence.
 $fr0 = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevision
 if ($fr0 -ne 0) {
   throw "uninstall --keep-user: FenceRevision expected 0 (removed), got '$fr0'"
@@ -406,10 +399,8 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
-# Control for the lowered-integrity attempts, recorded and not
-# asserted: with no filters they should connect too, which shows that
-# `blocked` for them with the fence active is the filter's doing and
-# not something a lowered-integrity token cannot do anyway.
+# Control, recorded and not asserted: with no filters the lowered-integrity
+# attempts should connect too, so `blocked` above is the filter's doing.
 Write-Host ("wfp verify control (fence-inactive): " +
             "low_integrity_loopback_probe=$($v.json.low_integrity_loopback_probe) " +
             "untrusted_integrity_loopback_probe=$($v.json.untrusted_integrity_loopback_probe)")

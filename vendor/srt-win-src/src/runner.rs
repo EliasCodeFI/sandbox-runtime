@@ -38,29 +38,9 @@ pub enum RunnerCmd {
     /// `srt-win uninstall` deletes the profile. Exit non-zero on
     /// failure.
     InstallCa { der: crate::cert_store::CertDer },
-    /// `wfp verify` probe: attempt direct TCP connects **as the
-    /// sandbox user**, one per token shape a sandboxed process can
-    /// present to the filtering engine — see [`crate::probe`].
-    /// `target` (`host:port`) is the loopback probe target;
-    /// `anonymous_target` the off-loopback one for the attempt made
-    /// while impersonating the anonymous token (`None` skips it).
-    ///
-    /// A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
-    /// leaves — so a fenced connect yields WSAEACCES immediately. The
-    /// runner exits with every result encoded
-    /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
-    /// the runner's own anyhow `Err` path, and never decodes as a
-    /// report. No desk/grants/lockdown — the probe runs as the bare
-    /// runner (same as [`InstallCa`](Self::InstallCa)); the filters
-    /// key on the token, which the runner already carries.
-    ///
-    /// This is the probe for the **ordinary** child token. The
-    /// write-restricted token differs from the runner's in a way a
-    /// filter's access check can see, so `wfp verify
-    /// --write-restricted-token` does not use this command: it sends
-    /// an [`Exec`](Self::Exec) of `srt-win probe fence`, which runs
-    /// the same attempts from a process holding the child token and
-    /// exits with the same encoded report.
+    /// `wfp verify` probe ([`crate::probe`]) for the **default** child token,
+    /// run as the bare runner; exit 1 never decodes as a report. The
+    /// write-restricted verify sends an [`Exec`](Self::Exec) of `probe fence`.
     ProbeEgress {
         target: String,
         #[serde(default)]

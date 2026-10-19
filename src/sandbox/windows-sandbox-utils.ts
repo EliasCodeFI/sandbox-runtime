@@ -91,9 +91,8 @@ export type WindowsSandboxErrorCode =
   /** `srt-win wfp verify` was neither `blocked` nor `connected`. */
   | 'wfp_verify_inconclusive'
   /**
-   * The installed filter set was written by an earlier `srt-win` and
-   * lacks filters this one requires (`srt-win wfp verify` exit 19) —
-   * re-run the install.
+   * The installed filter set is not the one this `srt-win` requires
+   * (`srt-win wfp verify` exit 19) — re-run the install.
    */
   | 'wfp_fence_outdated'
   /** `srt-win user trust-ca` exited non-zero. */
@@ -181,10 +180,8 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
  * is access-denied (it is admin-gated). The non-elevated readiness
  * check is {@link verifyWindowsWfpEgress}, not this enum.
  *
- * `outdated` means a filter set is installed but was written by an
- * earlier `srt-win` and is not the set the current one installs; the
- * sandbox refuses to run until the install is re-run. It is reported
- * to elevated and non-elevated callers alike.
+ * `outdated`: a filter set is installed but is not the one this
+ * `srt-win` installs; the sandbox refuses to run until re-installed.
  */
 export type WindowsWfpStatus =
   | 'absent'
@@ -201,27 +198,16 @@ export interface WindowsWfpStatusResult {
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
-   * Populated on `cannot-read` (BFE enumeration is admin-gated; a
-   * non-elevated caller can't read it — the non-elevated readiness
-   * check is {@link verifyWindowsWfpEgress}, not this enum) and on
-   * `outdated` (what is out of date and how to repair it).
+   * Populated on `cannot-read` (a non-elevated caller cannot enumerate
+   * filters) and on `outdated` (how to repair it).
    */
   hint?: string
 }
 
 /**
- * Result of one connect attempt made by `srt-win wfp verify`.
- * `blocked` is a filter refusing the connect. `connected` and
- * `refused` both mean the connect got past the filters (a refusal
- * comes from the destination). `unreachable` and `error` say nothing
- * about the fence; `skipped` means the attempt was not made.
- * `denied` means the kernel refused to let the probing process
- * impersonate that token (access-denied at the impersonation call),
- * so no connect could be made under it: with the write-restricted
- * token, where the probing process holds a command's own token, that
- * identity is closed to commands and `srt-win` does not fail the
- * verify for it; with the ordinary token it is inconclusive, like
- * `error`.
+ * Result of one connect attempt by `srt-win wfp verify`. `connected`
+ * and `refused` both mean the connect got past the filters; `denied`
+ * means the kernel refused the impersonation, so no connect was made.
  */
 export type WindowsWfpProbeOutcome =
   | 'blocked'
@@ -234,21 +220,8 @@ export type WindowsWfpProbeOutcome =
 
 /**
  * A gap {@link verifyWindowsWfpEgress} observed that the filter set
- * does not close. The fence is active; these are what it leaves open.
- *
- * - `anonymous-egress` — a connect to an off-loopback destination
- *   made while impersonating the anonymous token is not blocked. This
- *   is expected on every machine that has such an address: no filter
- *   is keyed on the anonymous token, because one would apply to every
- *   process on the machine and not only to sandboxed ones.
- * - `anonymous-loopback` — a connect to a loopback destination made
- *   while impersonating the anonymous token is not blocked, so local
- *   listeners outside the proxy port range are reachable that way.
- * - `deny-only-user-sid` — a connect made under a copy of the sandbox
- *   token whose user SID is deny-only is not blocked.
- *
- * Each is probed on a socket created before the token is assumed and
- * on one created after; the residual is named when either connects.
+ * does not close. `anonymous-egress` is expected on every machine with
+ * an off-loopback address: no filter is keyed on the anonymous token.
  */
 export type WindowsWfpResidual =
   | 'anonymous-egress'
@@ -256,50 +229,31 @@ export type WindowsWfpResidual =
   | 'deny-only-user-sid'
 
 /**
- * Result of `srt-win wfp verify` on success (exit 0) — see
- * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
- * return path `probes.plain` and the two lowered-integrity loopback
- * attempts are always `blocked`, and the two lowered-integrity
- * off-loopback attempts are `blocked` or `skipped` — except that
- * under the write-restricted token any of them but `probes.plain` may
- * instead be `denied`. The remaining three (`anonymous`,
- * `anonymousLoopback`, `denyOnly`) can be anything: the filters do not
- * cover them, and one that got through is named in `residuals`.
+ * Result of `srt-win wfp verify` on success (exit 0); anything else
+ * throws. Only `anonymous`, `anonymousLoopback` and `denyOnly` can have
+ * got past the fence: one that did is named in `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
   /** Runner's stderr (carries one diagnostic line per attempt). */
   stderr: string
-  /** Each attempt's own result. */
+  /**
+   * One per attempt. `anonymous`, `lowIntegrity` and `untrustedIntegrity`
+   * go to an off-loopback target, the rest to the loopback one.
+   */
   probes: {
-    /** The sandbox account's own token, to the loopback target. */
     plain: WindowsWfpProbeOutcome
-    /** Impersonating the anonymous token, to an off-loopback target. */
     anonymous: WindowsWfpProbeOutcome
-    /** Impersonating the anonymous token, to the loopback target. */
     anonymousLoopback: WindowsWfpProbeOutcome
-    /** The sandbox token with its user SID deny-only, to the loopback target. */
     denyOnly: WindowsWfpProbeOutcome
-    /** The sandbox token at low integrity, to an off-loopback target. */
     lowIntegrity: WindowsWfpProbeOutcome
-    /** The sandbox token at low integrity, to the loopback target. */
     lowIntegrityLoopback: WindowsWfpProbeOutcome
-    /** The sandbox token at untrusted integrity, to an off-loopback target. */
     untrustedIntegrity: WindowsWfpProbeOutcome
-    /** The sandbox token at untrusted integrity, to the loopback target. */
     untrustedIntegrityLoopback: WindowsWfpProbeOutcome
   }
-  /**
-   * Gaps the probe found open. NOT a clean pass when non-empty: the
-   * fence blocks what it is built to block, and these named shapes
-   * get past it. Empty when none were observed.
-   */
+  /** Gaps the probe found open: NOT a clean pass when non-empty. */
   residuals: WindowsWfpResidual[]
-  /**
-   * Human-readable warnings: one per residual, plus one per attempt
-   * that was skipped (no off-loopback address to aim
-   * at). `initialize()` logs them.
-   */
+  /** Warnings for residuals and skipped attempts; `initialize()` logs them. */
   warnings: string[]
 }
 
@@ -1046,10 +1000,9 @@ export async function checkWindowsSandboxStatusAsync(
 
 /**
  * Query the WFP filter set under the given sublayer via live BFE
- * enumeration. `installed` means the srt-win-tagged BLOCK filters
- * this version requires are all present on both connect layers;
- * `outdated` means a set is there but was written by an earlier
- * version (see {@link WindowsWfpStatus}). Detection is **tag-based**
+ * enumeration. `installed` means the BLOCK filters this version
+ * requires are present on both connect layers (`outdated`: see
+ * {@link WindowsWfpStatus}). Detection is **tag-based**
  * (providerData JSON); filters installed by other tooling without the
  * tag are not counted.
  *
@@ -1081,7 +1034,6 @@ export async function getWindowsWfpStatusAsync(
   )
 }
 
-/** Shape of `srt-win wfp verify` stdout. */
 type RawWfpVerify = {
   egress_probe: string
   target: string
@@ -1128,20 +1080,9 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
 }
 
 /**
- * Turn one `srt-win wfp verify` run into a result or a typed error.
- * Pure — the spawn and the listener live in
- * {@link verifyWindowsWfpEgress}.
- *
- * - exit 19 → `wfp_fence_outdated` (the install predates this build).
- * - exit 3, or any attempt the fence must refuse reported as having
- *   got past the filters → `wfp_fence_inactive`. Those attempts are
- *   the plain one and the four made under a copy of the sandbox
- *   token with its integrity level lowered. The attempts made while
- *   impersonating the anonymous token are not among them.
- * - any other non-zero exit → `wfp_verify_inconclusive`.
- * - exit 0 → the result, with any residuals and their warnings. A
- *   residual never throws: the filters do not close it, so refusing
- *   to start would refuse every machine.
+ * Turn one `srt-win wfp verify` run into a result or a typed error
+ * (pure). An attempt the fence must refuse that got through rejects
+ * whatever the exit code says; a residual never throws.
  */
 export function interpretWindowsWfpVerify(r: {
   status: number | null
@@ -1153,10 +1094,8 @@ export function interpretWindowsWfpVerify(r: {
   try {
     raw = JSON.parse(r.stdout) as RawWfpVerify
   } catch {
-    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
-    // this parse; status=null here means an external signal.
-    // Include signal + stderr so the CI log self-explains instead
-    // of just `exited null with unparseable output ""`.
+    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before this
+    // parse; status=null here means an external signal.
     throw new WindowsSandboxError(
       'wfp_verify_unparseable',
       `WFP egress fence could not be verified — \`srt-win wfp ` +
@@ -1260,45 +1199,18 @@ export function interpretWindowsWfpVerify(r: {
  * sandbox user. Binds a local listener on an ephemeral loopback port
  * outside the WFP loopback-permit range, then spawns `srt-win
  * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
- * attempt direct TCP connects under each token shape a sandboxed
- * process can present to the filtering engine:
- *
- * 1. its own token, to the listener;
- * 2. impersonating the anonymous token, to this machine's own
- *    off-loopback address (chosen by `srt-win`; nothing needs to
- *    listen there);
- * 3. impersonating the anonymous token, to the listener;
- * 4. a copy of its token with the user SID deny-only, to the
- *    listener;
- * 5. a copy of its token at low integrity, and one at untrusted
- *    integrity, each to the off-loopback address and to the
- *    listener.
- *
- * Attempts 2 to 5 each connect twice: on a socket created before the
- * token is assumed and on one created after. The filtering engine
- * attributes a connect to the token in effect when its socket was
- * created, so only the second is a connect by the assumed identity;
- * the first is kept in case that attribution differs. Each attempt
- * reports the worse of its two results, and `stderr` carries one line
- * per ordering.
- *
- * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
- * leaves — so a fenced connect yields WSAEACCES immediately and an
- * unfenced one goes through (the kernel completes the handshake
- * against the listening socket's backlog; no event-loop tick
- * required, so the synchronous `runSrtWin` is safe). Does not require
- * elevation and does not depend on any external host.
- *
- * Attempts 1 and 5 are what the fence must refuse: either getting
- * through throws. Attempts 2, 3 and 4 are shapes the filter set does
- * not refuse — attempt 2 is expected to get through; when they do,
- * the result names them in `residuals` (with `warnings`) rather than
- * passing silently — see {@link WindowsWfpResidual}.
+ * attempt direct TCP connects, one per token shape a sandboxed
+ * process can present. The WFP block-user filter
+ * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
+ * active fence yields WSAEACCES immediately and a missing fence lets
+ * the connect through (the kernel completes the handshake against
+ * the listening socket's backlog; no event-loop tick required, so
+ * the synchronous `runSrtWin` is safe). Does not require elevation
+ * and does not depend on any external host.
  *
  * `initialize()` calls this once per session, so a stale install
- * (sandbox user provisioned but filters since removed, or a filter
- * set from an earlier version) fails closed at session start instead
- * of running every exec with full egress.
+ * (sandbox user provisioned but filters since removed) fails closed
+ * at session start instead of running every exec with full egress.
  *
  * @param opts.target overrides the probe target (skips the local
  *   listener bind).
@@ -2898,10 +2810,7 @@ function windowsInstallCommandLines(sublayerGuid: string | undefined): string {
   )
 }
 
-/**
- * What the install changes for the rest of the machine's network, in
- * one sentence. Shown wherever the install is offered or confirmed.
- */
+/** What the install changes for the rest of the machine's network. */
 export const WINDOWS_INSTALL_NETWORK_EFFECT =
   `The WFP filters key on the dedicated \`srt-sandbox\` account's SID, ` +
   `so your own network is unaffected.`
@@ -2980,9 +2889,8 @@ function interpretDependencyProbes(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
     )
   } else if (ws.state === 'outdated') {
-    // A filter set from an earlier version: the sandbox would run
-    // without filters this version relies on, so it is an error, not
-    // a warning. The repair is the same one-time install.
+    // The sandbox would run without filters this version relies on, so
+    // it is an error, not a warning.
     errors.push(
       `WFP filters under sublayer ${sublayerGuid ?? '(default)'} are out ` +
         `of date${ws.hint ? ` (${ws.hint})` : ''}. ` +
