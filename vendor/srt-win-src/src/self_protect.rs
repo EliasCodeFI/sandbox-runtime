@@ -193,7 +193,7 @@ pub fn install_broker_dacl(extra_allow: Option<&str>) -> Result<()> {
 /// Build an ACL of ACCESS_ALLOWED ACEs, one per `(sid, mask)`, in
 /// order. The returned buffer is the ACL; cast `.as_mut_ptr()` to
 /// `*mut ACL`.
-fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec<u8>> {
+fn build_allow_acl(aces: &[(PSID, u32)]) -> Result<Vec<u8>> {
     // ACL size = header + Σ(ACE fixed prefix + SID body). The fixed
     // prefix of an ACCESS_ALLOWED_ACE is 8 bytes (Header 4 + Mask 4);
     // `SidStart` is the first DWORD of the SID, so total per-ACE =
@@ -218,6 +218,18 @@ fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec
         }
     }
     Ok(buf)
+}
+
+/// The ACL SYSTEM:`full` + Admins:`full` + `OWNER_RIGHTS:READ_CONTROL`.
+fn build_protected_acl(full: u32) -> Result<Vec<u8>> {
+    let system = LocalPsid::from_string(SID_SYSTEM)?;
+    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
+    build_allow_acl(&[
+        (system.as_psid(), full),
+        (admins.as_psid(), full),
+        (owner_rights.as_psid(), READ_CONTROL),
+    ])
 }
 
 /// Rewrite the DACL of every thread this process currently has to
@@ -247,14 +259,7 @@ pub fn protect_own_threads() -> Result<usize> {
     /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
     const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
 
-    let system = LocalPsid::from_string(SID_SYSTEM)?;
-    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
-    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
-    let mut buf = build_allow_acl(&[
-        (system.as_psid(), THREAD_ALL_ACCESS.0),
-        (admins.as_psid(), THREAD_ALL_ACCESS.0),
-        (owner_rights.as_psid(), READ_CONTROL),
-    ])?;
+    let mut buf = build_protected_acl(THREAD_ALL_ACCESS.0)?;
     let acl = buf.as_mut_ptr() as *mut ACL;
 
     let tids = crate::util::thread_ids_of(unsafe { GetCurrentProcessId() })?;
@@ -265,7 +270,7 @@ pub fn protect_own_threads() -> Result<usize> {
     for tid in &tids {
         unsafe {
             let h = match OpenThread(THREAD_ACCESS_RIGHTS(DACL_RW), false, *tid) {
-                Ok(h) => crate::util::OwnedHandle(h),
+                Ok(h) => OwnedHandle(h),
                 // The thread exited after the snapshot: nothing left
                 // to protect.
                 Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
@@ -353,14 +358,7 @@ pub fn protect_future_threads() -> Result<()> {
     use windows::Win32::System::Threading::OpenProcessToken;
     const GENERIC_ALL: u32 = 0x1000_0000;
 
-    let system = LocalPsid::from_string(SID_SYSTEM)?;
-    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
-    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
-    let mut buf = build_allow_acl(&[
-        (system.as_psid(), GENERIC_ALL),
-        (admins.as_psid(), GENERIC_ALL),
-        (owner_rights.as_psid(), READ_CONTROL),
-    ])?;
+    let mut buf = build_protected_acl(GENERIC_ALL)?;
     unsafe {
         let mut tok = HANDLE::default();
         OpenProcessToken(
