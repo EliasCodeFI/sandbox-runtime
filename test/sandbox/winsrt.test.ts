@@ -1519,6 +1519,11 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     user_sid: 'S-1-5-21-1',
     hint: 'the network fence on this machine is out of date',
   })
+  // As srt-win prints them: the reason alone, and the hint with its repair.
+  const REMOVED_REASON =
+    'the network fence on this machine does not match its install record ' +
+    '(the record says the filters were removed)'
+  const REPAIR = ' — re-run `srt-win install` (one UAC prompt)'
 
   it('getWindowsWfpStatus{,Async}: an out-of-date fence maps to state "outdated" with its hint', async () => {
     stubSpawn(argv => ({
@@ -1548,6 +1553,26 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(sync.errors[0]).toMatch(/out of date/)
     expect(sync.errors[0]).toMatch(/windows-install/)
     expect(await checkWindowsDependenciesAsync({ srtWin })).toEqual(sync)
+  })
+
+  it('checkWindowsDependencies: the fence error states the reason once and gives one repair', () => {
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user')
+        ? RAW_USER
+        : JSON.stringify({
+            state: 'outdated',
+            filters: 4,
+            reason: REMOVED_REASON,
+            hint: REMOVED_REASON + REPAIR,
+          }),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const [error] = checkWindowsDependencies({ srtWin }).errors
+    expect(error).toContain(REMOVED_REASON)
+    expect(error).not.toMatch(/out of date/)
+    expect(error).not.toContain('srt-win install`')
+    expect(error.match(/one UAC prompt/g)?.length).toBe(1)
   })
 
   const verifyOut = (over: Record<string, unknown> = {}): string =>
@@ -1751,13 +1776,33 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       egress_probe: 'not-run',
       target: '127.0.0.1:49999',
       outdated: true,
-      hint: 'the network fence on this machine is out of date (revision 1)',
+      reason: 'the network fence on this machine is out of date (revision 1)',
+      hint:
+        'the network fence on this machine is out of date (revision 1)' +
+        REPAIR,
     })
     const err = await runVerify(19, out).catch(e => e as WindowsSandboxError)
     expect(err).toBeInstanceOf(WindowsSandboxError)
     expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
-    expect((err as WindowsSandboxError).message).toMatch(/revision 1/)
-    expect((err as WindowsSandboxError).message).toMatch(/windows-install/)
+    const message = (err as WindowsSandboxError).message
+    expect(message).toMatch(/revision 1/)
+    expect(message).toMatch(/windows-install/)
+    // One repair instruction, and no second "out of date" around the reason.
+    expect(message.match(/one UAC prompt/g)?.length).toBe(1)
+    expect(message.match(/out of date/g)?.length).toBe(1)
+  })
+
+  it('verifyWindowsWfpEgress: an install record that cannot be read is reported as that, not as out of date', async () => {
+    const out = JSON.stringify({
+      egress_probe: 'not-run',
+      target: '127.0.0.1:49999',
+      record_error: 'could not read the install record: access denied',
+    })
+    const err = await runVerify(2, out).catch(e => e as WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('wfp_verify_inconclusive')
+    const message = (err as WindowsSandboxError).message
+    expect(message).toMatch(/could not read the install record/)
+    expect(message).not.toMatch(/out of date|Re-run/)
   })
 
   it('verifyWindowsWfpEgress: inconclusive and unparseable runs reject', async () => {

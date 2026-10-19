@@ -685,24 +685,46 @@ pub struct WfpStatus {
     /// Populated on `cannot-read` and on `outdated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Why the fence is not current, without the repair `hint` adds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
-pub fn outdated_hint(have: Option<u32>) -> String {
-    if have == Some(FENCE_REVISION_REMOVED) {
-        return "the network fence on this machine is not installed (its \
-                filters were removed by an uninstall) — re-run `srt-win \
-                install` (one UAC prompt)"
-            .to_string();
-    }
+/// Why a recorded revision is not usable, without the repair.
+pub fn outdated_reason(have: Option<u32>) -> String {
     let have = match have {
+        Some(FENCE_REVISION_REMOVED) => {
+            return "the network fence on this machine is not installed (its \
+                    filters were removed by an uninstall)"
+                .to_string();
+        }
         Some(r) => format!("revision {r}"),
         None => "an unrecorded earlier revision".to_string(),
     };
     format!(
         "the network fence on this machine is out of date ({have}; \
-         this build requires revision {FENCE_REVISION}) — re-run \
-         `srt-win install` (one UAC prompt)"
+         this build requires revision {FENCE_REVISION})"
     )
+}
+
+/// `reason` followed by the one repair there is.
+pub fn repair_hint(reason: &str) -> String {
+    format!("{reason} — re-run `srt-win install` (one UAC prompt)")
+}
+
+pub fn outdated_hint(have: Option<u32>) -> String {
+    repair_hint(&outdated_reason(have))
+}
+
+/// Why an enumerated set classifies as `outdated`: a missing filter when
+/// every tag is at this build's revision, else the oldest revision present.
+pub(crate) fn enumerated_outdated_reason(tags: &[(&str, FilterTag)]) -> String {
+    match tags.iter().map(|(_, t)| t.rev).min().flatten() {
+        Some(FENCE_REVISION) => "the network fence on this machine is incomplete (a \
+                                 filter of the set is missing)"
+            .to_string(),
+        oldest => outdated_reason(oldest),
+    }
 }
 
 /// Classify the srt-win filters enumerated under a sublayer: `absent`,
@@ -730,12 +752,20 @@ pub fn apply_recorded_revision(mut st: WfpStatus, record: Option<Option<u32>>) -
         && matches!(st.state, "installed" | "cannot-read")
     {
         let removed = rev == Some(FENCE_REVISION_REMOVED);
+        let reason = if removed && st.state == "installed" {
+            "the network fence on this machine does not match its install record \
+             (the record says the filters were removed)"
+                .to_string()
+        } else {
+            outdated_reason(rev)
+        };
         st.state = if removed && st.state == "cannot-read" {
             "absent"
         } else {
             "outdated"
         };
-        st.hint = Some(outdated_hint(rev));
+        st.hint = Some(repair_hint(&reason));
+        st.reason = Some(reason);
     }
     st
 }
@@ -772,15 +802,14 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         return Err(e);
     }
     let state = classify_fence(&tags);
+    let reason = (state == "outdated").then(|| enumerated_outdated_reason(&tags));
     Ok(WfpStatus {
         state,
         filters: tags.len(),
         port_range,
         user_sid,
-        hint: (state == "outdated").then(|| {
-            // The oldest revision present is the one worth naming.
-            outdated_hint(tags.iter().map(|(_, t)| t.rev).min().flatten())
-        }),
+        hint: reason.as_deref().map(repair_hint),
+        reason,
     })
 }
 
@@ -794,6 +823,7 @@ fn cannot_read(e: anyhow::Error) -> WfpStatus {
             "{e}; elevation required for filter enum — run `srt-win \
              wfp verify` for a behavioral check"
         )),
+        reason: None,
     }
 }
 
@@ -923,6 +953,40 @@ mod tests {
         assert!(outdated_hint(Some(2)).contains("requires revision 3"));
     }
 
+    #[test]
+    fn outdated_wording_does_not_contradict_itself() {
+        // A partial set at this build's revision is incomplete, not "out
+        // of date (revision N; this build requires revision N)".
+        let mut partial = full_set(Some(FENCE_REVISION), &ALL_KINDS);
+        let v6 = ALE_LAYERS[1].1;
+        partial.retain(|(l, t)| !(*l == v6 && t.kind == "block-user"));
+        assert_eq!(classify_fence(&partial), "outdated");
+        let reason = enumerated_outdated_reason(&partial);
+        assert!(reason.contains("incomplete"), "{reason}");
+        assert!(!reason.contains("requires revision"), "{reason}");
+        // An earlier or unrecorded revision is named as before.
+        let old = enumerated_outdated_reason(&full_set(Some(2), &REV2_KINDS));
+        assert!(old.contains("revision 2") && old.contains("requires revision"));
+        assert!(enumerated_outdated_reason(&full_set(None, &ALL_KINDS)).contains("unrecorded"));
+        // A removed set is "not installed", never "out of date".
+        let removed = outdated_reason(Some(FENCE_REVISION_REMOVED));
+        assert!(removed.contains("not installed") && !removed.contains("out of date"));
+        // A reason carries no repair; the hint carries exactly one.
+        for have in [None, Some(0), Some(1)] {
+            assert!(!outdated_reason(have).contains("srt-win install"));
+            assert_eq!(outdated_hint(have).matches("srt-win install").count(), 1);
+        }
+        // Filters present under a record that says "removed".
+        let st = apply_recorded_revision(status("installed"), Some(Some(0)));
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("does not match its install record"),
+            "{reason}"
+        );
+        assert!(!reason.contains("not installed"));
+        assert_eq!(st.hint.unwrap(), repair_hint(&reason));
+    }
+
     fn status(state: &'static str) -> WfpStatus {
         WfpStatus {
             state,
@@ -930,6 +994,7 @@ mod tests {
             port_range: None,
             user_sid: None,
             hint: None,
+            reason: None,
         }
     }
 

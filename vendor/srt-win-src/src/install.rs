@@ -467,22 +467,15 @@ pub fn fence_record() -> Result<FenceRecord> {
     Ok(summarize_fence_records(&read_fence_records()?))
 }
 
-/// Whether the record says every installed set was uninstalled. A read
-/// error is "no".
-pub fn fence_marked_removed() -> bool {
-    matches!(fence_record(), Ok(FenceRecord::Removed))
-}
-
-/// `Err` (operator-facing text) unless the record shows a set at this
-/// build's revision.
-pub fn require_current_fence() -> std::result::Result<(), String> {
-    match fence_record().map_err(|e| format!("read fence revision: {e:#}"))? {
-        FenceRecord::Current => Ok(()),
-        FenceRecord::Removed => Err(crate::wfp::outdated_hint(Some(
-            crate::wfp::FENCE_REVISION_REMOVED,
-        ))),
-        FenceRecord::Outdated(have) => Err(crate::wfp::outdated_hint(have)),
-    }
+/// What a launch finds in place of a current record: `None` when a set
+/// at this build's revision is recorded, else the revision to name
+/// ([`crate::wfp::FENCE_REVISION_REMOVED`] once every set was uninstalled).
+pub fn fence_gap() -> Result<Option<Option<u32>>> {
+    Ok(match fence_record()? {
+        FenceRecord::Current => None,
+        FenceRecord::Removed => Some(Some(crate::wfp::FENCE_REVISION_REMOVED)),
+        FenceRecord::Outdated(have) => Some(have),
+    })
 }
 
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`

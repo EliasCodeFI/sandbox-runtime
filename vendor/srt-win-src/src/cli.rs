@@ -614,16 +614,22 @@ fn remove_fence(sublayer: &windows::core::GUID) -> anyhow::Result<usize> {
 /// folded in — the `wfp` object both status commands print.
 fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::WfpStatus> {
     use srt_win::{install, wfp};
-    // No install record → nothing to compare against. A record whose
-    // revision cannot be read is treated as carrying none.
-    let record = install::read_setup()
-        .ok()
-        .flatten()
-        .map(|_| install::read_fence_revision(sublayer).ok().flatten());
-    Ok(wfp::apply_recorded_revision(
-        wfp::filter_status(sublayer)?,
-        record,
-    ))
+    let mut st = wfp::filter_status(sublayer)?;
+    // No install record → nothing to compare against.
+    if install::read_setup().ok().flatten().is_none() {
+        return Ok(st);
+    }
+    match install::read_fence_revision(sublayer) {
+        Ok(rev) => Ok(wfp::apply_recorded_revision(st, Some(rev))),
+        Err(e) => {
+            let unread = format!("could not read the install record's fence revision: {e:#}");
+            st.hint = Some(match st.hint.take() {
+                Some(hint) => format!("{hint}; {unread}"),
+                None => unread,
+            });
+            Ok(st)
+        }
+    }
 }
 
 /// Install-time ambient write-deny state: the recorded paths (HKLM
@@ -1198,19 +1204,34 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             // A record that says the filters were REMOVED is not refused
             // here: the probe then shows the missing fence (exit 3).
-            if !install::fence_marked_removed()
-                && let Err(hint) = install::require_current_fence()
-            {
-                eprintln!("srt-win: error: wfp verify: {hint}");
-                finish(
-                    json!({
-                        "egress_probe": "not-run",
-                        "target": target,
-                        "outdated": true,
-                        "hint": hint,
-                    }),
-                    probe::EXIT_FENCE_OUTDATED,
-                );
+            match install::fence_gap() {
+                Ok(None) | Ok(Some(Some(wfp::FENCE_REVISION_REMOVED))) => {}
+                Ok(Some(have)) => {
+                    let hint = wfp::outdated_hint(have);
+                    eprintln!("srt-win: error: wfp verify: {hint}");
+                    finish(
+                        json!({
+                            "egress_probe": "not-run",
+                            "target": target,
+                            "outdated": true,
+                            "reason": wfp::outdated_reason(have),
+                            "hint": hint,
+                        }),
+                        probe::EXIT_FENCE_OUTDATED,
+                    );
+                }
+                Err(e) => {
+                    let unread = format!("could not read the install record: {e:#}");
+                    eprintln!("srt-win: error: wfp verify: {unread}");
+                    finish(
+                        json!({
+                            "egress_probe": "not-run",
+                            "target": target,
+                            "record_error": unread,
+                        }),
+                        probe::EXIT_INCONCLUSIVE,
+                    );
+                }
             }
             let anonymous_target = anonymous_target.or_else(|| {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
@@ -1618,8 +1639,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
 
             // The non-elevated broker cannot enumerate filters; the install
             // record's fence revision is what it can check before launching.
-            if let Err(hint) = install::require_current_fence() {
-                eprintln!("srt-win: error: {hint}");
+            if let Some(have) = install::fence_gap().context("read the install record")? {
+                eprintln!("srt-win: error: {}", wfp::outdated_hint(have));
                 std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
             }
 

@@ -194,6 +194,8 @@ export interface WindowsWfpStatusResult {
    * filters) and on `outdated` (how to repair it).
    */
   hint?: string
+  /** Why the set is not current, without the repair that `hint` adds. */
+  reason?: string
 }
 
 /**
@@ -845,6 +847,7 @@ type RawWfpStatus = {
   port_range?: [number, number]
   user_sid?: string
   hint?: string
+  reason?: string
 }
 
 function wfpStatusArgs(sublayerGuid?: string): string[] {
@@ -860,6 +863,7 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
     ...(raw.port_range && { portRange: raw.port_range }),
     ...(raw.user_sid && { userSid: raw.user_sid }),
     ...(raw.hint && { hint: raw.hint }),
+    ...(raw.reason && { reason: raw.reason }),
   }
 }
 
@@ -988,6 +992,8 @@ type RawWfpVerify = {
   residuals?: string[]
   outdated?: boolean
   hint?: string
+  reason?: string
+  record_error?: string
 }
 
 const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
@@ -1057,13 +1063,24 @@ export function interpretWindowsWfpVerify(r: {
     `low-integrity-loopback=${probes.lowIntegrityLoopback}, ` +
     `untrusted-integrity=${probes.untrustedIntegrity} (${offLoopback}), ` +
     `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}`
+  if (raw.record_error) {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — ${raw.record_error}.`,
+    )
+  }
   if (r.status === 19 || raw.outdated) {
+    // `hint` already names a repair; `reason` does not.
+    const why =
+      raw.reason ??
+      raw.hint ??
+      'the installed filter set predates this version of srt-win'
     throw new WindowsSandboxError(
       'wfp_fence_outdated',
-      `WFP egress fence is out of date — ` +
-        (raw.hint ??
-          'the installed filter set predates this version of srt-win') +
-        `. Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`,
+      `WFP egress fence cannot be used — ${why}.` +
+        (raw.reason || !raw.hint
+          ? ` Re-run \`npx sandbox-runtime windows-install\` (one UAC prompt).`
+          : ''),
     )
   }
   // The attempts the fence must refuse. One getting through rejects
@@ -2558,8 +2575,8 @@ function interpretDependencyProbes(
     // The sandbox would run without filters this version relies on, so
     // it is an error, not a warning.
     errors.push(
-      `WFP filters under sublayer ${sublayerGuid ?? '(default)'} are out ` +
-        `of date${ws.hint ? ` (${ws.hint})` : ''}. ` +
+      `WFP filters under sublayer ${sublayerGuid ?? '(default)'} cannot ` +
+        `be used: ${ws.reason ?? ws.hint ?? 'they are out of date'}. ` +
         windowsInstallInstructions(sublayerGuid),
     )
   } else if (ws.state !== 'installed') {
