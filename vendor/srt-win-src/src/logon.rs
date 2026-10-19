@@ -134,15 +134,27 @@ pub enum SeclogonState {
 }
 
 /// A running service launches regardless of its start type (disabling does
-/// not stop it), so only "Disabled and not running" is `Disabled`.
+/// not stop it), so only "Disabled and known not to run" is `Disabled`; with
+/// the status unreadable, a Disabled start type is `CannotRead`.
 fn classify_seclogon(
     start: SERVICE_START_TYPE,
     current: Option<SERVICE_STATUS_CURRENT_STATE>,
 ) -> SeclogonState {
-    if start == SERVICE_DISABLED && current != Some(SERVICE_RUNNING) {
-        SeclogonState::Disabled
-    } else {
-        SeclogonState::Ok
+    match (start == SERVICE_DISABLED, current) {
+        (true, Some(SERVICE_RUNNING)) | (false, _) => SeclogonState::Ok,
+        (true, Some(_)) => SeclogonState::Disabled,
+        (true, None) => SeclogonState::CannotRead,
+    }
+}
+
+/// Whether a failed logon call is the Secondary Logon service being unusable:
+/// the probe says so, or the call failed with `ERROR_SERVICE_DISABLED` (which
+/// any service on the logon path can cause) and the probe did not read it `Ok`.
+fn logon_failure_is_seclogon(service_disabled_error: bool, state: SeclogonState) -> bool {
+    match state {
+        SeclogonState::Disabled | SeclogonState::Missing => true,
+        SeclogonState::Ok => false,
+        SeclogonState::CannotRead => service_disabled_error,
     }
 }
 
@@ -437,12 +449,8 @@ pub fn spawn_runner(
                 .unwrap_or_else(|| "<unknown>".into());
             return Err(MappedDriveCwd { drive }.into());
         }
-        // The probe is consulted too, so the typed error does not hinge on which
-        // code a given Windows build surfaces for a disabled or absent service.
         let state = seclogon_state();
-        if e.code() == ERROR_SERVICE_DISABLED.to_hresult()
-            || matches!(state, SeclogonState::Disabled | SeclogonState::Missing)
-        {
+        if logon_failure_is_seclogon(e.code() == ERROR_SERVICE_DISABLED.to_hresult(), state) {
             return Err(SeclogonDisabled {
                 missing: state == SeclogonState::Missing,
             }
@@ -599,7 +607,10 @@ impl AsRawHandle for std::io::Stderr {
 
 #[cfg(test)]
 mod tests {
-    use super::{SeclogonDisabled, SeclogonState, classify_seclogon, cwd_drive_root};
+    use super::{
+        SeclogonDisabled, SeclogonState, classify_seclogon, cwd_drive_root,
+        logon_failure_is_seclogon,
+    };
     use windows::Win32::System::Services::{
         SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_RUNNING,
         SERVICE_STOPPED,
@@ -613,10 +624,28 @@ mod tests {
         assert_eq!(classify_seclogon(SERVICE_DEMAND_START, stopped), S::Ok);
         assert_eq!(classify_seclogon(SERVICE_AUTO_START, running), S::Ok);
         assert_eq!(classify_seclogon(SERVICE_DISABLED, stopped), S::Disabled);
-        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::Disabled);
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::CannotRead);
         assert_eq!(classify_seclogon(SERVICE_DEMAND_START, None), S::Ok);
         // Disabled after it was started: still launches until the service stops.
         assert_eq!(classify_seclogon(SERVICE_DISABLED, running), S::Ok);
+    }
+
+    #[test]
+    fn logon_failure_is_seclogon_only_when_the_probe_agrees() {
+        use SeclogonState as S;
+        for service_disabled_error in [true, false] {
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Disabled
+            ));
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Missing
+            ));
+            assert!(!logon_failure_is_seclogon(service_disabled_error, S::Ok));
+        }
+        assert!(logon_failure_is_seclogon(true, S::CannotRead));
+        assert!(!logon_failure_is_seclogon(false, S::CannotRead));
     }
 
     #[test]
