@@ -1068,8 +1068,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(17);
                 }
             }
-            // A changing (or unreadable) loopback mode: mark the fence removed
-            // BEFORE replacing the filters, so no failure leaves a current record.
+            // A changing (or unreadable) loopback mode: mark the fence removed FIRST, or
+            // a failure could leave a current record beside filters of the other mode.
             if install::read_allow_loopback().ok() != Some(allow_loopback)
                 && let Err(e) = install::mark_fence_removed()
             {
@@ -1316,8 +1316,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
-            // Held for as long as the runner takes; nothing listens at the
-            // off-loopback address with the same port.
+            // The listener is held for as long as the runner takes; nothing
+            // listens at the off-loopback address with the same port.
             let open_listener = allow_loopback.then(probe::bind_open_loopback).flatten();
             let open_loopback_addr = open_listener.as_ref().and_then(|l| l.local_addr().ok());
             let open_loopback_target = open_loopback_addr.map(|a| a.to_string());

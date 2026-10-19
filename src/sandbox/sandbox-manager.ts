@@ -1008,8 +1008,8 @@ async function initializeSteps(
     // stale install (user provisioned but filters since removed)
     // throws here instead of running every exec with full egress.
     // After the user-status check so the not-provisioned message is
-    // the actionable one. Once per process — the fence is install-
-    // scoped, not session-scoped.
+    // the actionable one. Once per process and loopback mode — the
+    // fence is install-scoped, not session-scoped.
     const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
     if (windowsWfpVerifiedFor !== allowLoopback) {
       try {

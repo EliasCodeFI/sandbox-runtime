@@ -118,9 +118,9 @@ pub fn is_loopback_floor_port(port: u16) -> bool {
     LOOPBACK_FLOOR_PORTS.iter().any(|(p, _)| *p == port)
 }
 
-/// Every port from 1 to 65535 not in `floor` (ascending), as inclusive
-/// ranges. Port 0 is left out: for ICMP the engine presents the message
-/// code as the remote port, and an echo request (code 0) must not match.
+/// Every port from 1 to 65535 not in `floor` (which must be ascending),
+/// as inclusive ranges. Port 0 is left out: for ICMP the engine presents the
+/// message code as the remote port, and an echo request (code 0) must not match.
 pub(crate) fn port_ranges_outside(floor: &[u16]) -> Vec<(u16, u16)> {
     let mut ranges = Vec::new();
     let mut next: u32 = 1;
@@ -832,7 +832,8 @@ pub struct WfpStatus {
     pub filters: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
-    /// From the filters when elevated, else from the install record.
+    /// Whether the set opens loopback: read from the filters when
+    /// elevated, else from the install record.
     pub allow_loopback: bool,
     /// [`open_loopback_notice`], present exactly when `allow_loopback`.
     #[serde(skip_serializing_if = "Option::is_none")]

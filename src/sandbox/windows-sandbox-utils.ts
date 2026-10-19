@@ -466,8 +466,8 @@ export interface WindowsSandboxParams {
   proxyAuthToken?: string
   /**
    * The session's `network.allowLocalBinding`. `srt-win exec` launches
-   * nothing (exit 19) unless the install recorded the same mode. With a
-   * proxy, `NO_PROXY` then names the loopback hosts.
+   * nothing (exit 19) unless the install recorded the same mode. When
+   * true, with a proxy, `NO_PROXY` names the loopback hosts.
    */
   allowLoopback?: boolean
   /**
@@ -2804,7 +2804,8 @@ function interpretDependencyProbes(
  * (Windows Defender cold-scan can add seconds).
  *
  * @param opts.allowLoopback the configured `network.allowLocalBinding`:
- *   an install with the other loopback mode is an error. Omit to skip.
+ *   an install with the other loopback mode is an error. Omit it to
+ *   skip the comparison.
  */
 export function checkWindowsDependencies(
   opts: {

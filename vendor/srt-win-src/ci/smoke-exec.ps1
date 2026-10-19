@@ -1285,8 +1285,8 @@ function RExecStart {
   }
 }
 
-# A server started INSIDE the sandbox, then one connect from a second
-# sandboxed command. It prints SERVED on accept: no other listener passes.
+# A server started INSIDE the sandbox, then one connect from a second sandboxed
+# command. The server prints SERVED on accept, so reaching another listener does not pass.
 function SbServerRoundTrip {
   param([string] $Row, [int] $Port, [string[]] $ExecFlags = @())
   $srv = RExecStart ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command',
@@ -1485,7 +1485,8 @@ if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an open-loopback --target 
 Write-Host 'L2 ok: wfp verify probes open loopback (listener connected, blocked port and off-loopback blocked), says it is open, and refuses an open target'
 
 # L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1.
-# Ports from four stretches between the blocked ones: several conditions.
+# The ports span four stretches between the blocked ones, to exercise
+# several of the PERMIT's port conditions.
 foreach ($slice in @((1100..1107), (8100..8107), ($LbLo..($LbLo + 7)), (48100..48107))) {
   $l3 = Bind-Listener $slice
   try {
