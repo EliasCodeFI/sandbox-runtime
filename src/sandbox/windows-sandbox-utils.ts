@@ -469,15 +469,11 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
-   * Run the child under the write-restricted token
-   * (`SandboxRuntimeConfig.windows.writeRestrictedToken`): adds
+   * Run the child under the write-restricted token: adds
    * `--write-restricted-token` to the `srt-win exec` argv and selects
-   * git's OpenSSL backend in the injected git config (Schannel
-   * refuses restricted tokens). Default `false`, which leaves argv
-   * and env exactly as they are without the option.
-   *
-   * The caller must have verified the egress fence for this token
-   * shape first — {@link verifyWindowsWfpEgress} with the same flag.
+   * git's OpenSSL backend (Schannel refuses restricted tokens). The
+   * caller must have verified the egress fence for this token shape
+   * first — {@link verifyWindowsWfpEgress} with the same flag.
    */
   writeRestrictedToken?: boolean
   /**
@@ -956,13 +952,10 @@ export async function getWindowsWfpStatusAsync(
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
  * @param opts.writeRestrictedToken probe with the write-restricted
- *   child token instead of the default one (`srt-win wfp verify
- *   --write-restricted-token`: the connect is made by a lockdown
- *   child holding that token). The WFP block filter matches by an
- *   access check of the connecting token, and a restricted token is
- *   checked differently — a session that will run commands with the
- *   option MUST verify with it, because a filter that stopped
- *   matching would leave egress open, not closed.
+ *   child token instead of the default one. The WFP block filter
+ *   matches by an access check of the connecting token, so a session
+ *   that will run commands with the option MUST verify with it: a
+ *   filter that stopped matching would leave egress open.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
@@ -2407,9 +2400,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     ],
     schannelCa: p.caCertPath !== undefined,
     // Schannel cannot acquire credentials under the write-restricted
-    // token, so git's default backend on Windows would fail every
-    // HTTPS operation; its OpenSSL backend is unaffected and reads the
-    // same GIT_SSL_CAINFO.
+    // token; git's OpenSSL backend is unaffected and reads the same
+    // GIT_SSL_CAINFO.
     opensslBackend: p.writeRestrictedToken === true,
     baseEnv: p.setEnvVars,
   })

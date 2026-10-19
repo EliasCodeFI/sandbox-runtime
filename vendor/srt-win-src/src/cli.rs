@@ -1162,15 +1162,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Default token: the bare runner connects. Its token and
+            // Default token: the bare runner connects; its token and
             // the default child token give the filter's access check
             // the same answer. Write-restricted token: the runner
             // launches this binary's `probe connect` as a lockdown
-            // child, so the connect is made under the exact token
-            // (and job, desktop, mitigations) a sandboxed command
-            // gets. A probe child that cannot be created exits the
-            // runner with 1, which is reported as `error` below —
-            // never as `blocked`.
+            // child, so the connect is made under the exact token a
+            // sandboxed command gets. A probe child that cannot be
+            // created exits the runner with 1, reported as `error`.
             let cmd = if write_restricted_token {
                 let exe = std::env::current_exe().context("current_exe")?;
                 let exe = exe

@@ -52,12 +52,10 @@ pub enum RunnerCmd {
     /// (same as [`InstallCa`](Self::InstallCa)); the WFP filter
     /// keys on the user SID, which the runner already carries.
     ///
-    /// This is the probe for the **default** child token. With the
-    /// write-restricted token the child's token differs from the
-    /// runner's in a way the filter's access check can see, so `wfp
-    /// verify --write-restricted-token` does not use this command: it
-    /// sends an [`Exec`](Self::Exec) of `srt-win probe connect`, so
-    /// the connect is made by a process holding the child token.
+    /// This is the probe for the **default** child token only. `wfp
+    /// verify --write-restricted-token` sends an [`Exec`](Self::Exec)
+    /// of `srt-win probe connect` instead, so the connect is made by
+    /// a process holding the child token.
     ProbeEgress { target: String },
 }
 
@@ -74,8 +72,7 @@ pub struct RunnerSpec {
     /// `TEMP` stay isolated. The proxy var set rides here too.
     pub env_overlay: Vec<(String, String)>,
     /// Build the child token write-restricted (`srt-win exec
-    /// --write-restricted-token`; see [`crate::token`]). Off unless
-    /// the broker asks for it.
+    /// --write-restricted-token`; see [`crate::token`]).
     #[serde(default)]
     pub write_restricted_token: bool,
 }
