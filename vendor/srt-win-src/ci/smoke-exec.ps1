@@ -1267,8 +1267,8 @@ try {
 }
 
 # ── U-rows: a fence written by an earlier build ─────────────────
-# Removing `FenceRevision` reproduces an install that predates the record.
-# U0b adds a filter tagged like revision 2's `block-anonymous`, to be deleted.
+# Removing `FenceRevision` reproduces an install that predates the record. U0b adds
+# a revision-2 `block-anonymous` filter, which the reinstall (U4) and uninstall must delete.
 
 # The test sublayer's filters per `netsh` (independent of srt-win's own
 # enumeration): the count, and which name the anonymous token.

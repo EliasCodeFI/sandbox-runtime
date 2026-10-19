@@ -725,9 +725,9 @@ pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
     if current { "installed" } else { "outdated" }
 }
 
-/// Fold the install record's fence revision into an enumerated
-/// status: only a record at [`FENCE_REVISION`] leaves `installed` or
-/// `cannot-read` standing. `record` is `None` with no install record.
+/// Fold the install record's fence revision into an enumerated status:
+/// only a record at [`FENCE_REVISION`] leaves `installed` or `cannot-read`
+/// standing. Outer `None`: no install record; inner: it predates the revision.
 pub fn apply_recorded_revision(mut st: WfpStatus, record: Option<Option<u32>>) -> WfpStatus {
     if let Some(rev) = record
         && rev != Some(FENCE_REVISION)

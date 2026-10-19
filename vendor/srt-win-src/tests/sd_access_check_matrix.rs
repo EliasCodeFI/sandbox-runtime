@@ -9,7 +9,7 @@
 //!
 //! A token below the descriptor's integrity level keeps only what the
 //! caller's `GENERIC_MAPPING` allows, and the engine's mapping is
-//! unknown: rows are judged under [`STRICT`], which holds under any.
+//! unknown: a grant under [`STRICT`], used here, holds under any mapping.
 
 #![cfg(windows)]
 
