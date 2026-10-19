@@ -785,15 +785,9 @@ pub fn forget_everything() -> Result<(usize, usize)> {
     Ok((out.len(), failed))
 }
 
-/// `acl grant` without `--persistent` is about to give the sandbox
-/// USER SID access to `targets` (canonical), for sessions that run
-/// under the ordinary token. Refuse while a persistent grant is
-/// recorded anywhere ([`unrestricted_block_reason`]) — and, because
-/// the records may be gone while ACEs remain, look at each target's
-/// own DACL too: a persistent ALLOW written on the target itself is
-/// removed (one walk), one inherited from a directory above cannot be
-/// removed from here and refuses. So does a target whose DACL cannot
-/// be read: "could not look" is not "no grant there".
+/// For `acl grant` without `--persistent`: refuse while a persistent
+/// grant is recorded or a target's DACL cannot be read, and remove a
+/// persistent ALLOW found on a target's own DACL (inherited: refuse).
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
     if let Some(why) = unrestricted_block_reason() {
         bail!(
@@ -833,9 +827,8 @@ enum UnrecordedGrant {
     Inherited,
 }
 
-/// What `aces` (a path's own DACL, as [`acl::read_aces`] returned it)
-/// says about a persistent ALLOW — one for the sandbox group or for a
-/// capability SID. A DACL that could not be read is an error, never
+/// What `aces` (a path's own DACL) says about a persistent ALLOW. A
+/// DACL that could not be read is an error, never
 /// [`UnrecordedGrant::None`].
 fn unrecorded_grant_on(
     aces: Result<Vec<AceView>>,
@@ -961,25 +954,19 @@ mod tests {
         }
     }
 
-    /// The ordinary token is allowed only on a positive "nothing
-    /// kept": every store that could not be read refuses.
+    /// Every store that could not be read refuses the ordinary token.
     #[test]
     fn ordinary_token_is_refused_on_any_read_failure() {
         let no_db = || -> Option<Vec<String>> { panic!("database consulted") };
-        // Nothing was ever kept: allowed, without the database.
         assert_eq!(block_reason_from(Ok(Marker::default()), no_db), None);
-        // The marker cannot be read.
         let r = block_reason_from(Err(anyhow!("access denied")), no_db).unwrap();
         assert!(r.contains("cannot be read"), "{r}");
-        // The marker lists a root.
         let r = block_reason_from(Ok(marker_with(true, &[r"\\?\C:\a"])), no_db).unwrap();
         assert!(r.contains("1 persistent write grant"), "{r}");
-        // Grants were made, no root is listed now: the database decides.
         let ever = || Ok(marker_with(true, &[]));
         assert_eq!(block_reason_from(ever(), || Some(Vec::new())), None);
         let r = block_reason_from(ever(), || Some(vec![r"\\?\C:\b".to_owned()])).unwrap();
         assert!(r.contains("state database records 1"), "{r}");
-        // … and a database that is missing or unreadable refuses.
         let r = block_reason_from(ever(), || None).unwrap();
         assert!(r.contains("missing or unreadable"), "{r}");
     }
@@ -998,7 +985,6 @@ mod tests {
         let on = |aces: Vec<AceView>| unrecorded_grant_on(Ok(aces), Some(GROUP)).unwrap();
         assert!(unrecorded_grant_on(Err(anyhow!("access denied")), Some(GROUP)).is_err());
         assert_eq!(on(vec![]), UnrecordedGrant::None);
-        // Other trustees, and the group's DENY, are not grants.
         assert_eq!(
             on(vec![
                 ace("S-1-5-32-545", false, true),
@@ -1012,8 +998,7 @@ mod tests {
             on(vec![ace(GROUP, false, false), ace(&cap, false, true)]),
             UnrecordedGrant::Inherited
         );
-        // Without an install record the group cannot be told apart;
-        // a capability SID still can.
+        // Without an install record only a capability SID can be told apart.
         assert_eq!(
             unrecorded_grant_on(Ok(vec![ace(GROUP, false, false)]), None).unwrap(),
             UnrecordedGrant::None

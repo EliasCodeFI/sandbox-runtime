@@ -28,10 +28,8 @@
 //!
 //! ## Write-restricted token
 //!
-//! The token a sandboxed command gets from the library unless its
-//! `windows.writeRestrictedToken` option is `false`; `srt-win exec`
-//! builds it when given `--write-restricted-token`, and the token
-//! above (the ordinary one) otherwise.
+//! What the library uses unless `windows.writeRestrictedToken` is
+//! `false`; `srt-win exec` builds it only with `--write-restricted-token`.
 //!
 //! `write_restricted` adds the `WRITE_RESTRICTED` flag and the
 //! restricting SIDs [`restricting_sid_list`]: a write must then also
@@ -466,7 +464,6 @@ mod tests {
             let _ = CloseHandle(base);
         }
         let tok = r.expect("make_sandbox_token");
-        // The ordinary token carries no restricting SIDs.
         let shape = token_restriction(tok).expect("token_restriction");
         assert!(!shape.write_restricted);
         assert_eq!(shape.restricted_sids, Vec::<String>::new());
@@ -477,10 +474,7 @@ mod tests {
         }
     }
 
-    /// The exact flag and restricting list of the write-restricted token. The
-    /// user SID is first and must stay: the WFP egress BLOCK matches
-    /// through it (see `wfp::sddl_sandbox_user`), so a list without
-    /// it would leave the child's network egress unfenced.
+    /// The user SID must stay in the list: the WFP egress BLOCK matches through it.
     #[test]
     fn write_restricted_shape_is_pinned() {
         assert_eq!(restricted_token_flags(false), LUA_TOKEN);

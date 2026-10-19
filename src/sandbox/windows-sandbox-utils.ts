@@ -231,10 +231,9 @@ export interface WindowsSandboxUserStatus {
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
-   * The setup version this `srt-win` requires. It launches nothing,
-   * and keeps no grant, while {@link markerVersion} differs — see
-   * {@link windowsSetupVersionMismatch}. Absent from an `srt-win`
-   * that does not report it.
+   * The setup version this `srt-win` requires; it launches nothing
+   * while {@link markerVersion} differs. Absent from an `srt-win` that
+   * does not report it.
    */
   setupVersion?: number
   /**
@@ -251,12 +250,9 @@ export interface WindowsSandboxUserStatus {
   /** PEM-encoded install-time CA certificate, when present. */
   caCertPem?: string
   /**
-   * Set when write grants kept between sessions (the default; see
-   * `windows.writeRestrictedToken`) exist (`present`, with their
-   * roots) or cannot be ruled out (`unknown`). While it is set,
-   * `srt-win` refuses to run a command under the ordinary token;
-   * `initialize()` with the option set to `false` removes the grants
-   * first.
+   * Set when write grants kept between sessions exist (`present`) or
+   * cannot be ruled out (`unknown`); `srt-win` then refuses to run a
+   * command under the ordinary token.
    */
   persistentGrants?: {
     state: 'present' | 'unknown'
@@ -497,21 +493,15 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
-   * Run the child under the write-restricted token: adds
-   * `--write-restricted-token` to the `srt-win exec` argv and selects
-   * git's OpenSSL backend (Schannel refuses restricted tokens).
-   * Default `true`; only an explicit `false` gives the ordinary
-   * token: no flag, no `--write-root`, no git backend entry. The
-   * caller must have verified the egress fence for this token shape
-   * first — {@link verifyWindowsWfpEgress} with the same value.
+   * Run the child under the write-restricted token. Default `true`;
+   * only an explicit `false` gives the ordinary token. The caller must
+   * have verified the egress fence for this token shape first.
    */
   writeRestrictedToken?: boolean
   /**
-   * The session's write roots, as granted by
-   * {@link grantWindowsAclPersistent}. Each is passed as
-   * `--write-root`, which puts the root's capability SID in the
-   * child token — without it the child cannot write the root.
-   * Ignored when {@link writeRestrictedToken} is `false`.
+   * The session's write roots. Each is passed as `--write-root`, which
+   * puts the root's capability SID in the child token; without it the
+   * child cannot write the root. Ignored with the ordinary token.
    */
   writeRoots?: readonly string[]
   /**
@@ -1012,15 +1002,11 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @param opts.writeRoots the session's write roots, so the probe
- *   child's token carries the same capability SIDs a command of the
- *   session gets. Ignored when `writeRestrictedToken` is `false`.
+ * @param opts.writeRoots the session's write roots; ignored when
+ *   `writeRestrictedToken` is `false`.
  * @param opts.writeRestrictedToken default `true`: probe with the
- *   write-restricted child token; `false` probes with the ordinary
- *   one. The WFP block filter matches by an access check of the
- *   connecting token, so a session MUST verify with the token its
- *   commands will run under: a filter that stopped matching would
- *   leave egress open.
+ *   write-restricted child token; a session MUST verify with the
+ *   token its commands will run under.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
@@ -2266,21 +2252,9 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
- * Session start under the write-restricted token (the default; see
- * `windows.writeRestrictedToken`): one `srt-win acl grant
- * --persistent` carrying the grants and the deny lists.
- *
- * Each `write` path becomes a persistent root: its ACEs name the
- * sandbox group and a capability SID of its own (not the sandbox
- * user) and are KEPT when the session ends —
- * {@link forgetWindowsPersistentGrants} removes them,
- * {@link revokeWindowsAclChecked} does not. Deny targets under a
- * persistent root are kept with it; `read` grants and deny targets
- * elsewhere are per-session. Pass `write` to
- * {@link wrapCommandWithSandboxWindows} as `writeRoots`.
- *
- * @throws on exit ≠ 0, including exit 2 (an input was skipped).
- *   Nothing falls back to a per-session grant.
+ * Session start under the write-restricted token: one `srt-win acl
+ * grant --persistent`. Grants on the `write` roots are KEPT at session
+ * end; {@link forgetWindowsPersistentGrants} removes them.
  */
 export function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
@@ -2324,15 +2298,8 @@ export function grantWindowsAclPersistent(
 
 /**
  * Remove every write grant kept between sessions (`srt-win acl forget
- * --all`): one walk per root.
- *
- * A session with `windows.writeRestrictedToken: false` must run this
- * before it grants anything, whenever
- * {@link WindowsSandboxUserStatus.persistentGrants} is set: a kept
- * grant lets the sandbox account write its tree under the ordinary
- * token.
- *
- * @throws if any grant could not be removed.
+ * --all`). A session with `windows.writeRestrictedToken: false` must
+ * run this first: a kept grant is writable under the ordinary token.
  */
 export function forgetWindowsPersistentGrants(
   opts: { srtWin?: SrtWinSpawn } = {},
@@ -2532,8 +2499,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     ],
     schannelCa: p.caCertPath !== undefined,
     // Schannel cannot acquire credentials under the write-restricted
-    // token; git's OpenSSL backend is unaffected and reads the same
-    // GIT_SSL_CAINFO.
+    // token; git's OpenSSL backend reads the same GIT_SSL_CAINFO.
     opensslBackend: writeRestricted,
     baseEnv: p.setEnvVars,
   })
@@ -2629,12 +2595,9 @@ export function windowsWriteRestrictedTokenEnabled(
 }
 
 /**
- * Why an existing install cannot be used by this `srt-win`, or
- * `undefined` when it can: its setup marker was written by a release
- * with a different setup version, and the repair is to re-run the
- * install. Only meaningful for a provisioned install; an `srt-win`
- * that does not report its setup version is not judged here (it
- * enforces the same check itself at launch).
+ * Why an existing install cannot be used by this `srt-win` (its setup
+ * marker is another release's; re-run the install), or `undefined`.
+ * An `srt-win` that does not report its setup version is not judged.
  */
 export function windowsSetupVersionMismatch(
   us: WindowsSandboxUserStatus,

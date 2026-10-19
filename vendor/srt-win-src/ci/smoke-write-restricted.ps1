@@ -1,93 +1,16 @@
 <#
-  Smoke test for the write-restricted child token
-  (`srt-win exec --write-restricted-token`, `token.rs`).
-
-  `srt-win exec` builds that token only when given the flag; the
-  library passes the flag unless its `windows.writeRestrictedToken`
-  option is `false`. Every row here names its token on the command
-  line: "option ON" is with the flag, "option OFF" / "ordinary token"
-  is without it.
-
-  The sandbox account is a member of BUILTIN\Users and Authenticated
-  Users, so with the ordinary token it can write wherever those groups
-  hold write access. The flag adds WRITE_RESTRICTED and the
-  restricting SIDs [<sandbox user>, Everyone, RESTRICTED] to the child
-  token. Rows (option ON unless noted):
-
-    A  write / create / delete in a directory that grants Modify only
-       to Authenticated Users, and in one that grants it only to
-       BUILTIN\Users: DENIED with the option, ALLOWED without it (the
-       OFF half proves the option is what closes it).
-    B  inside an `acl grant` root: write succeeds; a deny-stamped file
-       inside it is still denied.
-    C  the egress fence holds for this token (`wfp verify
-       --write-restricted-token`, and a direct connect from a
-       sandboxed process), and the permitted loopback range is still
-       reachable.
-    D  cmd, Windows PowerShell, node and git-bash each start; a
-       process can create and open a named mutex and event; two
-       sandboxed processes talk over a named pipe created with the
-       default security descriptor.
-    E  the child cannot open the runner process, or any of its
-       threads, with a write / code-execution / impersonation right.
-    F  OBSERVATION ONLY: whether a Schannel client handshake fails
-       under the option; prints the error. Never fails the run.
-    G  the child token itself: write-restricted, restricting SIDs
-       exactly the three above.
-
-  Then the write grants that are kept between sessions (`acl grant
-  --persistent`, `exec --write-root`, `persist.rs`), roots PA and PB:
-
-    P0  on an install whose setup marker is the previous version's —
-        one a broker of the previous release, which knows only the
-        ordinary token, would still launch on — `acl grant
-        --persistent` is refused and leaves nothing behind, and `exec`
-        does not run.
-    P1  a session given only PA writes, creates and deletes in PA and
-        can do none of them in PB, although PB carries the persistent
-        sandbox-group ACE; it can read PB. With the test-hooks build:
-        its token's restricting SIDs are the three plus one capability
-        SID.
-    P2  a session on PB creates a file and a directory there; a
-        session given only PA can then neither change their DACL
-        (icacls, and SetAccessControl on a handle) nor write the file
-        nor create inside the directory.
-    P3  a repeat session start on PA performs zero DACL writes.
-    P4  a deny target inside PA — one the real user owns and one the
-        sandbox user owns — stays denied during a session and after
-        it, and the owner cannot take the deny off.
-    P5  the real user can still change the ACL of a file of their own
-        under a persistent root.
-    P6  the fence probe reports blocked for a session's token; cmd,
-        Windows PowerShell, node and git-bash start under it and
-        git-bash forks.
-    P7  `acl forget <root>` removes a root's ACEs and its denies.
-    P8  while a persistent grant exists, `exec` without the token
-        flag is refused, also after the state database is deleted;
-        a restricted exec whose root has no capability SID recorded
-        does not run; a per-session `acl grant` is refused.
-    P9  turning the option off (`acl forget --all`) removes the
-        persistent ACEs and leaves each root's DACL as it was before
-        its grant; then the ordinary token runs again, and cannot
-        write a root that gives the sandbox account nothing itself.
-    P10 a per-session `acl grant` finds and removes a persistent grant
-        that neither the marker nor the database records.
-    P11 `uninstall` removes persistent grants.
-
-  A failing row is recorded and the script keeps going, so one run
-  reports every row; it throws at the end if any row failed.
-
-  Self-contained: installs under a fixed test-only sublayer GUID
-  (referenced by cleanup.ps1) and uninstalls in `finally`.
-
-  Two binaries. `$Exe` is the default-feature build: it is the broker
-  and runner of EVERY row, so the token, the fence and the
-  self-protection under test are always the shipped ones. `$HooksExe`
-  is a second build with `--features test-hooks`, which adds the
-  `probe token` and `probe parent-access` subcommands; rows G and E
-  run it as the sandboxed command (launched by `$Exe`) and nothing
-  else uses it. Without `$HooksExe` rows G and E are SKIPPED, with a
-  message, and the rest still run.
+  Smoke test for the write-restricted child token (`srt-win exec
+  --write-restricted-token`). Rows (option ON unless noted):
+    A  group-held write access is denied (allowed with the option off)
+    B  an `acl grant` root is writable; a deny stamp inside it holds
+    C  the egress fence holds for this token
+    D  common programs start; named objects and pipes work
+    E  the child cannot open the runner or its threads
+    F  observation only: Schannel handshake under the option
+    G  the child token's restricting SIDs
+    P0-P11  write grants kept between sessions (`acl grant --persistent`)
+  `$HooksExe` is a `--features test-hooks` build that rows G and E run
+  as the sandboxed command; without it they are skipped.
 #>
 param(
   [Parameter(Mandatory = $true, Position = 0)]
@@ -199,7 +122,6 @@ function Wait-Sb { param($h, [int] $TimeoutSec = 180)
   $child = (($raw -split "`r?`n") | Where-Object { $_ -notmatch '^srt-win:' }) -join "`n"
   return [pscustomobject]@{ exit = $h.p.ExitCode; raw = $raw; out = $child }
 }
-# Sandboxed exec, ordinary token (no flag).
 function SbOff { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--') + $tail)) $TimeoutSec
 }
@@ -542,7 +464,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
       } else { Ok "E: no write/VM/impersonation open of the runner process or its $($a.threads) thread(s) succeeded" }
       if (@($a.errors).Count -gt 0) { Write-Host "E: note: non-access-denied results: $(@($a.errors) -join '; ')" }
     }
-    # For the record only: the same probe under the ordinary token.
     $r = SbOff @($HooksAbs, 'probe', 'parent-access')
     Write-Host "E-obs: option OFF (not asserted): $($r.out.Trim())"
   }

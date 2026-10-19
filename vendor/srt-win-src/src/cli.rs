@@ -704,9 +704,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // read as present from any user's session).
         "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
-        // The marker version this build requires. An install whose
-        // `marker_version` differs was made by another release and
-        // must be re-run before this build launches anything.
+        // An install whose `marker_version` differs must be re-run.
         "setup_version": install::SETUP_VERSION,
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
@@ -1272,13 +1270,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Ordinary token: the bare runner connects; its token and
-            // the ordinary child token give the filter's access check
-            // the same answer. Write-restricted token: the runner
-            // launches this binary's `probe connect` as a lockdown
-            // child, so the connect is made under the exact token a
-            // sandboxed command gets. A probe child that cannot be
-            // created exits the runner with 1, reported as `error`.
+            // Write-restricted: the runner launches `probe connect` as a
+            // lockdown child, so the connect is made under the child token.
             let cmd = if write_restricted_token {
                 // A root with no capability SID fails the verify — never
                 // a probe under a shorter list.
@@ -1433,12 +1426,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
-            // A grant that outlives the session is made only on an
-            // install of this build's setup version: a broker built
-            // for an earlier one runs the sandbox account under the
-            // ordinary token, and refuses to launch exactly when the
-            // marker is this build's. Checked before the session
-            // database is opened, so a refusal leaves no state.
+            // Kept grants are made only on an install of this build's setup
+            // version; checked before the session database is opened.
             if persistent && let Err(e) = srt_win::install::require_current_setup() {
                 eprintln!("srt-win: error: acl grant --persistent: {e:#}");
                 std::process::exit(15);
