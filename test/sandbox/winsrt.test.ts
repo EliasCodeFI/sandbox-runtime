@@ -1928,6 +1928,32 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     90_000,
   )
 
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B7: node fetch to an allowedDomains host → 200 via proxy (NODE_USE_ENV_PROXY)',
+    async () => {
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `node -e "fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},15000)"`,
+        x => x.stdout.trim() === 'OK:200',
+      )
+      expectStatus('B7', r, [0])
+      expect(r.stdout.trim()).toBe('OK:200')
+    },
+    90_000,
+  )
+
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B8: clearing NODE_USE_ENV_PROXY in the command sends node fetch direct → BLOCKED',
+    async () => {
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxed(
+        `set "NODE_USE_ENV_PROXY=" & node -e "fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},8000)"`,
+      )
+      expect(r.stdout.startsWith('OK:')).toBe(false)
+    },
+    60_000,
+  )
+
   // ════════════════════════════════════════════════════════════════
   // Group C — direct-egress / bypass resistance
   // ════════════════════════════════════════════════════════════════
