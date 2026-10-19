@@ -392,31 +392,22 @@ fn encode_env_block(entries: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> V
 /// applied on top, holding **no two names that are equal ignoring
 /// case**.
 ///
-/// Windows environment names are case-insensitive, and a block that
-/// spells one name two ways breaks programs that load it into a
-/// case-insensitive table: .NET throws `ArgumentException: Item has
-/// already been added` from `Process.Start`, which takes down MSBuild
-/// tasks, `Start-Process -RedirectStandardOutput` in Windows
-/// PowerShell, `dotnet watch`, and so on. A second spelling also
-/// survives `set "NAME="`, which removes only the first match. This
-/// is the last point before the block is built, so the rule holds
-/// here whatever the overlay or the runner's environment contains:
+/// A block that spells one name two ways breaks programs that load it
+/// into a case-insensitive table (.NET's `Process.Start` throws
+/// `ArgumentException: Item has already been added`), and the second
+/// spelling survives `set "NAME="`.
 ///
 /// - Among inherited entries that differ only by case, the first in
 ///   the block is kept — the one `GetEnvironmentVariableW` returns.
 /// - An overlay entry replaces, name and value, whatever entry
-///   matches its name ignoring case (so the broker-supplied `PATH`
-///   supersedes the sandbox-user default `Path`), including an
-///   earlier overlay entry: the last `--env` wins.
-/// - The proxy variables in [`PROXY_NAME_SPELLING`] are then spelled
-///   as that table says, wherever they came from. Every other name
-///   keeps the spelling it arrived with.
+///   matches its name ignoring case, including an earlier overlay
+///   entry: the last `--env` wins.
+/// - The names in [`PROXY_NAME_SPELLING`] are then spelled as that
+///   table says. Every other name keeps the spelling it arrived with.
 ///
-/// Entries are sorted case-insensitively by name for block ordering —
-/// not the strict collation the `CreateProcess` docs describe, but in
-/// practice the loader and `GetEnvironmentVariableW` don't enforce
-/// ordering; `cmd /c set` and every consumer we've tested work
-/// regardless.
+/// Entries are sorted case-insensitively by name, not by the strict
+/// collation the `CreateProcess` docs describe; the loader and
+/// `GetEnvironmentVariableW` don't enforce ordering.
 fn merge_env(
     inherited: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     overlay: &[(String, String)],
@@ -475,31 +466,22 @@ fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
 /// The one spelling each proxy variable has in the child's
 /// environment.
 ///
-/// A native Windows program (C runtime `getenv`, .NET, PowerShell,
-/// cmd) looks names up ignoring case, so any one spelling serves it.
-/// A program on the Cygwin/MSYS2 runtime (Git Bash and its `/usr/bin`
-/// tools) sees names case-sensitively, so the spelling is chosen for
-/// those:
-///
-/// - `http_proxy`, `https_proxy`, `ftp_proxy`, `no_proxy`: wget reads
-///   only the lower-case names, and curl reads `http_proxy` in lower
-///   case only. curl reads the others, and `all_proxy`, in either
-///   case, lower case first.
-/// - `grpc_proxy`: gRPC reads the lower-case name.
-/// - `RSYNC_PROXY`: rsync reads only the upper-case name.
+/// A native Windows program looks names up ignoring case, so any one
+/// spelling serves it. A program on the Cygwin/MSYS2 runtime sees
+/// names case-sensitively, so the spelling is the one those read:
+/// wget reads only the lower-case names and curl reads `http_proxy`
+/// in lower case only, gRPC reads `grpc_proxy`, rsync reads only
+/// `RSYNC_PROXY`.
 ///
 /// Both spellings cannot be handed to such a program: when it starts
 /// a native child it rebuilds a Windows block from its case-sensitive
-/// environment, and the duplicate reaches everything it starts. What
-/// one spelling costs: on that runtime, a shell script that expands
-/// `$HTTP_PROXY`, `$HTTPS_PROXY`, `$ALL_PROXY`, `$FTP_PROXY`,
-/// `$NO_PROXY` or `$GRPC_PROXY` in upper case, or a program that
-/// reads only those, finds them unset. Native programs it starts are
-/// unaffected.
+/// environment, and the duplicate reaches everything it starts. The
+/// cost: on that runtime, a script or program that reads only the
+/// upper-case form of a lower-case name here finds it unset.
 ///
-/// A name that is not listed is not a proxy address this table knows
-/// a reader for (`NODE_USE_ENV_PROXY` is a switch, `DOCKER_HTTP_PROXY`
-/// has upper-case readers only) and keeps the spelling it was given.
+/// A name that is not listed (`NODE_USE_ENV_PROXY` is a switch,
+/// `DOCKER_HTTP_PROXY` has upper-case readers only) keeps the
+/// spelling it was given.
 const PROXY_NAME_SPELLING: &[&str] = &[
     "http_proxy",
     "https_proxy",

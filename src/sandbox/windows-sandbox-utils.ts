@@ -2253,8 +2253,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   //
   // Merged ignoring case, as Windows reads names: `generated` names
   // each proxy variable in both cases for Unix tools, and a caller's
-  // `Https_Proxy` is the same variable as ours. One name each goes to
-  // the runner (see mergeWindowsEnv).
+  // `Https_Proxy` is the same variable as ours.
   const overlay = mergeWindowsEnv(
     { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT },
     p.setEnvVars ?? {},
@@ -2298,11 +2297,9 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
 /**
  * The one spelling each of these proxy variables has in a sandboxed
- * command's environment. Mirrors `PROXY_NAME_SPELLING` in
- * `vendor/srt-win-src/src/launch.rs`, which has the reasoning: native
- * Windows programs look names up ignoring case, so the spelling is the
- * one the case-sensitive Cygwin/MSYS2 tools read (wget and curl want
- * `http_proxy` in lower case, rsync wants `RSYNC_PROXY` in upper).
+ * command's environment: the one the case-sensitive Cygwin/MSYS2 tools
+ * read. Must match `PROXY_NAME_SPELLING` in
+ * `vendor/srt-win-src/src/launch.rs`.
  */
 const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
   'http_proxy',
@@ -2317,10 +2314,8 @@ const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
 /**
  * Merge environment layers the way Windows reads names: ignoring case.
  * A later layer's entry replaces an earlier one, name and value, so the
- * result never holds two names that differ only by case. Two such names
- * in one environment block make .NET's `Process.Start` throw ("Item has
- * already been added"), which breaks MSBuild, `Start-Process` with
- * redirection and anything else that starts a process that way. The
+ * result never holds two names that differ only by case (two such names
+ * in one environment block make .NET's `Process.Start` throw). The
  * names in {@link WINDOWS_PROXY_NAME_SPELLING} are spelled as listed;
  * every other name keeps the spelling it was last given.
  *

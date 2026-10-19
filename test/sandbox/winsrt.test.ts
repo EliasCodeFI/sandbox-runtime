@@ -424,10 +424,8 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
   })
 
   it('the --env overlay names each variable once ignoring case', () => {
-    // Windows names are case-insensitive, and two spellings of one name
-    // in a block make .NET's Process.Start throw. The generated list
-    // names each proxy variable in both cases (for Unix tools), and a
-    // caller may spell ours a third way.
+    // The generated list names each proxy variable in both cases (for
+    // Unix tools), and a caller may spell ours a third way.
     const srtWin = resolveSrtWin({ path: process.execPath })
     const { argv } = wrapCommandWithSandboxWindows({
       command: 'exit 0',
@@ -2219,7 +2217,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     async () => {
       // ProcessStartInfo copies the block into a case-insensitive table
       // and throws "Item has already been added" on a name spelled two
-      // ways: what MSBuild, `dotnet watch` and Start-Process hit.
+      // ways.
       const r = await runSandboxed(
         `"${GIT_BASH}" -c "powershell.exe -NoProfile -Command '(New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count'"`,
         120_000,

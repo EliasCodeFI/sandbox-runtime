@@ -218,10 +218,8 @@ function Get-RepeatedEnvNames {
 }
 
 # ── R4b: a proxy variable given in upper case reaches the child ──
-# in lower case, once. Cygwin/MSYS2 programs see names
-# case-sensitively and wget and curl read the lower-case http_proxy;
-# native programs find it under either spelling. Two spellings in one
-# block break .NET (R4d, R4e), so there is exactly one.
+# in lower case, once: the spelling Cygwin/MSYS2 programs read. Two
+# spellings in one block break .NET (R4d, R4e).
 $r = RExec @('--env', "HTTP_PROXY=http://127.0.0.1:$PortLo",
              '--', $cmd, '/c', 'set http')
 if ($r.exit -ne 0) { throw "R4b: 'set http' exited $($r.exit). out: $($r.out)" }
@@ -288,8 +286,7 @@ Write-Host 'R4d ok: ProcessStartInfo.EnvironmentVariables loads'
 
 # ── R4e: Windows PowerShell Start-Process with redirection ───────
 # The same table is built before anything is started, so with a
-# repeated name nothing starts: MSBuild tasks, `dotnet watch` and
-# scripts that start a server this way all fail alike.
+# repeated name nothing starts.
 $r = RExec ($bothCases + @('--', $pwsh, '-NoProfile', '-Command',
   "`$o = Join-Path `$env:TEMP 'srt-r4e-out.txt'; " +
   "try { Start-Process cmd -ArgumentList '/c','echo R4E-OK' -RedirectStandardOutput `$o -Wait -NoNewWindow; Get-Content `$o } " +
