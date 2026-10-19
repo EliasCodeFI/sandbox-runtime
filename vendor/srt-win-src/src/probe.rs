@@ -60,9 +60,9 @@ pub enum Outcome {
     Refused = 3,
     Unreachable = 4,
     Skipped = 5,
-    /// No connect was made under the token shape: it could not be
-    /// assumed, no socket could be created under it, or the thread's
-    /// token did not read back as the one assumed.
+    /// No connect was made under the token shape: it could not be built
+    /// or assumed (a kernel refusal is `Denied`), no socket could be created
+    /// under it, or the thread's token did not read back as the one assumed.
     Error = 6,
     /// The kernel refused to put the token on the thread (access-denied
     /// at the impersonation call): the process cannot present that
