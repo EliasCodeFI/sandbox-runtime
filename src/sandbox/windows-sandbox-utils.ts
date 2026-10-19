@@ -2073,7 +2073,7 @@ export interface WindowsAclAceOutcome {
 
 /**
  * `acl revoke` statuses that show a grant released. An allow-list, so
- * a status from a newer or older srt-win fails closed.
+ * a status this code does not know fails closed.
  */
 const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
   'revoked',
