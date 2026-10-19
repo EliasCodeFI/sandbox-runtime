@@ -85,7 +85,6 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAclChecked,
-  windowsAclIncompleteRevoke,
   type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
@@ -288,29 +287,23 @@ function logWindowsAclOutcomes(
 
 /**
  * Whether the deny restore may run: only after a revoke that
- * completed, and never again in this process once one did not — a
- * grant may still be on disk and the sandbox account is shared.
+ * completed — otherwise a grant may still be on disk, and the sandbox
+ * account is shared. srt-win enforces the same rule from its records.
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
-  const earlier = windowsAclIncompleteRevoke()
-  if (revoke.complete && earlier === undefined) return true
-  const paths = [...new Set([...revoke.pending, ...(earlier ?? [])])]
+  if (revoke.complete) return true
+  const paths = revoke.pending
   logForDebugging(
-    `[Sandbox Windows] ` +
-      (revoke.complete
-        ? `an earlier grant revoke in this process did not complete`
-        : `grant revoke did not complete`) +
+    `[Sandbox Windows] grant revoke did not complete` +
       ` — NOT running the deny restore; deny ACEs stay in place ` +
       `while a grant may still be on disk. Grants possibly left in ` +
       `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
       (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
-      `. After this process exits, \`srt-win acl recover\` retries ` +
-      `the grants still recorded for it and removes its deny ACEs ` +
-      `once they are released (it exits non-zero while one is not). ` +
-      `A listed path that still shows an ALLOW entry for the sandbox ` +
-      `account after that is no longer recorded; remove the entry by ` +
-      `hand.`,
+      `. The next revoke retries them; after this process exits, ` +
+      `\`srt-win acl recover\` does, and removes its deny ACEs once ` +
+      `they are released (\`--force\` drops the record of a grant ` +
+      `that can no longer be located).`,
     { level: 'error' },
   )
   return false
