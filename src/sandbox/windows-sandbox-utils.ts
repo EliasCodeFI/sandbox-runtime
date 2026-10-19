@@ -1080,9 +1080,8 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
 } as const
 
 /**
- * The capability this library needs for a session under the
- * write-restricted token and `capabilities` (as `srt-win` reported
- * them) does not list, if any.
+ * The first capability this library needs under the write-restricted
+ * token that `capabilities` (as `srt-win` reported them) does not list.
  */
 export function missingWindowsSrtWinCapability(
   capabilities: readonly string[],
@@ -2034,9 +2033,9 @@ const WINDOWS_SERVICE_ACCOUNT_SIDS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Why an install leaves the profile read grant unapplied, if it does;
- * `undefined` when it applies it. The grant is made by this process,
- * for the profile of the user it runs as.
+ * Why an install leaves the profile read grant unapplied (`undefined`: it
+ * applies it): asked to skip, a service account, or not running as the
+ * owner of the interactive session, whose profile it would open instead.
  */
 export function windowsProfileGrantSkipReason(
   user: Pick<WindowsSandboxUserStatus, 'realUserSid' | 'sessionUserSid'>,
@@ -2323,9 +2322,8 @@ function resolveWindowsPath(p: string): ResolvedWindowsPath {
 }
 
 /**
- * `p` for comparison with another path, as the object `srt-win` opens for it:
- * links, junctions, 8.3 names and the case on disk are resolved by the same
- * final-path lookup the helper makes.
+ * `p` for comparison with another path: links, junctions, 8.3 names and
+ * the case on disk are resolved, as `srt-win` resolves a path it is given.
  */
 function windowsPathKey(p: string): string {
   return windowsPathKeyOf(p, resolveWindowsPath(p))
@@ -3081,7 +3079,9 @@ const PROFILE_PATH_KINDS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * The variables {@link windowsProfileReadEnv} can return.
+ * The variables {@link windowsProfileReadEnv} can return; any other name
+ * `srt-win` reports is dropped. `RUSTUP_HOME` and `CARGO_HOME` name
+ * directories, which stay read-only to the sandboxed command.
  */
 export const WINDOWS_PROFILE_READ_ENV_VARS: readonly string[] = [
   'NPM_CONFIG_USERCONFIG',
@@ -3093,8 +3093,8 @@ export const WINDOWS_PROFILE_READ_ENV_VARS: readonly string[] = [
 ]
 
 /**
- * The version of `srt-win profile status`'s record format this
- * library reads.
+ * The version of `srt-win profile status`'s record format this library
+ * reads. Any other version is not read: its lists decide what may be granted.
  */
 const WINDOWS_PROFILE_RECORD_VERSION = 1
 
@@ -3174,9 +3174,9 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
 }
 
 /**
- * The recorded profile read grant (`srt-win profile status`): whether
- * one exists and is current, and with `paths` every path it wrote on.
- * Cheap.
+ * The recorded profile read grant (`srt-win profile status`): whether one
+ * exists and is current, and with `paths` every path it wrote on. Throws
+ * `profile_operation_in_progress` while a grant or forget is running.
  */
 export function getWindowsProfileReadStatus(
   opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},
@@ -3223,9 +3223,9 @@ export interface WindowsProfileGrantItem {
   path: string
   reason: string
   /**
-   * On an `unverifiable` item: whether YOU can open the object for
-   * reading — `true`, `false`, or `'unknown'` where that was not
-   * tried.
+   * On an `unverifiable` item: whether YOU can open the object for reading
+   * (`'unknown'`: not tried). One you can read without seeing its access
+   * list is to be taken as readable to sandboxed commands as well.
    */
   callerReads?: boolean | 'unknown'
   /**
@@ -3264,8 +3264,8 @@ export interface WindowsProfileGrantResult {
   /** Junctions, symbolic links, cloud placeholders: nothing is written on or through them. */
   skipped: WindowsProfileGrantItem[]
   /**
-   * Paths that were to be granted and whose access list this user may
-   * not change.
+   * Paths that were to be granted and whose access list this user may not
+   * change. They stay unreadable to sandboxed commands.
    */
   notGranted: WindowsProfileGrantItem[]
   /**
@@ -3717,8 +3717,9 @@ export function windowsProfileExclusionConflicts(
 }
 
 /**
- * Environment variables an embedder may set for a sandboxed command
- * so each tool reads the real user's configuration FILE in place.
+ * Variables an embedder may set so a tool reads the real user's files in
+ * place. Empty unless the grant is current; never one `env` already holds.
+ * The library sets none of them itself.
  */
 export function windowsProfileReadEnv(
   status: WindowsProfileGrantStatus,

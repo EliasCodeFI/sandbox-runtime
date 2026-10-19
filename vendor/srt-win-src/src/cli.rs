@@ -1803,8 +1803,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .cloned()
                         .collect();
                     rest.extend(per_session_denies);
-                    // With them, for this session only, the recorded
-                    // profile paths the read denies cover.
+                    // Plus, for this session only, a read deny on each recorded
+                    // profile path those denies cover; never kept with a root.
                     let (w, f) =
                         db.apply_aces_and(&sandbox_user_sid, &rest, &denies.also_read_deny)?;
                     at.targets.extend(denies.targets);
@@ -2124,8 +2124,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let test_profile: Option<String> = None;
             #[cfg(feature = "test-hooks")]
             let test_profile = test_profile.or_else(test_profile_from_env);
-            // The grant is for the profile of a person who runs
-            // sessions.
+            // A service account runs no sessions: its profile gets no grant.
             let me = srt_win::sid::current_user_sid()?;
             if test_profile.is_none() && is_service_account(&me) {
                 eprintln!(
@@ -2386,7 +2385,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // direct connect). Standalone `srt-win exec` callers
             // should run `srt-win wfp verify` once per session.
 
-            // Per-exec file deny — `--deny-read`/`--deny-write`.
+            // A named session is verified and WATCHED. Not recorded, or gone,
+            // this process holds for itself: it lives as long as the command.
             let session = match held_by {
                 Some(pid) => srt_win::state_db::watch_session(pid)?,
                 None => None,
@@ -2700,9 +2700,9 @@ fn exit_if_roots_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Resul
 /// recorded, and `acl forget --all` / `profile forget` finish the job.
 const EXIT_GRANTS_NOT_FORGOTTEN: i32 = 23;
 
-/// The calling user's half of `uninstall`, run once the machine-wide
-/// removal has succeeded: forget their profile read grant and their
-/// kept write grants.
+/// The calling user's half of `uninstall`, after the machine-wide removal:
+/// forget their profile read grant and kept write grants. Returns 0, or
+/// [`EXIT_GRANTS_NOT_FORGOTTEN`] when something stays recorded.
 fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: bool) -> i32 {
     if keep_user {
         return 0;
@@ -2760,8 +2760,8 @@ fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: b
             eprintln!("srt-win: WARNING: persistent write grants not removed: {e:#}");
         }
     }
-    // The quiet check was made before the elevated step and nothing
-    // kept a session from starting since.
+    // Nothing kept a session from starting after the quiet check. One
+    // that did has lost its account: named, so the user can end it.
     let holder = srt_win::state_db::HolderPid(std::process::id());
     if let Ok((held, _)) = srt_win::state_db::with_init_lock(holder, false, |db| {
         srt_win::state_db::live_holders(db, None)

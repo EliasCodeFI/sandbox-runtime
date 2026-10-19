@@ -1094,7 +1094,8 @@ async function startMuxProxyServer(
  */
 export interface SandboxInitializeOptions {
   /**
-   * Windows.
+   * Windows: profile exclusions this session may still be granted READ on.
+   * Never applies to a write root or to a path above an exclusion.
    */
   dangerouslyAllowReadOfProfileExclusions?: readonly string[]
 }
@@ -1277,8 +1278,8 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
-    // The read grant on the user's profile. It belongs to the
-    // write-restricted token (the default).
+    // The profile read grant exists only under the write-restricted
+    // token. initialize() never writes or refreshes it.
     windowsProfileRead = 'absent'
     windowsProfileReadWarnings = []
     let profileExclusions: Parameters<
@@ -1308,7 +1309,7 @@ async function initializeSteps(
           })
         }
       } else {
-        // The write-restricted token (the default).
+        // Required whether or not a profile grant is recorded.
         const missing = missingWindowsSrtWinCapability(u.capabilities)
         if (missing !== undefined) {
           throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
@@ -2954,8 +2955,6 @@ async function wrapWithSandboxArgv(
         ],
         held: windowsFsStampedSet,
       })
-      // As at initialize(): `srt-win` expands a deny onto the recorded
-      // profile paths it covers.
       const denyRead = ranked.denyRead
       perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
       // srt-win expands the deny from the record as it is when the command
@@ -3600,9 +3599,9 @@ export interface ISandboxManager {
    */
   getWindowsProfileRead(): 'granted' | 'absent' | undefined
   /**
-   * Windows: what the current session has to tell its user about the
-   * profile read grant — at present, excluded paths that sandboxed
-   * commands can read all the same.
+   * Windows: warnings about the profile read grant for the current session:
+   * excluded paths that are, or may be, readable to sandboxed commands, and
+   * entries that could not be removed. None of them is a rejection.
    */
   getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
   getSentinelRegistry(): SentinelRegistry

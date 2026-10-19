@@ -684,9 +684,9 @@ pub fn share_root(canon: &str) -> Option<String> {
         .then(|| format!(r"\\?\{}\", &rest[..2]))
 }
 
-/// [`locate_by_file_id`] for an object on a network share, asked of
-/// the share `canon` is on: the caller named that path, so the server
-/// is contacted.
+/// [`locate_by_file_id`] on the share `canon` is on (contacts the server).
+/// Only the share's plain "no such file" is `Gone`; unsupported or refused
+/// is `Unknown`; a share that does not answer is `VolumeAbsent`.
 pub fn locate_on_share(canon: &str, file_id: &FileId) -> Located {
     let Some(root) = share_root(canon) else {
         return Located::Unknown;
@@ -709,8 +709,9 @@ pub fn locate_on_share(canon: &str, file_id: &FileId) -> Located {
     locate_from(root_handle.raw(), file_id, false)
 }
 
-/// Open the object `file_id` names on the volume `anchor` is a handle
-/// on, and say where it is.
+/// Open the object `file_id` names on the volume `anchor` is open on, and
+/// say where it is. `stale_is_gone`: `ERROR_INVALID_PARAMETER` means the id
+/// names nothing (true of local NTFS, not of a share).
 fn locate_from(anchor: HANDLE, file_id: &FileId, stale_is_gone: bool) -> Located {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{

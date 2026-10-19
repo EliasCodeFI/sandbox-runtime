@@ -246,8 +246,8 @@ pub fn mark_profile_operation() -> Result<()> {
     Ok(())
 }
 
-/// Whether the lock file's word names a profile operation of a
-/// process that is still running.
+/// Whether the lock file's word names a profile operation of a process
+/// that is still running. No word, another shape or a dead pid is not one.
 fn word_says_profile_operation(file: &std::fs::File) -> bool {
     use std::os::windows::fs::FileExt;
     let mut word = [0u8; LOCK_WORD_LEN];
@@ -411,8 +411,9 @@ pub fn acquire_session_lock() -> Result<impl Drop> {
 
 use crate::profile::is_access_denied;
 
-/// Every live holder of anything: `(process, kind, path)` of each
-/// holder row whose process is alive, except those of `except`.
+/// Every holder row whose process is alive, except those of `except`.
+/// Fails if the process list cannot be read. Call under the init lock,
+/// after crash recovery.
 pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
     live_holders_with(db.conn(), except, alive_by_one_snapshot()?)
 }
@@ -570,9 +571,9 @@ pub fn open_db() -> Result<Connection> {
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
 pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", KIND_DENY_SATISFIED];
-/// A read deny the holder asked for that could not be written because
-/// the object's access list may not be changed, on an object whose own
-/// access list gave the sandbox account no read at the time.
+/// A read deny that could not be written (access denied) on an object
+/// whose own access list gave the sandbox account no read at the time.
+/// No ACE and no `working_aces` row stand behind the row.
 pub const KIND_DENY_SATISFIED: &str = "deny_satisfied";
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
@@ -884,7 +885,8 @@ pub fn with_init_lock<R>(
 }
 
 /// [`with_init_lock`] WITHOUT crash recovery, for a command that only
-/// records its own hold.
+/// records its own hold: starting a command must not release what a dead
+/// holder left behind.
 pub fn with_init_lock_unrecovered<R>(
     holder_pid: HolderPid,
     f: impl FnOnce(&mut Locked) -> Result<R>,
@@ -897,8 +899,9 @@ pub fn with_init_lock_unrecovered<R>(
     f(&mut locked)
 }
 
-/// [`with_init_lock`] for a profile grant or forget: the same lock, held for
-/// the whole run.
+/// [`with_init_lock`] for a profile grant or forget, held for the whole
+/// run. `f` must refuse if [`live_holders`] finds anyone, and otherwise
+/// call [`mark_profile_operation`].
 pub fn with_profile_lock<R>(f: impl FnOnce(&mut Locked) -> Result<R>) -> Result<R> {
     let (_mutex, conn, _report) = locked_recovered(false)?;
     let mut locked = Locked {
@@ -1173,7 +1176,8 @@ impl Locked {
                 match db.ensure_ace(canon, read_deny, sandbox_sid) {
                     Ok(w) => witnesses.push(w),
                     Err(e) if path_id::is_not_found(&e) => {}
-                    // As above: satisfied by the object's own access list.
+                    // Access denied, and the object's own access list already gives
+                    // the sandbox account no read: satisfied, not failed.
                     Err(e) if is_access_denied(&e) && crate::profile::closed_to_sandbox(canon) => {
                         if let Err(e) = db.note_satisfied_deny(canon) {
                             eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
@@ -1835,8 +1839,8 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
         // somehow stale.
         return true;
     }
-    // Decided from the system's process list, which gives every
-    // process's creation time to any caller.
+    // From the system's process list: opening the process cannot tell a
+    // dead holder whose pid was reused from a live one.
     match process_create_times() {
         Ok(all) => listed_alive(&all, pid, expected_create_filetime),
         // No complete list: ask the process directly; what that cannot
@@ -1845,9 +1849,9 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
     }
 }
 
-/// The rule: a holder is DEAD only on positive evidence from a
-/// complete process list — its pid is not in it, or is in it with a
-/// creation time other than the one recorded.
+/// A holder is DEAD only on positive evidence from a complete list: its pid
+/// is absent, or listed with another creation time. Recorded with no
+/// creation time (0), it counts as alive while the pid exists.
 fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i64) -> bool {
     match all.get(&pid) {
         None => false,
@@ -1855,9 +1859,9 @@ fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i
     }
 }
 
-/// [`is_process_alive`] over ONE reading of the process list, for a
-/// query that judges a holder per row: a session with hundreds of rows
-/// is one reading, not hundreds.
+/// [`is_process_alive`] over ONE reading of the process list, for a query
+/// that judges a holder per row. Fails, rather than guess, if the list
+/// cannot be read.
 fn alive_by_one_snapshot() -> Result<impl Fn(u32, i64) -> bool> {
     let all = process_create_times().context(
         "cannot tell which sandbox sessions are running (the system's process list could \
@@ -2177,7 +2181,8 @@ mod tests {
         (n("brokers"), n("ace_holders"), n("working_aces"))
     }
 
-    /// One lock for everything.
+    /// A profile operation that is going ahead is named to those it keeps out;
+    /// before that, after it, or under another word, it is an ordinary wait.
     #[test]
     fn a_profile_operation_going_ahead_is_named_to_those_it_keeps_out() {
         use std::os::windows::fs::FileExt;

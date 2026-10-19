@@ -38,7 +38,8 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The calling user's profile, from the known folders.
+    /// The calling user's profile, from the known folders. `test_profile`,
+    /// which only a `test-hooks` build can pass, stands in for it.
     pub fn resolve(test_profile: Option<&str>) -> Result<Layout> {
         let canon = |p: &str| -> Result<String> {
             let (c, is_dir) = path_id::canonicalize_path(p)
@@ -212,9 +213,9 @@ fn open_no_follow(path: &str, access: u32) -> Result<Opened> {
     })
 }
 
-/// Open `path` itself with EXACTLY `access` and nothing more.
-/// `CreateFileW` always asks for `SYNCHRONIZE` and
-/// `FILE_READ_ATTRIBUTES` on top of what it is given.
+/// Open `path` itself with EXACTLY `access` (`NtOpenFile`). `CreateFileW`
+/// always adds `SYNCHRONIZE` and `FILE_READ_ATTRIBUTES`, which an object
+/// that denies reading refuses even to its owner.
 fn open_bare(path: &str, access: u32) -> Result<OwnedHandle> {
     use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows::Wdk::Storage::FileSystem::NtOpenFile;
@@ -273,7 +274,9 @@ pub(crate) fn is_access_denied(e: &anyhow::Error) -> bool {
         .is_some_and(|we| we.code() == windows::Win32::Foundation::ERROR_ACCESS_DENIED.into())
 }
 
-/// [`open_no_follow`] with the access a DACL read and write needs.
+/// [`open_no_follow`] with the access a DACL read and write needs. Refused
+/// that, it opens for `READ_CONTROL | WRITE_DAC` alone and takes the
+/// object's attributes and identity from its parent's listing.
 fn open_for_stamp(path: &str, is_dir: Option<bool>) -> Result<Opened> {
     let full = || -> Result<Opened> {
         let (is_dir, probe) = match is_dir {
@@ -612,8 +615,8 @@ pub enum NoteClass {
     /// be readable, and the allow could not be removed. Not on the
     /// exclusion list: it has merely left the grant.
     StaleAllow,
-    /// The same on a path that IS on the exclusion list now: a
-    /// protected store readable through an entry this product wrote.
+    /// An allow of an earlier run that could not be removed, on a path that IS
+    /// on the exclusion list now. Reported with the unprotected ones.
     OurAllow,
     /// A directory granted whole that must now be granted child by child
     /// (something beneath it became an exclusion) and could not be rewritten:
@@ -807,9 +810,9 @@ pub struct Marker {
     /// as paths beneath the profile. A later run keeps them unless it
     /// is told to replace them.
     pub extra: Vec<String>,
-    /// Exclusions that came from the calling user's environment
-    /// ([`plan::ENV_STORES`]): a store a variable had moved inside the
-    /// profile when a grant ran.
+    /// Exclusions from the calling user's environment ([`plan::ENV_STORES`]).
+    /// No run drops them, not even one told to replace the added exclusions:
+    /// what was protected once stays protected until the grant is forgotten.
     pub env_extra: Vec<String>,
     /// Every PROTECTED exclusion the grant was made with, as absolute paths,
     /// wildcards as written, existing or not: what must never be granted, by
@@ -1369,9 +1372,9 @@ fn sandbox_sids(ids: &Ids) -> Vec<&str> {
         .collect()
 }
 
-/// What the object's own access list says about the sandbox account
-/// reading it, read with the least access that can ([`open_bare`],
-/// `READ_CONTROL`).
+/// What the object's own access list lets the sandbox account read, on it
+/// or in what it hands down; `Ok(None)` if nothing is there. Read with
+/// `READ_CONTROL` alone ([`open_bare`]).
 fn own_access(
     path: &str,
     ids: &Ids,
@@ -1463,8 +1466,8 @@ fn exclusion_without_deny(path: &str, ids: &Ids, why: &anyhow::Error) -> Probe {
     exclusion_as_it_is(path, ids, &format!("could not be written ({why:#})"))
 }
 
-/// [`exclusion_without_deny`] at any later time: what an exclusion
-/// that carries no deny of ours is NOW.
+/// What an exclusion that carries no deny of ours is NOW, by its own
+/// access list. A look that fails is `Unverifiable`, never closed.
 fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
     if !path_id::is_drive_path(path) || path_id::on_network_drive(path) {
         return Probe::unverifiable(
@@ -1506,7 +1509,6 @@ fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
                  Only its owner or an administrator can"
             ),
         ),
-        // Unverifiable.
         Err((cause, e)) => {
             const FILE_READ_DATA: u32 = 0x1;
             let caller_reads = open_bare(path, FILE_READ_DATA).is_ok();
@@ -1526,9 +1528,9 @@ fn exclusion_as_it_is(path: &str, ids: &Ids, why: &str) -> Probe {
     }
 }
 
-/// Whether `path` is closed to the sandbox account by its own access
-/// list: for a session read deny that cannot be written there — the
-/// deny is then already what the access list says.
+/// Whether `path` is closed to the sandbox account by its own access list,
+/// so that a session read deny that cannot be written there is already
+/// satisfied. `false` whenever that cannot be established.
 pub fn closed_to_sandbox(path: &str) -> bool {
     Ids::load().is_ok_and(|ids| {
         matches!(
@@ -1694,8 +1696,8 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
     Ok(removed)
 }
 
-/// Exclusions added by the caller, as components beneath the
-/// profile.
+/// Exclusions added by the caller, as components beneath the profile,
+/// resolved where they exist. One outside the profile is an error.
 fn resolve_extra(profile: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     for r in raw {
@@ -1719,7 +1721,9 @@ fn resolve_extra(profile: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
     Ok(out)
 }
 
-/// `profile grant`: bring the profile to the plan.
+/// `profile grant`: bring the profile to the plan. Order: the record
+/// (marked incomplete), every exclusion's deny, stale removals, the allows.
+/// A path that cannot be written is reported by class, never a failure.
 pub fn grant(
     store: &Store<'_>,
     ids: &Ids,
@@ -1927,8 +1931,8 @@ pub fn grant(
         // The stamp may have got as far as recording the new kind.
         upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created)?;
         match (is_allow(r.kind), wanted.map(|n| is_allow(n.kind))) {
-            // An allow of ours is on it and it is no longer to be
-            // readable. Two cases, not equally serious.
+            // An allow of ours stays on a path that is no longer to be readable:
+            // on the exclusion list now it is `OurAllow`, otherwise `StaleAllow`.
             (true, Some(false)) | (true, None) => {
                 let excluded_now = wanted.is_some()
                     || plan::rel_components(profile, path).is_ok_and(|rel| {
@@ -2980,9 +2984,8 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// The first failure met on a real profile: an excluded directory
-    /// whose owner has denied reading to Everyone, Authenticated Users
-    /// and Users.
+    /// An excluded directory whose owner has denied reading to Everyone,
+    /// Authenticated Users and Users does not stop the grant.
     #[test]
     fn an_excluded_directory_its_owner_is_denied_reading_of_does_not_stop_the_grant() {
         let base = scratch("locked");
@@ -3063,9 +3066,9 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// The second: objects the caller neither owns nor may change.
-    /// Needs to hand objects to another owner, which takes an elevated
-    /// run (CI's); elsewhere it stops after finding that out.
+    /// Objects the caller neither owns nor may change are classed and do not
+    /// stop the grant. Handing objects to another owner needs an elevated run;
+    /// without one the test stops there.
     #[test]
     fn a_cargo_home_moved_inside_the_profile_has_its_credentials_protected() {
         const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestCargoHome";

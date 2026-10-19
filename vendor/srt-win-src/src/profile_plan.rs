@@ -239,7 +239,8 @@ pub const BUILT_IN: &[Excl] = &[
         ungranted_only: false,
         create: false,
     },
-    // UNGRANTED-ONLY.
+    // Ungranted-only: every program writes there, and sessions stage
+    // directories of their own in it.
     ungranted(Local, "Temp"),
 ];
 
@@ -571,8 +572,9 @@ enum Beneath {
     Unexamined(String),
 }
 
-/// Whether something that exists beneath the directory `path` matches
-/// the rest of `rule`, which `path` lies above.
+/// Whether something that exists beneath the directory `path` matches the
+/// rest of `rule`, which `path` lies above. A directory that cannot be
+/// listed counts as a match.
 fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Listing) -> Beneath {
     fn go(dir: &str, rest: &[Pat], top: bool, list: &dyn Fn(&str) -> Listing) -> Beneath {
         let Some((first, rest)) = rest.split_first() else {
@@ -606,9 +608,9 @@ fn matched_beneath(path: &str, rule: &str, list: &dyn Fn(&str) -> Listing) -> Be
     go(path, &pats[depth..], true, list)
 }
 
-/// Why a session must not be granted `path` (canonical) while a
-/// profile read grant with these recorded exclusions exists; `None`
-/// when it may.
+/// Why a session must not be granted `path` while a profile read grant
+/// with these exclusions exists (`None`: it may): it is a protected path,
+/// lies inside one, or lies above one. Only a read path can be `admitted`.
 pub fn session_grant_refusal(
     path: &str,
     write: bool,
@@ -939,7 +941,8 @@ pub fn plan(tree: &mut dyn Tree, rules: &Rules) -> Result<Vec<Node>, String> {
     plan_resolved(tree, rules).map(|(nodes, _)| nodes)
 }
 
-/// [`plan`], with the rules it ended up with.
+/// [`plan`], with the rules it ended up with: those carried over to the
+/// targets of links included, which are what is recorded.
 pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, Rules), String> {
     let mut rules = rules.clone();
     for _ in 0..=MAX_LINK_ROUNDS {
@@ -1290,8 +1293,9 @@ pub const SANDBOX_MAYBE: [&str; 9] = [
 /// Read data / list directory, and the generic rights that include it.
 const READS: u32 = 0x1 | 0x8000_0000 | 0x1000_0000;
 
-/// Whether an object's own access list may let the sandbox account
-/// read it (a file's data, a directory's listing).
+/// Whether an object's own access list may let the sandbox account read
+/// it. No access list at all admits everyone; a group the account only may
+/// be in counts for an allow, never for a deny.
 pub fn may_read(dacl: Option<&[AceFact<'_>]>, certain: &[&str], maybe: &[&str]) -> bool {
     let Some(dacl) = dacl else {
         return true;
@@ -1332,9 +1336,8 @@ fn first_word_on_reading<'a>(
     None
 }
 
-/// What an excluded path is, when the deny that marks it could not be
-/// written (the caller neither owns the object nor may change its
-/// access list). The deny is the second layer.
+/// What an excluded path is when its deny could not be written. The first
+/// layer holds regardless: nothing above it carries an inheriting allow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unstamped {
     /// Its own access list gives the sandbox account no read — neither
@@ -1377,8 +1380,8 @@ pub enum Moved {
     List,
 }
 
-/// The built-in list protects each tool's store where the tool keeps
-/// it by default.
+/// Variables that move a protected store. What one names, when inside the
+/// profile, is protected as well as the store's default place.
 pub const ENV_STORES: &[(&str, Moved)] = &[
     (
         "CARGO_HOME",
@@ -1427,8 +1430,9 @@ pub fn env_exclusions(own_env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     out
 }
 
-/// Whether both credential files of the cargo home `dir` are among
-/// the recorded protected exclusions (absolute paths, as recorded).
+/// Whether both credential files of the cargo home `dir` are among the
+/// recorded protected exclusions. Only then is `dir` offered as
+/// `CARGO_HOME`.
 pub fn cargo_home_protected(exclusions: &[String], dir: &str) -> bool {
     let key = |p: &str| {
         p.strip_prefix(r"\\?\")
@@ -1444,8 +1448,9 @@ pub fn cargo_home_protected(exclusions: &[String], dir: &str) -> bool {
 
 // ─── Configuration pointers ─────────────────────────────────────────
 
-/// Environment variables an embedder may set for a sandboxed command
-/// so a tool reads the real user's configuration file in place.
+/// Variables an embedder may set so a tool reads the real user's files in
+/// place, each only when its file or directory is there and covered by the
+/// grant. `RUSTUP_HOME` and `CARGO_HOME` name directories.
 pub fn env_pointers(
     profile: &str,
     roaming: Option<&str>,
@@ -2644,8 +2649,8 @@ mod tests {
         }
     }
 
-    /// The two Rust homes are named where the grant reaches them, at the place
-    /// the real user's environment says, else the default one.
+    /// `RUSTUP_HOME` and `CARGO_HOME` are named where the grant reaches them, at
+    /// the place the real user's environment says, else the default one.
     #[test]
     fn the_rust_homes_are_named_where_the_grant_reaches_them() {
         let profile = r"C:\Users\me";
@@ -2723,8 +2728,8 @@ mod tests {
         assert!(!cargo_home_protected(&[], r"C:\Users\me\.cargo"));
     }
 
-    /// What "traversable through the grant" is for a directory, on
-    /// the plan of a profile.
+    /// `.rustup` is granted whole; `.cargo` is a container whose credential
+    /// files are denied on themselves.
     #[test]
     fn a_container_is_traversable_and_its_exclusions_stay_denied() {
         let mut t = Mem::default();

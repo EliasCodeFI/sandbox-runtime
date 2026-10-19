@@ -671,8 +671,8 @@ pub(crate) fn converge_on(
         params![canon, cur.as_bytes().as_slice(), spec],
     )
     .context("record persistent write intent")?;
-    // The walk of the tree is spared only where the write is seen to
-    // change nothing that is handed down.
+    // The walk is spared only where nothing handed down changes, and
+    // never where the record cannot vouch that an earlier write finished.
     let unfinished = matches!(&record, Some((_, _, 0)));
     let written = acl::write_persistent_aces_at(target, &t, &want, unfinished || same)?;
     if want.is_empty() {
@@ -1151,7 +1151,9 @@ fn forget_one_with(
     })
 }
 
-/// Look at every pending strip again.
+/// Look at every pending strip again; an entry goes only once its ACEs are
+/// off or its volume says the object is gone. A share is contacted only
+/// with `probe_network`. Returns what is still pending.
 pub(crate) fn retry_pending(
     conn: &Connection,
     ids: &Ids,
@@ -1166,7 +1168,8 @@ pub(crate) fn retry_pending(
             if !probe_network {
                 return Located::VolumeAbsent;
             }
-            // On a share the recorded path is tried first.
+            // Not at its recorded path: looked for by id on that share. If the
+            // share cannot say where it is or that it is gone, the entry stays.
             let elsewhere = || match path_id::locate_on_share(&p.path, &p.file_id) {
                 Located::Gone => {
                     eprintln!(
@@ -1241,9 +1244,9 @@ fn retry_pending_with(
     Ok((left, changed))
 }
 
-/// Give up the pending strips recorded for `paths`: the deliberate way to
-/// stop waiting for a volume that will not return (reformatted, discarded).
-/// Nothing is written anywhere but the list.
+/// Give up the pending strips recorded for `paths` (a volume that will not
+/// return). Refuses an entry whose volume is present; writes nothing but
+/// the list.
 pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Vec<PendingStrip>> {
     let pending = retry_pending(conn, ids, true)?;
     let names = |p: &PendingStrip, want: &str| {

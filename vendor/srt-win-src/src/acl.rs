@@ -660,9 +660,9 @@ fn write_dacl_on_object(
     Ok(())
 }
 
-/// Write `new` — the explicit entries the object is to carry — as
-/// `target`'s access list, read as `(sd, old)`. The one place a DACL
-/// of a file or directory is written from a composed list.
+/// Write `new` (the explicit entries) as `target`'s access list. On the
+/// object alone when nothing handed down changes ([`same_inheritable`]);
+/// otherwise, or if that fails or loses a mark, with the walking call.
 pub(crate) fn commit_dacl(
     target: DaclTarget<'_>,
     sd: &OwnedSd,
@@ -1117,9 +1117,8 @@ struct Placement {
     allows_first: bool,
 }
 
-/// A DACL with `denies` and `allows` written into `acl` around the
-/// explicit entries `stays` keeps — the entries that are not the
-/// caller's.
+/// A DACL with `denies` at the head and `allows` after the last explicit
+/// deny among the entries `stays` keeps, which are not moved.
 fn place_around(
     acl: *const ACL,
     stays: impl Fn(&ACE_HEADER, &[u8]) -> bool,
@@ -1164,13 +1163,16 @@ fn place_around(
     )
 }
 
-/// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to
-/// exactly `set`.
+/// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to exactly
+/// `set`. Always writes, with the walk of the tree: the install's entry
+/// point, where a repeated run must finish what a cut-short one left.
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
     apply_sandbox_aces_how(canonical_path, sandbox_sid, set, None, Commit::Walk)
 }
 
-/// [`apply_sandbox_aces`], told the sandbox group.
+/// [`apply_sandbox_aces`] for a session: nothing is written if nothing
+/// changes. Where the object carries an explicit read deny for the group,
+/// the session's allow goes ahead of it (an exclusion admitted on purpose).
 pub fn apply_sandbox_aces_over(
     canonical_path: &str,
     sandbox_sid: &str,
@@ -1398,10 +1400,12 @@ pub struct PersistentTrustees<'a> {
     /// for and may still name (the marker's record of them): their
     /// ACEs are ours to remove like the current group's.
     pub previous_group_sids: &'a [String],
-    /// The sandbox user.
+    /// The sandbox user. A session's allow for it may precede our deny
+    /// ([`persistent_layout_ok`]).
     pub sandbox_user_sid: Option<&'a str>,
-    /// The DENY entries the record lists for the path being judged:
-    /// those wanted now and those of the last write.
+    /// The DENY entries the record lists for the path: those wanted now and
+    /// those of the last write. `None`: no record, so a deny is told by its
+    /// mask ([`product_deny_shape`]).
     pub recorded_denies: Option<&'a [AceView]>,
 }
 
@@ -1480,8 +1484,9 @@ pub struct PersistentWant<'a> {
     pub profile: Option<ProfileAce>,
 }
 
-/// The explicit ACEs of a persistent path, in the order they are
-/// written at the head of its DACL.
+/// The explicit ACEs a persistent path is to carry, denies first. None
+/// names the sandbox USER: its SID is a restricting SID of every session,
+/// so an allow for it would pass both checks for all of them.
 pub fn persistent_aces(w: &PersistentWant<'_>) -> Vec<AceView> {
     let g = w.group_sid;
     let mut v = Vec::with_capacity(7);
@@ -1578,7 +1583,8 @@ pub fn write_persistent_aces(
     write_persistent_aces_at(DaclTarget::Path(canonical_path), t, want, false)
 }
 
-/// [`write_persistent_aces`] on a path or on an open handle.
+/// [`write_persistent_aces`] on a path or an open handle. `finish_walk`
+/// forces the walk of the tree: an earlier write may have been cut short.
 pub fn write_persistent_aces_at(
     target: DaclTarget<'_>,
     t: &PersistentTrustees<'_>,
@@ -1627,9 +1633,9 @@ pub fn write_persistent_aces_at(
     commit_dacl(target, &sd, old, &new, how).with_context(|| format!("persistent ACEs '{label}'"))
 }
 
-/// Whether the explicit ACEs among `aces` (DACL order) are laid out
-/// so that the persistent ones do what they are for
-/// ([`place_around`]).
+/// Whether no explicit allow precedes one of our denies and no explicit
+/// deny follows one of our allows. A session's allow for the sandbox user
+/// ahead of our deny is the one exception.
 pub fn persistent_layout_ok(aces: &[AceView], t: &PersistentTrustees<'_>) -> bool {
     let mut seen_allow = false;
     let mut seen_our_allow = false;
