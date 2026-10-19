@@ -2407,8 +2407,6 @@ describe('Config Validation', () => {
       ]) {
         expect(keys).not.toContain(gone)
       }
-      // A configuration written for the earlier flag still parses; the
-      // keys are dropped, not honoured.
       const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
       expect(r.success).toBe(true)
       expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])

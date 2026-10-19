@@ -1,22 +1,8 @@
-//! What the ACEs of a persistent write root grant to which token —
-//! `AccessCheck` run directly on a security descriptor built from
-//! [`srt_win::acl::persistent_aces`], against tokens built by
-//! [`srt_win::token::make_sandbox_token`]. No file, no sandbox
-//! account: the test's own user stands in for the sandbox user (it
-//! owns the descriptor, as the sandbox user owns the files it
-//! creates), and `Authenticated Users`, which its token carries and
-//! which is not a restricting SID, stands in for the sandbox group.
-//!
-//! Pinned here:
-//!   - a write-restricted token WITH the root's capability SID
-//!     writes; one with another root's capability SID does not, and
-//!     still reads;
-//!   - neither can change the DACL of an object the sandbox user
-//!     owns, and the `OWNER RIGHTS` ACE is what stops it;
-//!   - a group deny holds against the token that has the capability
-//!     SID;
-//!   - the real user keeps `WRITE_DAC` on what they own, through
-//!     their own ACE.
+//! What the ACEs of a persistent write root grant to which token:
+//! `AccessCheck` on a descriptor built from
+//! [`srt_win::acl::persistent_aces`], against tokens from
+//! [`srt_win::token::make_sandbox_token`]. The test's own user stands
+//! in for the sandbox user, `Authenticated Users` for the sandbox group.
 
 #![cfg(windows)]
 
@@ -46,9 +32,7 @@ const AUTHENTICATED_USERS: &str = "S-1-5-11";
 /// A well-formed account SID no token here carries.
 const SOMEONE_ELSE: &str = "S-1-5-21-1-2-3-1000";
 
-/// An impersonation token (which `AccessCheck` requires) of the
-/// sandbox child token built from this process's own: the default
-/// one, or write-restricted with `caps`.
+/// An impersonation token (which `AccessCheck` requires) of the sandbox child token.
 fn child_token(write_restricted: bool, caps: &[String]) -> HANDLE {
     let base = open_self_token().expect("open_self_token");
     let tok = make_sandbox_token(base, write_restricted, caps).expect("make_sandbox_token");
@@ -69,10 +53,7 @@ fn child_token(write_restricted: bool, caps: &[String]) -> HANDLE {
     imp
 }
 
-/// Whether `token` is granted `access` to an object owned by `owner`
-/// whose DACL is exactly `aces`, under the file generic mapping (it
-/// is what tells a write-restricted token's check which rights are
-/// write rights).
+/// Whether `token` is granted `access` to an object owned by `owner` with DACL `aces`.
 fn granted(token: HANDLE, owner: &str, aces: &[AceView], access: u32) -> bool {
     let dacl: String = aces.iter().map(AceView::sddl).collect();
     let sddl = format!("O:{owner}G:{owner}D:{dacl}");
@@ -130,8 +111,7 @@ fn persistent_root_access_matrix() {
         deny_delete: false,
         profile: None,
     };
-    // A file in root B that the sandbox user created: it owns it, and
-    // the DACL is what B's ACEs put there.
+    // A file in root B that the sandbox user created and owns.
     let in_b = persistent_aces(&root_b);
 
     let session_a = child_token(true, std::slice::from_ref(&cap_a));
@@ -142,9 +122,7 @@ fn persistent_root_access_matrix() {
     // The session that was given B writes there.
     assert!(granted(session_b, &me, &in_b, FILE_WRITE_DATA));
     assert!(granted(session_b, &me, &in_b, FILE_READ_DATA));
-    // A session given only A, or no root, does not — although the
-    // group ACE is there and the file's owner is a restricting SID
-    // of its token. It still reads.
+    // A session given only A, or no root, does not write it; it still reads.
     for (name, tok) in [("session A", session_a), ("no roots", no_roots)] {
         assert!(!granted(tok, &me, &in_b, FILE_WRITE_DATA), "{name} wrote");
         assert!(granted(tok, &me, &in_b, FILE_READ_DATA), "{name} read");
@@ -158,8 +136,7 @@ fn persistent_root_access_matrix() {
     ] {
         assert!(!granted(tok, &me, &in_b, WRITE_DAC), "{name} got WRITE_DAC");
     }
-    // ... and OWNER RIGHTS is the ACE that stops it: without it the
-    // owner's implicit WRITE_DAC is back.
+    // OWNER RIGHTS is the ACE that stops it.
     let no_owner_rights: Vec<AceView> = in_b
         .iter()
         .filter(|a| a.sid != srt_win::acl::SID_OWNER_RIGHTS)
@@ -168,8 +145,7 @@ fn persistent_root_access_matrix() {
     assert_eq!(no_owner_rights.len(), in_b.len() - 1);
     assert!(granted(ordinary, &me, &no_owner_rights, WRITE_DAC));
 
-    // A deny kept with the root holds against the session that has
-    // the capability SID, on an object the sandbox user owns.
+    // A deny kept with the root holds against the session with the capability SID.
     let denied = persistent_aces(&PersistentWant {
         deny: Some(DenyMask::WriteDeny),
         ..root_b
@@ -178,14 +154,10 @@ fn persistent_root_access_matrix() {
     assert!(granted(session_b, &me, &denied, FILE_READ_DATA));
     assert!(!granted(session_b, &me, &denied, WRITE_DAC));
 
-    // The ordinary token writes B through the group ACE alone — why
-    // nothing may run under it while a persistent grant exists.
+    // The ordinary token writes B through the group ACE alone.
     assert!(granted(ordinary, &me, &in_b, FILE_WRITE_DATA));
 
-    // The real user, on a file they own: the test's user is now the
-    // real user, and no ACE names a group of theirs. WRITE_DAC comes
-    // from their own ACE; with that ACE naming someone else, OWNER
-    // RIGHTS has taken it away.
+    // The real user, on a file they own: WRITE_DAC comes from their own ACE.
     const NO_GROUP_OF_OURS: &str = "S-1-5-32-9999";
     let as_real_user = PersistentWant {
         group_sid: NO_GROUP_OF_OURS,
@@ -216,14 +188,9 @@ fn persistent_root_access_matrix() {
     }
 }
 
-/// What the profile read grant's entries give a sandboxed process, on
-/// objects the real user owns: read and execute, listing for a
-/// container, and no way to write, create, delete, rename or re-ACL
-/// under either token shape. And how a session's read deny meets
-/// them: one written beneath a granted directory wins by itself, one
-/// that is only inherited from above the granted directory loses to
-/// the directory's own allow — which is why a session stamps its
-/// deny on the granted directory itself.
+/// What the profile grant's entries give a sandboxed process: read, execute
+/// and listing, never a write. A session's read deny inherited from above
+/// a granted directory loses to that directory's own allow.
 #[test]
 fn profile_grant_access_matrix() {
     const FILE_APPEND_DATA: u32 = 0x4;
@@ -268,10 +235,7 @@ fn profile_grant_access_matrix() {
         ("write-restricted with a root", with_a_root),
         ("ordinary", ordinary),
     ] {
-        // The real user owns everything in their profile.
         let can = |aces: &[AceView], access: u32| granted(tok, SOMEONE_ELSE, aces, access);
-        // A granted directory (and what inherits from it), and a
-        // granted file: read and execute.
         for (what, aces) in [("granted directory", &granted_dir), ("granted file", &file)] {
             assert!(can(aces, FILE_GENERIC_READ.0), "{name}: read {what}");
             assert!(can(aces, FILE_EXECUTE), "{name}: execute {what}");
@@ -279,20 +243,20 @@ fn profile_grant_access_matrix() {
                 assert!(!can(aces, access), "{name}: {right} on a {what}");
             }
         }
-        // A container: list it and pass through it; no file data
-        // rights beyond that, and no write.
         assert!(can(&container, FILE_READ_DATA), "{name}: list a container");
         assert!(
             can(&container, FILE_EXECUTE),
             "{name}: traverse a container"
         );
         assert!(can(&container, FILE_READ_ATTRIBUTES));
-        assert!(!can(&container, FILE_GENERIC_READ.0));
+        // What a generic-read open of the directory asks for.
+        assert!(
+            can(&container, FILE_GENERIC_READ.0),
+            "{name}: open a container"
+        );
         for (right, access) in every_write {
             assert!(!can(&container, access), "{name}: {right} on a container");
         }
-        // An excluded path: nothing, also with an allow behind the
-        // deny (as an entry inherited from somewhere would be).
         let mut excluded_with_allow = excluded.clone();
         excluded_with_allow.extend(granted_dir.iter().cloned());
         for aces in [&excluded, &excluded_with_allow] {
@@ -300,14 +264,8 @@ fn profile_grant_access_matrix() {
             assert!(!can(aces, FILE_EXECUTE));
             assert!(!can(aces, FILE_READ_ATTRIBUTES));
         }
-        // An ungranted file in a container carries nothing for the
-        // group.
         assert!(!can(&[], FILE_READ_DATA), "{name}: read with no entry");
 
-        // A session's read deny names the sandbox user (here: the
-        // test's own user). On an object beneath a granted directory
-        // the deny is inherited from nearer than the allow, or is
-        // explicit: it comes first and wins.
         let session_deny = AceView {
             deny: true,
             inherited: false,
@@ -321,9 +279,6 @@ fn profile_grant_access_matrix() {
             !can(&beneath, FILE_READ_DATA),
             "{name}: a deny beneath a granted directory lost"
         );
-        // On the granted directory itself, a deny that only arrives
-        // by inheritance from above sits behind the directory's own
-        // allow, and loses.
         let mut inherited_from_above = granted_dir.clone();
         inherited_from_above.push(session_deny);
         assert!(

@@ -87,16 +87,12 @@ pub struct RunnerSpec {
     /// sandbox user's machine-only `PATH` while `USERPROFILE` /
     /// `TEMP` stay isolated. The proxy var set rides here too.
     pub env_overlay: Vec<(String, String)>,
-    /// Build the child token write-restricted (`srt-win exec
-    /// --write-restricted-token`; see [`crate::token`]). Off unless
-    /// the broker asks for it.
+    /// Build the child token write-restricted (see [`crate::token`]).
     #[serde(default)]
     pub write_restricted_token: bool,
-    /// Capability SIDs of the write roots this command's session was
-    /// given (`crate::persist`), looked up by the broker; they join
-    /// the child token's restricting SIDs. Only with
-    /// `write_restricted_token`; the runner accepts nothing here that
-    /// is not a capability SID.
+    /// Capability SIDs of the session's write roots (`crate::persist`),
+    /// added to the child token's restricting SIDs. Only with
+    /// `write_restricted_token`.
     #[serde(default)]
     pub capability_sids: Vec<String>,
 }
