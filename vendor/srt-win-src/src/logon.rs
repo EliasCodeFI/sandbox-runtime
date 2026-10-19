@@ -11,7 +11,8 @@
 //!
 //! **The sandbox side only ever holds pipe CLIENT ends**: a server end can
 //! `ImpersonateNamedPipeClient` whoever opened the other end, here the real
-//! user. So stdin is not a `CreatePipe` pair (see [`make_stdin_pipe`]).
+//! user. The read end of a `CreatePipe` pair is a server end, so stdin is
+//! built by [`make_stdin_pipe`] instead.
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -593,7 +594,7 @@ mod tests {
         assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x4000_0000, 0);
         assert_eq!(STDIN_PIPE_MODE.0, 0x8);
         assert_eq!(STDIN_PIPE_MAX_INSTANCES, 1);
-        // SQOS present with level ANONYMOUS (bits 16-17), no other SQOS bit.
+        // GENERIC_READ | FILE_WRITE_ATTRIBUTES; SQOS present at level ANONYMOUS.
         assert_eq!(STDIN_CLIENT_ACCESS, 0x8000_0100);
         assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
     }
