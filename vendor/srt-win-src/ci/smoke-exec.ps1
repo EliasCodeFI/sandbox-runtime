@@ -1050,7 +1050,7 @@ try {
 }
 
 # ── U-rows: a fence written by an earlier build ─────────────────
-# Removing `FenceRevision` reproduces an install that predates the record. U0b adds
+# Removing `FenceRevisions` reproduces an install that predates the record. U0b adds
 # a revision-2 `block-anonymous` filter, which the reinstall (U4) and uninstall must delete.
 
 # The test sublayer's filters per `netsh` (independent of srt-win's own
@@ -1160,8 +1160,15 @@ function Add-OldAnonymousFilter([string] $row) {
 }
 
 $regBase = 'HKLM:\SOFTWARE\sandbox-runtime'
-$rev = (Get-ItemProperty $regBase -ea Stop).FenceRevision
-if (-not $rev) { throw "U0: install did not record FenceRevision under $regBase" }
+# The record is one `<sublayer>=<revision>` line per sublayer.
+function Get-FenceRecord([string] $sublayer) {
+  $lines = @((Get-ItemProperty $regBase -ea Stop).FenceRevisions)
+  $line = $lines | Where-Object { $_ -like "$($sublayer.ToLower())=*" } | Select-Object -First 1
+  if ($line) { return [int]($line -split '=')[1] }
+  return $null
+}
+$rev = Get-FenceRecord $Sublayer
+if (-not $rev) { throw "U0: install did not record this sublayer in FenceRevisions under $regBase" }
 $st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
 # Exactly 4: `filters` counts every srt-win filter under the sublayer,
 # so a fifth would be one this build must not install.
@@ -1169,7 +1176,7 @@ if ($st0.state -ne 'installed' -or $st0.filters -ne 4) {
   throw "U0: fresh install expected installed/4 filters, got $($st0.state)/$($st0.filters)"
 }
 Assert-AnonymousFiltersInDump 'U0' $st0.filters 0
-Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters, none for the anonymous token"
+Write-Host "U0 ok: fresh install records fence revision $rev for the sublayer, $($st0.filters) filters, none for the anonymous token"
 
 # U0b: the earlier revision's anonymous filter, under the sublayer.
 Add-OldAnonymousFilter 'U0b'
@@ -1179,7 +1186,7 @@ if ($st0b.filters -ne $st0.filters + 1) {
 }
 Assert-AnonymousFiltersInDump 'U0b' $st0b.filters 1
 Write-Host "U0b ok: sublayer holds $($st0b.filters) filters, one tagged block-anonymous at revision 2"
-Remove-ItemProperty $regBase -Name FenceRevision -ea Stop
+Remove-ItemProperty $regBase -Name FenceRevisions -ea Stop
 
 # U1: status (both forms) reports the fence as out of date, with the repair.
 $u1 = J @('wfp','status','--sublayer-guid',$Sublayer)
@@ -1218,14 +1225,26 @@ if ($u4.state -ne 'installed' -or $u4.filters -ne $st0.filters) {
   throw "U4: after reinstall expected installed/$($st0.filters) filters, got $($u4.state)/$($u4.filters)"
 }
 Assert-AnonymousFiltersInDump 'U4' $u4.filters 0
-if ((Get-ItemProperty $regBase -ea Stop).FenceRevision -ne $rev) {
-  throw 'U4: reinstall did not restore FenceRevision'
+if ((Get-FenceRecord $Sublayer) -ne $rev) {
+  throw 'U4: reinstall did not restore the sublayer''s fence record'
 }
 $r = RExec @('--', $cmd, '/c', 'echo U4-RAN')
 if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
   throw "U4: exec after reinstall failed. exit=$($r.exit) raw: $($r.raw)"
 }
 Write-Host 'U4 ok: reinstall restores the fence and removes the earlier revision''s anonymous filter; exec runs again'
+
+# U5: uninstalling ANOTHER sublayer leaves this one's record, and exec, alone.
+$otherSublayer = '7d3c1a52-6e0b-4f8a-b1d4-2a9c5e7f3b60'
+Run @('wfp','uninstall','--sublayer-guid',$otherSublayer)
+if ((Get-FenceRecord $Sublayer) -ne $rev) {
+  throw "U5: uninstalling sublayer $otherSublayer changed the record of $Sublayer"
+}
+$r = RExec @('--', $cmd, '/c', 'echo U5-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'U5-RAN') {
+  throw "U5: exec after uninstalling another sublayer failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'U5 ok: uninstalling another sublayer does not change this one''s record; exec still launches'
 
 # ── teardown ─────────────────────────────────────────────────────
 # Uninstall must delete the earlier revision's anonymous filter too.
@@ -1238,4 +1257,4 @@ if ($post.state -ne 'absent') {
 if ($post.filters -ne 0) {
   throw "post-uninstall expected 0 filters, got $($post.filters)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0/U0b-U4)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, U0/U0b-U5)'

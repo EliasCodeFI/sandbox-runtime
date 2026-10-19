@@ -364,17 +364,17 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
-# `FenceRevision` is reset to 0 ("removed"), and `exec` refuses on it
-# (exit 19) instead of launching with no fence.
-$fr0 = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevision
-if ($fr0 -ne 0) {
-  throw "uninstall --keep-user: FenceRevision expected 0 (removed), got '$fr0'"
+# This sublayer's line in `FenceRevisions` is reset to 0 ("removed"), and
+# `exec` refuses on it (exit 19) instead of launching with no fence.
+$fr0 = @((Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop).FenceRevisions)
+if ($fr0 -notcontains "$($InstallSublayer.ToLower())=0") {
+  throw "uninstall --keep-user: FenceRevisions expected '$($InstallSublayer.ToLower())=0', got '$($fr0 -join ' ')'"
 }
 $x0 = & $Exe exec -- (Join-Path $env:SystemRoot 'System32\cmd.exe') /c 'echo KEEPUSER-RAN' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 19 -or $x0 -match 'KEEPUSER-RAN' -or $x0 -notmatch '(?i)srt-win install') {
   throw "uninstall --keep-user: exec expected exit 19 + install hint, got $LASTEXITCODE. out: $x0"
 }
-Write-Host 'uninstall --keep-user ok: FenceRevision reset to 0; exec refuses (exit 19)'
+Write-Host 'uninstall --keep-user ok: the sublayer''s fence record reset to 0; exec refuses (exit 19)'
 
 # ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
 # Filters were just removed (`uninstall --keep-user`) but the

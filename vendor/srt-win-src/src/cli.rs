@@ -592,6 +592,24 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// Remove `sublayer`'s filters: its record first, the filters second
+/// (`install::mark_fence_removed`). Returns how many were removed.
+fn remove_fence(sublayer: &windows::core::GUID) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    use srt_win::{install, wfp};
+    install::mark_fence_removed(sublayer).context("mark WFP fence removed")?;
+    let n = wfp::uninstall_filters(sublayer)?;
+    // A record written before records were per sublayer is read as the
+    // default sublayer's: reset it when that sublayer holds no filters.
+    let default = wfp::DEFAULT_SUBLAYER_GUID;
+    if install::read_fence_revision(&default).ok().flatten() == Some(wfp::FENCE_REVISION)
+        && wfp::filter_status(&default).is_ok_and(|st| st.state == "absent")
+    {
+        install::mark_fence_removed(&default).context("mark WFP fence removed")?;
+    }
+    Ok(n)
+}
+
 /// `wfp::filter_status` with the install record's fence revision
 /// folded in — the `wfp` object both status commands print.
 fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::WfpStatus> {
@@ -601,7 +619,7 @@ fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::Wf
     let record = install::read_setup()
         .ok()
         .flatten()
-        .map(|_| install::read_fence_revision().ok().flatten());
+        .map(|_| install::read_fence_revision(sublayer).ok().flatten());
     Ok(wfp::apply_recorded_revision(
         wfp::filter_status(sublayer)?,
         record,
@@ -883,7 +901,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
-                    && install::require_current_fence().is_ok()
+                    && install::read_fence_revision(&sl).ok().flatten() == Some(wfp::FENCE_REVISION)
                     && install::cred_present()
                     && ambient_ok()
                 {
@@ -1004,7 +1022,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             // Only now that the filters are committed: the non-elevated
             // broker goes by this record, as it cannot enumerate them.
-            if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
+            if let Err(e) = install::write_fence_revision(&sl, wfp::FENCE_REVISION) {
                 eprintln!("srt-win: error: record WFP fence revision: {e:#}");
                 std::process::exit(12);
             }
@@ -1039,9 +1057,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            // Record first, filters second (`install::mark_fence_removed`).
-            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
-            let n = wfp::uninstall_filters(&sl)?;
+            let n = remove_fence(&sl)?;
             // Read setup up front: the ambient cleanup and the
             // deprovision fallback both need the recorded name/SID
             // before clear_setup wipes them.
@@ -1280,8 +1296,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
-            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
-            let n = wfp::uninstall_filters(&sl)?;
+            let n = remove_fence(&sl)?;
             eprintln!("srt-win: removed {n} WFP filter(s)");
         }
 
