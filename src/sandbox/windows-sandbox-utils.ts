@@ -2645,9 +2645,8 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 
 /**
  * `windows.writeRestrictedToken` as it applies: on unless it is
- * explicitly `false`. The one place the default is decided — every
- * reader of the option (and of the parameters derived from it) goes
- * through here, so unset and `true` cannot diverge.
+ * explicitly `false`. Every reader of the option goes through here,
+ * so unset and `true` cannot diverge.
  */
 export function windowsWriteRestrictedTokenEnabled(
   w: { writeRestrictedToken?: boolean } | undefined,
@@ -2657,14 +2656,11 @@ export function windowsWriteRestrictedTokenEnabled(
 
 /**
  * Why an existing install cannot be used by this `srt-win`, or
- * `undefined` when it can: the install's setup marker was written by
- * a release with a different setup version. `srt-win` then refuses to
- * launch the sandbox account and to keep a write grant, and the
- * repair is to re-run the install, which upgrades in place.
- *
- * Only meaningful for a provisioned install; an `srt-win` that does
- * not report its setup version is not judged here (it enforces the
- * same check itself at launch).
+ * `undefined` when it can: its setup marker was written by a release
+ * with a different setup version, and the repair is to re-run the
+ * install. Only meaningful for a provisioned install; an `srt-win`
+ * that does not report its setup version is not judged here (it
+ * enforces the same check itself at launch).
  */
 export function windowsSetupVersionMismatch(
   us: WindowsSandboxUserStatus,
