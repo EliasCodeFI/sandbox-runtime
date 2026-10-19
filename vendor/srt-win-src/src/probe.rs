@@ -327,9 +327,26 @@ struct Assumed {
 }
 impl Drop for Assumed {
     fn drop(&mut self) {
-        unsafe {
-            let _ = RevertToSelf();
+        if let Err(e) = unsafe { RevertToSelf() } {
+            REVERT_FAILURE.with(|f| f.set(Some(e.code().0)));
         }
+    }
+}
+
+thread_local! {
+    /// The HRESULT of a `RevertToSelf` that failed on this thread.
+    static REVERT_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// `Err` once a `RevertToSelf` has failed on this thread: a later
+/// attempt would be made under the leftover token, so the run must end.
+fn ensure_reverted() -> Result<()> {
+    match REVERT_FAILURE.with(|f| f.get()) {
+        Some(hr) => Err(anyhow!(
+            "RevertToSelf failed ({hr:#010x}) after an assumed-identity attempt; \
+             the probe cannot continue under a leftover token"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -705,7 +722,7 @@ fn connect_as(id: Identity, target: &SocketAddr, order: SocketOrder) -> (Outcome
     (o, format!("winsock error {code}"))
 }
 
-fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
+fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Result<Outcome> {
     // stderr, never stdout: the runner's stdout is the broker's, and
     // the broker prints its own JSON there.
     if matches!(id, Identity::Own) {
@@ -714,11 +731,12 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
             "srt-win: runner: egress probe [{name}] {target}: {} ({detail})",
             outcome.label().to_uppercase(),
         );
-        return outcome;
+        return Ok(outcome);
     }
     let mut worst = Outcome::Blocked;
     for order in SocketOrder::BOTH {
         let (outcome, detail) = connect_as(id, target, order);
+        ensure_reverted()?;
         eprintln!(
             "srt-win: runner: egress probe [{name}; {}] {target}: {} ({detail})",
             order.label(),
@@ -730,7 +748,7 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
         "srt-win: runner: egress probe [{name}] {target}: {} (the worse of both orderings)",
         worst.label().to_uppercase(),
     );
-    worst
+    Ok(worst)
 }
 
 /// Run the attempts; with no `anonymous_target` the off-loopback ones
@@ -755,18 +773,18 @@ pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool)
                 "srt-win: runner: egress probe [{name}]: SKIPPED \
                  (no off-loopback target)"
             );
-            Outcome::Skipped
+            Ok(Outcome::Skipped)
         }
     };
     let low = Identity::LoweredIntegrity(IL_LOW);
     let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
-    let plain = attempt("plain", Identity::Own, &target);
+    let plain = attempt("plain", Identity::Own, &target)?;
     if plain.passed_fence() {
         eprintln!("srt-win: runner: egress probe: the plain connect was not blocked; stopping");
         return Ok(Report::unfenced_at_plain(plain));
     }
     let anonymous = if anonymous_egress {
-        off_loopback("anonymous", Identity::Anonymous)
+        off_loopback("anonymous", Identity::Anonymous)?
     } else {
         eprintln!("srt-win: runner: egress probe [anonymous]: SKIPPED (not requested)");
         Outcome::Skipped
@@ -774,12 +792,12 @@ pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool)
     Ok(Report {
         plain,
         anonymous,
-        anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target),
-        deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target),
-        low_integrity: off_loopback("low integrity", low),
-        low_integrity_loopback: attempt("low integrity, loopback", low, &target),
-        untrusted_integrity: off_loopback("untrusted integrity", untrusted),
-        untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target),
+        anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target)?,
+        deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target)?,
+        low_integrity: off_loopback("low integrity", low)?,
+        low_integrity_loopback: attempt("low integrity, loopback", low, &target)?,
+        untrusted_integrity: off_loopback("untrusted integrity", untrusted)?,
+        untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target)?,
     })
 }
 
@@ -1009,6 +1027,18 @@ mod tests {
             l[loopback] = Skipped;
             assert_eq!(verdict(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
         }
+    }
+
+    #[test]
+    fn a_failed_revert_ends_the_run() {
+        assert!(ensure_reverted().is_ok());
+        REVERT_FAILURE.with(|f| f.set(Some(0x8007_0005_u32 as i32)));
+        let e = ensure_reverted().unwrap_err().to_string();
+        REVERT_FAILURE.with(|f| f.set(None));
+        assert!(
+            e.contains("RevertToSelf") && e.contains("0x80070005"),
+            "{e}"
+        );
     }
 
     #[test]
