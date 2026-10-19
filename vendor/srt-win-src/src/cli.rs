@@ -761,6 +761,9 @@ enum WfpCmd {
     ///     change the exit code. `anonymous-egress` is expected
     ///     wherever the machine has an off-loopback address: no
     ///     filter is keyed on the anonymous token.
+    ///     `lowered-integrity-unprobed` is named when a
+    ///     lowered-integrity probe is `error`: that token shape could
+    ///     not be set up, so no connect under it was observed.
     ///
     /// Every probe but `egress_probe` makes its connect twice: once
     /// on a socket created before the token is assumed and once on a
@@ -773,12 +776,12 @@ enum WfpCmd {
     /// Every other probe must be blocked: `egress_probe` and the
     /// four lowered-integrity ones, whose token still carries the
     /// sandbox account's SID. Exits **0**
-    /// (all of them were blocked, or skipped for want of an
-    /// off-loopback address = fence active), **3** (one got past the
-    /// filters = fence MISSING), **2** (one was inconclusive — `error`
-    /// means no connect was made under the token: it could not be
-    /// assumed, or did not read back as assumed once the socket
-    /// existed, which is not a block; treat as failure), **19** when the
+    /// (`egress_probe` was blocked and each lowered-integrity one was
+    /// blocked, skipped for want of an off-loopback address, or
+    /// `error` = fence active), **3** (one got past the filters =
+    /// fence MISSING), **2** (`egress_probe` was not blocked, or a
+    /// lowered-integrity connect was made and got no answer; treat
+    /// as failure), **19** when the
     /// install record says the filter set predates this build, or
     /// **15** when the sandbox user is not provisioned. A runner
     /// exit that is not a probe report prints every probe as
@@ -1284,6 +1287,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             "a connect to a loopback destination made while \
                              impersonating the anonymous token is not blocked \
                              (see the per-ordering lines above)",
+                        probe::RESIDUAL_LOWERED_INTEGRITY_UNPROBED =>
+                            "a lowered-integrity copy of the sandbox token \
+                             could not be set up, so no connect under it was \
+                             observed (see the per-ordering lines above)",
                         _ =>
                             "a connect made under a copy of the sandbox token \
                              whose user SID is deny-only is not blocked \

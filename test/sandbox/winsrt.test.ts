@@ -1749,9 +1749,30 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('verifyWindowsWfpEgress: a lowered token that could not be assumed rejects (not a block)', async () => {
+  it('verifyWindowsWfpEgress: a lowered token that could not be set up resolves, named as a residual', async () => {
+    const r = await runVerify(
+      0,
+      verifyOut({
+        low_integrity_loopback_probe: 'error',
+        residuals: ['lowered-integrity-unprobed'],
+      }),
+    )
+    expect(r.probes.plain).toBe('blocked')
+    expect(r.probes.lowIntegrityLoopback).toBe('error')
+    expect(r.residuals).toEqual(['lowered-integrity-unprobed'])
+    expect(r.warnings.length).toBe(1)
+    expect(r.warnings[0]).toMatch(/could not be set up/)
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // A plain attempt that is itself inconclusive still rejects.
     expect(
-      await verifyCode(2, verifyOut({ low_integrity_loopback_probe: 'error' })),
+      await verifyCode(
+        2,
+        verifyOut({
+          egress_probe: 'error',
+          low_integrity_loopback_probe: 'error',
+        }),
+      ),
     ).toBe('wfp_verify_inconclusive')
   })
 

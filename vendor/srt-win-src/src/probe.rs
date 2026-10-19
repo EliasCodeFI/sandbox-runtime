@@ -38,6 +38,11 @@ pub const RESIDUAL_ANONYMOUS_EGRESS: &str = "anonymous-egress";
 
 pub const RESIDUAL_ANONYMOUS_LOOPBACK: &str = "anonymous-loopback";
 
+/// Residual: a lowered-integrity attempt could not be set up (the token
+/// could not be assumed, or no socket made under it), so no connect
+/// under that shape was observed.
+pub const RESIDUAL_LOWERED_INTEGRITY_UNPROBED: &str = "lowered-integrity-unprobed";
+
 const ANONYMOUS_SID: &str = "S-1-5-7";
 
 const IL_LOW: u32 = 0x1000;
@@ -182,11 +187,11 @@ impl Report {
         })
     }
 
-    /// The attempts the filters must refuse, each with whether it may
-    /// have been skipped (a machine can lack an off-loopback target).
-    fn must_be_blocked(&self) -> [(Outcome, bool); 5] {
+    /// The lowered-integrity attempts, which the filters must refuse like
+    /// the plain one, each with whether it may have been skipped (a
+    /// machine can lack an off-loopback target).
+    fn lowered(&self) -> [(Outcome, bool); 4] {
         [
-            (self.plain, false),
             (self.low_integrity, true),
             (self.low_integrity_loopback, false),
             (self.untrusted_integrity, true),
@@ -209,16 +214,18 @@ pub struct Verdict {
     pub residuals: Vec<&'static str>,
 }
 
-/// The plain and lowered-integrity attempts decide the exit code: one
-/// past the filters is a missing fence; one neither blocked nor (off
-/// loopback only) skipped is inconclusive. The rest only add residuals.
+/// The plain attempt must be blocked and no lowered-integrity one may
+/// pass the filters. A lowered-integrity attempt that could not be set
+/// up (`Error`) is reported as a residual, as the rest are when they connect.
 pub fn verdict(r: &Report) -> Verdict {
-    let must = r.must_be_blocked();
-    let exit = if must.iter().any(|(o, _)| o.passed_fence()) {
+    let lowered = r.lowered();
+    let exit = if r.plain.passed_fence() || lowered.iter().any(|(o, _)| o.passed_fence()) {
         EXIT_NOT_FENCED
-    } else if must
-        .iter()
-        .any(|(o, may_skip)| !(*o == Outcome::Blocked || (*may_skip && *o == Outcome::Skipped)))
+    } else if r.plain != Outcome::Blocked
+        || lowered.iter().any(|(o, may_skip)| {
+            !(matches!(o, Outcome::Blocked | Outcome::Error)
+                || (*may_skip && *o == Outcome::Skipped))
+        })
     {
         EXIT_INCONCLUSIVE
     } else {
@@ -234,6 +241,9 @@ pub fn verdict(r: &Report) -> Verdict {
         }
         if r.deny_only.passed_fence() {
             residuals.push(crate::wfp::RESIDUAL_DENY_ONLY);
+        }
+        if lowered.iter().any(|(o, _)| *o == Outcome::Error) {
+            residuals.push(RESIDUAL_LOWERED_INTEGRITY_UNPROBED);
         }
     }
     Verdict { exit, residuals }
@@ -932,20 +942,37 @@ mod tests {
     }
 
     #[test]
-    fn verdict_lowered_integrity_not_assumed_is_inconclusive() {
+    fn verdict_lowered_integrity_not_set_up_is_reported_not_failed() {
         let all_blocked = report(Blocked, Blocked, Blocked, Blocked);
         for field in 0..4 {
-            // A token that could not be assumed is not a block.
-            for odd in [Error, Unreachable] {
-                let mut l = [Blocked; 4];
-                l[field] = odd;
-                assert_eq!(
-                    verdict(&lowered(all_blocked, l)).exit,
-                    EXIT_INCONCLUSIVE,
-                    "field {field} {odd:?}"
-                );
-            }
+            // A token that could not be assumed is not a block: it is named.
+            let mut l = [Blocked; 4];
+            l[field] = Error;
+            let v = verdict(&lowered(all_blocked, l));
+            assert_eq!(v.exit, EXIT_FENCED, "field {field}");
+            assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
+            // A connect that was made and did not answer is still unknown.
+            l[field] = Unreachable;
+            let v = verdict(&lowered(all_blocked, l));
+            assert_eq!(v.exit, EXIT_INCONCLUSIVE, "field {field}");
+            assert!(v.residuals.is_empty());
         }
+        // It does not excuse the plain attempt, nor a leak beside it.
+        for plain in [Error, Unreachable, Skipped] {
+            let r = lowered(report(plain, Blocked, Blocked, Blocked), [Error; 4]);
+            assert_eq!(verdict(&r).exit, EXIT_INCONCLUSIVE, "{plain:?}");
+        }
+        let leak = lowered(all_blocked, [Error, Connected, Error, Error]);
+        assert_eq!(verdict(&leak).exit, EXIT_NOT_FENCED);
+        // It is named after the residuals that connected.
+        let r = lowered(report(Blocked, Blocked, Blocked, Connected), [Error; 4]);
+        assert_eq!(
+            verdict(&r).residuals,
+            [
+                crate::wfp::RESIDUAL_DENY_ONLY,
+                RESIDUAL_LOWERED_INTEGRITY_UNPROBED
+            ]
+        );
         // Only the attempts at the off-loopback target can be skipped.
         let v = verdict(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
         assert_eq!(v.exit, EXIT_FENCED);

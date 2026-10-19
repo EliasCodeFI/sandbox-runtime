@@ -220,11 +220,12 @@ export type WindowsWfpResidual =
   | 'anonymous-egress'
   | 'anonymous-loopback'
   | 'deny-only-user-sid'
+  | 'lowered-integrity-unprobed'
 
 /**
  * Result of `srt-win wfp verify` on success (exit 0); anything else
- * throws. Only `anonymous`, `anonymousLoopback` and `denyOnly` can be
- * other than `blocked`/`skipped`: one that got through is in `residuals`.
+ * throws. `plain` is `blocked`. A lowered-integrity attempt may be
+ * `error` (not set up), and the rest anything: see `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -1009,6 +1010,9 @@ const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
   'deny-only-user-sid':
     'a connect made under a copy of the sandbox token whose user SID is ' +
     'deny-only is not blocked (the filters cannot match that token)',
+  'lowered-integrity-unprobed':
+    'a lowered-integrity copy of the sandbox token could not be set up on ' +
+    'this machine, so no connect under it was observed',
 }
 
 function isWfpResidual(s: string): s is WindowsWfpResidual {
