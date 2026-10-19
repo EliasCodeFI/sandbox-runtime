@@ -882,12 +882,6 @@ pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<b
     Ok(!denies.0.is_empty())
 }
 
-// ─── Persistent grants (write-restricted token) ─────────────────────
-//
-// `crate::persist` keeps a write root's grant between sessions. The
-// functions here are its DACL half: what the ACEs are, reading them
-// back for the session-start comparison, and writing them.
-
 /// `CREATOR OWNER`: an inheritable ACE for it becomes, on each new
 /// object, an ACE for that object's creator.
 pub const SID_CREATOR_OWNER: &str = "S-1-3-0";
@@ -996,11 +990,9 @@ pub struct PersistentTrustees<'a> {
     pub real_user_sid: &'a str,
 }
 
-/// Whether `a` is one of the ACEs [`persistent_aces`] produces: any
-/// ACE for the sandbox group or for a capability SID, the owner-rights
-/// ACE, or the real user's `READ_CONTROL | WRITE_DAC` ACE. The last
-/// two are recognised by their exact mask, so an ACE the user wrote
-/// for themselves (full control, say) is never taken for one of ours.
+/// Whether `a` is one of the ACEs [`persistent_aces`] produces. The
+/// owner-rights and real-user ACEs are recognised by exact mask, so
+/// an ACE the user wrote for themselves is never taken for ours.
 pub fn is_persistent_ace(a: &AceView, t: &PersistentTrustees<'_>) -> bool {
     t.group_sid == Some(a.sid.as_str())
         || crate::persist::is_capability_sid(&a.sid)
@@ -1021,50 +1013,18 @@ pub struct PersistentWant<'a> {
 }
 
 /// The explicit ACEs of a persistent path, in the order they are
-/// written at the head of its DACL. All inherit to files and
-/// directories below (`(OI)(CI)`), except the object-only delete deny.
+/// written at the head of its DACL:
 ///
-/// Denies come first and name the sandbox GROUP. The group is enabled
-/// in every token of the sandbox account and is not a restricting
-/// SID, so a deny for it applies in the ordinary access check whatever
-/// the token shape.
-///
-/// A write root then carries four ALLOW ACEs:
-///
-/// 1. the sandbox group, [`Mask::MODIFY_NO_FDC`] — satisfies the
-///    ordinary check;
-/// 2. the root's capability SID, same mask — satisfies the check
-///    against the restricting SIDs, which only a session that was
-///    given this root has in its token;
-/// 3. `OWNER RIGHTS`, `READ_CONTROL`. Its presence replaces what an
-///    owner otherwise gets implicitly (`READ_CONTROL | WRITE_DAC`).
-///    Files the sandbox creates are owned by the sandbox user, whose
-///    SID is a restricting SID of every session; without this ACE a
-///    session of another project could rewrite the DACL of any such
-///    file here and then write it. It likewise stops the owner
-///    removing a deny from an object it owns;
-/// 4. the real user, `READ_CONTROL | WRITE_DAC`. ACE 3 applies to
-///    every owner, the real user included, and they may own files
-///    here with no ACE granting them `WRITE_DAC` (a folder that only
-///    gives `Authenticated Users` modify). This gives back what
-///    ownership gave them.
-///
-/// Why the order works. `OWNER RIGHTS` is an ALLOW: it takes nothing
-/// away in the ACE walk, it only switches the implicit owner grant
-/// off, so ACE 4 does not have to precede it. What can stop ACE 4 is
-/// a DENY met earlier in the walk. The four are explicit ACEs at the
-/// head of the root's DACL, ahead of every ACE the root had and of
-/// everything it inherits; on a descendant they arrive as inherited
-/// ACEs from the root, which are placed ahead of those inherited from
-/// further up. So no deny of the root or of a directory above it is
-/// reached before ACE 4. Only an explicit deny on the descendant
-/// itself comes first — the one case where the real user had
-/// `WRITE_DAC` as owner and no longer has it. None of the denies
-/// written here name the real user.
+/// - denies, for the sandbox GROUP (they apply whatever the token);
+/// - sandbox group, [`Mask::MODIFY_NO_FDC`] (ordinary check);
+/// - the root's capability SID, same mask (restricting-SID check);
+/// - `OWNER RIGHTS`, `READ_CONTROL` — removes the owner's implicit
+///   `WRITE_DAC` from files the sandbox user owns;
+/// - the real user, `READ_CONTROL | WRITE_DAC` — gives back what the
+///   previous ACE took from them.
 ///
 /// No ACE names the sandbox USER SID: it is a restricting SID of
-/// every session, so an ALLOW for it would pass both checks for all
-/// of them.
+/// every session.
 pub fn persistent_aces(w: &PersistentWant<'_>) -> Vec<AceView> {
     let g = w.group_sid;
     let mut v = Vec::with_capacity(7);
@@ -1103,9 +1063,8 @@ pub fn comparable(aces: &[AceView], is_dir: bool) -> Vec<AceView> {
 }
 
 /// The explicit persistent ACEs among `aces`, in DACL order, in
-/// [`comparable`] form. Equal to `comparable(persistent_aces(..))`
-/// exactly when the path carries the wanted set and nothing else of
-/// ours.
+/// [`comparable`] form: equal to `comparable(persistent_aces(..))`
+/// exactly when the path carries the wanted set and nothing else of ours.
 pub fn persistent_on_disk(
     aces: &[AceView],
     t: &PersistentTrustees<'_>,
@@ -1126,12 +1085,9 @@ pub fn allows_more_than_read(aces: &[AceView], sid: &str) -> bool {
         .any(|a| !a.deny && a.sid == sid && a.mask & !Mask::FILE_READ_EXEC.bits() != 0)
 }
 
-/// ACEs among `aces` that let the sandbox account write an object it
-/// created here under ANY session's token, which the persistent ACE
-/// set cannot take back: an inheritable `CREATOR OWNER` ALLOW with a
-/// write right (each new object gets it as an ACE for the sandbox
-/// user), and an `OWNER RIGHTS` ALLOW that includes `WRITE_DAC`.
-/// Returned as text for a warning.
+/// ACEs that let the sandbox account write an object it created here
+/// under ANY session's token: an inheritable `CREATOR OWNER` write
+/// ALLOW, or an `OWNER RIGHTS` ALLOW with `WRITE_DAC`. Text for a warning.
 pub fn owner_write_paths(aces: &[AceView]) -> Vec<String> {
     let write = DenyMask::WriteDeny.bits()
         | Mask::WRITE_DAC.bits()
@@ -1148,13 +1104,9 @@ pub fn owner_write_paths(aces: &[AceView]) -> Vec<String> {
         .collect()
 }
 
-/// Converge `canonical_path`'s explicit persistent ACEs (see
-/// [`is_persistent_ace`]) to exactly `want`, written at the head of
-/// the DACL in the given order; an empty `want` removes them. Every
-/// other explicit ACE is kept, and the DACL's protection state is
-/// preserved, as in [`apply_sandbox_aces`]. On a directory the write
-/// re-derives the inherited ACEs of everything below it, so its cost
-/// is linear in the tree.
+/// Converge the explicit persistent ACEs of `canonical_path` to exactly
+/// `want`, at the head of the DACL in the given order (empty removes
+/// them). On a directory the cost is linear in the tree.
 pub fn write_persistent_aces(
     canonical_path: &str,
     t: &PersistentTrustees<'_>,
@@ -1340,8 +1292,7 @@ mod tests {
                 format!("(A;OICI;0x60000;;;{REAL})"),
             ]
         );
-        // Denies lead, for the group; the delete deny does not
-        // inherit. Without a capability SID there is no ALLOW at all.
+        // Without a capability SID there is no ALLOW at all.
         let denies = PersistentWant {
             capability_sid: None,
             deny: Some(DenyMask::WriteDeny),
@@ -1364,8 +1315,6 @@ mod tests {
         });
         assert_eq!(both.len(), 5);
         assert!(both[0].deny && !both[1..].iter().any(|a| a.deny));
-        // No ACE of any persistent path names the sandbox user: only
-        // the group, the capability SID, OWNER RIGHTS, the real user.
         assert!(
             both.iter()
                 .all(|a| [GROUP, CAP, SID_OWNER_RIGHTS, REAL].contains(&a.sid.as_str()))
@@ -1387,9 +1336,7 @@ mod tests {
             inherited: false,
             ..inherited(sid, mask)
         };
-        // The wanted ACEs among unrelated ones: a match, on a
-        // directory. The real user's own full-control ACE and an
-        // inherited copy of a persistent ACE are not ours.
+        // The user's own full-control ACE and an inherited persistent ACE are not ours.
         let mut dacl = want.clone();
         dacl.push(other(REAL, Mask::FILE_ALL.bits()));
         dacl.push(other(SID_SYSTEM, Mask::FILE_ALL.bits()));
@@ -1408,8 +1355,6 @@ mod tests {
             d.remove(i);
             assert!(differs(&d), "missing ACE {i}");
         }
-        // A wrong mask, wrong inheritance flags, a deny in place of an
-        // allow, a different capability SID, an extra ACE of ours.
         let mut d = want.clone();
         d[0].mask = Mask::FILE_ALL.bits();
         assert!(differs(&d));
@@ -1446,8 +1391,7 @@ mod tests {
             comparable(&want, true)
         );
 
-        // With the install record gone the group's ACEs are no longer
-        // recognised; the other three still are.
+        // With the install record gone the group's ACEs are not recognised.
         let no_group = PersistentTrustees {
             group_sid: None,
             ..T
@@ -1495,9 +1439,7 @@ mod tests {
             &[ace(GROUP, Mask::MODIFY_NO_FDC.bits(), 0x3)],
             sb
         ));
-        // CREATOR OWNER full control that inherits; the same ACE on
-        // the object only does not reach new files. OWNER RIGHTS with
-        // WRITE_DAC; ours (READ_CONTROL) is not reported.
+        // Ours (OWNER RIGHTS with READ_CONTROL only) is not reported.
         let found = owner_write_paths(&[
             ace(SID_CREATOR_OWNER, Mask::GENERIC_ALL.bits(), 0xb),
             ace(SID_CREATOR_OWNER, Mask::GENERIC_ALL.bits(), 0),
@@ -1508,14 +1450,10 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
     }
 
-    /// The persistent ACEs through the real DACL write and read:
-    /// they land at the head, a child inherits them, a second write
-    /// of the same list changes nothing, and an empty list removes
-    /// them and leaves the rest.
+    /// The persistent ACEs through the real DACL write and read.
     #[test]
     fn persistent_aces_round_trip_on_disk() {
-        // Guests stands in for the sandbox group, as in
-        // `recompose_preserves_dacl_protection`.
+        // Guests stands in for the sandbox group.
         const GROUP: &str = "S-1-5-32-546";
         let real = crate::sid::current_user_sid().unwrap();
         let cap = crate::persist::new_capability_sid().unwrap();

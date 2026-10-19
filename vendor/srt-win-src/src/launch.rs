@@ -126,17 +126,9 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
 ///
-/// `write_restricted` builds the child token write-restricted (see
-/// [`crate::token`]), with `capability_sids` — the capability SIDs of
-/// the session's write roots — among its restricting SIDs. It is
-/// fail-closed throughout: token creation,
-/// the runner's process self-protect and its thread self-protect
-/// must all succeed or no child runs — there is no fallback to the
-/// ordinary token. Both self-protects matter more here than in the
-/// default mode, because the runner's own token is NOT
-/// write-restricted: a child that could open the runner, or one of
-/// its threads, could act with the runner's token and write wherever
-/// `BUILTIN\Users` can.
+/// `write_restricted` is fail-closed: token creation and the runner's
+/// process and thread self-protect must all succeed, because the
+/// runner's own token is not write-restricted.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
@@ -166,8 +158,6 @@ pub fn run_lockdown(
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    //    `write_restricted` has no fallback: an error here ends the
-    //    launch.
     let restricted = OwnedHandle(
         token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
             .context("make_sandbox_token")?,
@@ -328,10 +318,8 @@ pub fn run_lockdown(
             )
         });
     }
-    // Runner threads get the process's self-protect DACL before the
-    // child can run (it is still suspended). Here rather than at
-    // entry so it covers every thread the runner has started by the
-    // time the child first runs.
+    // Here rather than at entry, so it covers every thread the runner
+    // has started by the time the (still suspended) child first runs.
     if write_restricted {
         let n = self_protect::protect_own_threads()
             .context("runner thread self-protect (required with --write-restricted-token)")?;

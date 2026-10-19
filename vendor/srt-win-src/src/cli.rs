@@ -724,9 +724,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // read as present from any user's session).
         "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
-        // The marker version this build requires. An install whose
-        // `marker_version` differs was made by another release and
-        // must be re-run before this build launches anything.
+        // An install whose `marker_version` differs must be re-run.
         "setup_version": install::SETUP_VERSION,
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
@@ -734,9 +732,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
-        // Whether the ordinary token may be used: `state` is `none`
-        // unless persistent write grants exist or cannot be ruled
-        // out (`srt_win::persist`).
+        // `none` unless persistent write grants exist or cannot be ruled out.
         "persistent_grants": srt_win::persist::status_json(),
     }))
 }
@@ -779,6 +775,14 @@ fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
         paths.push(json!({ "path": p, "present": present }));
     }
     Ok(json!({ "paths": paths }))
+}
+
+fn quoted_list<S: AsRef<str>>(paths: &[S]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("'{}'", p.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Read `path` and decode it as a single DER-encoded X.509
@@ -1222,15 +1226,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            // Persistent write grants go with the account. Done here,
-            // before the elevation hop: the records are the CALLING
-            // user's (their registry hive, their session database),
-            // and the elevated process may be another user. They name
-            // the sandbox group, so this must also precede its
-            // removal. A root that cannot be completed stays recorded
-            // (`acl forget --all` retries) and does not stop the
-            // uninstall: once the group is gone its ACEs match no
-            // token.
+            // Before the elevation hop: the records are the CALLING
+            // user's. And before the group the grants name is removed.
             if !keep_user {
                 match srt_win::persist::forget_everything() {
                     Ok((0, _)) => {}
@@ -1426,26 +1423,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
-            // The same attempts either way ([`probe::run`]); what
-            // differs is the process that makes them.
-            //
-            // Ordinary token: the bare runner. Its token and the
-            // ordinary child token give a filter's access check the
-            // same answer.
-            //
-            // Write-restricted token: the runner launches this
-            // binary's `probe fence` as a lockdown child, so every
-            // attempt starts from the exact token (and job, desktop,
-            // mitigations) a sandboxed command gets, and the child's
-            // exit code — the encoded report — becomes the runner's. A
-            // probe child that cannot be created exits the runner
-            // with 1, which does not decode and is reported as
-            // `error` below — never as `blocked`.
+            // Write-restricted: the runner launches `probe fence` as a
+            // lockdown child, so every attempt is made under the child token.
             let cmd = if write_restricted_token {
-                // The probe child's restricting SIDs are the ones a
-                // command of this session gets. A root with no
-                // capability SID fails the verify (exit 1, nothing on
-                // stdout) — never a probe under a shorter list.
+                // A root with no capability SID fails the verify — never
+                // a probe under a shorter list.
                 let capability_sids = srt_win::persist::capability_sids_for(&write_root)
                     .context("wfp verify --write-root")?;
                 let exe = std::env::current_exe().context("current_exe")?;
@@ -1643,12 +1625,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
-            // A grant that outlives the session is made only on an
-            // install of this build's setup version: a broker built
-            // for an earlier one runs the sandbox account under the
-            // ordinary token, and refuses to launch exactly when the
-            // marker is this build's. Checked before the session
-            // database is opened, so a refusal leaves no state.
+            // Kept grants are made only on an install of this build's setup
+            // version; checked before the session database is opened.
             if persistent && let Err(e) = srt_win::install::require_current_setup() {
                 eprintln!("srt-win: error: acl grant --persistent: {e:#}");
                 std::process::exit(15);
@@ -1714,9 +1692,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .collect();
                     let (kept, per_session_denies) =
                         persist::apply(db, &ids, &roots, &denies.targets)?;
-                    // Per session, for the sandbox user SID as without
-                    // the flag: the read grants, and the denies under
-                    // no persistent root.
+                    // Per session, for the sandbox user SID: the read
+                    // grants, and the denies under no persistent root.
                     let mut rest: Vec<(String, acl::SbAce)> = at
                         .targets
                         .iter()
@@ -1881,11 +1858,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     "acl revoke: {} grant(s) could not be released \
                      and may still be on disk (rows kept for retry): {}",
                     pending.len(),
-                    pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&pending),
                 ));
             }
         }
@@ -1965,12 +1938,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      and may still be on disk (rows, and their \
                      holders' deny ACEs, kept for retry): {}",
                     report.grants_pending.len(),
-                    report
-                        .grants_pending
-                        .iter()
-                        .map(|p| format!("'{p}'"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    quoted_list(&report.grants_pending),
                 ));
             }
         }
@@ -2044,11 +2012,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 }
             };
 
-            // Token shape. With the flag: the capability SIDs of the
-            // session's write roots — every one of them, or no exec.
-            // Without it: nothing may run while a persistent grant
-            // exists, since its sandbox-group ACE is all the ordinary
-            // token needs to write that tree.
+            // Without the flag nothing may run while a persistent grant
+            // exists: its sandbox-group ACE is all the ordinary token needs.
             let capability_sids = if write_restricted_token {
                 srt_win::persist::capability_sids_for(&write_root).context("exec --write-root")?
             } else if let Some(why) = srt_win::persist::unrestricted_block_reason() {
@@ -2483,10 +2448,7 @@ mod tests {
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 
-    /// `--write-restricted-token` is off unless given, on `exec` and
-    /// on `wfp verify`, and the hidden `probe` subcommands the
-    /// write-restricted verify re-enters through parse — with the
-    /// dispatch sentinel stripped the way `run_from_args` strips it.
+    /// The flag is off unless given, and the hidden `probe` subcommands parse.
     #[test]
     fn write_restricted_token_flag_parses() {
         let on = Cli::try_parse_from([
@@ -2558,8 +2520,6 @@ mod tests {
                 }
             }
         ));
-        // --write-root: repeatable, on exec and on wfp verify, and
-        // only with the token flag.
         let roots = Cli::try_parse_from([
             "srt-win",
             "exec",
@@ -2631,9 +2591,6 @@ mod tests {
         }
     }
 
-    /// `probe token` and `probe parent-access` are CI smoke hooks:
-    /// they parse only in a `test-hooks` build, so a default (shipped)
-    /// binary does not have them at all.
     #[test]
     fn persistent_grant_subcommands_parse() {
         let grant = |extra: &[&str]| {
@@ -2698,6 +2655,7 @@ mod tests {
         assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
     }
 
+    /// `probe token` / `probe parent-access` parse only in a `test-hooks` build.
     #[test]
     fn probe_test_hooks_follow_the_feature() {
         for sub in ["token", "parent-access"] {

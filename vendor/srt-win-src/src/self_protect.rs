@@ -35,10 +35,8 @@
 //! The runner reaches itself via the `GetCurrentProcess()`
 //! pseudo-handle (which bypasses the DACL).
 //!
-//! A process DACL does not cover the process's **threads** — each
-//! thread object has its own descriptor. [`protect_own_threads`]
-//! gives the runner's threads the same shape; the runner applies it
-//! when the write-restricted child token is on.
+//! A process DACL does not cover the process's threads;
+//! [`protect_own_threads`] gives them the same shape.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
@@ -153,14 +151,10 @@ pub fn install_broker_dacl(extra_allow: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Build an ACL of ACCESS_ALLOWED ACEs, one per `(sid, mask)`, in
-/// order. The returned buffer is the ACL; cast `.as_mut_ptr()` to
-/// `*mut ACL`.
+/// Build an ACL of ACCESS_ALLOWED ACEs, one per `(sid, mask)`, in order.
 fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec<u8>> {
-    // ACL size = header + Σ(ACE fixed prefix + SID body). The fixed
-    // prefix of an ACCESS_ALLOWED_ACE is 8 bytes (Header 4 + Mask 4);
-    // `SidStart` is the first DWORD of the SID, so total per-ACE =
-    // 8 + GetLengthSid.
+    // Per ACE: 8-byte fixed prefix (Header 4 + Mask 4; `SidStart` is
+    // the first DWORD of the SID) + `GetLengthSid`.
     const ACE_FIXED: usize = 8;
     let mut total = size_of::<ACL>();
     for (s, _) in aces {
@@ -183,28 +177,16 @@ fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec
     Ok(buf)
 }
 
-/// Rewrite the DACL of every thread this process currently has to
-/// SYSTEM + Admins + `OWNER_RIGHTS:READ_CONTROL` — the same shape
-/// [`install_broker_dacl`] gives the process, for the same reason. A
-/// thread object carries its own security descriptor, taken from the
-/// creating token's default DACL, which grants the account full
-/// access; the process DACL does not cover it. Without this a child
-/// running as the same account can open a runner thread for
-/// `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
-/// the runner's token, which is not write-restricted.
-///
-/// Called by the runner when the write-restricted token is on, after
-/// the child exists but before it is resumed. Threads the runner
-/// starts after this call are not covered. Returns the number of
-/// threads rewritten; any thread that cannot be rewritten is an
-/// error.
+/// Give every current thread of this process the DACL shape
+/// [`install_broker_dacl`] gives the process: a thread's descriptor
+/// comes from the token's default DACL, not the process DACL.
 pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenThread, THREAD_ACCESS_RIGHTS, THREAD_ALL_ACCESS,
     };
     /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
-    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
+    const DACL_RW: u32 = READ_CONTROL | 0x0004_0000;
 
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
@@ -225,8 +207,7 @@ pub fn protect_own_threads() -> Result<usize> {
         unsafe {
             let h = match OpenThread(THREAD_ACCESS_RIGHTS(DACL_RW), false, *tid) {
                 Ok(h) => crate::util::OwnedHandle(h),
-                // The thread exited after the snapshot: nothing left
-                // to protect.
+                // The thread exited after the snapshot.
                 Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
                 Err(e) => return Err(anyhow!("OpenThread(WRITE_DAC, tid={tid}): {e}")),
             };

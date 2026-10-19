@@ -177,11 +177,6 @@ if (-not ($caAcl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $
 }
 
 # ── M1: a marker of another setup version → plain install upgrades ─
-# An install made by the previous release (marker one below this
-# build's), or a value an admin left: read_cred refuses with "re-run
-# install", status still exits 0 and reports both versions, and a
-# plain (no --force) install falls through the early-out and rewrites
-# the marker to this build's.
 foreach ($stale in @(($SetupVersion - 1), 99)) {
   Set-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -Name MarkerVersion -Value $stale
   $m1b = & $Exe user read-cred 2>&1 | Out-String
