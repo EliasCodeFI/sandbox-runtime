@@ -207,9 +207,10 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the ordinary child token only: the write-restricted
-// token (the default) differs per session, so every initialize() probes.
-let windowsWfpVerified = false
+// Remembered per child-token shape, as the sandbox account the check
+// passed for: a different account (a reinstall) is checked again.
+const windowsWfpVerifiedFor: { ordinary?: string; writeRestricted?: string } =
+  {}
 // The child-token shape initialize() verified the fence for (the wrap
 // path uses it, not `config`); outside a session, the option's default.
 let windowsWriteRestrictedToken = true
@@ -921,6 +922,8 @@ async function initialize(
     // registered, and the next call makes a CA of its own.
     if (mitmCA) disposeMitmCASync(mitmCA)
     mitmCA = undefined
+    // No session came of it: back to the option's default.
+    if (config === undefined) windowsWriteRestrictedToken = true
     throw error
   }
 }
@@ -981,6 +984,12 @@ async function initializeSteps(
   // Check dependencies
   const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
+    if (deps.reinstallRequired) {
+      throw new WindowsSandboxError(
+        'reinstall_required',
+        deps.reinstallRequired,
+      )
+    }
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
@@ -1104,7 +1113,7 @@ async function initializeSteps(
           throw e
         }
       }
-      if (!windowsWfpVerified) {
+      if (u.sid === undefined || windowsWfpVerifiedFor.ordinary !== u.sid) {
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1115,7 +1124,7 @@ async function initializeSteps(
           config = undefined
           throw e
         }
-        windowsWfpVerified = true
+        windowsWfpVerifiedFor.ordinary = u.sid
       }
     }
     windowsWriteRestrictedToken = writeRestricted
@@ -1145,7 +1154,9 @@ async function initializeSteps(
     // must not) write. Compare thumbprints so a stale install-time
     // CA doesn't pass the gate while schannel rejects the session's
     // proxy-minted leaves.
-    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
+    // Only the ordinary token: under the write-restricted one Schannel
+    // gets no credentials, so nothing that runs reads that store.
+    if (tlsTerminate && mitmCA && !useWindowsPersistentCa && !writeRestricted) {
       const installed = getWindowsSandboxCaCert(u)
       const sessionThumb = certThumbprint(mitmCA.certPem)
       if (!installed) {
@@ -1232,12 +1243,15 @@ async function initializeSteps(
         }
         // The egress probe, under the token this session's commands
         // get; anything but a refused connect throws.
-        await verifyWindowsWfpEgress({
-          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-          writeRestrictedToken: true,
-          writeRoots: acc.grantWrite,
-          srtWin,
-        })
+        if (windowsWfpVerifiedFor.writeRestricted !== sb) {
+          await verifyWindowsWfpEgress({
+            proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+            writeRestrictedToken: true,
+            writeRoots: acc.grantWrite,
+            srtWin,
+          })
+          windowsWfpVerifiedFor.writeRestricted = sb
+        }
       } else {
         // Grant FIRST so the sandbox user has working-tree access by
         // the time the deny stamp runs. The two are independent
@@ -2944,7 +2958,7 @@ async function reset(): Promise<void> {
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
   windowsWriteRestrictedToken = true
-  // windowsWfpVerified is NOT cleared — per-process, not per-session.
+  // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.

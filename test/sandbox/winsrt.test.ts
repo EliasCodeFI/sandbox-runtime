@@ -37,6 +37,7 @@ import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
+import { overrideEmittedConnectionProbe } from '../../src/sandbox/emitted-connection.js'
 import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
 import {
   getSrtWinPath,
@@ -1413,6 +1414,33 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     expect(await flagged('--deny-read', { credentials })).toEqual([sub])
   })
 
+  it('a CA missing from the sandbox user store is required only under the ordinary token', async () => {
+    spies.push(spyOn(winUtils, 'getWindowsSandboxCaCert').mockReturnValue(null))
+    const base = configOf({})
+    // The check under test comes after the runtime's own TLS check.
+    overrideEmittedConnectionProbe(() => true)
+    try {
+      const started = SandboxManager.initialize({
+        ...base,
+        network: {
+          ...base.network,
+          tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+        },
+      })
+      if (writeRestrictedToken === false) {
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects as void; the await is required at runtime
+        await expect(started).rejects.toMatchObject({
+          code: 'trust_ca_not_installed',
+        })
+      } else {
+        await started
+        expect(SandboxManager.getMitmCA()).toBeDefined()
+      }
+    } finally {
+      overrideEmittedConnectionProbe(undefined)
+    }
+  })
+
   it("the library's trust bundle is granted beneath a credential deny", async () => {
     const above = { path: tmpdir(), mode: 'deny' as const }
     const base = configOf({ allowRead: [sub] }, [above])
@@ -1994,6 +2022,28 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(asynFail).toEqual(syncFail)
   })
 
+  it('checkWindowsDependencies: an install of a newer setup version is not offered an upgrade', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const newer = JSON.stringify({
+      ...JSON.parse(RAW_USER),
+      marker_version: 4,
+      setup_version: 3,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? newer : RAW_WFP,
+    }))
+    const r = checkWindowsDependencies({ srtWin })
+    expect(r.errors).toHaveLength(1)
+    expect(r.errors[0]).toMatch(
+      /set up by a newer release \(setup version 4; this release needs 3\)/,
+    )
+    expect(r.errors[0]).toContain('install --force')
+    expect(r.errors[0]).not.toMatch(/upgrade it in place/)
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+  })
+
   it('checkWindowsDependencies{,Async}: an install of another setup version asks for a re-install, not a first install', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const stale = JSON.stringify({
@@ -2080,9 +2130,13 @@ describe('Windows write-restricted token, the default: write roots are granted o
   let persistentGrants: unknown
   /** `marker_version` / `setup_version` overrides for `user status`. */
   let setupVersions: { marker_version?: number; setup_version?: number }
+  /** The sandbox account of this test: the fence check is kept per account. */
+  let sid = SID
+  let accounts = 0
   const stdoutFor = (argv: readonly string[]): string => {
     const user = {
       ...RAW_USER,
+      user: { ...RAW_USER.user, sid },
       ...setupVersions,
       ...(persistentGrants !== undefined && {
         persistent_grants: persistentGrants,
@@ -2109,6 +2163,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
   const subs = () => acl.map(c => c.sub)
 
   beforeEach(() => {
+    sid = `${SID}-${++accounts}`
     persistentGrants = undefined
     setupVersions = {}
     acl = []
@@ -2251,15 +2306,29 @@ describe('Windows write-restricted token, the default: write roots are granted o
       expect(subs()).not.toContain('forget')
     })
 
-    it(`${mode}: every initialize() probes the fence again, with that session's roots`, async () => {
+    it(`${mode}: the fence is probed once per sandbox account, not on every initialize()`, async () => {
       await SandboxManager.initialize(config(opt))
       await SandboxManager.reset()
       await SandboxManager.initialize(config(opt))
+      expect(verifyCalls).toHaveLength(1)
+      expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
+      expect(verifyCalls[0]?.writeRoots).toHaveLength(1)
+      // Another account (a reinstall) is probed again.
+      await SandboxManager.reset()
+      sid = `${SID}-other-${accounts}`
+      await SandboxManager.initialize(config(opt))
       expect(verifyCalls).toHaveLength(2)
-      for (const v of verifyCalls) {
-        expect(v?.writeRestrictedToken).toBe(true)
-        expect(v?.writeRoots).toHaveLength(1)
-      }
+    })
+
+    it(`${mode}: a probe that is not blocked is not remembered`, async () => {
+      verifyResult = () =>
+        Promise.reject(
+          new WindowsSandboxError('wfp_fence_inactive', 'connected'),
+        )
+      await rejection(config(opt))
+      verifyResult = () => Promise.resolve({ outcome: 'blocked' })
+      await SandboxManager.initialize(config(opt))
+      expect(verifyCalls).toHaveLength(2)
     })
 
     it(`${mode}: a session with nothing to grant still probes, with no roots`, async () => {
@@ -2317,11 +2386,13 @@ describe('Windows write-restricted token, the default: write roots are granted o
     const session = async (opt: true | undefined) => {
       acl = []
       verifyCalls = []
+      // An account of its own, so that each session probes.
+      sid = `${SID}-${++accounts}`
       await SandboxManager.initialize(config(opt))
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
       await SandboxManager.reset()
       return {
-        acl,
+        acl: JSON.parse(JSON.stringify(acl).split(sid).join('SID')) as unknown,
         probes: verifyCalls.map(v => ({
           writeRestrictedToken: v?.writeRestrictedToken,
           writeRoots: v?.writeRoots,
@@ -2332,6 +2403,17 @@ describe('Windows write-restricted token, the default: write roots are granted o
     const unset = await session(undefined)
     expect(await session(true)).toEqual(unset)
     expect(unset.argv).toContain('--write-restricted-token')
+  })
+
+  it('an initialize() that fails under the ordinary token leaves the default behind', async () => {
+    aclResult.grant = exit(1)
+    await rejection(config(false))
+    const { argv } = await SandboxManager.wrapWithSandboxArgv(
+      'echo x',
+      undefined,
+      { windows: { srtWin: { path: process.execPath } } },
+    )
+    expect(argv).toContain('--write-restricted-token')
   })
 
   it('a wrap outside a session gets the write-restricted token, with no roots', async () => {
@@ -2366,8 +2448,8 @@ describe('Windows write-restricted token, the default: write roots are granted o
       acl = []
       await SandboxManager.initialize(config(false))
       expect(acl.map(c => [c.sub, ...c.argv])).toEqual([
-        ['grant', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', SID],
-        ['stamp', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', SID],
+        ['grant', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', sid],
+        ['stamp', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', sid],
       ])
       const granted = acl[0].stdin as Record<string, string[]>
       expect(Object.keys(granted).sort()).toEqual(['read', 'write'])
@@ -2442,8 +2524,11 @@ describe('Windows write-restricted token, the default: write roots are granted o
         expect(subs()).toEqual([])
         expect(verifyCalls).toHaveLength(0)
       }
-      // The dependency check reports it first.
-      stale(await rejection(config(opt)))
+      // The dependency check reports it first, as the typed error.
+      const first = await rejection(config(opt))
+      expect(first).toBeInstanceOf(WindowsSandboxError)
+      expect(first.code).toBe('reinstall_required')
+      stale(first)
       // initialize() holds on its own reading of the install too.
       const deps = spyOn(
         winUtils,
@@ -3408,13 +3493,20 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(r.stdout.trim()).toBe('000')
   }, 120_000)
 
-  it('B2: powershell Invoke-WebRequest to a NON-allowed host → blocked', async () => {
-    SandboxManager.updateConfig(createTestConfig(['example.com']))
-    const r = await runSandboxed(
-      `powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { (Invoke-WebRequest https://google.com -UseBasicParsing -TimeoutSec 8).StatusCode } catch { 'ERR' }"`,
-    )
-    expect(r.stdout.trim()).not.toBe('200')
-  }, 60_000)
+  it.skipIf(!HAS_OWN_TLS_CLIENT)(
+    'B2: a NON-allowed host is refused by the proxy, from a client that reaches an allowed one',
+    async () => {
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const allowed = await runSandboxedUntil(ownTlsGet('example.com'), got200)
+      expect(got200(allowed)).toBe(true)
+      const r = await runSandboxed(ownTlsGet('google.com'))
+      expect(r.status).not.toBe(0)
+      expect(got200(r)).toBe(false)
+      // The proxy's own refusal, not a client that failed otherwise.
+      expect(r.stderr + r.stdout).toMatch(/CONNECT:403|\b403\b/)
+    },
+    120_000,
+  )
 
   it.skipIf(!HAS_OWN_TLS_CLIENT)(
     'B3: a SECOND allowed host (github.com) → 200',
@@ -3462,10 +3554,12 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     // WFP must still refuse it. Pairs with B5 as the "env-var bypass
     // doesn't defeat WFP" proof.
     SandboxManager.updateConfig(createTestConfig(['example.com']))
+    // Plain HTTP: a TLS failure must not stand in for the fence.
     const r = await runSandboxed(
-      'curl --noproxy "*" -sS -m 5 https://example.com',
+      'curl --noproxy "*" -sS -m 5 -o NUL -w "%{http_code}" http://example.com/',
     )
     expectEgressBlocked('C4', r)
+    expect(r.stdout.trim()).not.toBe('200')
   }, 60_000)
 
   it.skipIf(!hasTool('node'))(
@@ -3889,10 +3983,11 @@ describe.if(isWindows)(
     it('H4: direct outbound blocked by F-USER-BLOCK', async () => {
       const r = await rexec(
         'set "HTTP_PROXY=" & set "HTTPS_PROXY=" & set "ALL_PROXY=" & ' +
-          'curl -sS -m 5 https://example.com',
+          'curl -sS -m 5 -o NUL -w "%{http_code}" http://example.com/',
       )
-      // Exit-code only — see B/C convention: any non-zero is fenced.
+      // Plain HTTP, so any non-zero exit is the fence and not TLS.
       expect(r.status).not.toBe(0)
+      expect(r.stdout.trim()).not.toBe('200')
     }, 60_000)
 
     it('H-kill-chain: taskkill /F on the broker reaps the sandboxed child (Job kill-on-close)', async () => {

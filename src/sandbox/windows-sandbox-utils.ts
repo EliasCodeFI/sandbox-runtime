@@ -2287,7 +2287,9 @@ export function forgetWindowsPersistentGrants(
       'acl_forget_failed',
       `Write grants kept from earlier sessions could not be removed, ` +
         `so windows.writeRestrictedToken: false cannot take effect (srt-win ` +
-        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
+        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}. ` +
+        `For a root that can no longer be located (a removed drive), ` +
+        `\`srt-win acl forget --all --force\` drops its record.`,
     )
   }
 }
@@ -2565,6 +2567,16 @@ export function windowsSetupVersionMismatch(
   if (us.setupVersion === undefined || us.markerVersion === us.setupVersion) {
     return undefined
   }
+  if (us.markerVersion !== undefined && us.markerVersion > us.setupVersion) {
+    const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+    return (
+      `The Windows sandbox on this machine was set up by a newer ` +
+      `release (setup version ${us.markerVersion}; this release needs ` +
+      `${us.setupVersion}). Use that release, or replace its install ` +
+      `with this one: \`srt-win.exe install --force${sl}\`.\n` +
+      `Nothing is granted or run until then.`
+    )
+  }
   return (
     `The Windows sandbox on this machine was set up by a different ` +
     `release (setup version ${us.markerVersion ?? 'unknown'}; this ` +
@@ -2623,6 +2635,12 @@ function interpretDependencyProbes(
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
+  let reinstallRequired: string | undefined
+  const result = (): SandboxDependencyCheck => ({
+    errors,
+    warnings,
+    ...(reinstallRequired && { reinstallRequired }),
+  })
 
   // 2. Sandbox user provisioned + credential readable.
   if (user.status === 'rejected') {
@@ -2639,8 +2657,8 @@ function interpretDependencyProbes(
   } else {
     // Installed, by a release with another setup version: an upgrade,
     // not a missing sandbox, so its own wording.
-    const stale = windowsSetupVersionMismatch(us, sublayerGuid)
-    if (stale) errors.push(stale)
+    reinstallRequired = windowsSetupVersionMismatch(us, sublayerGuid)
+    if (reinstallRequired) errors.push(reinstallRequired)
   }
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is
@@ -2650,7 +2668,7 @@ function interpretDependencyProbes(
   const wfp = getWfp()
   if (wfp.status === 'rejected') {
     errors.push(`srt-win wfp status failed: ${(wfp.reason as Error).message}`)
-    return { errors, warnings }
+    return result()
   }
   const ws = wfp.value
   if (ws.state === 'cannot-read') {
@@ -2674,7 +2692,7 @@ function interpretDependencyProbes(
     )
   }
 
-  return { errors, warnings }
+  return result()
 }
 
 /**
