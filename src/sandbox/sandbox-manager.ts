@@ -2610,6 +2610,18 @@ async function wrapWithSandboxArgv(
           `at initialize(). Set it at the session level.`,
       )
     }
+    // A config that asks for the restricted token must not run a
+    // command under the ordinary one.
+    if (
+      config?.windows?.writeRestrictedToken === true &&
+      !writeRestrictedToken
+    ) {
+      throw new Error(
+        `windows.writeRestrictedToken was turned on after initialize() — ` +
+          `call reset() then initialize() to apply it. Refusing to run ` +
+          `the command under the ordinary token.`,
+      )
+    }
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,

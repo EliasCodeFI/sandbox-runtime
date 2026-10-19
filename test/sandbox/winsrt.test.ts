@@ -1973,6 +1973,17 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     expect(r.pending).toEqual(['C:\\tree'])
   })
 
+  it('windows.writeRestrictedToken turned on by updateConfig(): the wrap throws', async () => {
+    await SandboxManager.initialize(config())
+    const next = config()
+    next.windows = { ...next.windows, writeRestrictedToken: true }
+    SandboxManager.updateConfig(next)
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(SandboxManager.wrapWithSandboxArgv('echo x')).rejects.toThrow(
+      /turned on after initialize\(\)/,
+    )
+  })
+
   it('reset(): a restore that fails after a completed revoke stays best-effort', async () => {
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
