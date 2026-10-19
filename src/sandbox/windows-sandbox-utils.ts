@@ -3018,6 +3018,12 @@ export interface WindowsProfileGrantStatus {
   unverifiable: WindowsProfileGrantItem[]
   unprotected: WindowsProfileGrantItem[]
   staleAllow: WindowsProfileGrantItem[]
+  /**
+   * Configuration files granted by name that were replaced since (a save
+   * by write-and-rename): unreadable to sandboxed commands, and their
+   * variables are not in `env`, until the grant runs again.
+   */
+  replacedFiles: string[]
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
@@ -3050,6 +3056,7 @@ type RawProfileStatus = {
   unverifiable?: unknown
   unprotected?: unknown
   stale_allow?: unknown
+  replaced_files?: unknown
   state?: string
   reason?: string
   profile?: string | null
@@ -3152,6 +3159,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
     staleAllow: grantItems(raw.stale_allow),
+    replacedFiles: stringList(raw.replaced_files) ?? [],
     extraExclusions: raw.extra_exclusions ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],

@@ -282,6 +282,7 @@ export interface WindowsProfileReadWarning {
     | 'profile_exclusion_unprotected'
     | 'profile_exclusion_unverifiable'
     | 'profile_stale_allow'
+    | 'profile_file_replaced'
   message: string
   paths: WindowsProfileGrantItem[]
 }
@@ -295,7 +296,8 @@ export function windowsProfileReadWarningsOf(
   grant: Pick<
     WindowsProfileGrantStatus,
     'unprotected' | 'unverifiable' | 'staleAllow'
-  >,
+  > &
+    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles'>>,
 ): WindowsProfileReadWarning[] {
   const list = (items: readonly WindowsProfileGrantItem[]) =>
     items.map(i => i.path).join(', ')
@@ -382,6 +384,22 @@ export function windowsProfileReadWarningsOf(
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
         `path's reason gives the icacls command that removes the entry.`,
       paths: grant.staleAllow,
+    })
+  }
+  const replaced = grant.replacedFiles ?? []
+  if (replaced.length > 0) {
+    out.push({
+      code: 'profile_file_replaced',
+      message:
+        `${replaced.length} configuration file(s) were replaced since the ` +
+        `profile read grant was made and are not readable to sandboxed ` +
+        `commands; the variables that point at them are not returned: ` +
+        `${replaced.join(', ')}. Run grantWindowsProfileRead() ` +
+        `(\`srt-win profile grant\`) again.`,
+      paths: replaced.map(path => ({
+        path,
+        reason: 'replaced since the grant was made',
+      })),
     })
   }
   return out

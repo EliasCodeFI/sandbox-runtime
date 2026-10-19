@@ -2317,6 +2317,18 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Option<Forgotten>> {
 
 // ─── Status ─────────────────────────────────────────────────────────
 
+/// Whether the file at `path` carries its own recorded entry and is no
+/// longer the object that entry was written on.
+fn replaced_since(paths: &[Recorded], path: &str) -> bool {
+    let p = path_id::strip_extended_prefix(path).to_lowercase();
+    paths.iter().any(|r| {
+        r.kind == Kind::File
+            && path_id::strip_extended_prefix(&r.path).to_lowercase() == p
+            && r.file_id
+                .is_some_and(|id| path_id::capture_file_id(path).is_ok_and(|now| now != id))
+    })
+}
+
 /// Whether `p` lies strictly inside the directory `dir` (both lower
 /// case, no `\\?\` prefix).
 fn is_beneath(dir: &str, p: &str) -> bool {
@@ -2530,8 +2542,19 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
     }
     if let (true, Ok(l)) = (state == "current", &layout) {
         let shown = |p: &str| path_id::strip_extended_prefix(p).to_owned();
-        let readable =
-            |p: &str| std::fs::metadata(p).is_ok_and(|md| md.is_file()) && covered(&m.paths, p);
+        // A file granted by its own entry and replaced since (a save by
+        // write-and-rename) has no entry: not readable, and said.
+        let replaced = std::cell::RefCell::new(Vec::<String>::new());
+        let readable = |p: &str| {
+            if !(std::fs::metadata(p).is_ok_and(|md| md.is_file()) && covered(&m.paths, p)) {
+                return false;
+            }
+            let gone = replaced_since(&m.paths, p);
+            if gone && !replaced.borrow().iter().any(|r| r == p) {
+                replaced.borrow_mut().push(p.to_owned());
+            }
+            !gone
+        };
         // A directory: a real one (not a link to somewhere else),
         // which the grant made traversable.
         let dir_readable = |p: &str| {
@@ -2567,6 +2590,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         if !withheld.is_empty() {
             out["env_withheld"] = serde_json::Value::Object(withheld);
         }
+        out["replaced_files"] = json!(*replaced.borrow());
     }
     out
 }
@@ -3687,6 +3711,34 @@ mod tests {
             )
         );
         assert!(st["paths"].as_array().is_some_and(|p| !p.is_empty()));
+        assert_eq!(st["replaced_files"], serde_json::json!([]));
+
+        // Saved by write-and-rename, the file is another object and has
+        // no entry: its pointer is withheld and the file is named, until
+        // the next run of the grant.
+        let npmrc = prof.join(".npmrc");
+        let staged = prof.join(".npmrc.lock");
+        std::fs::write(&staged, b"y").unwrap();
+        std::fs::rename(&staged, &npmrc).unwrap();
+        assert!(group_aces(&npmrc).is_empty());
+        let st = status_json(TEST_KEY, Ok(layout.clone()), false);
+        assert_eq!(st["state"], "current", "{st}");
+        assert!(st["env"]["NPM_CONFIG_USERCONFIG"].is_null(), "{st}");
+        let named: Vec<String> = st["replaced_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_lowercase())
+            .collect();
+        assert_eq!(
+            named,
+            [path_id::strip_extended_prefix(&canon(&npmrc)).to_lowercase()]
+        );
+        let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        assert_eq!(again.writes, 1, "{again:?}");
+        let st = status_json(TEST_KEY, Ok(layout.clone()), false);
+        assert!(st["env"]["NPM_CONFIG_USERCONFIG"].is_string(), "{st}");
+        assert_eq!(st["replaced_files"], serde_json::json!([]));
 
         let with_extra = grant(
             &store,

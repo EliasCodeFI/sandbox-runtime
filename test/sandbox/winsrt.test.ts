@@ -1356,6 +1356,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        replacedFiles: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],
@@ -7619,6 +7620,29 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(e.code).toBe('profile_operation_in_progress')
       })
 
+      it('a configuration file replaced since the grant is named in a warning of its own', () => {
+        const replaced = join(home, '.gitconfig')
+        profileStatus = { ...current(), replaced_files: [replaced, 7] }
+        // A list with anything but paths in it is no list.
+        expect(
+          winUtils.getWindowsProfileReadStatus({ srtWin }).replacedFiles,
+        ).toEqual([])
+        profileStatus = { ...current(), replaced_files: [replaced] }
+        const st = winUtils.getWindowsProfileReadStatus({ srtWin })
+        expect(st.replacedFiles).toEqual([replaced])
+        const warnings = windowsProfileReadWarningsOf(st)
+        expect(warnings.map(w => w.code)).toEqual(['profile_file_replaced'])
+        expect(warnings[0]!.paths.map(p => p.path)).toEqual([replaced])
+        expect(warnings[0]!.message).toContain('grantWindowsProfileRead()')
+        // One that says nothing of them has none.
+        profileStatus = current()
+        expect(
+          windowsProfileReadWarningsOf(
+            winUtils.getWindowsProfileReadStatus({ srtWin }),
+          ),
+        ).toEqual([])
+      })
+
       it('a path open through an entry this product wrote is the strongest warning, with what was found about the entry', async () => {
         const ours = {
           ...item(
@@ -7868,6 +7892,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        replacedFiles: [],
         extraExclusions: [],
         exclusions: [],
         ungrantedOnly: [],

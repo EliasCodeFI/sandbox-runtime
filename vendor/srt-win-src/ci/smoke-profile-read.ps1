@@ -410,6 +410,18 @@ try {
   if ($st.state -eq 'current' -and $st.env.NPM_CONFIG_USERCONFIG -and @($st.paths).Count -gt 0) {
     Ok "G: status is current for the made-up profile, with NPM_CONFIG_USERCONFIG=$($st.env.NPM_CONFIG_USERCONFIG)"
   } else { Fail "G: status: $($st | ConvertTo-Json -Compress -Depth 4)" }
+  # A file granted by name and then saved by write-and-rename is another
+  # object with no entry: its pointer is withheld until the next grant.
+  $staged = "$npmrc.lock"
+  'NPMRC-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $staged
+  Move-Item -LiteralPath $staged -Destination $npmrc -Force
+  $st = Status
+  if ($st.state -eq 'current' -and -not $st.env.NPM_CONFIG_USERCONFIG -and @($st.replaced_files).Count -eq 1) { Ok 'G: a replaced configuration file loses its pointer and is named in the status' }
+  else { Fail "G: after replacing .npmrc: $($st | ConvertTo-Json -Compress -Depth 4)" }
+  $gr = Grant
+  $st = Status
+  if ($gr.exit -eq 0 -and $st.env.NPM_CONFIG_USERCONFIG -and @($st.replaced_files).Count -eq 0) { Ok 'G: the next grant gives the replaced file its entry back' }
+  else { Fail "G: re-grant after replacing .npmrc: exit=$($gr.exit) status=$($st | ConvertTo-Json -Compress -Depth 4)" }
   $savedHomes = @{ RUSTUP_HOME = $env:RUSTUP_HOME; CARGO_HOME = $env:CARGO_HOME }
   try {
     $env:RUSTUP_HOME = $null; $env:CARGO_HOME = $null
