@@ -825,7 +825,7 @@ export function generateProxyEnvVars(
   // loopback-only under seatbelt), so a NO_PROXY match makes the client try
   // direct getaddrinfo() and fail. Routing .local hostnames through the proxy
   // lets the parent resolve them (e.g. Kubernetes *.svc.cluster.local).
-  // `[::1]`: Node's `fetch` compares the host as the URL spells it.
+  // `[::1]` is for Node's `fetch`, which matches the host in bracketed form.
   const noProxyAddresses = [
     'localhost',
     '127.0.0.1',
