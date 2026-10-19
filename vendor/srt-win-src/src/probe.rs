@@ -365,16 +365,6 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
 
 // ────────────────────── the attempts ──────────────────────
 
-/// Reverts the thread to the process token on drop.
-struct Reverted;
-impl Drop for Reverted {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = RevertToSelf();
-        }
-    }
-}
-
 /// Which token the connect is made under.
 #[derive(Debug, Clone, Copy)]
 enum Identity {
@@ -418,10 +408,17 @@ enum Expect {
     Token { id: LUID, integrity: Option<u32> },
 }
 
-/// An identity in effect on this thread. Reverts on drop.
+/// An identity in effect on this thread. Reverts to the process
+/// token on drop.
 struct Assumed {
     expect: Expect,
-    _reverted: Reverted,
+}
+impl Drop for Assumed {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RevertToSelf();
+        }
+    }
 }
 
 /// Room for a token property struct and the SID it points to.
@@ -531,7 +528,6 @@ fn impersonate(imp: HANDLE, integrity: Option<u32>) -> Result<Assumed> {
     // including a failed confirmation.
     let assumed = Assumed {
         expect: Expect::Token { id, integrity },
-        _reverted: Reverted,
     };
     confirm_thread_token(assumed.expect)?;
     Ok(assumed)
@@ -547,7 +543,6 @@ fn assume(id: Identity) -> Result<Option<Assumed>> {
                 .context("ImpersonateAnonymousToken")?;
             let assumed = Assumed {
                 expect: Expect::Anonymous,
-                _reverted: Reverted,
             };
             confirm_thread_token(assumed.expect)?;
             Ok(Some(assumed))
@@ -710,8 +705,7 @@ fn connect_bounded(sock: &Sock, addr: &SocketAddr) -> (Outcome, i32) {
         return (classify_error(err.0), err.0);
     }
     // In progress: writable = connected, exceptional = failed.
-    let mut fds = [sock.0; 64];
-    fds[0] = sock.0;
+    let fds = [sock.0; 64];
     let mut writable = FD_SET {
         fd_count: 1,
         fd_array: fds,
@@ -889,19 +883,16 @@ mod tests {
     /// The four lowered-integrity attempts blocked, the rest as
     /// given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
-        lowered(
-            Report {
-                plain: p,
-                anonymous: a,
-                anonymous_loopback: al,
-                deny_only: d,
-                low_integrity: Outcome::Blocked,
-                low_integrity_loopback: Outcome::Blocked,
-                untrusted_integrity: Outcome::Blocked,
-                untrusted_integrity_loopback: Outcome::Blocked,
-            },
-            [Outcome::Blocked; 4],
-        )
+        Report {
+            plain: p,
+            anonymous: a,
+            anonymous_loopback: al,
+            deny_only: d,
+            low_integrity: Outcome::Blocked,
+            low_integrity_loopback: Outcome::Blocked,
+            untrusted_integrity: Outcome::Blocked,
+            untrusted_integrity_loopback: Outcome::Blocked,
+        }
     }
 
     /// `r` with the four lowered-integrity attempts replaced, in
