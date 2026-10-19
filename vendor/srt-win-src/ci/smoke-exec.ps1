@@ -289,7 +289,7 @@ Write-Host 'R4e ok: Start-Process -RedirectStandardOutput starts its command'
 # ── R4f: an MSYS2 shell sees one name, and so does what it starts ─
 $gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
 if (Test-Path $gitBash) {
-  # One argument to `-c`: in an array literal `,` binds tighter than `+`.
+  # Built as one string first: in an array literal `,` binds tighter than `+`.
   $script = "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; " +
             "/usr/bin/env | /usr/bin/grep -c '^http_proxy='"
   $r = RExec ($bothCases + @('--', $gitBash, '-c', $script))
