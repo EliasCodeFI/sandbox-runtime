@@ -992,8 +992,9 @@ mod tests {
 
     /// The final link of the `--env-stdin` delivery path: an overlay
     /// entry (as `exec` sends it in the runner spec) must land in
-    /// the `CREATE_UNICODE_ENVIRONMENT` block verbatim, with its
-    /// lowercase proxy case-twin appended.
+    /// the `CREATE_UNICODE_ENVIRONMENT` block, once, under the one
+    /// spelling a proxy variable has in a sandboxed command's
+    /// environment.
     #[test]
     fn build_env_block_carries_overlay_entry() {
         let url = "http://sb:tokprobe0123@localhost:60080";
@@ -1001,13 +1002,14 @@ mod tests {
         // Decode `KEY=VALUE\0`…`\0\0` back into strings.
         let s = String::from_utf16(&block).expect("utf16");
         let entries: Vec<&str> = s.split('\0').filter(|e| !e.is_empty()).collect();
-        assert!(
-            entries.iter().any(|e| *e == format!("HTTPS_PROXY={url}")),
-            "overlay var missing from env block: {entries:?}"
-        );
-        assert!(
-            entries.iter().any(|e| *e == format!("https_proxy={url}")),
-            "lowercase case-twin missing: {entries:?}"
+        let named: Vec<&&str> = entries
+            .iter()
+            .filter(|e| e.to_ascii_lowercase().starts_with("https_proxy="))
+            .collect();
+        assert_eq!(
+            named,
+            [&format!("https_proxy={url}").as_str()],
+            "overlay var missing or named twice in the env block: {entries:?}"
         );
     }
 }
