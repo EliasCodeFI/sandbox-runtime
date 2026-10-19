@@ -287,14 +287,9 @@ function logWindowsAclOutcomes(
 }
 
 /**
- * Whether the deny restore may run after `revoke`: only after a
- * revoke that completed, and never again in this process once one did
- * not. An ALLOW grant may then still be on disk, and the sandbox
- * account is shared by every session, so with the DENY stamps gone
- * another session's sandboxed process could write this tree's deny
- * targets. A later revoke that finds nothing left to release does not
- * show the earlier grant is gone (an older srt-win forgets a path it
- * could not open).
+ * Whether the deny restore may run: only after a revoke that
+ * completed, and never again in this process once one did not — a
+ * grant may still be on disk and the sandbox account is shared.
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
@@ -2831,10 +2826,8 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
-  // Windows: release this session's sandbox-user ACEs. Best-effort
-  // — log anomalies rather than throw, so teardown always
-  // completes. ACEs still recorded for this process are released by
-  // srt-win's crash recovery once it has exited.
+  // Windows: release this session's sandbox-user ACEs. Best-effort:
+  // log anomalies rather than throw, so teardown always completes.
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
