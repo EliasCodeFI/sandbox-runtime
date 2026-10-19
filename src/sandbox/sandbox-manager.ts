@@ -204,13 +204,11 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// Tracked per child-token shape: the WFP block filter matches by an
-// access check of the connecting token, so a pass for one shape says
-// nothing about the other.
+// Tracked per child-token shape: the WFP filter matches by an access
+// check of the connecting token.
 const windowsWfpVerified = { defaultToken: false, writeRestrictedToken: false }
-// The child-token shape initialize() verified the fence for. The wrap
-// path uses this rather than `config`, which updateConfig() swaps
-// live without re-verifying.
+// The child-token shape initialize() verified the fence for; the wrap
+// path uses this, not `config`, which updateConfig() swaps live.
 let windowsWriteRestrictedToken = false
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -1082,9 +1080,7 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    // The probe runs under the token shape this session's commands
-    // will get; anything but a refused connect throws, so the session
-    // never starts with that token unfenced.
+    // The probe runs under the token shape this session's commands get.
     const wfpShape =
       runtimeConfig.windows?.writeRestrictedToken === true
         ? 'writeRestrictedToken'
@@ -2607,9 +2603,8 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
-    // The token shape is session-level: initialize() verified the
-    // egress fence for exactly one shape, so a per-command override
-    // that differs is refused.
+    // initialize() verified the egress fence for one token shape, so a
+    // per-command override that differs is refused.
     const writeRestrictedToken = windowsWriteRestrictedToken
     const perCommandToken = customConfig?.windows?.writeRestrictedToken
     if (

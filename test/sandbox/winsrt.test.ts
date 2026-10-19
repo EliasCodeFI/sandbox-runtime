@@ -378,16 +378,13 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       ...base,
       writeRestrictedToken: true,
     })
-    // An srt-win option, so it must sit before `--`: after it the
-    // flag would be handed to the sandboxed command instead.
+    // Before `--`: after it the flag goes to the sandboxed command.
     const flagAt = on.argv.indexOf('--write-restricted-token')
     expect(flagAt).toBeGreaterThan(on.argv.indexOf('exec'))
     expect(flagAt).toBeLessThan(on.argv.indexOf('--'))
     expect(on.argv.filter(a => a === '--write-restricted-token')).toHaveLength(
       1,
     )
-    // The only differences from the option-off argv: the flag, one
-    // more git config entry, and the count that covers it.
     const added = on.argv.filter(a => !off.argv.includes(a))
     expect(added.sort()).toEqual(
       [
@@ -648,7 +645,6 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     // Appended last, so every earlier entry keeps its index.
     expect(values(on)).toEqual([...values(off), 'http.sslBackend=openssl'])
     expect(on.GIT_CONFIG_COUNT).toBe(String(Number(off.GIT_CONFIG_COUNT) + 1))
-    // On its own (no safe dirs, no schannel knobs) it is still emitted.
     expect(buildGitConfigEnv({ safeDirs: [], opensslBackend: true })).toEqual({
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'http.sslBackend',
@@ -1378,9 +1374,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
-    // 3 = the probe child connected (fence open for this token);
-    // 2 = unreachable; 1 = the probe child could not be created
-    // (e.g. the restricted token could not be built) → `error`.
+    // 3 = connected, 2 = unreachable, 1 = no probe child was created.
     for (const [status, probe, code] of [
       [3, 'connected', 'wfp_fence_inactive'],
       [2, 'unreachable', 'wfp_verify_inconclusive'],
@@ -2255,9 +2249,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     })
     const cfg = createTestConfig()
     cfg.windows = { ...cfg.windows, writeRestrictedToken: true }
-    // Runs `wfp verify --write-restricted-token` for real: a lockdown
-    // child holding the restricted token must be refused by the fence,
-    // or this throws.
     await SandboxManager.initialize(cfg)
     try {
       const { argv, env } =
@@ -2278,8 +2269,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
-      // The session's token shape is the one the fence was verified
-      // for; a command cannot switch to the other one.
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
         SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
@@ -2289,7 +2278,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     } finally {
       await SandboxManager.reset()
     }
-    // After reset the next session is back on the default token.
     await SandboxManager.initialize(createTestConfig())
     try {
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')

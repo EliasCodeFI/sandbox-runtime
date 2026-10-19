@@ -1,31 +1,20 @@
-//! `srt-win probe …` — small self-checks that report what the
-//! **calling process's own token** can do. They exist so a check can
-//! run under exactly the token the sandboxed child gets: `wfp verify
-//! --write-restricted-token` runs [`connect`] as the lockdown child.
-//! None of them changes any state.
-//!
-//! [`connect`] is the only one in a default build. `parent_access`
-//! (and `probe token`, see [`crate::token`]) are CI smoke hooks,
-//! compiled only with the `test-hooks` cargo feature.
+//! `srt-win probe …` — self-checks that report what the calling
+//! process's own token can do, so a check can run under exactly the
+//! sandboxed child's token. Only [`connect`] is in a default build;
+//! the rest are `test-hooks` CI smoke hooks.
 
 use anyhow::{Context, Result};
 #[cfg(feature = "test-hooks")]
 use serde::Serialize;
 
-/// Attempt a direct TCP connect to `target` (`ip:port`) and classify
-/// the outcome as an exit code: **0** = refused by the WFP fence
-/// (`WSAEACCES`), **3** = connected (the fence did not apply), **2**
-/// = any other error (timeout, unreachable). One line of diagnostics
-/// goes to stderr; stdout is left alone.
-///
-/// The WFP block filter fires at `ALE_AUTH_CONNECT`, before any
-/// packet leaves, so an active fence answers immediately.
+/// Direct TCP connect to `target` (`ip:port`), classified as an exit
+/// code: 0 = refused by the WFP fence (`WSAEACCES`), 3 = connected,
+/// 2 = any other error.
 pub fn connect(target: &str) -> Result<u32> {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
-    // Match on the raw code, not `ErrorKind::PermissionDenied`:
-    // `ERROR_ACCESS_DENIED` (5) would mean something other than the
-    // WFP fence and must fall through to `unreachable`.
+    // The raw code, not `ErrorKind::PermissionDenied`:
+    // `ERROR_ACCESS_DENIED` (5) is not the WFP fence.
     const WSAEACCES: i32 = 10013;
     let addr: SocketAddr = target
         .parse()
@@ -54,12 +43,10 @@ pub fn connect(target: &str) -> Result<u32> {
     }
 }
 
-/// Result of [`parent_access`].
 #[cfg(feature = "test-hooks")]
 #[derive(Debug, Serialize)]
 pub struct ParentAccess {
     pub parent_pid: u32,
-    /// How many threads of the parent were probed.
     pub threads: usize,
     /// Every `<object>:<right>` open that **succeeded** — e.g.
     /// `process:PROCESS_VM_WRITE`, `thread:1234:THREAD_SET_CONTEXT`.
@@ -68,8 +55,7 @@ pub struct ParentAccess {
     pub errors: Vec<String>,
 }
 
-/// Process rights that let the holder write to, run code in, or take
-/// the token of the target.
+/// Rights that let the holder write to, run code in, or take the token of the target.
 #[cfg(feature = "test-hooks")]
 const PROCESS_RIGHTS: &[(&str, u32)] = &[
     ("PROCESS_TERMINATE", 0x0001),
@@ -86,7 +72,6 @@ const PROCESS_RIGHTS: &[(&str, u32)] = &[
     ("WRITE_OWNER", 0x0008_0000),
 ];
 
-/// The thread-side equivalents.
 #[cfg(feature = "test-hooks")]
 const THREAD_RIGHTS: &[(&str, u32)] = &[
     ("THREAD_TERMINATE", 0x0001),
@@ -100,13 +85,9 @@ const THREAD_RIGHTS: &[(&str, u32)] = &[
     ("WRITE_OWNER", 0x0008_0000),
 ];
 
-/// Try to open this process's **parent** and each of the parent's
-/// threads with every right in [`PROCESS_RIGHTS`] / [`THREAD_RIGHTS`],
-/// one right per open, and report which opens succeeded. Run as the
-/// lockdown child, the parent is the runner, so an empty `opened`
-/// means the child has no handle-level way to write to the runner,
-/// run code in it, or impersonate it. Handles that do open are closed
-/// at once and never used.
+/// Try to open this process's parent and each of its threads with
+/// every right in [`PROCESS_RIGHTS`] / [`THREAD_RIGHTS`] and report
+/// which opens succeeded.
 #[cfg(feature = "test-hooks")]
 pub fn parent_access() -> Result<ParentAccess> {
     use crate::util::{OwnedHandle, parent_pid_of, thread_ids_of};

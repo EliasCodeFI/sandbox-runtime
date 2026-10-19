@@ -1,48 +1,15 @@
 <#
-  Smoke test for the opt-in write-restricted child token
-  (`srt-win exec --write-restricted-token`, `token.rs`).
-
-  The sandbox account is a member of BUILTIN\Users and Authenticated
-  Users, so with the default token it can write wherever those groups
-  hold write access. The option adds WRITE_RESTRICTED and the
-  restricting SIDs [<sandbox user>, Everyone, RESTRICTED] to the child
-  token. Rows (option ON unless noted):
-
-    A  write / create / delete in a directory that grants Modify only
-       to Authenticated Users, and in one that grants it only to
-       BUILTIN\Users: DENIED with the option, ALLOWED without it (the
-       OFF half proves the option is what closes it).
-    B  inside an `acl grant` root: write succeeds; a deny-stamped file
-       inside it is still denied.
-    C  the egress fence holds for this token (`wfp verify
-       --write-restricted-token`, and a direct connect from a
-       sandboxed process), and the permitted loopback range is still
-       reachable.
-    D  cmd, Windows PowerShell, node and git-bash each start; a
-       process can create and open a named mutex and event; two
-       sandboxed processes talk over a named pipe created with the
-       default security descriptor.
-    E  the child cannot open the runner process, or any of its
-       threads, with a write / code-execution / impersonation right.
-    F  OBSERVATION ONLY: whether a Schannel client handshake fails
-       under the option; prints the error. Never fails the run.
-    G  the child token itself: write-restricted, restricting SIDs
-       exactly the three above.
-
-  A failing row is recorded and the script keeps going, so one run
-  reports every row; it throws at the end if any row failed.
-
-  Self-contained: installs under a fixed test-only sublayer GUID
-  (referenced by cleanup.ps1) and uninstalls in `finally`.
-
-  Two binaries. `$Exe` is the default-feature build: it is the broker
-  and runner of EVERY row, so the token, the fence and the
-  self-protection under test are always the shipped ones. `$HooksExe`
-  is a second build with `--features test-hooks`, which adds the
-  `probe token` and `probe parent-access` subcommands; rows G and E
-  run it as the sandboxed command (launched by `$Exe`) and nothing
-  else uses it. Without `$HooksExe` rows G and E are SKIPPED, with a
-  message, and the rest still run.
+  Smoke test for the write-restricted child token (`srt-win exec
+  --write-restricted-token`). Rows (option ON unless noted):
+    A  group-held write access is denied (allowed with the option off)
+    B  an `acl grant` root is writable; a deny stamp inside it holds
+    C  the egress fence holds for this token
+    D  common programs start; named objects and pipes work
+    E  the child cannot open the runner or its threads
+    F  observation only: Schannel handshake under the option
+    G  the child token's restricting SIDs
+  `$HooksExe` is a `--features test-hooks` build that rows G and E run
+  as the sandboxed command; without it they are skipped.
 #>
 param(
   [Parameter(Mandatory = $true, Position = 0)]
@@ -59,8 +26,7 @@ $PortRange = '60080-60089'
 $PortLo    = 60080
 $PortHi    = 60089
 
-# Absolute: sandboxed children run these binaries for the probe rows
-# (`srt-win probe …`), and they do not share our cwd semantics.
+# Absolute: sandboxed children run these binaries and do not share our cwd.
 $ExeAbs = (Resolve-Path $Exe).Path
 $HooksAbs = $null
 if ($HooksExe) {
@@ -123,9 +89,7 @@ function Bind-OutOfRange {
   return $l
 }
 
-# Start `srt-win exec <tail>` without waiting. The broker forwards
-# only what it is told via --env, so pass PATH/PATHEXT — the same
-# overlay the TS wrapper builds.
+# The broker forwards only what it is told via --env, so pass PATH/PATHEXT.
 function Start-Sb { param([string[]] $tail)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
@@ -138,15 +102,13 @@ function Start-Sb { param([string[]] $tail)
   $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p = [System.Diagnostics.Process]::Start($psi)
-  # Drain both pipes concurrently so a full pipe buffer can't wedge
-  # WaitForExit.
+  # Drain both pipes concurrently so a full buffer can't wedge WaitForExit.
   return [pscustomobject]@{
     p = $p; so = $p.StandardOutput.ReadToEndAsync()
     se = $p.StandardError.ReadToEndAsync(); tail = $tail
   }
 }
-# Wait for a Start-Sb process. A timeout is reported as exit -1 with
-# the captured output, not thrown: the caller records the row.
+# A timeout is reported as exit -1, not thrown: the caller records the row.
 function Wait-Sb { param($h, [int] $TimeoutSec = 180)
   if (-not $h.p.WaitForExit($TimeoutSec * 1000)) {
     try { $h.p.Kill($true) } catch { }
@@ -159,11 +121,9 @@ function Wait-Sb { param($h, [int] $TimeoutSec = 180)
   $child = (($raw -split "`r?`n") | Where-Object { $_ -notmatch '^srt-win:' }) -join "`n"
   return [pscustomobject]@{ exit = $h.p.ExitCode; raw = $raw; out = $child }
 }
-# Sandboxed exec, default token.
 function SbOff { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--') + $tail)) $TimeoutSec
 }
-# Sandboxed exec, write-restricted token.
 function SbOn { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--write-restricted-token', '--') + $tail)) $TimeoutSec
 }
@@ -179,10 +139,7 @@ try { Start-Service seclogon -ea Stop } catch {
   Write-Host "smoke-write-restricted: WARNING: Start-Service seclogon: $_"
 }
 
-# Scratch tree at the system-drive root, with inheritance cut on each
-# test directory so the ACEs below are the only ones that apply.
-# Administrators + SYSTEM keep full control so this script can seed
-# and clean up.
+# Scratch tree with inheritance cut, so the ACEs below are the only ones that apply.
 $root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
 $adm  = @('*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')
 function New-AclDir { param([string] $name, [string[]] $extraGrants)
@@ -193,16 +150,13 @@ function New-AclDir { param([string] $name, [string[]] $extraGrants)
   if ($LASTEXITCODE -ne 0) { throw "icacls $d exited $LASTEXITCODE" }
   return $d
 }
-# Seed the three files an A-row acts on. Created AFTER the directory
-# ACL is set so they inherit it.
+# Created AFTER the directory ACL is set so the files inherit it.
 function Seed-Dir { param([string] $d)
   'KEEP' | Set-Content -Encoding ASCII (Join-Path $d 'keep.txt')
   'DEL'  | Set-Content -Encoding ASCII (Join-Path $d 'del.txt')
   Remove-Item (Join-Path $d 'new.txt') -Force -ea SilentlyContinue
 }
-# One sandboxed cmd that appends to keep.txt, creates new.txt and
-# deletes del.txt. cmd's `del` exits 0 even when refused, so the
-# verdict is read from the files, not the exit code.
+# cmd's `del` exits 0 even when refused, so the verdict is read from the files.
 function Mutate { param([string] $d, [bool] $restricted)
   $line = "echo APPENDED>> `"$d\keep.txt`" & echo NEW> `"$d\new.txt`" & del /q `"$d\del.txt`""
   $tail = @($cmd, '/d', '/s', '/c', $line)
@@ -227,9 +181,6 @@ try {
   New-Item -ItemType Directory -Path $root -Force | Out-Null
 
   # ── G: the token itself ──────────────────────────────────────────
-  # First, so every later row is read knowing what token it ran under.
-  # `probe token` exists only in the test-hooks build; it runs here as
-  # the sandboxed command, under a token the default build created.
   if (-not $HooksAbs) { Skip 'G (the child token''s restricting SIDs)' } else {
     $want = @($sbSid, 'S-1-1-0', 'S-1-5-12') | Sort-Object
     $r = SbOn @($HooksAbs, 'probe', 'token')
@@ -253,7 +204,6 @@ try {
       Fail 'G: default child token carries restricting SIDs (option off must be unchanged)'
     } else { Ok 'G: default child token has no restricting SIDs' }
   }
-  # For the log: the group view of the same token.
   $r = SbOn @($cmd, '/c', 'whoami /user /groups /fo csv /nh')
   Write-Host "G: whoami under the option (exit=$($r.exit)):`n$($r.out.Trim())"
 
@@ -263,8 +213,7 @@ try {
       @{ tag = 'BUILTIN\Users';       name = 'users'; ace = '*S-1-5-32-545:(OI)(CI)(M)' })) {
     $d = New-AclDir $case.name @($case.ace)
     Seed-Dir $d
-    # ON first: nothing in the directory is owned by the sandbox
-    # account yet.
+    # ON first: nothing in the directory is owned by the sandbox account yet.
     $r = Mutate $d $true
     $s = State $d
     Write-Host "A[$($case.tag)] ON : appended=$($s.appended) created=$($s.created) deleted=$($s.deleted)  out: $($r.out.Trim())"
@@ -274,13 +223,11 @@ try {
     if (-not ($s.appended -or $s.created -or $s.deleted)) {
       Ok "A[$($case.tag)]: write, create and delete denied with the option on"
     }
-    # Reads must be untouched.
     $r = SbOn @($cmd, '/c', "type `"$d\keep.txt`"")
     if ($r.out -notmatch 'KEEP') { Fail "A[$($case.tag)]: READ failed with the option on. raw: $($r.raw)" }
     else { Ok "A[$($case.tag)]: read still allowed with the option on" }
 
-    # OFF: the same three operations succeed — the baseline that makes
-    # the ON half mean something.
+    # OFF: the baseline that makes the ON half mean something.
     Seed-Dir $d
     $r = Mutate $d $false
     $s = State $d
@@ -292,17 +239,13 @@ try {
     }
   }
 
-  # A (observations, never failed): what stays writable by design.
-  # (1) A directory that grants Modify to Everyone — Everyone is in
-  #     the restricting list.
+  # A (observations, never failed): Everyone is in the restricting list.
   $d = New-AclDir 'everyone' @('*S-1-1-0:(OI)(CI)(M)')
   Seed-Dir $d
   $null = Mutate $d $true
   $s = State $d
   Write-Host "A-obs[Everyone] ON : appended=$($s.appended) created=$($s.created) deleted=$($s.deleted) (Everyone is a restricting SID; writable is expected)"
-  # (2) A file the sandbox account OWNS (created by the option-off run
-  #     above) in the Authenticated Users directory: can it re-grant
-  #     itself through the owner's implicit WRITE_DAC and then write?
+  # A file the sandbox account OWNS: can it re-grant itself via the owner's WRITE_DAC?
   $owned = Join-Path (Join-Path $root 'au') 'new.txt'
   if (Test-Path $owned) {
     $r = SbOn @($cmd, '/d', '/s', '/c',
@@ -357,17 +300,14 @@ try {
         Fail 'C: wfp verify --write-restricted-token did not report the token shape it probed'
       } else { Ok "C: wfp verify (write-restricted=$flag) reports blocked" }
     }
-    # The same connect from an ordinary sandboxed command. `probe
-    # connect` exits 0 = refused by the fence, 3 = connected.
+    # `probe connect` exits 0 = refused by the fence, 3 = connected.
     $r = SbOn @($ExeAbs, 'probe', 'connect', '--target', $tgt)
     if ($r.exit -eq 0) { Ok "C: out-of-range connect from a write-restricted child refused by the fence ($tgt)" }
     else { Fail "C: out-of-range connect from a write-restricted child was NOT refused (probe exit=$($r.exit); 3 = connected). raw: $($r.raw)" }
-    # The listener was live: the unsandboxed side reaches it.
     $c = [System.Net.Sockets.TcpClient]::new()
     try { $c.Connect('127.0.0.1', $outL.LocalEndpoint.Port) } finally { $c.Dispose() }
   } finally { $outL.Stop() }
 
-  # The permitted loopback range — the path to the host proxies.
   $inL = Bind-Listener ($PortHi..($PortLo + 5))
   $inPort = $inL.LocalEndpoint.Port
   try {
@@ -376,10 +316,6 @@ try {
     else { Fail "C: in-range loopback connect failed from a write-restricted child (probe exit=$($r.exit); want 3). raw: $($r.raw)" }
 
     # ── F: Schannel observation (never fails the run) ──────────────
-    # System32 curl.exe is a Schannel client. The listener accepts the
-    # TCP connect and stays silent, so with a working Schannel the
-    # request times out waiting for a ServerHello; if Schannel cannot
-    # acquire credentials it fails before sending anything.
     $observed = 0
     foreach ($mode in @('OFF', 'ON')) {
       $tail = @($curl, '-sS', '-m', '6', '--ssl-no-revoke', "https://127.0.0.1:$inPort/")
@@ -398,8 +334,6 @@ try {
   if ($r.exit -eq 0 -and $r.out -match 'D-CMD-OK') { Ok 'D: cmd starts' }
   else { Fail "D: cmd did not start. exit=$($r.exit) raw: $($r.raw)" }
 
-  # Windows PowerShell, plus a named mutex and event created and then
-  # opened by name in the session namespace.
   $n = [guid]::NewGuid().ToString('N')
   $ps = "Write-Output D-PS-OK; " +
         "`$m = New-Object System.Threading.Mutex(`$false, 'Local\srt-wr-m-$n'); " +
@@ -425,9 +359,7 @@ try {
     if ($r.exit -eq 0 -and $r.out -match 'D-NODE-OK') { Ok 'D: node starts' }
     else { Fail "D: node did not start. exit=$($r.exit) raw: $($r.raw)" }
 
-    # Two sandboxed node processes over a named pipe. libuv creates
-    # the pipe with no security attributes, i.e. the default
-    # descriptor built from the creating token's default DACL.
+    # libuv creates the pipe with the default descriptor from the token's default DACL.
     $pipe = "srt-wr-pipe-$n"
     $srvJs = @'
 const n=require('net');const p=String.raw`\\.\pipe\NAME`;const s=n.createServer(c=>{c.on('data',d=>{console.log('PIPE-SRV-GOT:'+d);c.end('pong');s.close()})});s.on('error',e=>{console.log('PIPE-SRV-ERR:'+e.code);process.exit(5)});s.listen(p,()=>console.log('PIPE-SRV-LISTENING'));setTimeout(()=>process.exit(7),90000).unref()
@@ -450,18 +382,13 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
           Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $bash) { Fail 'D: git-bash not found under Program Files\Git — row not run' }
   else {
-    # The command substitution makes bash fork, which is where an
-    # msys2 runtime needs its shared named objects.
+    # The command substitution makes bash fork, which needs msys2's shared named objects.
     $r = SbOn @($bash, '-c', 'echo D-BASH-$(echo FORK)-OK')
     if ($r.exit -eq 0 -and $r.out -match 'D-BASH-FORK-OK') { Ok 'D: git-bash starts and forks' }
     else { Fail "D: git-bash did not start or could not fork. exit=$($r.exit) raw: $($r.raw)" }
   }
 
   # ── E: the child cannot reach into the runner ────────────────────
-  # `probe parent-access` (test-hooks build only) runs as the lockdown
-  # child, whose parent is the default build's runner; it tries every
-  # write / code-execution / impersonation right on the runner process
-  # and on each of its threads.
   if (-not $HooksAbs) { Skip 'E (child cannot open the runner process or its threads)' } else {
     $r = SbOn @($HooksAbs, 'probe', 'parent-access')
     $a = JsonLine $r
@@ -475,7 +402,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
       } else { Ok "E: no write/VM/impersonation open of the runner process or its $($a.threads) thread(s) succeeded" }
       if (@($a.errors).Count -gt 0) { Write-Host "E: note: non-access-denied results: $(@($a.errors) -join '; ')" }
     }
-    # For the record only: the same probe under the default token.
     $r = SbOff @($HooksAbs, 'probe', 'parent-access')
     Write-Host "E-obs: option OFF (not asserted): $($r.out.Trim())"
   }
