@@ -98,7 +98,6 @@ import {
   getWindowsProfileReadStatus,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
-  windowsAclIncompleteRevoke,
   type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
@@ -220,9 +219,10 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the ordinary child token only: the write-restricted
-// token (the default) differs per session, so every initialize() probes.
-let windowsWfpVerified = false
+// Remembered per child-token shape, as the sandbox account the check
+// passed for: a different account (a reinstall) is checked again.
+const windowsWfpVerifiedFor: { ordinary?: string; writeRestricted?: string } =
+  {}
 // The child-token shape initialize() verified the fence for (the wrap
 // path uses it, not `config`); outside a session, the option's default.
 let windowsWriteRestrictedToken = true
@@ -487,29 +487,23 @@ function logWindowsAclOutcomes(
 
 /**
  * Whether the deny restore may run: only after a revoke that
- * completed, and never again in this process once one did not — a
- * grant may still be on disk and the sandbox account is shared.
+ * completed — otherwise a grant may still be on disk, and the sandbox
+ * account is shared. srt-win enforces the same rule from its records.
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
-  const earlier = windowsAclIncompleteRevoke()
-  if (revoke.complete && earlier === undefined) return true
-  const paths = [...new Set([...revoke.pending, ...(earlier ?? [])])]
+  if (revoke.complete) return true
+  const paths = revoke.pending
   logForDebugging(
-    `[Sandbox Windows] ` +
-      (revoke.complete
-        ? `an earlier grant revoke in this process did not complete`
-        : `grant revoke did not complete`) +
+    `[Sandbox Windows] grant revoke did not complete` +
       ` — NOT running the deny restore; deny ACEs stay in place ` +
       `while a grant may still be on disk. Grants possibly left in ` +
       `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
       (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
-      `. After this process exits, \`srt-win acl recover\` retries ` +
-      `the grants still recorded for it and removes its deny ACEs ` +
-      `once they are released (it exits non-zero while one is not). ` +
-      `A listed path that still shows an ALLOW entry for the sandbox ` +
-      `account after that is no longer recorded; remove the entry by ` +
-      `hand.`,
+      `. The next revoke retries them; after this process exits, ` +
+      `\`srt-win acl recover\` does, and removes its deny ACEs once ` +
+      `they are released (\`--force\` drops the record of a grant ` +
+      `that can no longer be located).`,
     { level: 'error' },
   )
   return false
@@ -1136,6 +1130,8 @@ async function initialize(
     // registered, and the next call makes a CA of its own.
     if (mitmCA) disposeMitmCASync(mitmCA)
     mitmCA = undefined
+    // No session came of it: back to the option's default.
+    if (config === undefined) windowsWriteRestrictedToken = true
     throw error
   }
 }
@@ -1197,6 +1193,12 @@ async function initializeSteps(
   // Check dependencies
   const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
+    if (deps.reinstallRequired) {
+      throw new WindowsSandboxError(
+        'reinstall_required',
+        deps.reinstallRequired,
+      )
+    }
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
@@ -1399,7 +1401,7 @@ async function initializeSteps(
           throw e
         }
       }
-      if (!windowsWfpVerified) {
+      if (u.sid === undefined || windowsWfpVerifiedFor.ordinary !== u.sid) {
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1410,7 +1412,7 @@ async function initializeSteps(
           config = undefined
           throw e
         }
-        windowsWfpVerified = true
+        windowsWfpVerifiedFor.ordinary = u.sid
       }
     }
     windowsWriteRestrictedToken = writeRestricted
@@ -1440,7 +1442,9 @@ async function initializeSteps(
     // must not) write. Compare thumbprints so a stale install-time
     // CA doesn't pass the gate while schannel rejects the session's
     // proxy-minted leaves.
-    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
+    // Only the ordinary token: under the write-restricted one Schannel
+    // gets no credentials, so nothing that runs reads that store.
+    if (tlsTerminate && mitmCA && !useWindowsPersistentCa && !writeRestricted) {
       const installed = getWindowsSandboxCaCert(u)
       const sessionThumb = certThumbprint(mitmCA.certPem)
       if (!installed) {
@@ -1570,12 +1574,15 @@ async function initializeSteps(
         }
         // The egress probe, under the token this session's commands
         // get; anything but a refused connect throws.
-        await verifyWindowsWfpEgress({
-          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-          writeRestrictedToken: true,
-          writeRoots: acc.grantWrite,
-          srtWin,
-        })
+        if (windowsWfpVerifiedFor.writeRestricted !== sb) {
+          await verifyWindowsWfpEgress({
+            proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+            writeRestrictedToken: true,
+            writeRoots: acc.grantWrite,
+            srtWin,
+          })
+          windowsWfpVerifiedFor.writeRestricted = sb
+        }
       } else {
         // Grant FIRST so the sandbox user has working-tree access by
         // the time the deny stamp runs.
@@ -3003,6 +3010,18 @@ async function wrapWithSandboxArgv(
           `at initialize(). Set it at the session level.`,
       )
     }
+    // A config that asks for the restricted token must not run a
+    // command under the ordinary one.
+    if (
+      windowsWriteRestrictedTokenEnabled(config?.windows) &&
+      !writeRestrictedToken
+    ) {
+      throw new Error(
+        `windows.writeRestrictedToken was turned on after initialize() — ` +
+          `call reset() then initialize() to apply it. Refusing to run ` +
+          `the command under the ordinary token.`,
+      )
+    }
     // Asked once per srt-win, so an older one is refused as outdated
     // instead of failing on a flag it does not know.
     if (writeRestrictedToken) {
@@ -3305,7 +3324,7 @@ async function reset(): Promise<void> {
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
   windowsCapableSrtWin.clear()
-  // windowsWfpVerified is NOT cleared — per-process, not per-session.
+  // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.

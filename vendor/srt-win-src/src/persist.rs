@@ -854,7 +854,7 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
             if prior.is_some() {
                 // The path names another object than the one granted:
                 // take the grant off that one first.
-                forget_one(conn, ids, canon)?;
+                forget_one(conn, ids, canon, false)?;
             }
             let sid = new_capability_sid()?;
             conn.execute(
@@ -872,8 +872,21 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
     marker_add(canon, cur).with_context(|| format!("list '{canon}' in the persistent-grant marker"))
 }
 
+/// A kept deny on a multi-link file is refused, as a per-session one
+/// is: the links share one DACL and the rows are keyed by path.
+fn refuse_hardlinked_deny(canon: &str, ace: SbAce, links: u32, is_dir: bool) -> Result<()> {
+    if matches!(ace, SbAce::Deny(_)) && !is_dir && links > 1 {
+        bail!(
+            "deny refused: '{canon}' has {links} hardlink(s); the deny \
+             would be kept or removed through one name only"
+        );
+    }
+    Ok(())
+}
+
 fn record_deny(conn: &Connection, canon: &str, ace: SbAce, root: &str) -> Result<()> {
-    let id = path_id::capture_file_id(canon)?;
+    let (id, links, is_dir) = path_id::capture_id_and_links(canon)?;
+    refuse_hardlinked_deny(canon, ace, links, is_dir)?;
     let prior: Option<(String, Vec<u8>)> = conn
         .query_row(
             "SELECT mask, file_id FROM persistent_denies \
@@ -1010,6 +1023,9 @@ pub enum Forgot {
     Pending,
     /// Could not be completed; the root stays recorded.
     Failed(String),
+    /// `--force` only: the object could not be located; its record is
+    /// gone and its ACEs may still be on disk.
+    Dropped,
 }
 
 impl Forgot {
@@ -1019,6 +1035,7 @@ impl Forgot {
             Forgot::Absent => "absent",
             Forgot::Pending => "pending",
             Forgot::Failed(_) => "failed",
+            Forgot::Dropped => "dropped",
         }
     }
 }
@@ -1093,17 +1110,35 @@ fn at_path(path: &str, id: &FileId) -> Result<AtPath> {
     }
 }
 
+/// A granted object that cannot be located fails the forget; with
+/// `force` it is reported and skipped, and the root's record is dropped.
+fn unlocatable(canon: &str, force: bool) -> Result<()> {
+    if !force {
+        bail!(
+            "the object '{canon}' was granted on is no longer at that path and could \
+             not be located by file id; its ACEs may still be on disk (`acl forget \
+             --all --force` drops its record)"
+        );
+    }
+    eprintln!(
+        "srt-win: acl forget --force: the object '{canon}' was granted on could not \
+         be located; its record is dropped and its ACEs may still be on disk"
+    );
+    Ok(())
+}
+
 /// Remove `canon`'s persistent grant. Rows are deleted only after every
-/// DACL write succeeded; an object that cannot be found while its volume
-/// is there fails the call, one whose volume is away becomes pending.
-pub(crate) fn forget_one(conn: &Connection, ids: &Ids, canon: &str) -> Result<Forgot> {
-    forget_one_with(conn, ids, canon, path_id::locate_by_file_id)
+/// DACL write succeeded; an object whose volume is away becomes pending,
+/// and one that cannot be located fails the call unless `force`.
+pub(crate) fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<Forgot> {
+    forget_one_with(conn, ids, canon, force, path_id::locate_by_file_id)
 }
 
 fn forget_one_with(
     conn: &Connection,
     ids: &Ids,
     canon: &str,
+    force: bool,
     locate: impl Fn(&FileId) -> Located,
 ) -> Result<Forgot> {
     // Every object the grant may have been written on.
@@ -1136,6 +1171,7 @@ fn forget_one_with(
     // With the rows gone, converging a path strips it (or leaves
     // what another root still records for it).
     let mut removed = false;
+    let mut dropped = false;
     let mut pending: Vec<PendingStrip> = Vec::new();
     let mut recorded: Vec<(String, FileId)> =
         granted.iter().map(|id| (canon.to_owned(), *id)).collect();
@@ -1163,10 +1199,10 @@ fn forget_one_with(
                 group_sid: ids.group_sid.clone().unwrap_or_default(),
                 path: path.clone(),
             }),
-            Disposition::Fail => bail!(
-                "the object recorded for '{path}' is no longer at that path and could not \
-                 be located by file id; its ACEs may still be on disk"
-            ),
+            Disposition::Fail => {
+                unlocatable(path, force)?;
+                dropped = true;
+            }
         }
     }
     // A root with no record of the object it was granted on (nothing
@@ -1179,7 +1215,9 @@ fn forget_one_with(
     marker_add_pending(&pending)?;
     tx.commit().context("commit forget")?;
     marker_remove(canon)?;
-    Ok(if !pending.is_empty() {
+    Ok(if dropped {
+        Forgot::Dropped
+    } else if !pending.is_empty() {
         Forgot::Pending
     } else if removed {
         Forgot::Removed
@@ -1350,6 +1388,7 @@ pub fn forget(
     ids: &Ids,
     roots: &[String],
     all: bool,
+    force: bool,
 ) -> Result<Vec<(String, Forgot)>> {
     let conn = db.conn();
     // First the grants forgotten earlier whose volume was absent.
@@ -1364,7 +1403,7 @@ pub fn forget(
     targets.retain(|t| seen.insert(t.clone()));
     let mut out = Vec::with_capacity(targets.len());
     for t in targets {
-        let r = match forget_one(conn, ids, &t) {
+        let r = match forget_one(conn, ids, &t, force) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("srt-win: forget '{t}': {e:#}");
@@ -1444,7 +1483,8 @@ pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Forgotten> {
         }
     };
     let holder = crate::state_db::HolderPid(std::process::id());
-    let (out, _) = crate::state_db::with_init_lock(holder, false, |db| forget(db, ids, &[], true))?;
+    let (out, _) =
+        crate::state_db::with_init_lock(holder, false, |db| forget(db, ids, &[], true, false))?;
     Ok(Forgotten {
         roots: out.len(),
         failed: out
@@ -1483,7 +1523,7 @@ pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<(
             Ok(UnrecordedGrant::None) => {}
             Ok(UnrecordedGrant::Own) => {
                 eprintln!("srt-win: '{canon}' carries an unrecorded persistent grant; removing it");
-                forget_one(db.conn(), &ids, canon)
+                forget_one(db.conn(), &ids, canon, false)
                     .with_context(|| format!("remove the persistent grant on '{canon}'"))?;
             }
             Ok(UnrecordedGrant::Inherited) => bail!(
@@ -1636,6 +1676,25 @@ mod tests {
             acl::foreign_group_denies(std::slice::from_ref(&fence), &t).len(),
             1
         );
+    }
+
+    #[test]
+    fn an_unlocatable_root_is_skipped_only_with_force() {
+        let e = unlocatable(r"\\?\X:\gone", false).unwrap_err();
+        assert!(format!("{e:#}").contains("could not be located"));
+        assert!(unlocatable(r"\\?\X:\gone", true).is_ok());
+        assert_eq!(Forgot::Dropped.as_str(), "dropped");
+    }
+
+    #[test]
+    fn a_kept_deny_on_a_hardlinked_file_is_refused() {
+        let deny = SbAce::Deny(acl::DenyMask::WriteDeny);
+        let e = refuse_hardlinked_deny(r"\\?\C:\r\f", deny, 2, false).unwrap_err();
+        assert!(format!("{e:#}").contains("2 hardlink(s)"));
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r\f", deny, 1, false).is_ok());
+        // A directory's link count is not a hard-link count.
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r", deny, 3, true).is_ok());
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r", SbAce::DenyFdc, 3, false).is_ok());
     }
 
     #[test]

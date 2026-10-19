@@ -121,19 +121,39 @@ pub fn token_restriction(tok: HANDLE) -> Result<TokenRestriction> {
     if groups.len() < size_of::<u32>() || access.len() < size_of::<TOKEN_ACCESS_INFORMATION>() {
         return Err(anyhow!("GetTokenInformation returned a short buffer"));
     }
+    let restricted_sids = token_group_sids(&groups)?
+        .into_iter()
+        .map(psid_to_string)
+        .collect::<Result<Vec<_>>>()?;
     unsafe {
-        let tg = &*(groups.as_ptr() as *const TOKEN_GROUPS);
-        let restricted_sids =
-            std::slice::from_raw_parts(tg.Groups.as_ptr(), tg.GroupCount as usize)
-                .iter()
-                .map(|g| psid_to_string(g.Sid))
-                .collect::<Result<Vec<_>>>()?;
-        let flags = (*(access.as_ptr() as *const TOKEN_ACCESS_INFORMATION)).Flags;
+        let info = access.as_ptr() as *const TOKEN_ACCESS_INFORMATION;
+        let flags = std::ptr::read_unaligned(std::ptr::addr_of!((*info).Flags));
         Ok(TokenRestriction {
             write_restricted: flags & TOKEN_FLAG_WRITE_RESTRICTED != 0,
             restricted_sids,
         })
     }
+}
+
+/// The SIDs of a `TOKEN_GROUPS` buffer. A buffer with no groups may be
+/// shorter than the struct, so it is read by offset, never by reference.
+fn token_group_sids(buf: &[u8]) -> Result<Vec<PSID>> {
+    let short = || anyhow!("TOKEN_GROUPS buffer is shorter than its group count needs");
+    let count = buf.get(..size_of::<u32>()).ok_or_else(short)?;
+    let count = u32::from_ne_bytes(count.try_into().expect("four bytes")) as usize;
+    let first = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    let each = size_of::<SID_AND_ATTRIBUTES>();
+    if count > 0 && buf.len() < first + count * each {
+        return Err(short());
+    }
+    Ok((0..count)
+        .map(|i| unsafe {
+            std::ptr::read_unaligned(
+                    buf.as_ptr().add(first + i * each) as *const SID_AND_ATTRIBUTES
+                )
+                .Sid
+        })
+        .collect())
 }
 
 /// [`token_restriction`] of this process's own primary token (`test-hooks` only).
@@ -472,6 +492,21 @@ mod tests {
             let _ = CloseHandle(tok);
             let _ = CloseHandle(prim);
         }
+    }
+
+    #[test]
+    fn token_group_sids_reads_a_buffer_shorter_than_the_struct() {
+        // What the kernel returns for no groups can be the count alone.
+        assert!(token_group_sids(&0u32.to_ne_bytes()).unwrap().is_empty());
+        assert!(token_group_sids(&[0u8; 2]).is_err());
+        // A count the buffer does not hold is refused, not read.
+        let mut one = 1u32.to_ne_bytes().to_vec();
+        assert!(token_group_sids(&one).is_err());
+        one.resize(
+            std::mem::offset_of!(TOKEN_GROUPS, Groups) + size_of::<SID_AND_ATTRIBUTES>(),
+            0,
+        );
+        assert_eq!(token_group_sids(&one).unwrap().len(), 1);
     }
 
     /// The user SID must stay in the list: the WFP egress BLOCK matches through it.

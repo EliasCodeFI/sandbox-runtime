@@ -178,6 +178,9 @@ pub struct RecoveryReport {
     /// not be released this pass. Their rows — and the same holder's
     /// deny rows — are kept for the next recovery.
     pub grants_pending: Vec<String>,
+    /// Grant paths whose record `acl recover --force` dropped without
+    /// locating the object; the ACE may still be on disk.
+    pub grants_dropped: Vec<String>,
 }
 
 /// RAII guard for the init lock — an exclusive `LockFileEx` range
@@ -959,17 +962,56 @@ impl Locked {
     pub fn register_broker(&self) -> Result<()> {
         let ct = pid_create_time(self.holder_pid.0)
             .with_context(|| format!("read create-time of holder pid {}", self.holder_pid.0))?;
-        let now = unix_now();
-        self.conn
-            .execute(
-                "INSERT INTO brokers (pid, process_create_time, started_at) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(pid) DO UPDATE SET \
-                   process_create_time = excluded.process_create_time, \
-                   started_at          = excluded.started_at",
-                params![self.holder_pid.0 as i64, ct, now],
+        self.register_broker_at(ct)
+    }
+
+    /// [`Self::register_broker`] for a holder created at `ct`. A row
+    /// for this pid with another creation time is a dead process whose
+    /// pid was reused: its holds are set aside, not adopted.
+    fn register_broker_at(&self, ct: i64) -> Result<()> {
+        let pid = self.holder_pid.0 as i64;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin register tx")?;
+        let prior: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT process_create_time, started_at FROM brokers WHERE pid = ?1",
+                params![pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .context("INSERT brokers")?;
+            .optional()?;
+        if let Some((old_ct, old_started)) = prior.filter(|&(c, _)| c != ct) {
+            // Negative pids name no process; recovery treats them as dead.
+            let lowest: Option<i64> =
+                tx.query_row("SELECT MIN(pid) FROM brokers", [], |r| r.get(0))?;
+            let aside = lowest.unwrap_or(0).min(0) - 1;
+            tx.execute(
+                "INSERT INTO brokers (pid, process_create_time, started_at) \
+                 VALUES (?1, ?2, ?3)",
+                params![aside, old_ct, old_started],
+            )
+            .context("INSERT brokers (set aside)")?;
+            tx.execute(
+                "UPDATE ace_holders SET pid = ?1 WHERE pid = ?2",
+                params![aside, pid],
+            )
+            .context("UPDATE ace_holders (set aside)")?;
+            eprintln!(
+                "srt-win: pid {pid} was reused; the holds of the earlier \
+                 process are kept apart for recovery"
+            );
+        }
+        tx.execute(
+            "INSERT INTO brokers (pid, process_create_time, started_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(pid) DO UPDATE SET \
+               process_create_time = excluded.process_create_time, \
+               started_at          = excluded.started_at",
+            params![pid, ct, unix_now()],
+        )
+        .context("INSERT brokers")?;
+        tx.commit().context("commit register")?;
         Ok(())
     }
 
@@ -1071,15 +1113,28 @@ impl Locked {
         self.register_broker()?;
         let (witnesses, failed) = f(self)?;
         if failed > 0 {
+            let mut left = Vec::new();
             for w in witnesses.iter().filter(|w| w.holder_added) {
-                if let Err(e) = self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid) {
-                    eprintln!(
-                        "srt-win: WARNING: rollback {} '{}': {e:#}; \
-                         ACE left in place",
-                        w.ace.kind(),
-                        w.canon
-                    );
-                }
+                let why = match self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid) {
+                    Ok(r) if r.is_pending() => r.as_str().to_string(),
+                    Ok(_) => continue,
+                    Err(e) => format!("{e:#}"),
+                };
+                eprintln!(
+                    "srt-win: WARNING: rollback {} '{}': {why}; \
+                     ACE left in place",
+                    w.ace.kind(),
+                    w.canon
+                );
+                left.push(format!("'{}'", w.canon));
+            }
+            if !left.is_empty() {
+                bail!(
+                    "{failed} path(s) failed and {} could not be rolled back \
+                     (ACE left in place, rows kept for retry): {}",
+                    left.len(),
+                    left.join(", ")
+                );
             }
             if self
                 .my_ace_holds(None)
@@ -1308,6 +1363,7 @@ impl Locked {
             kind,
             sandbox_sid,
             &DISK,
+            false,
         )
     }
 
@@ -1336,6 +1392,24 @@ impl Locked {
         kinds: &[&str],
     ) -> Result<(Vec<(String, AceRelease)>, usize)> {
         let holds = self.my_ace_holds(Some(kinds))?;
+        // A deny outlives every grant it was stamped under.
+        if !kinds.contains(&"grant") && !holds.is_empty() {
+            let grants = self.my_ace_holds(Some(KIND_GRANT))?.len();
+            if grants > 0 {
+                eprintln!(
+                    "srt-win: deny release refused: holder {} still has \
+                     {grants} grant(s) recorded; run `acl revoke` first",
+                    self.holder_pid.0
+                );
+                return Ok((
+                    holds
+                        .into_iter()
+                        .map(|(canon, _)| (canon, AceRelease::GrantPending))
+                        .collect(),
+                    0,
+                ));
+            }
+        }
         let mut out = Vec::with_capacity(holds.len());
         let mut failed = 0usize;
         for (canon, kind) in &holds {
@@ -1474,7 +1548,7 @@ pub enum AceRelease {
     /// The object is positively gone — the path is not found AND,
     /// for a grant, its volume reports no file with the recorded
     /// `file_id`. Row deleted.
-    Missing,
+    Gone,
     /// Holder row removed but no `working_aces` row found.
     NoRow,
     /// Where the ACE is now could not be established. Nothing was
@@ -1483,12 +1557,21 @@ pub enum AceRelease {
     /// The release errored (row update or converge). Nothing was
     /// changed: rows kept, ACE may still be on disk.
     Failed,
+    /// A deny hold whose holder still has a grant recorded. Nothing
+    /// was changed: a deny outlives every grant it was stamped under.
+    GrantPending,
+    /// `acl recover --force` only: the record of a grant that could
+    /// not be located was dropped; its ACE may still be on disk.
+    Dropped,
 }
 
 impl AceRelease {
     /// The rows are still there and the ACE may still be on disk.
     pub fn is_pending(&self) -> bool {
-        matches!(self, AceRelease::Unreadable | AceRelease::Failed)
+        matches!(
+            self,
+            AceRelease::Unreadable | AceRelease::Failed | AceRelease::GrantPending
+        )
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -1498,10 +1581,12 @@ impl AceRelease {
             AceRelease::Downgraded => "downgraded",
             AceRelease::Relocated { .. } => "relocated",
             AceRelease::Mismatch => "mismatch",
-            AceRelease::Missing => "missing",
+            AceRelease::Gone => "gone",
             AceRelease::NoRow => "noRow",
             AceRelease::Unreadable => "unreadable",
             AceRelease::Failed => "failed",
+            AceRelease::GrantPending => "grantPending",
+            AceRelease::Dropped => "dropped",
         }
     }
 }
@@ -1561,6 +1646,7 @@ fn release_hold(
     kind: &str,
     sandbox_sid: &str,
     disk: &Disk,
+    force: bool,
 ) -> Result<AceRelease> {
     let row: Option<(Vec<u8>, String)> = conn
         .prepare_cached(
@@ -1580,6 +1666,7 @@ fn release_hold(
         Moved(String),
         Gone,
         Foreign,
+        Dropped,
     }
     let site = match (disk.gate)(canon, want_id) {
         IdGate::Match => Site::Here,
@@ -1595,6 +1682,7 @@ fn release_hold(
         IdGate::Mismatch if kind == "grant" => match (disk.locate)(&want_id) {
             path_id::Located::At(at) => Site::Moved(at),
             path_id::Located::Gone => Site::Gone,
+            path_id::Located::Unknown if force => Site::Dropped,
             path_id::Located::Unknown | path_id::Located::VolumeAbsent => {
                 eprintln!(
                     "srt-win: grant '{canon}': not at its path and \
@@ -1650,7 +1738,7 @@ fn release_hold(
                 "srt-win: grant '{canon}': path and file_id both \
                  gone; dropping row"
             );
-            AceRelease::Missing
+            AceRelease::Gone
         }
         Site::Foreign => {
             eprintln!(
@@ -1659,6 +1747,14 @@ fn release_hold(
                  foreign object (fail-closed)"
             );
             AceRelease::Mismatch
+        }
+        Site::Dropped => {
+            eprintln!(
+                "srt-win: acl recover --force: grant '{canon}' could not \
+                 be located; its record is dropped and its ACE may still \
+                 be on disk"
+            );
+            AceRelease::Dropped
         }
     };
     tx.commit().context("commit release")?;
@@ -1671,27 +1767,36 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     // Identity comes from the validated machine-store read, never
     // from raw rows: the session DB is user-writable.
     let sb = crate::install::read_setup()?.map(|s| s.sandbox_user_sid);
-    let _ = force; // reserved for a future "force-recompose" mode
-    let report = recover_with(conn, sb.as_deref(), &DISK)?;
+    let report = recover_with(conn, sb.as_deref(), &DISK, force)?;
     // Persistent-grant DACL writes that were started and not seen to
     // finish (they have no holder, so nothing above covers them).
     crate::persist::replay_pending(conn);
     Ok(report)
 }
 
+/// What one recovery pass releases with.
+struct Recovery<'a> {
+    conn: &'a Connection,
+    sb: &'a str,
+    disk: &'a Disk,
+    force: bool,
+}
+
 /// Release `(canon, kind)` for recovery; `false` when its rows are
 /// still there (so the caller must not go on to dependent rows).
 fn recover_one(
-    conn: &Connection,
+    rc: &Recovery<'_>,
     holder: Option<i64>,
     canon: &str,
     kind: &str,
-    sb: &str,
-    disk: &Disk,
     report: &mut RecoveryReport,
 ) -> bool {
-    let done = match release_hold(conn, holder, canon, kind, sb, disk) {
+    let done = match release_hold(rc.conn, holder, canon, kind, rc.sb, rc.disk, rc.force) {
         Ok(r) if r.is_pending() => false,
+        Ok(AceRelease::Dropped) => {
+            report.grants_dropped.push(canon.to_string());
+            true
+        }
         Ok(AceRelease::StillHeld | AceRelease::Downgraded | AceRelease::NoRow) => true,
         Ok(_) => {
             report.aces_revoked += 1;
@@ -1714,16 +1819,14 @@ fn recover_one(
 /// Release `holds` grants-first; the non-grant rows only if every
 /// grant was released, and not at all when `blocked`.
 fn recover_holds(
-    conn: &Connection,
+    rc: &Recovery<'_>,
     holder: Option<i64>,
     holds: &[(String, String)],
     mut blocked: bool,
-    sb: &str,
-    disk: &Disk,
     report: &mut RecoveryReport,
 ) {
     for (canon, kind) in holds.iter().filter(|(_, k)| k == "grant") {
-        blocked |= !recover_one(conn, holder, canon, kind, sb, disk, report);
+        blocked |= !recover_one(rc, holder, canon, kind, report);
     }
     let denies = holds.iter().filter(|(_, k)| k != "grant");
     if blocked {
@@ -1740,11 +1843,16 @@ fn recover_holds(
         return;
     }
     for (canon, kind) in denies {
-        recover_one(conn, holder, canon, kind, sb, disk, report);
+        recover_one(rc, holder, canon, kind, report);
     }
 }
 
-fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<RecoveryReport> {
+fn recover_with(
+    conn: &Connection,
+    sb: Option<&str>,
+    disk: &Disk,
+    force: bool,
+) -> Result<RecoveryReport> {
     let mut report = RecoveryReport::default();
 
     // 1. Find dead brokers.
@@ -1755,7 +1863,8 @@ fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<Reco
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )?
     .into_iter()
-    .filter(|&(pid, ct)| !(disk.alive)(pid as u32, ct))
+    // A negative pid is a dead broker set aside by `register_broker`.
+    .filter(|&(pid, ct)| pid < 0 || !(disk.alive)(pid as u32, ct))
     .map(|(pid, _)| pid)
     .collect();
 
@@ -1770,7 +1879,13 @@ fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<Reco
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if let Some(sb) = sb {
-            recover_holds(conn, Some(pid), &holds, false, sb, disk, &mut report);
+            let rc = Recovery {
+                conn,
+                sb,
+                disk,
+                force,
+            };
+            recover_holds(&rc, Some(pid), &holds, false, &mut report);
         }
         let left: i64 = conn
             .query_row(
@@ -1802,7 +1917,13 @@ fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<Reco
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let blocked = !report.grants_pending.is_empty();
-        recover_holds(conn, None, &orphans, blocked, sb, disk, &mut report);
+        let rc = Recovery {
+            conn,
+            sb,
+            disk,
+            force,
+        };
+        recover_holds(&rc, None, &orphans, blocked, &mut report);
     }
     Ok(report)
 }
@@ -2379,7 +2500,7 @@ mod tests {
             assert!(held.iter().all(|h| i64::from(h.pid) == me) && held.len() == 2);
 
             let disk = Disk { alive, ..OK_DISK };
-            let report = recover_with(&db.conn, Some(SID), &disk).unwrap();
+            let report = recover_with(&db.conn, Some(SID), &disk, false).unwrap();
             assert_eq!(report.dead_brokers, 1);
             let left: i64 = db
                 .conn
@@ -2420,11 +2541,11 @@ mod tests {
                 gate: |_, _| IdGate::Unreadable,
                 ..OK_DISK
             };
-            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk, false).unwrap();
             assert_eq!(r, AceRelease::Unreadable);
             assert_eq!(r.as_str(), "unreadable");
             assert_eq!(counts(&db.conn), (1, 1, 1));
-            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &OK_DISK).unwrap();
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &OK_DISK, false).unwrap();
             assert_eq!(r, AceRelease::Revoked);
             assert_eq!(counts(&db.conn), (1, 0, 0));
         });
@@ -2439,7 +2560,7 @@ mod tests {
                 converge: |_, _, _| bail!("SetNamedSecurityInfoW failed"),
                 ..OK_DISK
             };
-            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).is_err());
+            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk, false).is_err());
             assert_eq!(counts(&db.conn), (1, 1, 1));
         });
     }
@@ -2454,7 +2575,7 @@ mod tests {
                 locate: |_| path_id::Located::Unknown,
                 ..OK_DISK
             };
-            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk, false).unwrap();
             assert_eq!(r, AceRelease::Unreadable);
             assert_eq!(counts(&db.conn), (1, 1, 1));
             let disk = Disk {
@@ -2463,14 +2584,15 @@ mod tests {
                 converge: |_, _, _| bail!("converge failed"),
                 ..OK_DISK
             };
-            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).is_err());
+            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk, false).is_err());
             assert_eq!(counts(&db.conn), (1, 1, 1));
             let disk = Disk {
                 gate: |_, _| IdGate::Mismatch,
                 ..OK_DISK
             };
-            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
-            assert_eq!(r, AceRelease::Missing);
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk, false).unwrap();
+            assert_eq!(r, AceRelease::Gone);
+            assert_eq!(r.as_str(), "gone");
             assert_eq!(counts(&db.conn), (1, 0, 0));
         });
     }
@@ -2495,7 +2617,7 @@ mod tests {
                 },
                 ..OK_DISK
             };
-            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            let rep = recover_with(c, Some(SID), &disk, false).unwrap();
             assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
             // 42 released and pruned; 41 untouched and still registered.
             assert_eq!(rep.dead_brokers, 1);
@@ -2511,11 +2633,11 @@ mod tests {
                 },
                 ..OK_DISK
             };
-            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            let rep = recover_with(c, Some(SID), &disk, false).unwrap();
             assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
             assert_eq!(counts(c), (1, 3, 3));
 
-            let rep = recover_with(c, Some(SID), &OK_DISK).unwrap();
+            let rep = recover_with(c, Some(SID), &OK_DISK, false).unwrap();
             assert!(rep.grants_pending.is_empty());
             assert_eq!((rep.dead_brokers, rep.aces_revoked), (1, 3));
             assert_eq!(counts(c), (0, 0, 0));
@@ -2541,13 +2663,103 @@ mod tests {
                 },
                 ..OK_DISK
             };
-            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            let rep = recover_with(c, Some(SID), &disk, false).unwrap();
             assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
             assert_eq!(counts(c), (0, 0, 2));
 
-            let rep = recover_with(c, Some(SID), &OK_DISK).unwrap();
+            let rep = recover_with(c, Some(SID), &OK_DISK, false).unwrap();
             assert!(rep.grants_pending.is_empty());
             assert_eq!(counts(c), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn deny_release_is_refused_while_the_holder_has_a_grant() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            seed(&db.conn, me, TREE, "grant", "modify");
+            seed(&db.conn, me, SECRET, "deny", "denyWrite");
+            let (out, failed) = db.release_aces(SID, KIND_DENY).unwrap();
+            assert_eq!(out, vec![(SECRET.to_string(), AceRelease::GrantPending)]);
+            assert_eq!(failed, 0);
+            assert!(out[0].1.is_pending());
+            assert_eq!(out[0].1.as_str(), "grantPending");
+            assert_eq!(counts(&db.conn), (1, 2, 2));
+        });
+    }
+
+    #[test]
+    fn forced_recovery_drops_only_a_grant_that_cannot_be_located() {
+        with_mem_db(|db| {
+            let c = &db.conn;
+            seed(c, 41, TREE, "grant", "modify");
+            seed(c, 41, SECRET, "deny", "denyWrite");
+            let lost = Disk {
+                gate: |p, _| {
+                    if p == TREE {
+                        IdGate::Mismatch
+                    } else {
+                        IdGate::Match
+                    }
+                },
+                locate: |_| path_id::Located::Unknown,
+                ..OK_DISK
+            };
+            let rep = recover_with(c, Some(SID), &lost, false).unwrap();
+            assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
+            assert!(rep.grants_dropped.is_empty());
+            assert_eq!(counts(c), (1, 2, 2));
+
+            // A path that merely cannot be opened is not dropped.
+            let closed = Disk {
+                gate: |p, _| {
+                    if p == TREE {
+                        IdGate::Unreadable
+                    } else {
+                        IdGate::Match
+                    }
+                },
+                ..OK_DISK
+            };
+            let rep = recover_with(c, Some(SID), &closed, true).unwrap();
+            assert!(rep.grants_dropped.is_empty());
+            assert_eq!(counts(c), (1, 2, 2));
+
+            let rep = recover_with(c, Some(SID), &lost, true).unwrap();
+            assert_eq!(rep.grants_dropped, vec![TREE.to_string()]);
+            assert!(rep.grants_pending.is_empty());
+            assert_eq!((rep.dead_brokers, rep.aces_revoked), (1, 1));
+            assert_eq!(counts(c), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn a_reused_pid_does_not_adopt_the_dead_brokers_holds() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            seed(&db.conn, me, TREE, "grant", "modify");
+            db.register_broker_at(7).unwrap();
+            let holds_of = |pid: i64| -> i64 {
+                db.conn
+                    .query_row(
+                        "SELECT count(*) FROM ace_holders WHERE pid = ?1",
+                        params![pid],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!((holds_of(me), holds_of(-1)), (0, 1));
+            // The same process registering again moves nothing.
+            db.register_broker_at(7).unwrap();
+            assert_eq!(counts(&db.conn), (2, 1, 1));
+            // Recovery releases the set-aside holds whatever the probe says.
+            let disk = Disk {
+                alive: |_, _| true,
+                ..OK_DISK
+            };
+            let rep = recover_with(&db.conn, Some(SID), &disk, false).unwrap();
+            assert_eq!((rep.dead_brokers, rep.aces_revoked), (1, 1));
+            assert_eq!(counts(&db.conn), (1, 0, 0));
         });
     }
 
@@ -2562,7 +2774,7 @@ mod tests {
                 [],
             )
             .unwrap();
-            let rep = recover_with(c, None, &OK_DISK).unwrap();
+            let rep = recover_with(c, None, &OK_DISK, false).unwrap();
             // Only the hold-less dead broker is pruned.
             assert_eq!(rep.dead_brokers, 1);
             assert_eq!(counts(c), (1, 1, 1));

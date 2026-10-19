@@ -185,19 +185,32 @@ foreach ($stale in @(($SetupVersion - 1), 99)) {
     throw "M1c: user status on marker v$stale reports marker_version=$($m1s.marker_version) setup_version=$($m1s.setup_version)"
   }
   Write-Host "M1b ok: read-cred refuses + status survives a v$stale marker"
-  $m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE on marker v$stale. out: $m1out" }
-  if ($m1out -match '(?i)already installed.*no changes') {
-    throw "M1: install short-circuited on a v$stale marker. out: $m1out"
-  }
-  if ($m1out -notmatch "setup version $stale; upgrading it to $SetupVersion") {
-    throw "M1: install did not report the upgrade from v$stale. out: $m1out"
+  if ($stale -gt $SetupVersion) {
+    # A newer install is not replaced without --force.
+    $m1n = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -or $m1n -notmatch "newer than this build's") {
+      throw "M1n: plain install on a newer marker v${stale}: exit=$LASTEXITCODE out: $m1n"
+    }
+    $mvn = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
+    if ($mvn -ne $stale) { throw "M1n: refused install changed the marker (v$stale -> v$mvn)" }
+    Write-Host "M1n ok: plain install refuses a newer marker v$stale"
+    $m1out = & $Exe @(@('install', '--force') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "M1: install --force exited $LASTEXITCODE on marker v$stale. out: $m1out" }
+  } else {
+    $m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE on marker v$stale. out: $m1out" }
+    if ($m1out -match '(?i)already installed.*no changes') {
+      throw "M1: install short-circuited on a v$stale marker. out: $m1out"
+    }
+    if ($m1out -notmatch "setup version $stale; upgrading it to $SetupVersion") {
+      throw "M1: install did not report the upgrade from v$stale. out: $m1out"
+    }
   }
   $mv = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
   if ($mv -ne $SetupVersion) { throw "M1: marker not rewritten (v$stale -> v$mv, expected v$SetupVersion)" }
   & $Exe user read-cred 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "M1: read-cred fails after the upgrade from v$stale" }
-  Write-Host "M1 ok: v$stale marker upgraded by plain install (now v$mv)"
+  Write-Host "M1 ok: v$stale marker brought to this build's (now v$mv)"
 }
 # Re-install above re-wrote the cred; downstream rows (read-cred
 # etc.) already ran and don't depend on it.

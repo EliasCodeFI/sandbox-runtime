@@ -2045,7 +2045,7 @@ pub fn grant(
             ) else {
                 continue;
             };
-            persist::forget_one(store.conn, ids, &root).with_context(|| {
+            persist::forget_one(store.conn, ids, &root, false).with_context(|| {
                 format!(
                     "the write grant kept on '{root}' reaches an exclusion ({why}) and could \
                      not be removed; run `srt-win acl forget \"{}\"` and then the grant again",

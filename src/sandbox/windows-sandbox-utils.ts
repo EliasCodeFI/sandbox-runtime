@@ -2631,13 +2631,14 @@ const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
   'downgraded',
   'relocated',
   'noRow',
+  'gone',
   'missing',
 ])
 
 /**
  * Whether one `acl revoke` outcome shows its grant released. "missing"
- * counts only if the path is really gone: an older srt-win reports a
- * path it could not open as "missing", with the ACE still there.
+ * comes only from an older srt-win, which also says it of a path it
+ * could not open, so it counts only if the path is really gone.
  */
 function windowsAclGrantReleased(o: unknown): boolean {
   if (typeof o !== 'object' || o === null) return false
@@ -2654,31 +2655,9 @@ function windowsAclGrantReleased(o: unknown): boolean {
 }
 
 /**
- * Holders (by PID) whose grant revoke did not complete in this
- * process, with the paths possibly still granted. Never cleared.
- */
-const windowsAclIncompleteRevokes = new Map<number, Set<string>>()
-
-/**
- * Paths an incomplete revoke by `holderPid` may have left granted;
- * `undefined` if every revoke completed. Can be empty.
- */
-export function windowsAclIncompleteRevoke(
-  holderPid: number = process.pid,
-): string[] | undefined {
-  const paths = windowsAclIncompleteRevokes.get(holderPid)
-  return paths && [...paths]
-}
-
-/** @internal Test hook: forget every incomplete revoke. */
-export function clearWindowsAclIncompleteRevokesForTesting(): void {
-  windowsAclIncompleteRevokes.clear()
-}
-
-/**
  * Release this holder's deny ACEs. Best-effort; `undefined` when
- * `srt-win` failed or the restore was refused. Call only after
- * {@link revokeWindowsAclChecked} reported `complete`.
+ * `srt-win` failed. srt-win refuses (status `grantPending`) while the
+ * holder still has a grant recorded: revoke first.
  */
 export function restoreWindowsAcl(opts: {
   sandboxUserSid: string
@@ -2686,15 +2665,6 @@ export function restoreWindowsAcl(opts: {
   srtWin?: SrtWinSpawn
 }): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
-  if (windowsAclIncompleteRevokes.has(holder)) {
-    logForDebugging(
-      `[Sandbox Windows] acl restore refused: a grant revoke for ` +
-        `holder ${holder} did not complete in this process, so its ` +
-        `deny ACEs stay in place`,
-      { level: 'error' },
-    )
-    return undefined
-  }
   // Don't let a teardown helper throw — the caller's reset() must
   // complete. runSrtWinJsonAllowFail parses stdout before checking
   // the exit code, so a non-zero exit with the per-path JSON intact
@@ -2866,7 +2836,9 @@ export async function forgetWindowsPersistentGrants(
       'acl_forget_failed',
       `Write grants kept from earlier sessions could not be removed, ` +
         `so windows.writeRestrictedToken: false cannot take effect (srt-win ` +
-        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
+        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}. ` +
+        `For a root that can no longer be located (a removed drive), ` +
+        `\`srt-win acl forget --all --force\` drops its record.`,
     )
   }
 }
@@ -2932,7 +2904,6 @@ export function revokeWindowsAclChecked(opts: {
     })
     result = { complete: false, outcomes: undefined, pending: [], detail }
   }
-  noteWindowsAclRevoke(holder, result)
   return result
 }
 
@@ -2952,16 +2923,6 @@ function windowsAclRevokeResult(
     pending: unreleased.map(o => String(o?.path)),
     detail: stderr.trim() || undefined,
   }
-}
-
-function noteWindowsAclRevoke(
-  holder: number,
-  result: WindowsAclRevokeResult,
-): void {
-  if (result.complete) return
-  let paths = windowsAclIncompleteRevokes.get(holder)
-  if (!paths) windowsAclIncompleteRevokes.set(holder, (paths = new Set()))
-  for (const p of result.pending) paths.add(p)
 }
 
 /**
@@ -3951,6 +3912,16 @@ export function windowsSetupVersionMismatch(
   if (us.setupVersion === undefined || us.markerVersion === us.setupVersion) {
     return undefined
   }
+  if (us.markerVersion !== undefined && us.markerVersion > us.setupVersion) {
+    const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+    return (
+      `The Windows sandbox on this machine was set up by a newer ` +
+      `release (setup version ${us.markerVersion}; this release needs ` +
+      `${us.setupVersion}). Use that release, or replace its install ` +
+      `with this one: \`srt-win.exe install --force${sl}\`.\n` +
+      `Nothing is granted or run until then.`
+    )
+  }
   return (
     `The Windows sandbox on this machine was set up by a different ` +
     `release (setup version ${us.markerVersion ?? 'unknown'}; this ` +
@@ -4009,6 +3980,12 @@ function interpretDependencyProbes(
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
+  let reinstallRequired: string | undefined
+  const result = (): SandboxDependencyCheck => ({
+    errors,
+    warnings,
+    ...(reinstallRequired && { reinstallRequired }),
+  })
 
   // 2. Sandbox user provisioned + credential readable.
   if (user.status === 'rejected') {
@@ -4025,8 +4002,8 @@ function interpretDependencyProbes(
   } else {
     // Installed, by a release with another setup version: an upgrade,
     // not a missing sandbox, so its own wording.
-    const stale = windowsSetupVersionMismatch(us, sublayerGuid)
-    if (stale) errors.push(stale)
+    reinstallRequired = windowsSetupVersionMismatch(us, sublayerGuid)
+    if (reinstallRequired) errors.push(reinstallRequired)
   }
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is
@@ -4036,7 +4013,7 @@ function interpretDependencyProbes(
   const wfp = getWfp()
   if (wfp.status === 'rejected') {
     errors.push(`srt-win wfp status failed: ${(wfp.reason as Error).message}`)
-    return { errors, warnings }
+    return result()
   }
   const ws = wfp.value
   if (ws.state === 'cannot-read') {
@@ -4060,7 +4037,7 @@ function interpretDependencyProbes(
     )
   }
 
-  return { errors, warnings }
+  return result()
 }
 
 /**
