@@ -802,7 +802,7 @@ impl Locked {
             ])
             .context("UPSERT ace_holders")?;
         let holder_added = !already_held;
-        let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
+        let eff = effective_ace(&self.conn, canon, want.kind())?.unwrap_or(want);
         self.conn
             .prepare_cached(
                 "INSERT INTO working_aces \
@@ -827,11 +827,6 @@ impl Locked {
             holder_added,
             _sealed: (),
         })
-    }
-
-    /// `MAX(want_mask)` across live holders of `(canon, kind)`.
-    fn effective_ace(&self, canon: &str, kind: &str) -> Result<Option<SbAce>> {
-        effective_ace(&self.conn, canon, kind)
     }
 
     /// Release this holder's `(canon, kind)` hold — see
@@ -1278,12 +1273,11 @@ fn recover_holds(
     conn: &Connection,
     holder: Option<i64>,
     holds: &[(String, String)],
-    blocked: bool,
+    mut blocked: bool,
     sb: &str,
     disk: &Disk,
     report: &mut RecoveryReport,
 ) {
-    let mut blocked = blocked;
     for (canon, kind) in holds.iter().filter(|(_, k)| k == "grant") {
         blocked |= !recover_one(conn, holder, canon, kind, sb, disk, report);
     }

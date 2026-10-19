@@ -321,6 +321,16 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   return false
 }
 
+function releaseWindowsSessionAcls(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+): void {
+  const o = { sandboxUserSid, srtWin }
+  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+  }
+}
+
 /**
  * Attribution key to command text for every wrapped invocation, so each
  * producer can report (and ignoreViolations can match) the command an event
@@ -1220,10 +1230,7 @@ async function initializeSteps(
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
       if (windowsFsSbUserSid) {
-        const o = { sandboxUserSid: windowsFsSbUserSid, srtWin }
-        if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-          logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-        }
+        releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -2835,10 +2842,7 @@ async function reset(): Promise<void> {
     const srtWin = srtWinSpawn
     // The 'exit'/signal handler lands here too: this part of
     // reset() runs synchronously.
-    const o = { sandboxUserSid: sb, srtWin }
-    if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-      logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-    }
+    releaseWindowsSessionAcls(sb, srtWin)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined

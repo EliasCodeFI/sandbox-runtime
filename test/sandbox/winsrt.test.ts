@@ -1872,7 +1872,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
     await SandboxManager.reset()
-    expect(aclCalls).toEqual(['grant', 'stamp', 'revoke', 'restore'])
+    expect(aclCalls).toEqual(WITH_RESTORE)
   })
 })
 
