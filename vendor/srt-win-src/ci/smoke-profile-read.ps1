@@ -429,6 +429,11 @@ try {
   # one object and walks nothing.
   $untouched = @((Join-Path $prof 'AppData\Local\Temp'), $sessFile)
   $sdBefore = @($untouched | ForEach-Object { Sddl $_ })
+  # The control flags of the profile's own access list (`P`, `AI`, …):
+  # the profile is one of the containers, and they must be the same
+  # after its write.
+  function Dacl-Flags { param([string] $p) [regex]::Match((Sddl $p), 'D:([A-Z]*)\(').Groups[1].Value }
+  $profFlags = Dacl-Flags $prof
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $g = Grant
   $sw.Stop()
@@ -437,8 +442,10 @@ try {
   $sdAfter = @($untouched | ForEach-Object { Sddl $_ })
   if (($sdBefore -join '|') -eq ($sdAfter -join '|')) { Ok 'G: a child and a grandchild of a container keep their security descriptors, auto-inherited mark included' }
   else { Fail "G: below a container: before=$($sdBefore -join ' | ') after=$($sdAfter -join ' | ')" }
-  if ($g.json.local_writes -ge 1 -and (Sddl $prof) -match 'D:P?AI\(') { Ok "G: containers are written on the object alone ($($g.json.local_writes) such write(s)); the profile keeps its auto-inherited mark" }
-  else { Fail "G: local_writes=$($g.json.local_writes) tree_walks=$($g.json.tree_walks) profile=$(Sddl $prof)" }
+  # Every container is written that way; one that fell back to the
+  # walk shows here as a shortfall.
+  if ($g.json.local_writes -ge $g.json.containers -and $g.json.containers -ge 1 -and (Dacl-Flags $prof) -eq $profFlags) { Ok "G: containers are written on the object alone ($($g.json.local_writes) such write(s) for $($g.json.containers) container(s)); the profile's access list keeps its marks ('$profFlags')" }
+  else { Fail "G: local_writes=$($g.json.local_writes) containers=$($g.json.containers) tree_walks=$($g.json.tree_walks) flags before='$profFlags' profile=$(Sddl $prof)" }
   if ($g.exit -eq 0 -and $g.json.complete) { Ok "G: grant complete ($($g.json.containers) containers, $($g.json.granted) granted, $($g.json.files) files, $($g.json.denied) excluded, $($g.json.placeholders) created)" }
   else { Fail "G: profile grant exit=$($g.exit) complete=$($g.json.complete) raw: $($g.raw)" }
   if ($g.raw -match 'top-level item\(s\) done') { Ok 'G: progress lines on stderr' }

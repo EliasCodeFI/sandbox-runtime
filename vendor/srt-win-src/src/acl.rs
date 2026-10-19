@@ -2975,6 +2975,48 @@ mod tests {
             )
         };
         let below = || (state(child), state(grandchild));
+        // The inherited entries of an object's own list, byte for
+        // byte and in order.
+        let inherited_raw = |p: &str| {
+            let (_sd, dacl) = read_file_dacl(p).unwrap();
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            filter_aces(dacl, |hdr, body| {
+                if hdr.AceFlags & INHERITED_ACE != 0 {
+                    out.push(body.to_vec());
+                }
+                false
+            })
+            .unwrap();
+            out
+        };
+        // Owner and primary group, which a DACL write has no business
+        // with.
+        let owner_and_group = |p: &str| {
+            use windows::Win32::Security::{GROUP_SECURITY_INFORMATION, GetLengthSid};
+            let w = wstr(p);
+            let (mut owner, mut group) = (PSID::default(), PSID::default());
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            let r = unsafe {
+                GetNamedSecurityInfoW(
+                    pcwstr(&w),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+                    Some(&mut owner),
+                    Some(&mut group),
+                    None,
+                    None,
+                    &mut psd,
+                )
+            };
+            win32_ok(r, "GetNamedSecurityInfoW(owner, group)").unwrap();
+            let _sd = OwnedSd::from_raw(psd);
+            let text = |sid: PSID| {
+                let len = unsafe { GetLengthSid(sid) } as usize;
+                let bytes = unsafe { std::slice::from_raw_parts(sid.0 as *const u8, len) };
+                sid_string_from_bytes(bytes).unwrap()
+            };
+            (text(owner), text(group))
+        };
         let counted = |f: &dyn Fn() -> Written| {
             let before = write_counts();
             let how = f();
@@ -2984,6 +3026,9 @@ mod tests {
 
         // The embedder's fence, laid on the folder alone.
         let root_marks = state(path);
+        let root_inherited = inherited_raw(path);
+        let root_owner = owner_and_group(path);
+        assert!(!root_inherited.is_empty(), "setup: the root inherits");
         let fence = AceView {
             deny: true,
             inherited: false,
@@ -3015,6 +3060,10 @@ mod tests {
             (root_marks.1, root_marks.2),
             "the root's auto-inherited mark and protection"
         );
+        // Its own inherited entries are the ones it had, and its owner
+        // and group are not touched.
+        assert_eq!(inherited_raw(path), root_inherited);
+        assert_eq!(owner_and_group(path), root_owner);
 
         // A kept root beside it. The record lists no deny: the fence
         // is foreign.
@@ -3058,6 +3107,12 @@ mod tests {
             "the grant did not reach a deep child"
         );
         let granted_below = below();
+        // The walking call marks the list as one whose inherited
+        // entries the system maintains. From here that mark is set,
+        // and an object-only write has to keep it: the system clears
+        // it unless the request carries it.
+        let marked = state(path);
+        assert!(marked.1, "setup: the walking write marks the list");
 
         // The delete fence a session adds on the root itself: only an
         // entry of the object changes. No walk, nothing below touched.
@@ -3088,7 +3143,14 @@ mod tests {
             foreign_group_denies(&aces, &t_fenced),
             std::slice::from_ref(&fence)
         );
-        assert_eq!(state(path).1, root_marks.1, "the auto-inherited mark");
+        let now = state(path);
+        assert_eq!(
+            (now.1, now.2),
+            (true, marked.2),
+            "the auto-inherited mark was lost, or protection changed"
+        );
+        assert_eq!(inherited_raw(path), root_inherited);
+        assert_eq!(owner_and_group(path), root_owner);
         // A walk that was cut short is finished with the walk, whatever
         // the write changes on the object.
         let before = write_counts();
@@ -3163,6 +3225,40 @@ mod tests {
         assert_eq!(write_counts(), before, "an unchanged list is not written");
         apply_sandbox_aces_over(path, SB, SbAceSet::default(), None).unwrap();
         assert_eq!(below(), untouched);
+        // Protection is kept in the other direction too: a list that
+        // blocks inheritance from above still does after an
+        // object-only write, with the entries it had.
+        let shut = dir.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        let shut = shut.to_str().unwrap();
+        let lockdown = build_allow_dacl(&[
+            Allow(&real, Mask::FILE_ALL, OICI),
+            Allow(SID_SYSTEM, Mask::FILE_ALL, OICI),
+        ])
+        .unwrap();
+        write_file_dacl(shut, lockdown.as_ptr(), Protection::Protected).unwrap();
+        let shut_before = state(shut);
+        assert!(shut_before.2, "setup: protected");
+        let (sd, old) = read_file_dacl(shut).unwrap();
+        let with_own = place_around(
+            old,
+            |h, _| h.AceFlags & INHERITED_ACE == 0,
+            Placement::default(),
+            &[NewAce::Deny(group.as_psid(), FENCE, NO_INHERIT)],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            commit_dacl(DaclTarget::Path(shut), &sd, old, &with_own, Commit::Write).unwrap(),
+            Written::Local
+        );
+        drop(sd);
+        let shut_after = state(shut);
+        assert_eq!((shut_after.1, shut_after.2), (shut_before.1, true));
+        assert_eq!(shut_after.0.len(), shut_before.0.len() + 1);
+        assert!(inherited_raw(shut).is_empty());
+        assert_eq!(owner_and_group(shut), owner_and_group(path));
+
         // The install's entry point walks whatever it changes.
         let before = write_counts();
         apply_sandbox_aces(path, SB, SbAceSet::default()).unwrap();
