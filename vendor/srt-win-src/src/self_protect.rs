@@ -35,24 +35,10 @@
 //! The runner reaches itself via the `GetCurrentProcess()`
 //! pseudo-handle (which bypasses the DACL).
 //!
-//! A process DACL does not cover the process's **threads** — each
-//! thread object has its own descriptor, taken from the creating
-//! token's default DACL, which grants the account full access. A
-//! child running as the same account could open a runner thread for
-//! `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
-//! the runner's token, which is not locked down. The runner closes
-//! that on every launch with two pieces, both keyed on the same
-//! trustees as the process DACL:
-//!
-//!   - [`protect_own_threads`] rewrites the DACL of every thread the
-//!     runner has;
-//!   - [`protect_future_threads`] rewrites the runner token's default
-//!     DACL, so a thread created afterwards (by the runner, the
-//!     runtime or the thread pool) starts out with the same shape.
-//!
-//! Neither depends on how the child's token is restricted: the DACLs
-//! name neither the account's user SID nor a logon SID, and the
-//! `OWNER RIGHTS` ACE takes away what ownership would otherwise give.
+//! A process DACL does not cover the process's **threads** (each takes its
+//! descriptor from the creating token's default DACL), so
+//! [`protect_own_threads`] and [`protect_future_threads`] give each thread
+//! the same DACL shape.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
@@ -116,15 +102,8 @@ const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
 /// the descriptor, waiting for exit, and the exit code and times.
 const THREAD_RIGHTS_HARMLESS: u32 = READ_CONTROL | SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION;
 
-/// Every single access right of a thread object outside
-/// [`THREAD_RIGHTS_HARMLESS`] — the rights the sandbox account must
-/// not be able to open a runner thread with. Includes the ones that
-/// lend out the runner's identity or control (`THREAD_IMPERSONATE`,
-/// `THREAD_DIRECT_IMPERSONATION`, `THREAD_SET_THREAD_TOKEN`,
-/// `THREAD_SET_CONTEXT`, `THREAD_SET_INFORMATION`,
-/// `THREAD_SUSPEND_RESUME`, `THREAD_TERMINATE`) and the ones that
-/// would let the holder grant itself those (`WRITE_DAC`,
-/// `WRITE_OWNER`).
+/// Every access right of a thread object outside [`THREAD_RIGHTS_HARMLESS`],
+/// one bit each; `WRITE_DAC` and `WRITE_OWNER` are among them.
 fn withheld_thread_rights() -> impl Iterator<Item = u32> {
     (0..u32::BITS)
         .map(|bit| 1u32 << bit)
@@ -190,14 +169,10 @@ pub fn install_broker_dacl(extra_allow: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Build an ACL of ACCESS_ALLOWED ACEs, one per `(sid, mask)`, in
-/// order. The returned buffer is the ACL; cast `.as_mut_ptr()` to
-/// `*mut ACL`.
-fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec<u8>> {
-    // ACL size = header + Σ(ACE fixed prefix + SID body). The fixed
-    // prefix of an ACCESS_ALLOWED_ACE is 8 bytes (Header 4 + Mask 4);
-    // `SidStart` is the first DWORD of the SID, so total per-ACE =
-    // 8 + GetLengthSid.
+/// An ACL of ACCESS_ALLOWED ACEs, one per `(sid, mask)`, in order.
+fn build_allow_acl(aces: &[(PSID, u32)]) -> Result<Vec<u8>> {
+    // ACL size = header + Σ(8-byte ACE prefix + SID body): `SidStart` is the
+    // first DWORD of the SID, so per ACE it is 8 + GetLengthSid.
     const ACE_FIXED: usize = 8;
     let mut total = size_of::<ACL>();
     for (s, _) in aces {
@@ -220,41 +195,82 @@ fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec
     Ok(buf)
 }
 
-/// Rewrite the DACL of every thread this process currently has to
-/// SYSTEM + Admins + `OWNER_RIGHTS:READ_CONTROL` — the same shape
-/// [`install_broker_dacl`] gives the process, for the same reason. A
-/// thread object carries its own security descriptor, taken from the
-/// creating token's default DACL, which grants the account full
-/// access; the process DACL does not cover it. Without this a child
-/// running as the same account can open a runner thread for
-/// `THREAD_SET_CONTEXT` or `THREAD_DIRECT_IMPERSONATION` and act with
-/// the runner's token, which is not locked down.
-///
-/// Repeatable. A thread this process can no longer open for a DACL
-/// rewrite — one an earlier call already rewrote, one created after
-/// [`protect_future_threads`], or one another principal created in
-/// this process — is checked instead: it counts as protected only if
-/// this process, whose token holds every SID the child's does, is
-/// refused each right in [`withheld_thread_rights`].
-///
-/// Returns the number of threads rewritten or found protected; a
-/// thread that is neither is an error.
+/// The ACL SYSTEM:`full` + Admins:`full` + `OWNER_RIGHTS:READ_CONTROL`.
+fn build_protected_acl(full: u32) -> Result<Vec<u8>> {
+    let system = LocalPsid::from_string(SID_SYSTEM)?;
+    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
+    build_allow_acl(&[
+        (system.as_psid(), full),
+        (admins.as_psid(), full),
+        (owner_rights.as_psid(), READ_CONTROL),
+    ])
+}
+
+/// Give a just-created, still-suspended runner the DACLs it gives itself, on
+/// the handles its creation returned (they must carry `WRITE_DAC`). Until then
+/// another process of the sandbox account could open the runner and keep it.
+pub fn protect_suspended_runner(process: HANDLE, thread: HANDLE) -> Result<()> {
+    set_protected_dacl(process, PROCESS_ALL_ACCESS.0).context("runner process DACL")?;
+    set_protected_dacl(thread, THREAD_ALL_ACCESS.0).context("runner initial-thread DACL")
+}
+
+fn set_protected_dacl(handle: HANDLE, full: u32) -> Result<()> {
+    let mut buf = build_protected_acl(full)?;
+    let r = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(buf.as_mut_ptr() as *mut ACL),
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(anyhow!("SetSecurityInfo(DACL): {r:?}"));
+    }
+    Ok(())
+}
+
+/// Self-protection for a runner mode that starts no child: the process DACL,
+/// the default DACL for threads created later, then every existing thread.
+pub fn protect_runner() -> Result<()> {
+    install_broker_dacl(None).context("runner self-protect (process)")?;
+    protect_future_threads().context("runner self-protect (default DACL for new threads)")?;
+    protect_own_threads().context("runner self-protect (threads)")?;
+    Ok(())
+}
+
+/// Whether the thread behind `h` (a handle with
+/// `THREAD_QUERY_LIMITED_INFORMATION`) belongs to this process. A thread id
+/// taken from a snapshot can have been reused by another process since.
+fn is_own_thread(h: HANDLE) -> Result<bool> {
+    use windows::Win32::System::Threading::{GetCurrentProcessId, GetProcessIdOfThread};
+    let owner = unsafe { GetProcessIdOfThread(h) };
+    if owner == 0 {
+        return Err(anyhow!(
+            "GetProcessIdOfThread: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(owner == unsafe { GetCurrentProcessId() })
+}
+
+/// Rewrite the DACL of every thread this process has to the shape
+/// [`install_broker_dacl`] gives the process. A thread whose DACL it cannot open
+/// counts as protected only if every [`withheld_thread_rights`] right is refused.
 pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenThread, THREAD_ACCESS_RIGHTS,
     };
-    /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
-    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
+    /// `READ_CONTROL | WRITE_DAC` to replace the DACL, plus the right
+    /// [`is_own_thread`] needs.
+    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000 | THREAD_QUERY_LIMITED_INFORMATION;
 
-    let system = LocalPsid::from_string(SID_SYSTEM)?;
-    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
-    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
-    let mut buf = build_allow_acl(&[
-        (system.as_psid(), THREAD_ALL_ACCESS.0),
-        (admins.as_psid(), THREAD_ALL_ACCESS.0),
-        (owner_rights.as_psid(), READ_CONTROL),
-    ])?;
+    let mut buf = build_protected_acl(THREAD_ALL_ACCESS.0)?;
     let acl = buf.as_mut_ptr() as *mut ACL;
 
     let tids = crate::util::thread_ids_of(unsafe { GetCurrentProcessId() })?;
@@ -265,24 +281,32 @@ pub fn protect_own_threads() -> Result<usize> {
     for tid in &tids {
         unsafe {
             let h = match OpenThread(THREAD_ACCESS_RIGHTS(DACL_RW), false, *tid) {
-                Ok(h) => crate::util::OwnedHandle(h),
-                // The thread exited after the snapshot: nothing left
-                // to protect.
+                Ok(h) => OwnedHandle(h),
+                // The thread exited after the snapshot.
                 Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
                 // No DACL access for this process: accept the thread
                 // only if it is already out of the account's reach.
                 Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
                     if let Some(right) = openable_withheld_right(*tid)? {
                         return Err(anyhow!(
-                            "thread {tid}: its DACL cannot be rewritten and it grants \
-                             this account access {right:#x}"
+                            "thread {tid} cannot be protected: opening it to rewrite \
+                             its DACL was refused ({e}), yet this account can still \
+                             open it with access {right:#x}"
                         ));
                     }
                     protected += 1;
                     continue;
                 }
-                Err(e) => return Err(anyhow!("OpenThread(WRITE_DAC, tid={tid}): {e}")),
+                Err(e) => {
+                    return Err(anyhow!(
+                        "thread {tid} cannot be protected: OpenThread(WRITE_DAC): {e}"
+                    ));
+                }
             };
+            // The id now names another process's thread: ours has exited.
+            if !is_own_thread(h.raw()).with_context(|| format!("thread {tid}"))? {
+                continue;
+            }
             let r = SetSecurityInfo(
                 h.raw(),
                 SE_KERNEL_OBJECT,
@@ -293,7 +317,9 @@ pub fn protect_own_threads() -> Result<usize> {
                 None,
             );
             if r.is_err() {
-                return Err(anyhow!("SetSecurityInfo(thread {tid} DACL): {r:?}"));
+                return Err(anyhow!(
+                    "thread {tid} cannot be protected: SetSecurityInfo(DACL): {r:?}"
+                ));
             }
             protected += 1;
         }
@@ -304,11 +330,9 @@ pub fn protect_own_threads() -> Result<usize> {
     Ok(protected)
 }
 
-/// The first right in [`withheld_thread_rights`] this process can
-/// open thread `tid` with, or `None` when every one is refused (or
-/// the thread has exited). Opens by ID, so the answer is what the
-/// thread's descriptor grants this process's token — and the child's
-/// token holds no SID this one lacks.
+/// The first right in [`withheld_thread_rights`] this process can open thread
+/// `tid` with, if any. The child's token holds no SID this one lacks, so the
+/// answer holds for the child too.
 fn openable_withheld_right(tid: u32) -> Result<Option<u32>> {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
     use windows::Win32::System::Threading::{OpenThread, THREAD_ACCESS_RIGHTS};
@@ -316,6 +340,15 @@ fn openable_withheld_right(tid: u32) -> Result<Option<u32>> {
         match unsafe { OpenThread(THREAD_ACCESS_RIGHTS(right), false, tid) } {
             Ok(h) => {
                 drop(OwnedHandle(h));
+                // A reused id that now names another process's thread is not
+                // ours to judge. If its owner cannot be read, it counts as ours.
+                let query = THREAD_ACCESS_RIGHTS(THREAD_QUERY_LIMITED_INFORMATION);
+                if let Ok(q) = unsafe { OpenThread(query, false, tid) } {
+                    let q = OwnedHandle(q);
+                    if !is_own_thread(q.raw())? {
+                        return Ok(None);
+                    }
+                }
                 return Ok(Some(right));
             }
             Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {}
@@ -326,25 +359,9 @@ fn openable_withheld_right(tid: u32) -> Result<Option<u32>> {
     Ok(None)
 }
 
-/// Rewrite this process's token default DACL to SYSTEM + Admins +
-/// `OWNER_RIGHTS:READ_CONTROL`, so that a thread created from now on
-/// starts out with the DACL [`protect_own_threads`] gives the
-/// existing ones. Thread objects get their descriptor from the
-/// creating token's default DACL, and nothing announces a new thread
-/// (the runtime and the thread pool start them on their own), so a
-/// sweep alone cannot cover them.
-///
-/// The default DACL also lands on every other object this process
-/// creates without an explicit descriptor — including a child
-/// process, its first thread and its token, which the child must be
-/// able to open. **Call it only once every such object exists**:
-/// [`crate::launch::run_lockdown`] calls it after the child has been
-/// created and before it is resumed, after which the runner creates
-/// nothing else.
-///
-/// Verifies the effect before returning: a thread started here must
-/// carry a DACL that passes [`dacl_shuts_out_account`], or the call
-/// fails.
+/// Rewrite this process's token default DACL so threads created from now on
+/// start out protected. It lands on every object created afterwards without a
+/// descriptor: call it only once the child's process, thread and token exist.
 pub fn protect_future_threads() -> Result<()> {
     use windows::Win32::Security::{
         SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_QUERY,
@@ -353,14 +370,7 @@ pub fn protect_future_threads() -> Result<()> {
     use windows::Win32::System::Threading::OpenProcessToken;
     const GENERIC_ALL: u32 = 0x1000_0000;
 
-    let system = LocalPsid::from_string(SID_SYSTEM)?;
-    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
-    let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
-    let mut buf = build_allow_acl(&[
-        (system.as_psid(), GENERIC_ALL),
-        (admins.as_psid(), GENERIC_ALL),
-        (owner_rights.as_psid(), READ_CONTROL),
-    ])?;
+    let mut buf = build_protected_acl(GENERIC_ALL)?;
     unsafe {
         let mut tok = HANDLE::default();
         OpenProcessToken(
@@ -417,8 +427,7 @@ enum AceKind {
     Other,
 }
 
-/// One ACE of a DACL, reduced to what [`dacl_shuts_out_account`]
-/// reads. `sid` is empty and `mask` is 0 for [`AceKind::Other`].
+/// One ACE of a DACL; `sid` is empty and `mask` 0 for [`AceKind::Other`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AceView {
     kind: AceKind,
@@ -426,12 +435,9 @@ struct AceView {
     mask: u32,
 }
 
-/// Whether a DACL with these ACEs leaves the sandbox account nothing
-/// but `READ_CONTROL` on an object the account owns: every ALLOW ACE
-/// names SYSTEM, Admins, or `OWNER RIGHTS` with at most
-/// `READ_CONTROL`, and an `OWNER RIGHTS` ACE is present (without one
-/// the owner may rewrite the DACL). An ACE of a type this does not
-/// know fails the check.
+/// Whether these ACEs leave the sandbox account nothing but `READ_CONTROL` on
+/// an object it owns. An `OWNER RIGHTS` ACE must be present (without one the
+/// owner may rewrite the DACL); an unknown ACE type fails the check.
 fn dacl_shuts_out_account(aces: &[AceView]) -> bool {
     let mut owner_limited = false;
     for ace in aces {
@@ -483,8 +489,7 @@ fn ace_views(acl: *const ACL) -> Result<Vec<AceView>> {
     Ok(out)
 }
 
-/// The ACEs of the DACL on the thread behind `thread` (a handle with
-/// `READ_CONTROL`). A thread with no DACL at all is an error.
+/// The ACEs of the DACL on `thread` (a handle with `READ_CONTROL`).
 fn thread_ace_views(thread: HANDLE) -> Result<Vec<AceView>> {
     use windows::Win32::Security::PSECURITY_DESCRIPTOR;
     unsafe {
@@ -567,7 +572,6 @@ mod tests {
     #[test]
     fn withheld_rights_cover_everything_but_the_harmless_ones() {
         let withheld: Vec<u32> = withheld_thread_rights().collect();
-        // One bit each.
         assert!(withheld.iter().all(|r| r.count_ones() == 1));
         let union = withheld.iter().fold(0, |acc, r| acc | r);
         assert_eq!(union & THREAD_RIGHTS_HARMLESS, 0);
@@ -601,18 +605,15 @@ mod tests {
             ace(AceKind::Allow, SID_OWNER_RIGHTS, READ_CONTROL),
         ];
         assert!(dacl_shuts_out_account(&protected));
-        // A DENY ACE grants nothing, whoever it names.
         let mut with_deny = protected.to_vec();
         with_deny.insert(0, ace(AceKind::Deny, USER, all));
         assert!(dacl_shuts_out_account(&with_deny));
 
-        // What a thread gets from an unchanged default DACL.
         assert!(!dacl_shuts_out_account(&[
             ace(AceKind::Allow, USER, all),
             ace(AceKind::Allow, SID_SYSTEM, all),
             ace(AceKind::Allow, LOGON, 0x0012_0000),
         ]));
-        // Any ACE for the account or a logon SID, however narrow.
         for extra in [USER, LOGON, "S-1-1-0", "S-1-5-11", "S-1-5-32-545"] {
             let mut aces = protected.to_vec();
             aces.push(ace(AceKind::Allow, extra, 0x0010));
@@ -620,12 +621,10 @@ mod tests {
         }
         // No OWNER RIGHTS ACE: the owner keeps WRITE_DAC.
         assert!(!dacl_shuts_out_account(&protected[..2]));
-        // OWNER RIGHTS with more than READ_CONTROL.
         assert!(!dacl_shuts_out_account(&[
             ace(AceKind::Allow, SID_SYSTEM, all),
             ace(AceKind::Allow, SID_OWNER_RIGHTS, READ_CONTROL | 0x0004_0000),
         ]));
-        // An ACE type the check does not understand.
         let mut with_other = protected.to_vec();
         with_other.push(ace(AceKind::Other, "", 0));
         assert!(!dacl_shuts_out_account(&with_other));
@@ -652,15 +651,53 @@ mod tests {
         );
     }
 
-    /// The sweep covers a thread it has already covered: the second
-    /// call either rewrites it again or finds it out of reach.
+    #[test]
+    fn a_thread_of_another_process_is_not_ours() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{
+            GetCurrentThreadId, OpenThread, THREAD_ACCESS_RIGHTS,
+        };
+        const CREATE_SUSPENDED: u32 = 0x4;
+        let open = |tid: u32, access: u32| {
+            unsafe { OpenThread(THREAD_ACCESS_RIGHTS(access), false, tid) }
+                .map(OwnedHandle)
+                .expect("OpenThread")
+        };
+        let me = open(
+            unsafe { GetCurrentThreadId() },
+            THREAD_QUERY_LIMITED_INFORMATION,
+        );
+        assert!(is_own_thread(me.raw()).unwrap());
+
+        let mut other = std::process::Command::new("cmd.exe")
+            .args(["/c", "exit"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn a suspended process");
+        let tids = crate::util::thread_ids_of(other.id()).unwrap();
+        assert_eq!(tids.len(), 1, "a suspended process has its initial thread");
+        let theirs = open(tids[0], THREAD_ALL_ACCESS.0);
+        assert!(!is_own_thread(theirs.raw()).unwrap());
+
+        // The broker's step on a suspended runner, on the same kind of handles.
+        let process = HANDLE(other.as_raw_handle());
+        protect_suspended_runner(process, theirs.raw()).unwrap();
+        for h in [process, theirs.raw()] {
+            let aces = thread_ace_views(h).unwrap();
+            assert!(dacl_shuts_out_account(&aces), "{aces:?}");
+        }
+        other.kill().unwrap();
+        let _ = other.wait();
+    }
+
+    /// A second sweep rewrites a thread again or finds it out of reach.
     #[test]
     fn protect_own_threads_is_repeatable() {
         let first = protect_own_threads().expect("first sweep");
         assert!(first >= 1);
         let second = protect_own_threads().expect("second sweep");
         assert!(second >= 1);
-        // The thread running this test now has the protected shape.
         let me = unsafe {
             windows::Win32::System::Threading::OpenThread(
                 windows::Win32::System::Threading::THREAD_ACCESS_RIGHTS(READ_CONTROL),
