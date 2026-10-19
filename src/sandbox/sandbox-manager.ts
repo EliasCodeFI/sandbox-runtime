@@ -1840,6 +1840,22 @@ function sameWindowsStampSet(newConfig: SandboxRuntimeConfig): boolean {
   )
 }
 
+/** Why a loopback mode other than the session's verified one is refused. */
+function windowsLoopbackModeChanged(
+  wanted: boolean,
+  verified: boolean,
+): string {
+  const mode = (open: boolean) => (open ? 'open' : 'closed')
+  return (
+    `network.allowLocalBinding asks for loopback ${mode(wanted)}, but this ` +
+    `session verified the network fence with loopback ${mode(verified)}. ` +
+    `On Windows the loopback mode is fixed by the install and checked at ` +
+    `initialize(): it cannot change for one command or through ` +
+    `updateConfig(). Call reset() then initialize() with the new value; ` +
+    `the installed mode must match it.`
+  )
+}
+
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
   if (!config) {
     return {}
@@ -2546,6 +2562,20 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
+    // The loopback mode is the one initialize() probed the fence with.
+    // A command or an updateConfig() asking for the other is refused here.
+    const wantsLoopback =
+      (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
+      true
+    if (
+      windowsWfpVerifiedFor !== undefined &&
+      wantsLoopback !== windowsWfpVerifiedFor
+    ) {
+      throw new WindowsSandboxError(
+        'wfp_fence_outdated',
+        windowsLoopbackModeChanged(wantsLoopback, windowsWfpVerifiedFor),
+      )
+    }
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -2555,9 +2585,7 @@ async function wrapWithSandboxArgv(
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
       // `srt-win exec` launches nothing unless this is the loopback mode
       // the install recorded: a difference is refused, never ignored.
-      allowLoopback:
-        (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
-        true,
+      allowLoopback: wantsLoopback,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
@@ -2637,6 +2665,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
         `(filesystem.* ∪ credentials.files) changed but the ACL ` +
         `stamp/grant is session-wide — call reset() then initialize() ` +
         `to apply. The previously-applied set stays in effect.`,
+      { level: 'warn' },
+    )
+  }
+  const nextLoopback = newConfig.network?.allowLocalBinding === true
+  if (
+    getPlatform() === 'windows' &&
+    config &&
+    windowsWfpVerifiedFor !== undefined &&
+    nextLoopback !== windowsWfpVerifiedFor
+  ) {
+    logForDebugging(
+      `[Sandbox Windows] updateConfig: ` +
+        windowsLoopbackModeChanged(nextLoopback, windowsWfpVerifiedFor) +
+        ` Commands are refused until then.`,
       { level: 'warn' },
     )
   }

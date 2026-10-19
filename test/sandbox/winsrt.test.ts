@@ -1185,21 +1185,41 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     }
   })
 
-  it('allowLocalBinding: a mode one command brings is passed on, for srt-win to hold to the install', async () => {
-    await SandboxManager.initialize(withLoopback())
+  it('allowLocalBinding: a command asking for the mode the session did not verify is refused before any launch', async () => {
     const network = { allowedDomains: [], deniedDomains: [] }
-    expect(
-      await opensLoopback({ network: { ...network, allowLocalBinding: true } }),
-    ).toBe(true)
+    for (const open of [false, true]) {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(withLoopback(open))
+      const err = await opensLoopback({
+        network: { ...network, allowLocalBinding: !open },
+      }).catch(e => e as WindowsSandboxError)
+      expect(err).toBeInstanceOf(WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
+      expect((err as WindowsSandboxError).message).toMatch(
+        /reset\(\) then initialize\(\)/,
+      )
+      // The session's own mode, stated or not, still runs.
+      expect(
+        await opensLoopback({
+          network: { ...network, allowLocalBinding: open },
+        }),
+      ).toBe(open)
+      expect(await opensLoopback({ network })).toBe(open)
+    }
+  })
+
+  it('allowLocalBinding: updateConfig cannot change the mode; commands are refused until the session is initialized again', async () => {
+    await SandboxManager.initialize(withLoopback())
+    SandboxManager.updateConfig(withLoopback(true))
+    const err = await opensLoopback().catch(e => e as WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('wfp_fence_outdated')
+    // Back to the verified mode: commands run again.
+    SandboxManager.updateConfig(withLoopback())
+    expect(await opensLoopback()).toBe(false)
+    // reset() and initialize() with the new value is the way to change it.
     await SandboxManager.reset()
     await SandboxManager.initialize(withLoopback(true))
-    expect(
-      await opensLoopback({
-        network: { ...network, allowLocalBinding: false },
-      }),
-    ).toBe(false)
-    // A command that says nothing about it runs with the session's.
-    expect(await opensLoopback({ network })).toBe(true)
+    expect(await opensLoopback()).toBe(true)
   })
 
   it('the session: an allowWrite beneath a denyWrite is a read grant', async () => {
