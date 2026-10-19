@@ -553,6 +553,16 @@ impl Ids {
             real_user_sid: &self.real_user_sid,
             previous_group_sids: &self.previous_group_sids,
             sandbox_user_sid: self.sandbox_user_sid.as_deref(),
+            recorded_denies: None,
+        }
+    }
+
+    /// [`Ids::trustees`] for a path with a record: `recorded` are the
+    /// denies the record lists for it ([`recorded_denies`]).
+    fn trustees_for<'a>(&'a self, recorded: Option<&'a [AceView]>) -> PersistentTrustees<'a> {
+        PersistentTrustees {
+            recorded_denies: recorded,
+            ..self.trustees()
         }
     }
 }
@@ -654,6 +664,38 @@ fn spec_of(want: &[AceView]) -> String {
     want.iter().map(AceView::sddl).collect()
 }
 
+/// The DENY entries of a write record's text ([`spec_of`]): trustee
+/// and mask of each `(D;…)`. An entry that does not read as one is
+/// left out.
+fn denies_of_spec(spec: &str) -> Vec<AceView> {
+    spec.split(')')
+        .filter_map(|ace| {
+            let mut f = ace.trim_start_matches('(').split(';');
+            let (ty, _flags, mask) = (f.next()?, f.next()?, f.next()?);
+            let sid = f.nth(2)?;
+            let mask = u32::from_str_radix(mask.strip_prefix("0x")?, 16).ok()?;
+            (ty == "D").then(|| AceView {
+                deny: true,
+                inherited: false,
+                flags: 0,
+                mask,
+                sid: sid.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The denies the record lists for a path: those wanted now and those
+/// of its last write (`last_spec`; they may be on the object still).
+/// `None` when the path has no write record: its denies are then told
+/// by their shape ([`acl::is_persistent_ace`]).
+fn recorded_denies(want: &[AceView], last_spec: Option<&str>) -> Option<Vec<AceView>> {
+    let last = last_spec?;
+    let mut v: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
+    v.extend(denies_of_spec(last));
+    Some(v)
+}
+
 // ─── Converge ───────────────────────────────────────────────────────
 
 /// Bring `canon`'s persistent ACEs to what the rows say, writing only
@@ -727,7 +769,6 @@ pub(crate) fn converge_on(
             );
         }
     }
-    let t = ids.trustees();
     let spec = spec_of(&want);
     let record: Option<(Vec<u8>, String, i64)> = conn
         .query_row(
@@ -737,6 +778,10 @@ pub(crate) fn converge_on(
         )
         .optional()
         .context("SELECT persistent_writes")?;
+    // Which denies for the group are ours: the ones the record lists.
+    // Any other is someone else's, is not judged, and stays.
+    let listed = recorded_denies(&want, record.as_ref().map(|r| r.1.as_str()));
+    let t = ids.trustees_for(listed.as_deref());
     // The same entries, and laid out so that no explicit deny on the
     // object sits behind one of our allows (a DACL an earlier build
     // wrote with its allows at the head is rewritten).
@@ -769,7 +814,23 @@ pub(crate) fn converge_on(
         params![canon, cur.as_bytes().as_slice(), spec],
     )
     .context("record persistent write intent")?;
-    acl::write_persistent_aces_at(target, &t, &want)?;
+    // The walk of the tree is spared only where the write is seen to
+    // change nothing that is handed down. Not where the record cannot
+    // vouch for the tree: a write it says was begun and not finished,
+    // or an object that already carries the wanted entries with no
+    // completed write of them on record, may have them on the object
+    // and not on everything below it.
+    let unfinished = matches!(&record, Some((_, _, 0)));
+    let written = acl::write_persistent_aces_at(target, &t, &want, unfinished || same)?;
+    if want.is_empty() {
+        for left in acl::foreign_group_denies(&aces, &t) {
+            eprintln!(
+                "srt-win: '{canon}' carries a deny for the sandbox group that this product \
+                 did not write, {}: left in place",
+                left.sddl()
+            );
+        }
+    }
     if want.is_empty() {
         conn.execute(
             "DELETE FROM persistent_writes WHERE canonical_path = ?1",
@@ -784,7 +845,7 @@ pub(crate) fn converge_on(
     .context("record persistent write completion")?;
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
         eprintln!(
-            "srt-win: persistent DACL write '{canon}' ({} ACE(s))",
+            "srt-win: persistent DACL write '{canon}' ({} ACE(s), {written:?})",
             want.len()
         );
     }
@@ -806,9 +867,17 @@ pub(crate) fn settled_on_object(
 ) -> Result<bool> {
     let want = wanted(conn, ids, canon, on.id)?;
     let aces = acl::read_aces_at(DaclTarget::Handle(on.handle, canon))?;
-    if acl::persistent_on_disk(&aces, &ids.trustees(), on.is_dir)
-        != acl::comparable(&want, on.is_dir)
-        || !acl::persistent_layout_ok(&aces, &ids.trustees())
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT spec FROM persistent_writes WHERE canonical_path = ?1",
+            params![canon],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let listed = recorded_denies(&want, last.as_deref());
+    let t = ids.trustees_for(listed.as_deref());
+    if acl::persistent_on_disk(&aces, &t, on.is_dir) != acl::comparable(&want, on.is_dir)
+        || !acl::persistent_layout_ok(&aces, &t)
     {
         return Ok(false);
     }
@@ -882,8 +951,11 @@ pub(crate) fn replay_pending(conn: &Connection) {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
     pub roots: usize,
-    /// Paths whose DACL was written.
+    /// DACL writes that walked a tree: the system brought the
+    /// inherited entries of everything below the path up to date.
     pub writes: usize,
+    /// DACL writes on an object alone ([`acl::Written::Local`]).
+    pub local_writes: usize,
     /// Paths found as wanted and left alone.
     pub unchanged: usize,
 }
@@ -1015,13 +1087,15 @@ pub fn apply(
         roots: roots.len(),
         ..Default::default()
     };
+    let before = acl::write_counts();
     for p in &touched {
-        if converge(conn, ids, p).with_context(|| format!("persistent grant '{p}'"))? {
-            out.writes += 1;
-        } else {
+        if !converge(conn, ids, p).with_context(|| format!("persistent grant '{p}'"))? {
             out.unchanged += 1;
         }
     }
+    let after = acl::write_counts();
+    out.writes = after.0 - before.0;
+    out.local_writes = after.1 - before.1;
     Ok((out, per_session))
 }
 
@@ -1680,6 +1754,64 @@ fn unrecorded_grant_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The denies a write record lists are read back from its text:
+    /// what tells a deny of ours from someone else's on the same
+    /// path.
+    #[test]
+    fn the_denies_of_a_write_record_are_read_back() {
+        const GROUP: &str = "S-1-5-21-1-2-3-1002";
+        const CAP: &str = "S-1-0-1936880739-1-2-3-4";
+        let want = acl::persistent_aces(&PersistentWant {
+            group_sid: GROUP,
+            real_user_sid: "S-1-5-21-1-2-3-1000",
+            capability_sid: Some(CAP),
+            deny: Some(acl::DenyMask::WriteDeny),
+            deny_fdc: true,
+            deny_delete: true,
+            profile: None,
+        });
+        let spec = spec_of(&want);
+        let key = |v: &[AceView]| -> Vec<(String, u32)> {
+            v.iter().map(|a| (a.sid.clone(), a.mask)).collect()
+        };
+        let wanted_denies: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
+        assert_eq!(wanted_denies.len(), 3);
+        assert_eq!(key(&denies_of_spec(&spec)), key(&wanted_denies));
+        assert!(denies_of_spec("").is_empty());
+        assert!(denies_of_spec("(A;OICI;0x1301bf;;;S-1-1-0)(nonsense").is_empty());
+        // No record for the path: nothing is listed, and a deny is
+        // told by its shape instead.
+        assert!(recorded_denies(&want, None).is_none());
+        // A record: what is wanted now and what was last written —
+        // a deny that is no longer wanted is still ours to take off.
+        let now: Vec<AceView> = want.iter().filter(|a| !a.deny).cloned().collect();
+        let listed = recorded_denies(&now, Some(&spec)).unwrap();
+        assert_eq!(key(&listed), key(&wanted_denies));
+        let t = PersistentTrustees {
+            group_sid: Some(GROUP),
+            real_user_sid: "S-1-5-21-1-2-3-1000",
+            previous_group_sids: &[],
+            sandbox_user_sid: None,
+            recorded_denies: Some(&listed),
+        };
+        for d in &wanted_denies {
+            assert!(acl::is_persistent_ace(d, &t), "{}", d.sddl());
+        }
+        // Someone else's fence on the same path is in no record.
+        let fence = AceView {
+            deny: true,
+            inherited: false,
+            flags: 0,
+            mask: 0x000d_0040,
+            sid: GROUP.to_owned(),
+        };
+        assert!(!acl::is_persistent_ace(&fence, &t));
+        assert_eq!(
+            acl::foreign_group_denies(std::slice::from_ref(&fence), &t).len(),
+            1
+        );
+    }
 
     #[test]
     fn capability_sid_format() {

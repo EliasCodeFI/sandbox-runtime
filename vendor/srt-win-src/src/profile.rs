@@ -1472,6 +1472,12 @@ pub struct Report {
     /// DACLs written by this run, and paths found as wanted.
     pub writes: usize,
     pub unchanged: usize,
+    /// Of the DACL writes of this run (stale removals included): those
+    /// that walked a tree — the system bringing the inherited entries
+    /// of everything below up to date — and those made on an object
+    /// alone.
+    pub tree_walks: usize,
+    pub local_writes: usize,
     /// Recorded paths that are no longer part of the grant and had
     /// their entry removed.
     pub removed: usize,
@@ -1985,6 +1991,7 @@ pub fn grant(
     progress: bool,
 ) -> Result<Report> {
     let started = std::time::Instant::now();
+    let writes_before = acl::write_counts();
     if ids.group_sid.is_none() {
         bail!("no install record: run `srt-win install`");
     }
@@ -2467,6 +2474,9 @@ pub fn grant(
         },
     )?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
+    let writes_after = acl::write_counts();
+    report.tree_walks = writes_after.0 - writes_before.0;
+    report.local_writes = writes_after.1 - writes_before.1;
     Ok(report)
 }
 
@@ -3210,7 +3220,7 @@ mod tests {
         let g = canon(&granted);
         let o = open_for_stamp(&g, None).unwrap();
         let target = acl::DaclTarget::Handle(o.h.raw(), &g);
-        acl::write_persistent_aces_at(target, &ids.trustees(), &want).unwrap();
+        acl::write_persistent_aces_at(target, &ids.trustees(), &want, false).unwrap();
         assert_eq!(group_aces(&granted), [(true, false, 0x3, RX)]);
         assert_eq!(
             group_aces(&granted.join(r"inner\f.txt")),
@@ -3228,7 +3238,7 @@ mod tests {
             }
         };
         unchanged("after the grant");
-        acl::write_persistent_aces_at(target, &ids.trustees(), &[]).unwrap();
+        acl::write_persistent_aces_at(target, &ids.trustees(), &[], false).unwrap();
         assert!(group_aces(&granted.join(r"inner\f.txt")).is_empty());
         unchanged("after the removal");
         drop(o);

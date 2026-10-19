@@ -421,11 +421,24 @@ try {
 
   # ── G: the grant ─────────────────────────────────────────────────
   $files = $bulkDirs * $bulkFiles
+  # What lies below a directory that only gets an entry of its own (a
+  # container: the profile itself, AppData\Local) and is not itself
+  # granted or excluded: its security descriptor must come out of the
+  # grant exactly as it went in — inherited entries, order and the
+  # auto-inherited mark (`D:AI`) — because such a write goes to the
+  # one object and walks nothing.
+  $untouched = @((Join-Path $prof 'AppData\Local\Temp'), $sessFile)
+  $sdBefore = @($untouched | ForEach-Object { Sddl $_ })
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $g = Grant
   $sw.Stop()
-  Write-Host ("G: TIMING: profile grant on a tree with {0} files in {1} directories under one granted child: {2} ms wall, {3} ms reported; {4} DACL write(s)" -f `
-    $files, $bulkDirs, $sw.ElapsedMilliseconds, $g.json.elapsed_ms, $g.json.writes)
+  Write-Host ("G: TIMING: profile grant on a tree with {0} files in {1} directories under one granted child: {2} ms wall, {3} ms reported; {4} DACL write(s), {5} with a walk of the tree, {6} without" -f `
+    $files, $bulkDirs, $sw.ElapsedMilliseconds, $g.json.elapsed_ms, $g.json.writes, $g.json.tree_walks, $g.json.local_writes)
+  $sdAfter = @($untouched | ForEach-Object { Sddl $_ })
+  if (($sdBefore -join '|') -eq ($sdAfter -join '|')) { Ok 'G: a child and a grandchild of a container keep their security descriptors, auto-inherited mark included' }
+  else { Fail "G: below a container: before=$($sdBefore -join ' | ') after=$($sdAfter -join ' | ')" }
+  if ($g.json.local_writes -ge 1 -and (Sddl $prof) -match 'D:P?AI\(') { Ok "G: containers are written on the object alone ($($g.json.local_writes) such write(s)); the profile keeps its auto-inherited mark" }
+  else { Fail "G: local_writes=$($g.json.local_writes) tree_walks=$($g.json.tree_walks) profile=$(Sddl $prof)" }
   if ($g.exit -eq 0 -and $g.json.complete) { Ok "G: grant complete ($($g.json.containers) containers, $($g.json.granted) granted, $($g.json.files) files, $($g.json.denied) excluded, $($g.json.placeholders) created)" }
   else { Fail "G: profile grant exit=$($g.exit) complete=$($g.json.complete) raw: $($g.raw)" }
   if ($g.raw -match 'top-level item\(s\) done') { Ok 'G: progress lines on stderr' }

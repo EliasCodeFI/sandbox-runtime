@@ -1857,11 +1857,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             if let Some(k) = kept {
                 // `DACL write(s)` is the number of tree walks this
-                // session start paid for: 0 once every root is granted.
+                // session start paid for: 0 once every root is granted
+                // — whatever entries of others, a deny for the sandbox
+                // group among them, the root carries. A write on an
+                // object alone costs no walk and is counted apart.
                 eprintln!(
                     "srt-win: acl grant (persistent) — {} root(s): {} DACL write(s), \
-                     {} path(s) unchanged",
-                    k.roots, k.writes, k.unchanged,
+                     {} path(s) unchanged, {} written without a walk of the tree",
+                    k.roots, k.writes, k.unchanged, k.local_writes,
                 );
             }
             eprintln!(
@@ -2231,7 +2234,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 "srt-win: profile grant — '{}': {} container(s), {} directory(ies) and {} \
                  file(s) granted, {} excluded ({} created), {} skipped, {} not granted, {} \
                  exclusion(s) without a deny ({} of them readable to the sandbox account); \
-                 {} DACL write(s), {} unchanged, {} stale removed; {} ms",
+                 {} DACL write(s), {} written without a walk of the tree, {} unchanged, \
+                 {} stale removed; {} ms",
                 report.profile,
                 report.containers,
                 report.granted,
@@ -2242,7 +2246,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 report.not_granted.len(),
                 report.self_closed.len() + report.unverifiable.len() + report.unprotected.len(),
                 report.unprotected.len(),
-                report.writes,
+                report.tree_walks,
+                report.local_writes,
                 report.unchanged,
                 report.removed,
                 report.elapsed_ms,

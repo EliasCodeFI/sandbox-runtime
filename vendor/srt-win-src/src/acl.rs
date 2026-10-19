@@ -49,7 +49,8 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
     GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SetKernelObjectSecurity, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -520,6 +521,218 @@ pub(crate) fn write_file_dacl(path: &str, acl: *const ACL, p: Protection) -> Res
         )
     };
     win32_ok(r, &format!("SetNamedSecurityInfoW('{path}')"))
+}
+
+// ─── Writing a DACL: with or without the walk of the tree ───────────
+
+/// How a DACL write was carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// The access list was already the one wanted: nothing written.
+    Unchanged,
+    /// Written on the object alone.
+    Local,
+    /// Written with the call that then brings the inherited entries
+    /// of everything below up to date — a walk of the tree.
+    Tree,
+}
+
+/// What a writer asks of [`commit_dacl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Commit {
+    /// Write; walk the tree only if the write changes what objects
+    /// below inherit ([`same_inheritable`]).
+    Write,
+    /// The same, and no write at all if no explicit entry changes.
+    IfChanged,
+    /// Write with the walk whatever changes: a walk that was cut
+    /// short is being finished.
+    Walk,
+}
+
+thread_local! {
+    /// `(tree walks, object-only writes)` made on this thread.
+    static WRITES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `(tree walks, object-only writes)` this thread has made so far. A
+/// caller that reports on a run reads it before and after.
+pub fn write_counts() -> (usize, usize) {
+    WRITES.with(std::cell::Cell::get)
+}
+
+/// The explicit ACEs of `acl`, each as its bytes, in order.
+fn explicit_raw(acl: *const ACL) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    filter_aces(acl, |hdr, body| {
+        if hdr.AceFlags & INHERITED_ACE == 0 {
+            out.push(body.to_vec());
+        }
+        false
+    })?;
+    Ok(out)
+}
+
+/// Whether two lists of explicit ACEs (each ACE as its bytes, in DACL
+/// order) hand the same down to the objects below: the entries that
+/// are inherited by files or by directories (`OI` or `CI`, with or
+/// without inherit-only and no-propagate) are the same entries, byte
+/// for byte, in the same order. Entries that apply to the object alone
+/// may differ in any way.
+///
+/// This is the one test for writing a DACL without the walk of the
+/// tree: when it holds, no descendant's inherited entries would come
+/// out differently, so there is nothing below to bring up to date.
+/// Anything that adds, removes, changes or reorders an inheritable
+/// entry fails it. (Whether inheritance from above is blocked is not
+/// in an ACE; a writer that changes that walks regardless.)
+pub fn same_inheritable(before: &[Vec<u8>], after: &[Vec<u8>]) -> bool {
+    // Byte 1 of an ACE is its flags; bits 0 and 1 are OI and CI.
+    let handed_down = |aces: &'_ [Vec<u8>]| -> Vec<Vec<u8>> {
+        aces.iter()
+            .filter(|a| a.get(1).is_some_and(|f| f & 0x3 != 0))
+            .cloned()
+            .collect()
+    };
+    handed_down(before) == handed_down(after)
+}
+
+/// `SE_DACL_AUTO_INHERITED` of `sd`: the mark the system keeps on an
+/// access list whose inherited entries it maintains.
+fn sd_dacl_auto_inherited(sd: &OwnedSd) -> Result<bool> {
+    let mut control: u16 = 0;
+    let mut revision = 0u32;
+    unsafe { GetSecurityDescriptorControl(sd.ptr, &mut control, &mut revision) }
+        .context("GetSecurityDescriptorControl")?;
+    Ok(control & SE_DACL_AUTO_INHERITED.0 != 0)
+}
+
+/// A handle on what `path` names that may write its access list —
+/// resolved as the by-name calls resolve it, so that the list read by
+/// name and the one written through this handle are one object's.
+fn open_to_write_dacl(path: &str) -> Result<crate::util::OwnedHandle> {
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let w = wstr(path);
+    let h = unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .with_context(|| format!("CreateFileW('{path}', WRITE_DAC)"))?;
+    if h == INVALID_HANDLE_VALUE {
+        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
+    }
+    Ok(crate::util::OwnedHandle(h))
+}
+
+/// Write `explicit` (the new explicit entries) as the access list of
+/// the object behind `h`, on that object alone: followed by the
+/// inherited entries exactly as they are in `old`, with the list's
+/// protection and its auto-inherited mark as they were.
+///
+/// The mark is kept only if the request asks for it: a descriptor
+/// that says "auto-inherited" without also saying "auto-inherit
+/// requested" has the mark cleared by the system, and tools would
+/// then treat the object's inherited entries as explicit ones.
+fn write_dacl_on_object(
+    h: HANDLE,
+    old: *const ACL,
+    explicit: &BuiltAcl,
+    protected: bool,
+    auto_inherited: bool,
+) -> Result<()> {
+    let inherited = filter_aces(old, |hdr, _| hdr.AceFlags & INHERITED_ACE != 0)?;
+    let own = filter_aces(explicit.as_ptr(), |_, _| true)?;
+    let full = rebuild_acl_seq(own.2, &[AclPart::Kept(&own), AclPart::Kept(&inherited)])?;
+    let mut sd = SECURITY_DESCRIPTOR::default();
+    let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut c_void);
+    let mut set = windows::Win32::Security::SECURITY_DESCRIPTOR_CONTROL(0);
+    if auto_inherited {
+        set |= SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
+    }
+    if protected {
+        set |= SE_DACL_PROTECTED;
+    }
+    unsafe {
+        InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION)
+            .context("InitializeSecurityDescriptor")?;
+        SetSecurityDescriptorDacl(psd, true, Some(full.as_ptr()), false)
+            .context("SetSecurityDescriptorDacl")?;
+        SetSecurityDescriptorControl(
+            psd,
+            SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
+            set,
+        )
+        .context("SetSecurityDescriptorControl")?;
+        SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, psd)
+            .context("SetKernelObjectSecurity")?;
+    }
+    Ok(())
+}
+
+/// Write `new` — the explicit entries the object is to carry — as
+/// `target`'s access list, read as `(sd, old)`. The one place a DACL
+/// of a file or directory is written from a composed list.
+///
+/// Where the write leaves what the objects below inherit as it is
+/// ([`same_inheritable`]) it is made on the object alone; otherwise,
+/// or if that cannot be done, or if afterwards the list's
+/// auto-inherited mark is not what it was, with the call that walks
+/// the tree. Protection is kept as it was either way.
+pub(crate) fn commit_dacl(
+    target: DaclTarget<'_>,
+    sd: &OwnedSd,
+    old: *const ACL,
+    new: &BuiltAcl,
+    how: Commit,
+) -> Result<Written> {
+    let protected = sd_dacl_protected(sd)?;
+    let before = explicit_raw(old)?;
+    let after = explicit_raw(new.as_ptr())?;
+    if how == Commit::IfChanged && before == after {
+        return Ok(Written::Unchanged);
+    }
+    if how != Commit::Walk && same_inheritable(&before, &after) {
+        let auto = sd_dacl_auto_inherited(sd)?;
+        let on_object = || -> Result<bool> {
+            let opened;
+            let h = match target {
+                DaclTarget::Handle(h, _) => h,
+                DaclTarget::Path(p) => {
+                    opened = open_to_write_dacl(p)?;
+                    opened.raw()
+                }
+            };
+            write_dacl_on_object(h, old, new, protected, auto)?;
+            // Read back: the mark must be what it was.
+            let (now, _) = read_handle_dacl(h, target.label())?;
+            Ok(sd_dacl_auto_inherited(&now)? == auto && sd_dacl_protected(&now)? == protected)
+        };
+        // Could it not be done that way, or did it not leave the
+        // list's marks as they were, the walking call does both.
+        if let Ok(true) = on_object() {
+            WRITES.with(|w| w.set((w.get().0, w.get().1 + 1)));
+            return Ok(Written::Local);
+        }
+    }
+    let prot = if protected {
+        Protection::Protected
+    } else {
+        Protection::Unprotected
+    };
+    target.write(new.as_ptr(), prot)?;
+    WRITES.with(|w| w.set((w.get().0 + 1, w.get().1)));
+    Ok(Written::Tree)
 }
 
 /// `(kept ACE ptrs+sizes, Σ kept sizes, source AclRevision)`.
@@ -1028,8 +1241,13 @@ fn place_around(
 ///
 /// Both grant and deny carry `(OI)(CI)` so directory targets cover
 /// the subtree; on a file the inheritance flags are inert.
+///
+/// This entry point always writes, with the walk of the tree: it is
+/// the install's (the write-deny floor on system directories), where
+/// a run repeated after one that was cut short must finish the tree.
+/// A session's entries go through [`apply_sandbox_aces_over`].
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
-    apply_sandbox_aces_over(canonical_path, sandbox_sid, set, None)
+    apply_sandbox_aces_how(canonical_path, sandbox_sid, set, None, Commit::Walk)
 }
 
 /// [`apply_sandbox_aces`], told the sandbox group.
@@ -1045,11 +1263,31 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
 /// beneath only inherit that deny, and an explicit allow on them
 /// precedes it anyway. On every other object the placement is the
 /// general one, behind the last explicit deny.
+///
+/// Nothing is written when the access list already is the composed
+/// one, and the tree is walked only when an entry that is handed down
+/// changes ([`commit_dacl`]).
 pub fn apply_sandbox_aces_over(
     canonical_path: &str,
     sandbox_sid: &str,
     set: SbAceSet,
     sandbox_group_sid: Option<&str>,
+) -> Result<()> {
+    apply_sandbox_aces_how(
+        canonical_path,
+        sandbox_sid,
+        set,
+        sandbox_group_sid,
+        Commit::IfChanged,
+    )
+}
+
+fn apply_sandbox_aces_how(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    sandbox_group_sid: Option<&str>,
+    how: Commit,
 ) -> Result<()> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
@@ -1059,8 +1297,6 @@ pub fn apply_sandbox_aces_over(
     //    4's write.
     let (sd, old) =
         read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
-    let protected =
-        sd_dacl_protected(&sd).with_context(|| format!("recompose '{canonical_path}'"))?;
     // 2. The surviving explicit ACEs (not inherited, not for
     //    sandbox_sid — allow AND deny), unmoved, with the set's
     //    entries placed around them.
@@ -1095,16 +1331,11 @@ pub fn apply_sandbox_aces_over(
         &denies,
         &allows,
     )?;
-    // 4. Write back, preserving the DACL's protection state:
-    //    UNPROTECTED so the kernel re-derives inherited ACEs from the
-    //    parent, PROTECTED when inheritance was severed before we
-    //    touched the path (see doc comment).
-    let prot = if protected {
-        Protection::Protected
-    } else {
-        Protection::Unprotected
-    };
-    write_file_dacl(canonical_path, new.as_ptr(), prot)
+    // 4. Write back, preserving the DACL's protection state — and
+    //    only if an explicit entry changes at all; on the object alone
+    //    where nothing it hands down does ([`commit_dacl`]).
+    commit_dacl(DaclTarget::Path(canonical_path), &sd, old, &new, how)
+        .map(|_| ())
         .with_context(|| format!("recompose '{canonical_path}'"))
 }
 
@@ -1278,6 +1509,13 @@ pub struct PersistentTrustees<'a> {
     /// order among the product's own entries together (see
     /// [`apply_sandbox_aces_over`]).
     pub sandbox_user_sid: Option<&'a str>,
+    /// The DENY entries the record lists for the path being judged:
+    /// those wanted now and those of the last write. A deny for the
+    /// sandbox group (or a capability SID) that is not among them is
+    /// FOREIGN — someone else's fence — see [`is_persistent_ace`].
+    /// `None` when there is no record for the path: a deny is then
+    /// told by its shape ([`product_deny_shape`]).
+    pub recorded_denies: Option<&'a [AceView]>,
 }
 
 /// What the profile read grant (`crate::profile`) allows on a path.
@@ -1293,17 +1531,74 @@ pub enum ProfileAce {
     File,
 }
 
-/// Whether `a` is one of the ACEs [`persistent_aces`] produces: any
-/// ACE for the sandbox group or for a capability SID, the owner-rights
-/// ACE, or the real user's `READ_CONTROL | WRITE_DAC` ACE. The last
-/// two are recognised by their exact mask, so an ACE the user wrote
-/// for themselves (full control, say) is never taken for one of ours.
+/// Whether `a` is an entry of this product's on a persistent path —
+/// one it manages strictly: converged to exactly the wanted list,
+/// removed when nothing is wanted.
+///
+/// - Any ALLOW for the sandbox group or for a capability SID. One
+///   that is not wanted is a stray, and is removed: an unknown allow
+///   widens what the sandbox account may do.
+/// - The owner-rights ALLOW and the real user's `READ_CONTROL |
+///   WRITE_DAC` ALLOW, recognised by their exact mask, so an entry the
+///   user wrote for themselves (full control, say) is never taken for
+///   one of ours.
+/// - A DENY for the sandbox group or a capability SID that the record
+///   lists ([`PersistentTrustees::recorded_denies`]) — or, where there
+///   is no record for the path, one with a mask this product writes.
+/// - Any entry for the sandbox group of an EARLIER install: nothing
+///   holds that SID any more, and what an uninstall could not take
+///   off is taken off when it is met.
+///
+/// A deny for the group that the record does not list is FOREIGN: an
+/// embedder's own fence (say, "do not delete or re-permission this
+/// folder"). It is not ours to judge or remove — a deny can only
+/// narrow what the sandbox account may do, so an unknown one is safe
+/// to leave. It is ignored when deciding whether a path is current,
+/// and kept where it is, among the other entries that are not ours,
+/// when the path is rewritten or forgotten.
 pub fn is_persistent_ace(a: &AceView, t: &PersistentTrustees<'_>) -> bool {
-    t.group_sid == Some(a.sid.as_str())
-        || t.previous_group_sids.contains(&a.sid)
-        || crate::persist::is_capability_sid(&a.sid)
-        || (!a.deny && a.sid == SID_OWNER_RIGHTS && a.mask == Mask::READ_CONTROL.bits())
+    if t.previous_group_sids.contains(&a.sid) {
+        return true;
+    }
+    if t.group_sid == Some(a.sid.as_str()) || crate::persist::is_capability_sid(&a.sid) {
+        return !a.deny
+            || match t.recorded_denies {
+                Some(listed) => listed
+                    .iter()
+                    .any(|d| d.deny && d.sid == a.sid && d.mask == a.mask),
+                None => product_deny_shape(a.mask),
+            };
+    }
+    (!a.deny && a.sid == SID_OWNER_RIGHTS && a.mask == Mask::READ_CONTROL.bits())
         || (!a.deny && a.sid == t.real_user_sid && a.mask == Mask::OWNER_IMPLICIT.bits())
+}
+
+/// Whether `mask` is one this product puts in a DENY: the two deny
+/// masks, the delete deny, the delete-child deny.
+pub fn product_deny_shape(mask: u32) -> bool {
+    [
+        DenyMask::ReadDeny.bits(),
+        DenyMask::WriteDeny.bits(),
+        Mask::DELETE.bits(),
+        Mask::FILE_DELETE_CHILD.bits(),
+    ]
+    .contains(&mask)
+}
+
+/// The explicit DENY entries among `aces` that name the sandbox group
+/// or a capability SID and are not this product's: left in place by
+/// everything here, and said so when a path is forgotten.
+pub fn foreign_group_denies(aces: &[AceView], t: &PersistentTrustees<'_>) -> Vec<AceView> {
+    aces.iter()
+        .filter(|a| {
+            a.deny
+                && !a.inherited
+                && (t.group_sid == Some(a.sid.as_str())
+                    || crate::persist::is_capability_sid(&a.sid))
+                && !is_persistent_ace(a, t)
+        })
+        .cloned()
+        .collect()
 }
 
 /// What a persistent path is to carry.
@@ -1473,8 +1768,8 @@ pub fn write_persistent_aces(
     canonical_path: &str,
     t: &PersistentTrustees<'_>,
     want: &[AceView],
-) -> Result<()> {
-    write_persistent_aces_at(DaclTarget::Path(canonical_path), t, want)
+) -> Result<Written> {
+    write_persistent_aces_at(DaclTarget::Path(canonical_path), t, want, false)
 }
 
 /// [`write_persistent_aces`] on a path or on an open handle.
@@ -1490,16 +1785,21 @@ pub fn write_persistent_aces(
 /// original order was not kept anywhere. It is recognised as laid out
 /// correctly, is not rewritten for that, and on removal keeps the
 /// sorted order.
+///
+/// The walk of the tree is made only when the write changes what the
+/// objects below inherit ([`commit_dacl`]) — or when `finish_walk`
+/// says an earlier write of this path was cut short, so that the
+/// object may carry its entries while objects below still lack them.
 pub fn write_persistent_aces_at(
     target: DaclTarget<'_>,
     t: &PersistentTrustees<'_>,
     want: &[AceView],
-) -> Result<()> {
+    finish_walk: bool,
+) -> Result<Written> {
     let label = target.label();
     let (sd, old) = target
         .read()
         .with_context(|| format!("persistent ACEs '{label}'"))?;
-    let protected = sd_dacl_protected(&sd)?;
     let stays = |hdr: &ACE_HEADER, body: &[u8]| {
         hdr.AceFlags & INHERITED_ACE == 0
             && !ace_view(hdr, body).is_some_and(|a| is_persistent_ace(&a, t))
@@ -1534,14 +1834,12 @@ pub fn write_persistent_aces_at(
         &denies,
         &allows,
     )?;
-    let prot = if protected {
-        Protection::Protected
+    let how = if finish_walk {
+        Commit::Walk
     } else {
-        Protection::Unprotected
+        Commit::Write
     };
-    target
-        .write(new.as_ptr(), prot)
-        .with_context(|| format!("persistent ACEs '{label}'"))
+    commit_dacl(target, &sd, old, &new, how).with_context(|| format!("persistent ACEs '{label}'"))
 }
 
 /// Whether the explicit ACEs among `aces` (DACL order) are laid out
@@ -1696,6 +1994,7 @@ mod tests {
         real_user_sid: REAL,
         previous_group_sids: &[],
         sandbox_user_sid: None,
+        recorded_denies: None,
     };
 
     fn root_want<'a>(cap: &'a str) -> PersistentWant<'a> {
@@ -1910,6 +2209,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            recorded_denies: None,
         };
         let dir = std::env::temp_dir().join(format!("srtwin-persist-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -2047,6 +2347,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            recorded_denies: None,
         };
         let cap = crate::persist::new_capability_sid().unwrap();
         let base = std::env::temp_dir().join(format!("srtwin-canon-{}", std::process::id()));
@@ -2172,6 +2473,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            recorded_denies: None,
         };
         let cap = crate::persist::new_capability_sid().unwrap();
         let root = persistent_aces(&PersistentWant {
@@ -2330,6 +2632,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: Some(SB),
+            recorded_denies: None,
         };
         // What the profile read grant writes on an excluded directory.
         let exclusion = persistent_aces(&PersistentWant {
@@ -2471,6 +2774,7 @@ mod tests {
             real_user_sid: "S-1-5-21-9-9-9-500",
             previous_group_sids: &previous,
             sandbox_user_sid: None,
+            recorded_denies: None,
         };
         let without = PersistentTrustees {
             previous_group_sids: &[],
@@ -2480,9 +2784,391 @@ mod tests {
         for deny in [false, true] {
             assert!(is_persistent_ace(&ace(&old, deny), &with));
             assert!(!is_persistent_ace(&ace(&old, deny), &without));
-            assert!(is_persistent_ace(&ace("S-1-5-21-1-2-3-2002", deny), &with));
+            // The current group's: every allow; a deny only if it is
+            // the product's (this mask is not one it writes).
+            assert_eq!(
+                is_persistent_ace(&ace("S-1-5-21-1-2-3-2002", deny), &with),
+                !deny
+            );
             assert!(!is_persistent_ace(&ace("S-1-5-32-545", deny), &with));
         }
+    }
+
+    /// The fence an embedder may put on a write root for the sandbox
+    /// group: do not delete, rename or re-permission this folder.
+    /// DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD, on the
+    /// folder alone.
+    const FENCE: u32 = 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x40;
+
+    /// Which entries for the sandbox group are the product's.
+    #[test]
+    fn a_group_deny_the_record_does_not_list_is_foreign() {
+        let deny = |sid: &str, mask: u32, flags: u8| AceView {
+            deny: true,
+            inherited: false,
+            flags,
+            mask,
+            sid: sid.to_owned(),
+        };
+        let allow = |sid: &str, mask: u32| AceView {
+            deny: false,
+            ..deny(sid, mask, 0x3)
+        };
+        let fence = deny(GROUP, FENCE, 0);
+        let want = persistent_aces(&PersistentWant {
+            deny: Some(DenyMask::WriteDeny),
+            deny_fdc: true,
+            deny_delete: true,
+            ..root_want(CAP)
+        });
+        let listed: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
+        let with_record = PersistentTrustees {
+            recorded_denies: Some(&listed),
+            ..T
+        };
+        for t in [&T, &with_record] {
+            // The fence is nobody's to judge: not ours, by record or
+            // by shape.
+            assert!(!is_persistent_ace(&fence, t));
+            assert!(!is_persistent_ace(&deny(CAP, FENCE, 0), t));
+            // Every deny the product wrote is.
+            for w in &listed {
+                assert!(is_persistent_ace(w, t), "{}", w.sddl());
+            }
+            // The profile read grant's exclusion deny too.
+            let exclusion = persistent_aces(&PersistentWant {
+                capability_sid: None,
+                deny: Some(DenyMask::ReadDeny),
+                ..root_want(CAP)
+            });
+            let t_ex = PersistentTrustees {
+                recorded_denies: t.recorded_denies.map(|_| exclusion.as_slice()),
+                ..*t
+            };
+            assert!(is_persistent_ace(&exclusion[0], &t_ex));
+            // An ALLOW for the group or a capability SID is ours
+            // whatever the record says: unwanted, it is a stray.
+            assert!(is_persistent_ace(&allow(GROUP, 0x1f01ff), t));
+            assert!(is_persistent_ace(&allow(CAP, 0x1200a9), t));
+            // Nobody else's entries are.
+            assert!(!is_persistent_ace(&deny(SID_BUILTIN_USERS, FENCE, 0), t));
+        }
+        // With a record, a deny of a shape the product writes that the
+        // record does not list is foreign as well; without one it is
+        // told by its shape.
+        let delete_only = deny(GROUP, Mask::DELETE.bits(), 0);
+        let none_listed = PersistentTrustees {
+            recorded_denies: Some(&[]),
+            ..T
+        };
+        assert!(is_persistent_ace(&delete_only, &T));
+        assert!(!is_persistent_ace(&delete_only, &none_listed));
+        assert!(!product_deny_shape(FENCE));
+
+        // "Already current": the fence is not counted, wherever it is.
+        let want_c = comparable(&want, true);
+        let mut dacl = vec![fence.clone()];
+        dacl.extend(want.clone());
+        assert_eq!(persistent_on_disk(&dacl, &with_record, true), want_c);
+        assert!(persistent_layout_ok(&dacl, &with_record));
+        assert_eq!(
+            foreign_group_denies(&dacl, &with_record),
+            std::slice::from_ref(&fence)
+        );
+        // A stray allow still makes the path not current.
+        let mut stray = dacl.clone();
+        stray.push(allow(GROUP, 0x1f01ff));
+        assert_ne!(persistent_on_disk(&stray, &with_record, true), want_c);
+        // Behind our allows the fence would be met after them: the
+        // layout is not the one wanted, and one rewrite puts our
+        // allows behind it.
+        let mut behind = want.clone();
+        behind.push(fence.clone());
+        assert_eq!(persistent_on_disk(&behind, &with_record, true), want_c);
+        assert!(!persistent_layout_ok(&behind, &with_record));
+    }
+
+    /// The one test for writing without the walk of the tree.
+    #[test]
+    fn only_a_change_to_what_is_handed_down_needs_the_walk() {
+        // An ACE as bytes: type, flags, then anything.
+        let ace = |ty: u8, flags: u8, tag: u8| vec![ty, flags, 12, 0, tag, 0, 0, 0, 1, 1, 0, 0];
+        const OI: u8 = 0x1;
+        const CI: u8 = 0x2;
+        const NP: u8 = 0x4;
+        const IO: u8 = 0x8;
+        let a = ace(0, OI | CI, 1);
+        let b = ace(1, CI, 2);
+        let own = ace(0, 0, 3);
+        let base = vec![a.clone(), own.clone(), b.clone()];
+        let same = |after: &[Vec<u8>]| same_inheritable(&base, after);
+        // Entries of the object alone may come, go, change and move.
+        assert!(same(&[a.clone(), b.clone()]));
+        assert!(same(&[
+            ace(1, 0, 9),
+            a.clone(),
+            ace(0, NP, 8),
+            b.clone(),
+            own.clone()
+        ]));
+        assert!(same(&[a.clone(), ace(0, 0, 77), b.clone()]));
+        assert!(same_inheritable(std::slice::from_ref(&own), &[]));
+        assert!(same_inheritable(&[], &[]));
+        // An inheritable entry added, removed, changed or moved does
+        // not pass — whichever of the inheritance flags it carries.
+        assert!(!same(&[a.clone(), own.clone()]));
+        assert!(!same(&[b.clone(), own.clone(), a.clone()]));
+        assert!(!same(&[a.clone(), own.clone(), ace(1, CI, 3)]));
+        assert!(!same(&[a.clone(), own.clone(), ace(0, CI, 2)]));
+        for flags in [
+            OI,
+            CI,
+            OI | CI,
+            OI | IO,
+            CI | IO,
+            OI | CI | IO,
+            CI | NP,
+            OI | NP,
+        ] {
+            let extra = ace(0, flags, 5);
+            assert!(
+                !same(&[a.clone(), own.clone(), b.clone(), extra]),
+                "{flags:#x}"
+            );
+        }
+        // The same entry with another inheritance flag is another
+        // entry: it reaches different objects.
+        assert!(!same(&[ace(0, OI, 1), own.clone(), b.clone()]));
+        assert!(!same(&[ace(0, OI | CI | IO, 1), own.clone(), b.clone()]));
+        // An entry that stops being handed down, or starts to be.
+        assert!(!same(&[ace(0, 0, 1), own.clone(), b.clone()]));
+        assert!(!same(&[a.clone(), ace(0, OI, 3), b.clone()]));
+    }
+
+    /// On disk: a write that changes only an entry of the directory
+    /// itself touches nothing below it — a child and a grandchild keep
+    /// their security descriptors, inherited entries and auto-inherited
+    /// mark included — while one that changes what is handed down
+    /// reaches them. A foreign deny for the group survives both, and
+    /// the removal; a stray allow for it does not.
+    #[test]
+    fn a_write_walks_the_tree_only_when_what_is_handed_down_changes() {
+        const GROUP: &str = "S-1-5-32-546";
+        let real = crate::sid::current_user_sid().unwrap();
+        let cap = crate::persist::new_capability_sid().unwrap();
+        let dir = std::env::temp_dir().join(format!("srtwin-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
+        std::fs::write(dir.join("sub").join("deep").join("f.txt"), b"x").unwrap();
+        let path = dir.to_str().unwrap();
+        let child = dir.join("sub");
+        let child = child.to_str().unwrap();
+        let grandchild = dir.join("sub").join("deep").join("f.txt");
+        let grandchild = grandchild.to_str().unwrap();
+        // Everything a descriptor says about its access list.
+        let state = |p: &str| {
+            let (sd, _) = read_file_dacl(p).unwrap();
+            (
+                read_aces(p).unwrap(),
+                sd_dacl_auto_inherited(&sd).unwrap(),
+                sd_dacl_protected(&sd).unwrap(),
+            )
+        };
+        let below = || (state(child), state(grandchild));
+        let counted = |f: &dyn Fn() -> Written| {
+            let before = write_counts();
+            let how = f();
+            let after = write_counts();
+            (how, after.0 - before.0, after.1 - before.1)
+        };
+
+        // The embedder's fence, laid on the folder alone.
+        let root_marks = state(path);
+        let fence = AceView {
+            deny: true,
+            inherited: false,
+            flags: 0,
+            mask: FENCE,
+            sid: GROUP.to_owned(),
+        };
+        let (sd, old) = read_file_dacl(path).unwrap();
+        let group = LocalPsid::from_string(GROUP).unwrap();
+        let laid = place_around(
+            old,
+            |h, _| h.AceFlags & INHERITED_ACE == 0,
+            Placement::default(),
+            &[NewAce::Deny(group.as_psid(), FENCE, NO_INHERIT)],
+            &[],
+        )
+        .unwrap();
+        let untouched = below();
+        // Laying it changes nothing that is handed down: no walk.
+        assert_eq!(
+            commit_dacl(DaclTarget::Path(path), &sd, old, &laid, Commit::Write).unwrap(),
+            Written::Local
+        );
+        drop(sd);
+        assert_eq!(below(), untouched, "an object-only write reached below");
+        let now = state(path);
+        assert_eq!(
+            (now.1, now.2),
+            (root_marks.1, root_marks.2),
+            "the root's auto-inherited mark and protection"
+        );
+
+        // A kept root beside it. The record lists no deny: the fence
+        // is foreign.
+        let want = persistent_aces(&PersistentWant {
+            group_sid: GROUP,
+            real_user_sid: &real,
+            capability_sid: Some(&cap),
+            deny: None,
+            deny_fdc: false,
+            deny_delete: false,
+            profile: None,
+        });
+        let t = PersistentTrustees {
+            group_sid: Some(GROUP),
+            real_user_sid: &real,
+            previous_group_sids: &[],
+            sandbox_user_sid: None,
+            recorded_denies: Some(&[]),
+        };
+        // The grant hands entries down: a walk, and it reaches the
+        // grandchild.
+        let (how, walks, _) = counted(&|| write_persistent_aces(path, &t, &want).unwrap());
+        assert_eq!((how, walks), (Written::Tree, 1));
+        let aces = read_aces(path).unwrap();
+        assert_eq!(persistent_on_disk(&aces, &t, true), comparable(&want, true));
+        assert!(persistent_layout_ok(&aces, &t));
+        assert_eq!(
+            foreign_group_denies(&aces, &t),
+            std::slice::from_ref(&fence)
+        );
+        // The fence is still met before our allow for the group.
+        let at = |aces: &[AceView], deny: bool| {
+            aces.iter().position(|a| a.sid == GROUP && a.deny == deny)
+        };
+        assert!(at(&aces, true) < at(&aces, false));
+        assert!(
+            state(grandchild)
+                .0
+                .iter()
+                .any(|a| a.inherited && a.sid == cap),
+            "the grant did not reach a deep child"
+        );
+        let granted_below = below();
+
+        // The delete fence a session adds on the root itself: only an
+        // entry of the object changes. No walk, nothing below touched.
+        let fenced = persistent_aces(&PersistentWant {
+            group_sid: GROUP,
+            real_user_sid: &real,
+            capability_sid: Some(&cap),
+            deny: None,
+            deny_fdc: false,
+            deny_delete: true,
+            profile: None,
+        });
+        let listed: Vec<AceView> = fenced.iter().filter(|a| a.deny).cloned().collect();
+        let t_fenced = PersistentTrustees {
+            recorded_denies: Some(&listed),
+            ..t
+        };
+        let (how, walks, local) =
+            counted(&|| write_persistent_aces(path, &t_fenced, &fenced).unwrap());
+        assert_eq!((how, walks, local), (Written::Local, 0, 1));
+        assert_eq!(below(), granted_below);
+        let aces = read_aces(path).unwrap();
+        assert_eq!(
+            persistent_on_disk(&aces, &t_fenced, true),
+            comparable(&fenced, true)
+        );
+        assert_eq!(
+            foreign_group_denies(&aces, &t_fenced),
+            std::slice::from_ref(&fence)
+        );
+        assert_eq!(state(path).1, root_marks.1, "the auto-inherited mark");
+        // A walk that was cut short is finished with the walk, whatever
+        // the write changes on the object.
+        let before = write_counts();
+        assert_eq!(
+            write_persistent_aces_at(DaclTarget::Path(path), &t_fenced, &fenced, true).unwrap(),
+            Written::Tree
+        );
+        assert_eq!(write_counts().0 - before.0, 1);
+
+        // A stray allow for the group is removed by the next write;
+        // the fence is not.
+        let (sd, old) = read_file_dacl(path).unwrap();
+        let with_stray = place_around(
+            old,
+            |h, _| h.AceFlags & INHERITED_ACE == 0,
+            Placement::default(),
+            &[],
+            &[NewAce::Allow(
+                group.as_psid(),
+                Mask::FILE_ALL.bits(),
+                NO_INHERIT,
+            )],
+        )
+        .unwrap();
+        commit_dacl(DaclTarget::Path(path), &sd, old, &with_stray, Commit::Write).unwrap();
+        drop(sd);
+        let aces = read_aces(path).unwrap();
+        assert_ne!(
+            persistent_on_disk(&aces, &t_fenced, true),
+            comparable(&fenced, true)
+        );
+        write_persistent_aces(path, &t_fenced, &fenced).unwrap();
+        let aces = read_aces(path).unwrap();
+        assert_eq!(
+            persistent_on_disk(&aces, &t_fenced, true),
+            comparable(&fenced, true)
+        );
+        assert!(
+            !aces
+                .iter()
+                .any(|a| !a.deny && a.sid == GROUP && a.mask == Mask::FILE_ALL.bits())
+        );
+
+        // Forgotten: everything of ours goes, by a walk (what was
+        // handed down goes with it); the fence stays where it was.
+        let (how, walks, _) = counted(&|| write_persistent_aces(path, &t_fenced, &[]).unwrap());
+        assert_eq!((how, walks), (Written::Tree, 1));
+        let aces = read_aces(path).unwrap();
+        assert!(persistent_on_disk(&aces, &t_fenced, true).is_empty());
+        assert_eq!(
+            foreign_group_denies(&aces, &t_fenced),
+            std::slice::from_ref(&fence)
+        );
+        assert!(!state(grandchild).0.iter().any(|a| a.sid == cap));
+        assert_eq!(below(), untouched, "forgetting restores what is below");
+
+        // The session writer: nothing to change, nothing written.
+        let session = SbAceSet {
+            deny_delete: true,
+            ..Default::default()
+        };
+        const SB: &str = "S-1-5-32-547";
+        let before = write_counts();
+        apply_sandbox_aces_over(path, SB, session, None).unwrap();
+        // Its delete fence is an entry of the object alone.
+        assert_eq!(
+            (write_counts().0 - before.0, write_counts().1 - before.1),
+            (0, 1)
+        );
+        let before = write_counts();
+        apply_sandbox_aces_over(path, SB, session, None).unwrap();
+        assert_eq!(write_counts(), before, "an unchanged list is not written");
+        apply_sandbox_aces_over(path, SB, SbAceSet::default(), None).unwrap();
+        assert_eq!(below(), untouched);
+        // The install's entry point walks whatever it changes.
+        let before = write_counts();
+        apply_sandbox_aces(path, SB, SbAceSet::default()).unwrap();
+        assert_eq!(write_counts().0 - before.0, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A session's deny for the sandbox user stays in front of the
@@ -2500,6 +3186,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            recorded_denies: None,
         };
         let want = persistent_aces(&PersistentWant {
             group_sid: GROUP,
