@@ -31,8 +31,8 @@
 //!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
 //!
 //! With loopback open (`wfp verify --allow-loopback`) it makes two
-//! more, both under its own token, which show that the open-loopback
-//! PERMIT opens what it says and no more:
+//! more, one connect each under its own token, which show that the
+//! open-loopback PERMIT opens what it says and no more:
 //!
 //!   - **open, off-loopback** — to a NON-loopback address of this
 //!     machine, on the port of the listener below. The PERMIT is for
@@ -43,16 +43,12 @@
 //!     must connect; a block here means the filters in place do not
 //!     open loopback.
 //!
-//! It also moves the off-loopback half of the lowered-integrity
-//! attempts onto that port ([`lowered_off_loopback`]): the address is
-//! the same, so nothing is lost, and the attempts then also show that
-//! the PERMIT stays closed off loopback for a lowered token, in both
-//! socket orderings described below. (The report is the runner's exit
-//! code, and ten three-bit results fill it; aiming the existing
-//! attempts at the stricter destination adds the check without another
-//! result.) The two open-loopback attempts themselves run under the
-//! runner's own token, where there is no ordering to vary: one connect
-//! each.
+//! It also aims the off-loopback half of the lowered-integrity
+//! attempts at that port ([`lowered_off_loopback`]): the address is
+//! the same, and the attempts then also show that the PERMIT stays
+//! closed off loopback for a lowered token. (Ten three-bit results
+//! fill the runner's exit code, so this check has no result of its
+//! own.)
 //!
 //! A pass with loopback open says that DIRECT connections off the
 //! machine are blocked. It does not say that nothing on localhost
@@ -315,11 +311,10 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 pub const EXIT_NOT_FENCED: i32 = 3;
 /// `wfp verify` / `exec` exit code: the installed filter set is not
 /// the one this session requires — the install record says it was
-/// written by an earlier build, or (for `exec`) removed by an
-/// uninstall, or has a different loopback mode than the one the
-/// session is configured with; or the probe found loopback closed
-/// where it is recorded open. The repair is always to re-run the
-/// install.
+/// written by an earlier build, removed by an uninstall (`exec`
+/// only) or installed with the other loopback mode, or the probe
+/// found loopback closed where it is recorded open. The repair is
+/// always to re-run the install.
 pub const EXIT_FENCE_OUTDATED: i32 = 19;
 
 /// What `wfp verify` concludes from a [`Report`].
@@ -404,13 +399,13 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
     None
 }
 
-/// A loopback listener on a port the open-loopback PERMIT covers, for
-/// the reachability attempt: whatever port the system hands out, tried
-/// again (with the earlier ones held) if that is one of the floor.
-/// Held by the caller (the broker) until the runner has reported, then
-/// dropped. A pending connection completes against the listen backlog,
-/// so nothing needs to accept. `None` when none could be bound: the
-/// probe never aims that attempt at a listener it does not own.
+/// A loopback listener on a port the open-loopback PERMIT covers:
+/// whatever port the system hands out, tried again (with the earlier
+/// ones held) if that is one of the floor. The caller holds it until
+/// the runner has reported; a pending connection completes against
+/// the listen backlog, so nothing needs to accept. `None` when none
+/// could be bound: the probe never aims that attempt at a listener it
+/// does not own.
 pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
     let mut on_floor = Vec::new();
     for _ in 0..4 {
@@ -904,8 +899,9 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
 /// The off-loopback target of the lowered-integrity attempts: the
 /// one at a port open on loopback when there is one, else the
 /// anonymous attempt's. Both are the same address; the open port is
-/// the stricter destination, since it is one a PERMIT names. Shared by the runner, which aims the attempts, and
-/// the broker, which reports where they went.
+/// the stricter destination, since it is one a PERMIT names. Shared
+/// by the runner, which aims the attempts, and the broker, which
+/// reports where they went.
 pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
     open_off_loopback.or(anonymous)
 }

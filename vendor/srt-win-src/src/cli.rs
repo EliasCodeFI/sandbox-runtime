@@ -1338,10 +1338,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
             // The two attempts open loopback adds: a loopback
-            // listener bound here, on an arbitrary port, for as long
-            // as the runner takes, and this machine's own off-loopback
-            // address at that port (nothing listens there). Neither
-            // depends on a listener some other process owns.
+            // listener held here for as long as the runner takes, and
+            // this machine's own off-loopback address at that port
+            // (nothing listens there).
             let open_listener = allow_loopback.then(probe::bind_open_loopback).flatten();
             let open_loopback_addr = open_listener.as_ref().and_then(|l| l.local_addr().ok());
             let open_loopback_target = open_loopback_addr.map(|a| a.to_string());
@@ -1448,9 +1447,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             // The record and the session agree that loopback is open,
             // and the broker's own loopback listener was still
-            // blocked: the filters in place are not the recorded
-            // ones. Reported like any other fence the install must
-            // replace.
+            // blocked: the filters in place are not the recorded ones.
             if verdict.exit == probe::EXIT_FENCE_OUTDATED {
                 let hint = wfp::loopback_closed_hint();
                 eprintln!("srt-win: error: wfp verify: {hint}");
@@ -2268,7 +2265,7 @@ mod tests {
                 } if allow_loopback == want
             ));
         }
-        // The retired range argument is not accepted anywhere.
+        // There is no range form of the option.
         assert!(
             Cli::try_parse_from(["srt-win", "install", "--loopback-port-range", "3000-3099"])
                 .is_err()

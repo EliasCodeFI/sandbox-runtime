@@ -25,12 +25,11 @@
 //!     [`LOOPBACK_FLOOR_PORTS`] ([`open_loopback_port_ranges`]).
 //!     Absent unless installed with `srt-win install
 //!     --allow-loopback`. It lets the sandboxed child connect directly
-//!     to local servers — a development server, a database, a server
-//!     another sandboxed command started — over TCP and UDP alike (no
-//!     filter of the set has a protocol condition). It opens every
-//!     listener on loopback, whoever owns it, including any local
-//!     forwarder that carries traffic off the machine; the floor is
-//!     the short list of ports that stay blocked regardless.
+//!     to local servers, over TCP and UDP alike (no filter of the set
+//!     has a protocol condition). It opens every listener on loopback,
+//!     whoever owns it, including any local forwarder that carries
+//!     traffic off the machine; the floor is the short list of ports
+//!     that stay blocked regardless.
 //!
 //!   - **BLOCK sandbox user** (weight [`W_BLOCK`]) — `ALE_USER_ID` SD
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
@@ -72,10 +71,9 @@
 //! port_range?, user_sid, rev}`) so install/uninstall/status can
 //! locate them by enumeration. `rev` is [`FENCE_REVISION`]; a set
 //! written by an earlier build lacks it or carries another and reads
-//! as `outdated`. Whether loopback is open is part of what a
-//! session must agree with the install about: it is recorded by the
+//! as `outdated`. Whether loopback is open is recorded by the
 //! presence of the `permit-loopback-open` filters and in the install
-//! record, and `wfp verify` / `exec` refuse a session configured the
+//! record; `wfp verify` / `exec` refuse a session configured the
 //! other way, in either direction ([`loopback_mismatch_hint`]). BFE
 //! enumeration is admin-gated (see
 //! [`WfpAccessDenied`]) — `wfp status` returns `cannot-read` for a
@@ -537,9 +535,8 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 // "manual weight" class (top 4 bits are auto-classifier). The
 // loopback PERMITs must sit **above** the user-SID BLOCK so the
 // sandbox user can still reach the host proxies (and, when it is
-// open, the rest of loopback). Module-level so
-// [`install_filters`] and the const-asserts in `tests` share one
-// source of truth.
+// open, the rest of loopback). Module-level so [`install_filters`]
+// and the const-asserts in `tests` share one source of truth.
 pub(crate) const W_LOOPBACK: u64 = 0x0F80_0000_0000_0000;
 pub(crate) const W_BLOCK: u64 = 0x0F40_0000_0000_0000;
 
@@ -1519,8 +1516,6 @@ mod tests {
 
     #[test]
     fn revision_follows_the_anonymous_block_removal() {
-        // One above the revision that dropped the anonymous BLOCK:
-        // this set may also carry the open-loopback PERMIT.
         const { assert!(FENCE_REVISION == 4) };
         assert!(outdated_hint(Some(2)).contains("revision 2"));
         assert!(outdated_hint(Some(2)).contains("requires revision 4"));

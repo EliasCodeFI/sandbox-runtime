@@ -590,8 +590,8 @@ describe('network.allowLocalBinding on Windows (pure, all platforms)', () => {
   })
 
   it('there is no loopback port range: the schema drops the key like any unknown one', () => {
-    // WindowsConfigSchema is not strict, so the retired key is
-    // dropped like any other unknown one — it configures nothing.
+    // WindowsConfigSchema is not strict, so the key is dropped like
+    // any other unknown one — it configures nothing.
     const r = SandboxRuntimeConfigSchema.safeParse({
       network: { allowedDomains: [], deniedDomains: [] },
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
@@ -1756,7 +1756,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(maxInFlight).toBe(2)
   })
 
-  // ── open loopback: install, status, dependency check ────────────
   it('installWindowsSandbox{,Async}: allowLoopback becomes --allow-loopback', async () => {
     stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
     const srtWin = resolveSrtWin({ path: process.execPath })
@@ -2180,7 +2179,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect((err as WindowsSandboxError).message).toMatch(/windows-install/)
   })
 
-  // ── fence probe: open loopback ──────────────────────────────────
   const openOut = (over: Record<string, unknown> = {}): string =>
     verifyOut({
       target: '127.0.0.1:9229',

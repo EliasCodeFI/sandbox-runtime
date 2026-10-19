@@ -371,11 +371,10 @@ pub fn read_allow_loopback() -> Result<bool> {
 
 /// `Err` with the operator-facing explanation unless the loopback mode
 /// this session is configured with is the one the install record says
-/// the filters have. A session that expects loopback open on a machine
-/// where it is closed would find its local servers unreachable; one
-/// that expects it closed on a machine where it is open would run with
-/// every local service reachable without having been told. Neither
-/// runs.
+/// the filters have. Either difference is refused: a session that
+/// expects loopback closed must not run with every local service
+/// reachable, and one that expects it open would find its local
+/// servers unreachable.
 pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
     let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
     if installed == configured {

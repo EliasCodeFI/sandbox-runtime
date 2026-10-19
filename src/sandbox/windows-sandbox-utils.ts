@@ -1870,8 +1870,8 @@ export interface WindowsInstallOptions {
   sandboxUser?: string
   /**
    * Replace an existing install whose configuration differs
-   * (different port range, loopback mode or sandbox-user name
-   * under the same sublayer). Without this, install refuses with "already
+   * (different port range, loopback mode or sandbox-user name under
+   * the same sublayer). Without this, install refuses with "already
    * installed with different config" rather than silently
    * overwriting.
    */
@@ -2673,13 +2673,11 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   delete generated.NO_PROXY
   delete generated.no_proxy
   // With loopback open the fence does permit direct connects to
-  // loopback, and that is the only way to a local server that the
-  // proxy would not reach or allow. So the loopback hosts — and
-  // nothing else of the POSIX list: the private-network entries are
-  // still fenced — go back into NO_PROXY. A proxy-aware client then
-  // connects directly to every localhost port, the filtering proxy is
-  // not consulted for them, and one of the few ports that stay blocked
-  // is refused by the fence instead of being sent through the proxy.
+  // loopback, so the loopback hosts — and nothing else of the POSIX
+  // list: the private-network entries are still fenced — go back into
+  // NO_PROXY. A proxy-aware client then connects directly to every
+  // localhost port, and one of the few ports that stay blocked is
+  // refused by the fence instead of being sent through the proxy.
   if (p.allowLoopback && (p.httpProxyPort || p.socksProxyPort)) {
     generated.NO_PROXY = WINDOWS_LOOPBACK_NO_PROXY
     generated.no_proxy = WINDOWS_LOOPBACK_NO_PROXY
@@ -2884,9 +2882,8 @@ function interpretDependencyProbes(
 
   // 4. The installed loopback mode is the configured one, in either
   // direction. `undefined` = the caller did not say what is
-  // configured (nothing to compare). Both an elevated status
-  // (`installed`, read off the filters) and a non-elevated one
-  // (`cannot-read`, read off the install record) report the mode.
+  // configured (nothing to compare). Both `installed` and
+  // `cannot-read` statuses report the mode.
   const fenced =
     us.provisioned &&
     us.credPresent &&

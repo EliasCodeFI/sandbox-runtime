@@ -1293,18 +1293,14 @@ Write-Host 'U4 ok: reinstall restores the fence and removes the earlier revision
 # ── L-rows: open loopback ────────────────────────────────────────
 # `install --allow-loopback` adds one PERMIT per layer: loopback
 # address AND any port but a short fixed list. The rows run the same
-# connects with loopback closed, as a default install leaves it (all
-# refused but the proxy port), then with it open (loopback reachable
-# on 127.0.0.1 and ::1 over TCP and UDP, the listed ports and
-# everything off loopback still refused), and show that a session
-# whose loopback mode differs from the installed one is not launched,
-# in either direction.
+# connects with loopback closed, then with it open, and show that a
+# session whose loopback mode differs from the installed one is not
+# launched, in either direction.
 #
 # The listeners sit clear of the proxy range, of every fixed port the
 # rows above listen on, and of the dynamic port range (49152 and up),
 # where Windows keeps its per-machine excluded ranges and hands out
-# ephemeral ports. Each listener takes the first port of its slice
-# that binds.
+# ephemeral ports.
 $LbLo = 41000
 # Two of the ports that stay blocked with loopback open.
 $LbFloor = @(9229, 1080)
@@ -1368,7 +1364,7 @@ function RExecStart {
 # SERVED once a client is accepted, so a CONNECTED that reached
 # anything else does not pass. Returns the client's output and
 # whether the server accepted. Listening is not filtered, so the
-# server comes up with or without a range installed.
+# server comes up whether or not loopback is open.
 function SbServerRoundTrip {
   param([string] $Row, [int] $Port, [string[]] $ExecFlags = @())
   $srv = RExecStart ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command',
