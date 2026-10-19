@@ -141,6 +141,19 @@ function hasTool(name: string): boolean {
   return whereAll(name).length > 0
 }
 
+/** Whether `node` on PATH reads NODE_USE_ENV_PROXY (22.21+, 24.5+). */
+function nodeReadsProxyEnv(): boolean {
+  if (!hasTool('node')) return false
+  const r = spawnSync('node', ['-p', 'process.versions.node'], {
+    encoding: 'utf8',
+  })
+  if (r.status !== 0) return false
+  const [major = 0, minor = 0] = r.stdout.trim().split('.').map(Number)
+  return (
+    (major === 22 && minor >= 21) || (major === 24 && minor >= 5) || major > 24
+  )
+}
+
 /**
  * Locate a sandbox-reachable OpenSSL-backend curl. On x64
  * git-for-windows ships `mingw64\bin\curl.exe` (typically OpenSSL);
@@ -1005,6 +1018,35 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       srtWin,
     })
     expect(bare.argv.some(a => /^no_proxy=/i.test(a))).toBe(false)
+  })
+
+  it('NODE_USE_ENV_PROXY=1 rides the --env overlay with the HTTP proxy, unless the caller names it', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const proxied = {
+      command: 'node app.js',
+      httpProxyPort: 60080,
+      socksProxyPort: 60080,
+      proxyAuthToken: 'tok',
+      srtWin,
+    }
+    const named = (p: Parameters<typeof wrapCommandWithSandboxWindows>[0]) => {
+      const { argv } = wrapCommandWithSandboxWindows(p)
+      return argv
+        .filter((_, i) => argv[i - 1] === '--env')
+        .filter(e => e.toUpperCase().startsWith('NODE_USE_ENV_PROXY='))
+    }
+    expect(named(proxied)).toEqual(['NODE_USE_ENV_PROXY=1'])
+    expect(
+      named({ ...proxied, setEnvVars: { NODE_USE_ENV_PROXY: '0' } }),
+    ).toEqual(['NODE_USE_ENV_PROXY=0'])
+    // Windows reads names ignoring case: one entry, the caller's.
+    expect(
+      named({ ...proxied, setEnvVars: { node_use_env_proxy: '' } }),
+    ).toEqual(['node_use_env_proxy='])
+    expect(
+      named({ command: 'node app.js', socksProxyPort: 60081, srtWin }),
+    ).toEqual([])
+    expect(named({ command: 'node app.js', srtWin })).toEqual([])
   })
 })
 
@@ -5299,15 +5341,61 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it.skipIf(!hasTool('node'))(
     'B5: node https.get direct egress is BLOCKED (proxy env not honoured)',
     async () => {
-      // KEY: Node's built-in https does NOT read HTTPS_PROXY, so it
-      // attempts a DIRECT connect. The user-SID WFP filter must
-      // refuse it. This is the load-bearing proof that WFP — not the
-      // proxy env vars — is the real network boundary.
+      // An agent of the script's own reads no proxy variable: a DIRECT connect.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
-        `node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
+        `node -e "const s=Date.now();const h=require('https');h.get('https://example.com',{agent:new h.Agent()},r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
       )
       expect(r.stdout.startsWith('OK:')).toBe(false)
+    },
+    60_000,
+  )
+
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B6: node https.get to an allowedDomains host → 200 via proxy (NODE_USE_ENV_PROXY)',
+    async () => {
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
+        x => x.stdout.trim() === 'OK:200',
+      )
+      expectStatus('B6', r, [0])
+      expect(r.stdout.trim()).toBe('OK:200')
+    },
+    90_000,
+  )
+
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B7: node fetch to an allowedDomains host → 200 via proxy (NODE_USE_ENV_PROXY)',
+    async () => {
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `node -e "fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},15000)"`,
+        x => x.stdout.trim() === 'OK:200',
+      )
+      expectStatus('B7', r, [0])
+      expect(r.stdout.trim()).toBe('OK:200')
+    },
+    90_000,
+  )
+
+  it.skipIf(!nodeReadsProxyEnv())(
+    'B8: with NODE_USE_ENV_PROXY cleared in the command, node fetch goes direct → BLOCKED',
+    async () => {
+      // The runner hands the child a `*_PROXY` name in both cases, and
+      // `set "NAME="` removes one entry: both are cleared.
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxed(
+        `set "NODE_USE_ENV_PROXY=" & set "node_use_env_proxy=" & node -e "console.log('ENV:'+(process.env.NODE_USE_ENV_PROXY===undefined?'unset':process.env.NODE_USE_ENV_PROXY)+' NODE:'+process.version);fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},8000)"`,
+      )
+      // The premise first: node must have started without the variable.
+      if (!/^ENV:unset NODE:v\d+/m.test(r.stdout)) {
+        throw new Error(
+          `B8: the variable was not cleared for node · status=${r.status} · ` +
+            `stdout=${JSON.stringify(r.stdout)} · stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
+        )
+      }
+      expect(r.stdout).not.toMatch(/^OK:/m)
     },
     60_000,
   )

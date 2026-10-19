@@ -4676,6 +4676,10 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // `Https_Proxy` is the same variable as ours.
   const overlay = mergeWindowsEnv(
     { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT },
+    // Node's built-in clients read the proxy variables only when this
+    // is set. It is no security variable: a caller's value, in any
+    // case, wins (the next layer replaces it).
+    p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {},
     p.setEnvVars ?? {},
     javaToolOptions !== undefined ? { JAVA_TOOL_OPTIONS: javaToolOptions } : {},
     generated,
