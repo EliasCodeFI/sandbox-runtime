@@ -1943,13 +1943,22 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   )
 
   it.skipIf(!nodeReadsProxyEnv())(
-    'B8: clearing NODE_USE_ENV_PROXY in the command sends node fetch direct → BLOCKED',
+    'B8: with NODE_USE_ENV_PROXY cleared in the command, node fetch goes direct → BLOCKED',
     async () => {
+      // The runner hands the child a `*_PROXY` name in both cases, and
+      // `set "NAME="` removes one entry: both are cleared.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
-        `set "NODE_USE_ENV_PROXY=" & node -e "fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},8000)"`,
+        `set "NODE_USE_ENV_PROXY=" & set "node_use_env_proxy=" & node -e "console.log('ENV:'+(process.env.NODE_USE_ENV_PROXY===undefined?'unset':process.env.NODE_USE_ENV_PROXY)+' NODE:'+process.version);fetch('https://example.com').then(r=>{console.log('OK:'+r.status);process.exit(0)},e=>{console.log('ERR:'+e.message);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},8000)"`,
       )
-      expect(r.stdout.startsWith('OK:')).toBe(false)
+      // The premise first: node must have started without the variable.
+      if (!/^ENV:unset NODE:v\d+/m.test(r.stdout)) {
+        throw new Error(
+          `B8: the variable was not cleared for node · status=${r.status} · ` +
+            `stdout=${JSON.stringify(r.stdout)} · stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
+        )
+      }
+      expect(r.stdout).not.toMatch(/^OK:/m)
     },
     60_000,
   )
