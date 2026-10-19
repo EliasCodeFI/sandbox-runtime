@@ -42,15 +42,13 @@ pub enum RunnerCmd {
     /// sandbox user**, one per token shape a sandboxed process can
     /// present to the filtering engine — see [`crate::probe`].
     /// `target` (`host:port`) is the loopback probe target;
-    /// `anonymous_target` the off-loopback one for the attempt made
-    /// while impersonating the anonymous token (`None` skips it).
-    /// With loopback open, `open_loopback_target` is the broker's own
-    /// loopback listener and `open_off_loopback_target` an
-    /// off-loopback address at its port (`None` skips each).
+    /// `anonymous_target` the off-loopback one (`None` skips the
+    /// attempts aimed at it). With loopback open,
+    /// `open_loopback_target` is the broker's own loopback listener
+    /// and `open_off_loopback_target` an off-loopback address at its
+    /// port (`None` skips each).
     ///
-    /// A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
-    /// leaves — so a fenced connect yields WSAEACCES immediately. The
-    /// runner exits with the results encoded
+    /// The runner exits with the results encoded
     /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
     /// the runner's own anyhow `Err` path, and never decodes as a
     /// report. No desk/grants/lockdown — the probe runs as the bare

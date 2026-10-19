@@ -403,17 +403,15 @@ pub fn write_fence_revision(rev: u32) -> Result<()> {
 /// as current beside filters with the other mode.
 ///
 /// Every path that deletes filters calls this FIRST and deletes the
-/// filters only if it succeeded. The record and the filters are two
-/// stores with no common transaction, so they can disagree after a
-/// failure; this order (and install's opposite one — filters first,
-/// record second) makes the only possible disagreement "filters
-/// present, record says removed or older". That reads as `absent` or
-/// `outdated`, never as a current fence that is not there.
+/// filters only if it succeeded. The record and the filters share no
+/// transaction; this order (and install's opposite one — filters
+/// first, record second) makes the only possible disagreement
+/// "filters present, record says removed or older", never a current
+/// record for a fence that is not there.
 ///
-/// The record is machine-wide and filters live under a sublayer:
-/// removing the filters of one sublayer marks the fence removed even
-/// if another sublayer still holds a set. That errs the same safe
-/// way, and re-running `srt-win install` restores the record.
+/// The record is machine-wide: removing the filters of one sublayer
+/// marks the fence removed even if another sublayer still holds a
+/// set.
 pub fn mark_fence_removed() -> Result<()> {
     match crate::reg::Key::open(crate::reg::BASE, true)? {
         Some(base) => {
@@ -436,14 +434,10 @@ pub fn fence_marked_removed() -> bool {
 }
 
 /// The recorded fence revision. `Ok(None)` when no install has run,
-/// or when the install that ran predates the record;
-/// [`crate::wfp::FENCE_REVISION_REMOVED`] once an uninstall has
-/// removed the filters and kept the account.
+/// or when the install that ran predates the record.
 ///
-/// This is what the non-elevated broker has in place of filter
-/// enumeration (which is admin-only): it says which filter set the
-/// last install wrote, not that the filters are still there —
-/// `srt-win wfp verify` is what shows that.
+/// It says which filter set the last install wrote, not that the
+/// filters are still there — `srt-win wfp verify` shows that.
 pub fn read_fence_revision() -> Result<Option<u32>> {
     let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
         return Ok(None);

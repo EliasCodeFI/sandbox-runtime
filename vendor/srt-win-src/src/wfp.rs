@@ -44,32 +44,20 @@
 //! ## What the filters do not cover
 //!
 //! The identity WFP checks for a connect is the token that was in
-//! effect when the SOCKET was created. Both gaps below are a sandboxed
-//! thread putting a token the sandbox-user BLOCK does not match on
-//! itself and then creating its socket. (A socket the process created
-//! under its own token stays attributed to the sandbox account, and to
-//! the BLOCK, even when the connect is made while impersonating.)
+//! effect when the SOCKET was created. A sandboxed thread that puts
+//! one of these tokens on itself before creating its socket is not
+//! matched by the sandbox-user BLOCK:
 //!
-//!   - The **anonymous token** (`ANONYMOUS LOGON`) is not the sandbox
-//!     account, so the BLOCK does not match a socket created while
-//!     impersonating it — to any destination, off the machine or on
-//!     loopback. The only filter that could refuse it is one keyed on
-//!     the anonymous SID itself, which would apply to every process on
-//!     the machine that uses that token, sandboxed or not; this set
-//!     carries none. `srt-win wfp verify` probes both destinations and
-//!     reports a connect as the
-//!     [`crate::probe::RESIDUAL_ANONYMOUS_EGRESS`] and
-//!     [`crate::probe::RESIDUAL_ANONYMOUS_LOOPBACK`] residuals.
+//!   - The **anonymous token** (`ANONYMOUS LOGON`), to any
+//!     destination. Only a filter keyed on the anonymous SID could
+//!     refuse it, and that would apply to every process on the
+//!     machine that uses that token; this set carries none.
 //!   - A token whose user SID has been made **deny-only**
-//!     (`CreateRestrictedToken`) is matched by no ALLOW ACE, so the
-//!     sandbox-user BLOCK does not match a socket created under it.
-//!     No descriptor can fix that: the filter set blocks what it can
-//!     name and permits the rest. `srt-win wfp verify` probes this
-//!     shape and reports a connect as the [`RESIDUAL_DENY_ONLY`]
-//!     residual.
+//!     (`CreateRestrictedToken`): no ALLOW ACE matches it, so no
+//!     descriptor can name it.
 //!
-//! The probe makes each of these connects with the socket created
-//! after the token is assumed as well as before; see [`crate::probe`].
+//! `srt-win wfp verify` probes both and reports a connect as a named
+//! residual; see [`crate::probe`].
 //!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
@@ -520,23 +508,11 @@ pub fn filter_count(allow_loopback: bool) -> usize {
 
 /// Revision of the filter set this build installs and requires.
 /// Bumped whenever the set changes in a way an existing install must
-/// pick up by re-running `srt-win install`:
-///
-///   1. loopback PERMIT + sandbox-user BLOCK (unrecorded — filters of
-///      this revision carry no `rev`).
-///   2. adds a BLOCK keyed on the anonymous SID, for off-loopback
-///      destinations, and the all-packages ACEs on the sandbox-user
-///      descriptor.
-///   3. drops the anonymous BLOCK, which applied to every process on
-///      the machine; keeps the all-packages ACEs. Installing over a
-///      set that has the anonymous BLOCK deletes it along with the
-///      rest ([`install_filters`] removes every tagged filter before
-///      adding its own).
-///   4. may carry the open-loopback PERMIT, and records whether it
-///      does beside the revision. A set without the PERMIT has the
-///      same filters as revision 3; the number moves so that a build
-///      which does not know about open loopback never accepts a set
-///      that may have it.
+/// pick up by re-running `srt-win install`. A set without the
+/// open-loopback PERMIT has the same filters as the revision before
+/// that PERMIT existed; the number moved all the same, so that a
+/// build which does not know about open loopback never accepts a set
+/// that may have it.
 ///
 /// Recorded twice: in every filter's tag (what an elevated `wfp
 /// status` reads) and in the install record (what the non-elevated
@@ -554,8 +530,7 @@ const REQUIRED_BLOCK_KINDS: [&str; 1] = [KIND_BLOCK_USER];
 
 /// Name of the residual `srt-win wfp verify` reports when a connect
 /// made under a copy of the sandbox token whose user SID is deny-only
-/// is not blocked, in either socket ordering the probe tries. See the
-/// module doc.
+/// is not blocked. See the module doc.
 pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 
 // Filter weights — kept below 2^60 so they stay in WFP's
@@ -760,22 +735,17 @@ fn add_filter(
 /// SID → no match → fall through to default-permit.
 ///
 /// The two package ACEs exist for AppContainer tokens. The access
-/// check of such a token has two halves that must BOTH grant: the
-/// ordinary one over the user and group SIDs, and one over the
-/// package and capability SIDs. With the user ACE alone, an
-/// AppContainer process started under the sandbox account passes the
-/// first half and fails the second, so the BLOCK would not match it.
-/// The package ACEs supply the second half. They grant nothing by
-/// themselves: a token outside an AppContainer does not carry either
+/// check of such a token has two halves that must BOTH grant: one
+/// over the user and group SIDs, and one over the package and
+/// capability SIDs, which the package ACEs supply. They grant nothing
+/// by themselves: a token outside an AppContainer carries neither
 /// SID, and an AppContainer token of any OTHER user still fails the
 /// first half.
 ///
-/// The descriptor carries no mandatory label: a process of the
-/// sandbox account runs at medium integrity, the level an unlabelled
-/// descriptor is given. A copy of its token
-/// with the integrity level lowered is below that level; whether the
-/// BLOCK still matches it is measured by the fence probe
-/// ([`crate::probe`]), which requires it to.
+/// The descriptor carries no mandatory label, so a copy of the
+/// sandbox token with its integrity level lowered is below the
+/// descriptor's level; the fence probe ([`crate::probe`]) requires
+/// the BLOCK to match it all the same.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }
@@ -786,8 +756,7 @@ pub fn sddl_sandbox_user(sid: &str) -> String {
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
 /// — including legacy discriminator-group-keyed filters from a
-/// pre-separate-user install, the anonymous BLOCK filters of an
-/// earlier revision, and an open-loopback PERMIT that is no
+/// pre-separate-user install and an open-loopback PERMIT that is no
 /// longer asked for — are deleted first, then a fresh set is added,
 /// all inside one WFP transaction.
 pub fn install_filters(
@@ -826,10 +795,10 @@ pub fn install_filters(
         }
 
         // Idempotency + migration: drop EVERY stale srt-win filter
-        // (this version's user-keyed shape, the anonymous BLOCK of
-        // an earlier revision, and any legacy group-keyed filters
-        // from a prior install) before re-adding. Inside the
-        // transaction so a crash leaves the previous state intact.
+        // (both this version's user-keyed shape and any legacy
+        // group-keyed filters from a prior install) before
+        // re-adding. Inside the transaction so a crash leaves the
+        // previous state intact.
         delete_tagged_filters(engine, sublayer)?;
 
         let mut sd_user_blob = sd_byte_blob(&sd_user);
@@ -1114,14 +1083,11 @@ pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> Wfp
 /// at all, `Some(rev)` when it has one (`rev` itself is `None` for a
 /// record written before the revision was kept).
 ///
-/// A non-elevated caller cannot enumerate filters (`cannot-read`), so
-/// the record is its only way to learn that the install predates this
-/// build (`outdated`) or that an uninstall removed the filters
-/// (`absent`); and an elevated caller that enumerated a
-/// current-looking set under one sublayer still must not report
-/// `installed` while the record says otherwise (`outdated`). Only a
-/// record at [`FENCE_REVISION`] leaves `installed` or `cannot-read`
-/// standing.
+/// Only a record at [`FENCE_REVISION`] leaves `installed` or
+/// `cannot-read` standing. A non-elevated caller cannot enumerate
+/// filters, so the record is its only way to learn of an `outdated`
+/// or removed (`absent`) set; an elevated one must not report
+/// `installed` while the record says otherwise.
 pub fn apply_recorded_revision(mut st: WfpStatus, record: Option<Option<u32>>) -> WfpStatus {
     if let Some(rev) = record
         && rev != Some(FENCE_REVISION)

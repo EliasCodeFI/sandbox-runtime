@@ -1299,14 +1299,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 std::process::exit(exit)
             }
-            // The install record is checked before probing: a filter
-            // set from an earlier build is refused by name, with the
-            // repair, instead of by whichever attempt happens to get
-            // through. So is a filter set whose loopback mode is not
-            // the one this session is configured with. A record that
-            // says the filters were REMOVED is not refused here: the
-            // probe then shows the missing fence itself (exit 3),
-            // which is the stronger answer.
+            // Checked before probing so that an out-of-date filter
+            // set, or one whose loopback mode is not the one this
+            // session is configured with, is refused by name, with
+            // the repair. A record that says the filters were REMOVED
+            // is not refused here: the probe then shows the missing
+            // fence itself (exit 3).
             let notice = allow_loopback.then(wfp::open_loopback_notice);
             if !install::fence_marked_removed() {
                 if let Err(hint) = install::require_current_fence() {
@@ -1797,12 +1795,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // No filter enumeration here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
             // What the broker CAN read is the install record's fence
-            // revision, so a filter set written by an earlier build
-            // — one that lacks filters this build relies on — or
-            // removed by an uninstall is refused before anything is
-            // launched. That the filters a current record describes
-            // are still in place is verified BEHAVIORALLY by `srt-win
-            // wfp verify` at the host's `initialize()`. Standalone
+            // revision, so a filter set that is not the one this
+            // build requires is refused before anything is launched.
+            // That the filters a current record describes are still
+            // in place is verified BEHAVIORALLY by `srt-win wfp
+            // verify` at the host's `initialize()`. Standalone
             // `srt-win exec` callers should run `srt-win wfp verify`
             // once per session.
             //

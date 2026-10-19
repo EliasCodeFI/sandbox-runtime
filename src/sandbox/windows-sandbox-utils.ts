@@ -93,9 +93,8 @@ export type WindowsSandboxErrorCode =
   /**
    * The installed filter set is not the one this session requires
    * (`srt-win wfp verify` exit 19): it was written by an earlier
-   * `srt-win` and lacks filters this one requires, or its loopback
-   * mode (open or closed) is not what `network.allowLocalBinding`
-   * asks for — re-run the install.
+   * `srt-win`, or its loopback mode (open or closed) is not what
+   * `network.allowLocalBinding` asks for — re-run the install.
    */
   | 'wfp_fence_outdated'
   /** `srt-win` predates `--allow-loopback`; `network.allowLocalBinding` needs a newer one. */
@@ -261,18 +260,14 @@ export type WindowsWfpProbeOutcome =
  * does not close. The fence is active; these are what it leaves open.
  *
  * - `anonymous-egress` — a connect to an off-loopback destination
- *   made while impersonating the anonymous token is not blocked. This
- *   is expected on every machine that has such an address: no filter
- *   is keyed on the anonymous token, because one would apply to every
+ *   made while impersonating the anonymous token is not blocked.
+ *   Expected on every machine that has such an address: no filter is
+ *   keyed on the anonymous token, because one would apply to every
  *   process on the machine and not only to sandboxed ones.
- * - `anonymous-loopback` — a connect to a loopback destination made
- *   while impersonating the anonymous token is not blocked, so local
- *   listeners outside the proxy port range are reachable that way.
+ * - `anonymous-loopback` — the same to a loopback destination, so
+ *   local listeners outside the proxy port range are reachable.
  * - `deny-only-user-sid` — a connect made under a copy of the sandbox
  *   token whose user SID is deny-only is not blocked.
- *
- * Each is probed on a socket created before the token is assumed and
- * on one created after; the residual is named when either connects.
  */
 export type WindowsWfpResidual =
   | 'anonymous-egress'
@@ -1333,26 +1328,11 @@ export function interpretWindowsWfpVerify(r: {
  * outside the WFP loopback-permit range, then spawns `srt-win
  * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
  * attempt direct TCP connects under each token shape a sandboxed
- * process can present to the filtering engine:
- *
- * 1. its own token, to the listener;
- * 2. impersonating the anonymous token, to this machine's own
- *    off-loopback address (chosen by `srt-win`; nothing needs to
- *    listen there);
- * 3. impersonating the anonymous token, to the listener;
- * 4. a copy of its token with the user SID deny-only, to the
- *    listener;
- * 5. a copy of its token at low integrity, and one at untrusted
- *    integrity, each to the off-loopback address and to the
- *    listener.
- *
- * Attempts 2 to 5 each connect twice: on a socket created before the
- * token is assumed and on one created after. The filtering engine
- * attributes a connect to the token in effect when its socket was
- * created, so only the second is a connect by the assumed identity;
- * the first is kept in case that attribution differs. Each attempt
- * reports the worse of its two results, and `stderr` carries one line
- * per ordering.
+ * process can present to the filtering engine: its own token, the
+ * anonymous token, and copies of its own token with the user SID
+ * deny-only or the integrity level lowered — to the listener and,
+ * for some, to this machine's own off-loopback address (see
+ * {@link WindowsWfpVerifyResult}).
  *
  * A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
  * leaves — so a fenced connect yields WSAEACCES immediately and an
@@ -1364,24 +1344,21 @@ export function interpretWindowsWfpVerify(r: {
  * With `opts.allowLoopback` (the session's `network.allowLocalBinding`)
  * loopback is open, so the listener is bound on one of
  * {@link WINDOWS_LOOPBACK_FLOOR_PORTS} — the loopback ports that stay
- * blocked — and the probe makes two more attempts, both under its own
- * token, aiming the off-loopback half of attempt 5 where attempt 6
- * goes:
+ * blocked — and the probe makes two more attempts under its own
+ * token: to this machine's own off-loopback address at a port that is
+ * open on loopback (loopback is open for loopback addresses only),
+ * and to a loopback listener `srt-win` itself binds for the probe
+ * (loopback must actually be open). The off-loopback
+ * lowered-integrity attempts are aimed at that same port.
  *
- * 6. to this machine's own off-loopback address at the port of
- *    attempt 7's listener (nothing listens there) — loopback is open
- *    for loopback addresses only;
- * 7. to a loopback listener `srt-win` itself binds on an arbitrary
- *    port for the probe — loopback must actually be open.
- *
- * Attempts 1, 5 and 6 are what the fence must refuse: any of them
- * getting through throws. So does attempt 7 being blocked, and a
- * loopback mode that is not the one the install recorded
- * (`wfp_fence_outdated`, before anything is probed). Attempts 2, 3 and
- * 4 are shapes the filter set does not refuse — attempt 2 is expected
- * to get through; when they do, the
- * result names them in `residuals` (with `warnings`) rather than
- * passing silently — see {@link WindowsWfpResidual}.
+ * The own-token attempts at the blocked targets and the
+ * lowered-integrity attempts are what the fence must refuse: one
+ * getting through throws. So does the probe's own loopback listener
+ * being blocked, and a loopback mode that is not the one the install
+ * recorded (`wfp_fence_outdated`, before anything is probed). The
+ * anonymous and deny-only attempts are shapes the filter set does not
+ * refuse; one getting through is named in `residuals` (with
+ * `warnings`) — see {@link WindowsWfpResidual}.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed, or a filter

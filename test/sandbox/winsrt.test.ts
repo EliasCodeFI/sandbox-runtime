@@ -1929,10 +1929,8 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
   })
 
-  // ── fence revision: status ──────────────────────────────────────
   // What `srt-win wfp status` prints for a filter set written by an
-  // earlier build (elevated: read off the filters; non-elevated: read
-  // off the install record).
+  // earlier build.
   const RAW_WFP_OUTDATED = JSON.stringify({
     state: 'outdated',
     filters: 4,
@@ -1972,7 +1970,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(await checkWindowsDependenciesAsync({ srtWin })).toEqual(sync)
   })
 
-  // ── fence probe: verify result handling ─────────────────────────
   const verifyOut = (over: Record<string, unknown> = {}): string =>
     JSON.stringify({
       egress_probe: 'blocked',

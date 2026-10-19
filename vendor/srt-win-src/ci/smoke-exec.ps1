@@ -104,13 +104,10 @@ $v = $vout | ConvertFrom-Json
 
 # ── V1c: lowered-integrity copies of the sandbox token are blocked ──
 # Same run as V1, checked first so that a failure here is named for
-# what it is instead of surfacing as V1's exit code. The runner makes
-# four more connects under a copy of its own token whose integrity
-# level it has lowered: low and untrusted, each to the off-loopback
-# address and to the out-of-range loopback listener. The copy still
-# carries the sandbox account's SID, so block-user must refuse every
-# one. `error` means the runner could not assume the lowered token;
-# that is not a block and fails the row as such.
+# what it is instead of surfacing as V1's exit code. A lowered copy
+# still carries the sandbox account's SID, so block-user must refuse
+# all four connects. `error` means the runner could not assume the
+# lowered token; that is not a block and fails the row as such.
 $loweredFields = 'low_integrity_probe','low_integrity_loopback_probe',
                  'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
 foreach ($f in $loweredFields) {
@@ -147,22 +144,12 @@ if ($v.egress_probe -ne 'blocked') {
 Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 
 # ── V1b: wfp verify reports each token shape separately ─────────
-# Same run as V1. Beside the plain connect the runner tries one
-# while impersonating the anonymous token, aimed at this machine's
-# own off-loopback address (srt-win picks it; `skipped` when there is
-# none), one under that token to the loopback listener, and one under
-# a deny-only copy of its own token. No filter covers these three
-# shapes; they must be REPORTED, and what they report is recorded
-# here, not asserted: a connect is the documented residual and is
-# named in `residuals`. The off-loopback anonymous connect is EXPECTED
-# to get through (`anonymous-egress`): no filter is keyed on the
-# anonymous token. None of the three changes the exit code, which V1
-# above required to be 0 on the plain connect being blocked.
-#
-# Every one of these is the worse of two connects - one on a socket
-# created before the token is assumed, one on a socket created after.
-# The runner's stderr lines above (`[<attempt>; socket before token]`,
-# `[<attempt>; socket after token]`) show each ordering's own result.
+# Same run as V1. No filter covers the two anonymous-token connects
+# or the deny-only one, so their results are recorded, not asserted;
+# what is asserted is that a connect is named in `residuals`, and only
+# a connect. The off-loopback anonymous connect is EXPECTED to get
+# through (`anonymous-egress`). Each result is the worse of two
+# orderings; the runner's stderr lines above show each one's own.
 foreach ($f in 'anonymous_probe','anonymous_loopback_probe','deny_only_probe','residuals') {
   if ($null -eq $v.PSObject.Properties[$f]) { throw "V1b: wfp verify output lacks '$f': $vout" }
 }
@@ -397,23 +384,18 @@ Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 
 # ── R5g-R5j: connects made under an assumed token ────────────────────
 # The filtering engine attributes a connect to the token that was in
-# effect when its SOCKET was created. A socket the process creates
-# under its own token and connects while impersonating is attributed
-# to the process, and block-user refuses it whatever the thread's
-# token is. So a probe that creates its socket first says nothing
-# about the assumed token. Each shape below is therefore tried in
-# both orderings, on one thread:
+# effect when its SOCKET was created, so a probe that creates its
+# socket first says nothing about the assumed token. Each shape below
+# is therefore tried in both orderings, on one thread:
 #
 #   AFTER  - assume the token, create the socket, connect. The socket
-#            belongs to the assumed token; this is the ordering that
-#            matters.
+#            belongs to the assumed token.
 #   BEFORE - create the socket, assume the token, connect. Kept in
 #            case an engine attributes at connect time instead.
 #
 # One C# method does this through ws2_32 directly, reads the thread's
-# token back after the socket exists and before the connect, and
-# reverts. It prints one line per shape and ordering,
-# `<SHAPE>.<BEFORE|AFTER>=<result>`, where the result is:
+# token back immediately before the connect, and reverts. It prints
+# `<SHAPE>.<BEFORE|AFTER>=<result>` per shape and ordering:
 #
 #   CONNECTED              the connect completed
 #   WSA:<code>             10013 = refused by a filter; 10061 = refused
@@ -608,7 +590,7 @@ function Probe-Orderings([string] $out, [string] $label, [string] $row) {
 }
 
 # Print what happened to a shape in each ordering, beside what
-# `wfp verify` reported for it. Never fails: for a shape no filter
+# `wfp verify` reported for it. Never fails: for shapes no filter
 # covers.
 function Write-OrderingsObserved([string] $out, [string] $label, [string] $row, [string] $residual, [string] $verifyField) {
   $o = Probe-Orderings $out $label $row
@@ -645,9 +627,8 @@ function Assert-BothOrderingsBlocked([string] $out, [string] $label, [string] $r
 # one of this runner's own addresses with a live listener, so "not
 # blocked" is an actual connect rather than a timeout. No filter is
 # keyed on the anonymous token, so the socket-after ordering is
-# expected to connect; this row prints what happened in each ordering
-# beside what `wfp verify` reported for the same shape. It fails only
-# if the PLAIN connect to that address gets through.
+# expected to connect. The row fails only if the PLAIN connect to
+# that address gets through.
 $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ea SilentlyContinue |
   Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
   Select-Object -First 1).IPAddress
@@ -693,15 +674,12 @@ try {
 
   # R5h: anonymous, out-of-range loopback - an OBSERVATION. No filter
   # covers a loopback connect on a socket created while impersonating
-  # anonymous; this row prints what happened in each ordering beside
-  # what `wfp verify` reported for the same shape, and never fails.
+  # anonymous.
   Write-OrderingsObserved $r.out 'ANON' 'R5h' 'anonymous-loopback' 'anonymous_loopback_probe'
 
   # R5i: a lowered-integrity copy of the child's own token - ASSERTED
-  # in both orderings. A process may lower the integrity level of a
-  # copy of its own token without any privilege; the copy still
-  # carries the sandbox account's SID, so block-user must refuse a
-  # connect on a socket created under it.
+  # in both orderings. Lowering takes no privilege, and the copy still
+  # carries the sandbox account's SID, so block-user must refuse it.
   foreach ($shape in 'LOW','UNTRUSTED') {
     Assert-BothOrderingsBlocked $r.out $shape 'R5i' `
       "connect under a $shape-integrity copy of the sandboxed child's token" $r.raw
@@ -709,9 +687,7 @@ try {
 
   # R5j: a copy of the child's own token with the user SID deny-only -
   # an OBSERVATION. A deny-only SID is matched by no allow entry, so
-  # no filter here can name that token; this row prints what happened
-  # in each ordering beside what `wfp verify` reported, and never
-  # fails.
+  # no filter here can name that token.
   Write-OrderingsObserved $r.out 'DENYONLY' 'R5j' 'deny-only-user-sid' 'deny_only_probe'
 } finally {
   $tokLsn.Stop()
@@ -1121,23 +1097,20 @@ try {
 }
 
 # ── U-rows: a fence written by an earlier build ─────────────────
-# An install from a build that predates the fence revision record has
-# no `FenceRevision` value. Removing the value reproduces what the
-# non-elevated broker can see of such an install — it cannot
-# enumerate filters, so the record is what it goes by.
+# An install that predates the fence revision record has no
+# `FenceRevision` value; removing the value reproduces what the
+# non-elevated broker can see of one (it cannot enumerate filters).
 #
-# An earlier revision of the filter set also carried a BLOCK keyed on
-# the anonymous token (`block-anonymous`), which this build does not
-# install and must remove. U0b puts a filter with that revision's tag
-# and name under the sublayer, so that the reinstall in U4 and the
-# uninstall in the teardown have one to delete.
+# Revision 2 of the filter set also carried a BLOCK keyed on the
+# anonymous token (`block-anonymous`). U0b puts a filter with that
+# tag and name under the sublayer, so that the reinstall in U4 and
+# the uninstall in the teardown have one to delete.
 
-# The filters under the test sublayer as the system's own dump of the
-# filtering engine lists them: how many there are, and which of them
-# name the anonymous token — by display name, or as `ANONYMOUS LOGON`
-# (`S-1-5-7`, `AN` in SDDL) in a condition's security descriptor.
-# Independent of srt-win's own enumeration. `$null` when the dump
-# could not be produced or read.
+# The filters under the test sublayer per `netsh`'s dump of the
+# filtering engine (independent of srt-win's own enumeration): how
+# many there are, and which name the anonymous token — by display
+# name, or as `S-1-5-7` / `AN` in a condition's security descriptor.
+# `$null` when the dump could not be produced or read.
 function Get-SublayerFilterDump {
   $file = Join-Path ([System.IO.Path]::GetTempPath()) "srt-wfp-$PID.xml"
   try {
@@ -1178,11 +1151,9 @@ function Assert-AnonymousFiltersInDump([string] $row, [int] $statusCount, [int] 
 }
 
 # Add one filter under the test sublayer that carries the tag and the
-# display name the earlier revision gave its anonymous BLOCK. It is a
-# PERMIT with no conditions and no weight of its own, not persistent:
-# it changes no verdict (the BLOCK outweighs it for the sandbox
-# account, and everyone else is permitted already) and is gone at the
-# next restart whatever happens here. What matters is the tag: install
+# display name revision 2 gave its anonymous BLOCK. It is a PERMIT
+# with no conditions or weight, not persistent: it changes no verdict
+# and is gone at the next restart. What matters is the tag: install
 # and uninstall find the filters to delete by it.
 Add-Type -TypeDefinition @'
 using System;

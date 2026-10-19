@@ -24,16 +24,9 @@
 //! | sandbox account, user SID deny-only     | no match        |
 //! | sandbox account, integrity lowered      | recorded        |
 //!
-//! The anonymous row is a gap the filter set leaves open: a thread of
-//! the sandbox account that impersonates the anonymous token is not
-//! matched, and no filter is keyed on the anonymous SID, which would
-//! apply to every process on the machine. The row is asserted so the
-//! gap stays visible.
-//!
-//! The deny-only row is not what the fence wants — it is what an
-//! ALLOW ACE can do. A deny-only SID satisfies no ALLOW ACE, so no
-//! descriptor of this shape reaches that token; the row is asserted
-//! so the gap stays visible.
+//! The anonymous and deny-only rows are gaps the filter set leaves
+//! open (see the `wfp` module doc); they are asserted so the gaps
+//! stay visible.
 //!
 //! ## Integrity levels and the generic mapping
 //!
@@ -47,13 +40,11 @@
 //! any mapping.
 //!
 //! Each check prints one line to stderr (written past the test
-//! harness's capture, so it shows for passing tests too): the token's
-//! type, impersonation level and integrity level, the descriptor,
-//! and the granted mask and Win32 status under [`STRICT`] and under
-//! [`LENIENT`]. Denied under the first and granted under the second
-//! means the mandatory check, not the DACL, refused. A failure of the
-//! `AccessCheck` call itself is never read as "no match": it panics
-//! with the Win32 error.
+//! harness's capture, so it shows for passing tests too) with the
+//! answer under [`STRICT`] and under [`LENIENT`]. Denied under the
+//! first and granted under the second means the mandatory check, not
+//! the DACL, refused. A failure of the `AccessCheck` call itself is
+//! never read as "no match": it panics with the Win32 error.
 
 #![cfg(windows)]
 
@@ -540,10 +531,8 @@ fn lowered_integrity_token_of_the_sandbox_account() {
 
     // Logged, not asserted. The sandbox-user SD has no label, so for
     // a token below medium integrity the answer is the mandatory
-    // check's and turns on the generic mapping: this row shows it
-    // under both. Whether the sandbox-user BLOCK reaches such a token
-    // is therefore the filtering engine's mapping to decide, which
-    // this test cannot observe.
+    // check's and turns on the generic mapping, which is the
+    // filtering engine's to choose and this test cannot observe.
     let _ = check(
         "low integrity / sandbox-user SD",
         tok,
