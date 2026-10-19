@@ -797,7 +797,7 @@ OpenSSL-backed clients (msys2 `curl`, `git -c http.sslBackend=openssl`, Node, Py
 
 The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
 
-- `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
+- `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range. The range may not contain one of the loopback ports that stay blocked (see [Local servers on Windows](#local-servers-on-windows)); the install refuses such a range.
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
 
