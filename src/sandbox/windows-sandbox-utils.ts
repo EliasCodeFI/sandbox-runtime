@@ -1975,15 +1975,13 @@ export function parseWindowsSandboxError(
  * in the number of files under the granted roots, and a kill
  * mid-propagation leaves a half-applied tree that the cleanup
  * revoke/restore then has to walk in full a second time — so waiting
- * is cheaper than timing out. Hence ten minutes, not the 15 s the
- * constant-time `srt-win` calls get. Override per session with
+ * is cheaper than timing out. Override per session with
  * `windows.aclTimeoutMs`.
  *
- * It is the default of all eight exported helpers, sync and async.
- * The one caller that must not use it is a process-exit path:
- * SandboxManager's exit/signal handler passes its own 60 s bound to
- * the sync helpers, and an embedder calling them from an exit
- * handler should pass a `timeoutMs` too.
+ * A process-exit path must not use it: SandboxManager's exit/signal
+ * handler passes its own 60 s bound to the sync helpers, and an
+ * embedder calling them from an exit handler should pass a
+ * `timeoutMs` too.
  */
 export const DEFAULT_WINDOWS_ACL_TIMEOUT_MS = 600_000
 

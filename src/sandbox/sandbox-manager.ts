@@ -219,18 +219,9 @@ let windowsAclTimeoutMs: number | undefined
 // handler runs (`releaseWindowsAclSync`). Deliberately not
 // `windows.aclTimeoutMs` and not the 10-minute default: that budget
 // is for calls the host awaits, while this one blocks process exit,
-// which must stay bounded.
-//
-// What a release killed at this bound leaves behind (srt-win's
-// `state_db.rs`): holds on paths it had not reached yet keep their
-// rows, and the next `srt-win acl` call of any session reaps them
-// once it sees this holder dead (`crash_recovery`). The path it was
-// walking is NOT covered: `release_row` deletes the row before the
-// on-disk converge, so recovery has no row left to find, and
-// descendants the walk had not reached keep their inherited
-// sandbox-user ACEs until a later grant/stamp + release of that same
-// path runs to completion. That residue is accepted here in exchange
-// for a bounded exit; it is not self-healing.
+// which must stay bounded. What a release killed at this bound
+// leaves behind is for srt-win's crash recovery (`state_db.rs`),
+// which the next `srt-win acl` call of any session runs.
 const WINDOWS_ACL_EXIT_TIMEOUT_MS = 60_000
 // Set while an async `srt-win acl` sequence (initialize()'s
 // grant→stamp, or a revoke→restore) is running. It carries what a
@@ -341,27 +332,19 @@ function logWindowsAclOutcomes(
  * this process once one did not. Returns whether it may run.
  *
  * Revoke takes the ALLOW grants off, restore takes the DENY stamps
- * off. If the revoke failed, timed out, was only partial, or reported
- * a path whose grant it could not release, an ALLOW grant may still
- * be on disk — and the sandbox account is shared by every session, so
- * with the stamps gone another session's sandboxed process could
- * write this tree's deny targets (`.git/hooks`, settings files, …).
- * So the stamps stay: they name only the sandbox account's SID and
- * cost the real user nothing.
+ * off. If the revoke did not complete, an ALLOW grant may still be on
+ * disk — and the sandbox account is shared by every session, so with
+ * the stamps gone another session's sandboxed process could write
+ * this tree's deny targets (`.git/hooks`, settings files, …). The
+ * stamps name only the sandbox account's SID and cost the real user
+ * nothing.
  *
  * The refusal lasts for the process: a later session's revoke that
  * finds nothing left to release does not show the earlier grant is
- * gone (an older srt-win forgets a path it could not open), so every
- * later reset() keeps its stamps too.
- *
- * What clears them afterwards depends on the srt-win in use. A
- * current one keeps the rows of a grant it could not release, held by
- * this process; once this process has exited, any `srt-win acl`
- * command retries those grants and takes this process's deny stamps
- * off only when all of them are released. An older one has already
- * dropped the row of such a grant: its crash recovery then removes
- * the deny stamps once this process is gone, and the leftover ALLOW
- * entry is recorded nowhere and has to be removed by hand.
+ * gone (an srt-win without the "unreadable" status forgets a path it
+ * could not open). Once this process has exited, srt-win's crash
+ * recovery retries the grants it still has rows for and takes the
+ * deny stamps off only when all of them are released.
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
@@ -433,14 +416,12 @@ function releaseWindowsAclAsync(
  * Synchronous release for contexts that cannot await: the process
  * 'exit' handler (and SIGINT/SIGTERM, which hosts usually follow with
  * process.exit()). `spawnSync`-blocks, each call bounded by
- * {@link WINDOWS_ACL_EXIT_TIMEOUT_MS} (see there for what a release
- * cut off at that bound leaves behind). Covers both a fully applied
+ * {@link WINDOWS_ACL_EXIT_TIMEOUT_MS}. Covers both a fully applied
  * session and an async ACL sequence that is still running: that
  * child is killed first (it would die with the process anyway), then
- * revoke and — only if it completed — restore run here. That fully undoes a killed grant/stamp
- * (their rows are recorded before the walk). A killed revoke/restore
- * is not redone for the path it was walking — its row is already
- * gone — so the same residue as a timed-out release applies.
+ * revoke and — only if it completed — restore run here. That fully
+ * undoes a killed grant/stamp (their rows are recorded before the
+ * walk); a killed revoke/restore is not redone here.
  */
 function releaseWindowsAclSync(): void {
   const inFlight = windowsAclInFlight
@@ -3019,10 +3000,9 @@ async function reset(): Promise<void> {
     const timeoutMs = windowsAclTimeoutMs
     // Async spawns (the walk is as long as the grant's was), chained
     // so two releases never overlap. Started here and awaited at the
-    // very end: the rest of this teardown, and the module state it
-    // clears, keep the timing they had when the release was a
-    // blocking call. initialize() waits on `windowsAclTeardown`
-    // before it grants again.
+    // very end, so the rest of this teardown does not wait on it.
+    // initialize() waits on `windowsAclTeardown` before it grants
+    // again.
     const teardown: Promise<void> = (windowsAclTeardown ?? Promise.resolve())
       .then(() => releaseWindowsAclAsync(sb, srtWin, timeoutMs))
       .finally(() => {

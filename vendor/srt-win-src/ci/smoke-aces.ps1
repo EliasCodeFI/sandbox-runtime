@@ -497,16 +497,14 @@ try {
   Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
 
   # ── A34: one DACL write per path per batch; no write when converged ─
-  # The session-init shape on a tree big enough for propagation to
-  # show: grant the root, then stamp a root-level deny plus two
-  # denies under a MISSING `.claude` (placeholder dir). Writing a
-  # directory DACL re-propagates to every descendant, so the root
-  # must be written ONCE by the grant and ONCE by the stamp (which
-  # adds its parent-FDC deny) — not once per deny/placeholder entry —
-  # and a repeat of the identical grant + stamp must write neither
-  # directory at all. Asserted on the `dacl write|unchanged` debug
-  # lines (SANDBOX_RUNTIME_WIN_DEBUG), not on wall-clock; the timings
-  # are printed for the log.
+  # The session-init shape: grant the root, then stamp a root-level
+  # deny plus two denies under a MISSING `.claude` (placeholder dir).
+  # Writing a directory DACL re-propagates to every descendant, so
+  # the root must be written ONCE by the grant and ONCE by the stamp
+  # (which adds its parent-FDC deny), and a repeat of the identical
+  # grant + stamp must write neither directory at all. Asserted on
+  # the `dacl write|unchanged` debug lines (SANDBOX_RUNTIME_WIN_DEBUG),
+  # not on wall-clock.
   $big = Join-Path $Root 'a34'
   foreach ($d in 0..59) {
     $dd = Join-Path $big ('d{0:d2}' -f $d)
@@ -664,16 +662,14 @@ try {
   # ── A33: release killed at the start of its propagation → recover ──
   # A release drops its row FIRST and walks the tree second, so a
   # broker killed mid-walk leaves sandbox ACEs on the tree with no
-  # row for recovery to find. The write-intent journal is the
-  # breadcrumb: `acl recover` (and the recovery pass of any acl op)
-  # re-runs the converge from the rows that exist now. The kill is
-  # the test hook (SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE),
-  # which exists only in the `--features test-hooks` build
-  # ($HooksExe): that binary exits right AFTER committing the intent
-  # row and BEFORE the DACL write — deterministic, and the worst case
-  # (nothing was stripped yet). Grant, recovery and every assertion
-  # use the default build. The tree sits OUTSIDE the granted $Root so
-  # "no sandbox ACE left" is exact, inherited ones included.
+  # row for recovery to find; the write-intent journal covers that.
+  # The kill is the test hook
+  # (SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE), which exists
+  # only in the `--features test-hooks` build ($HooksExe): that binary
+  # exits right AFTER committing the intent row and BEFORE the DACL
+  # write. Grant, recovery and every assertion use the default build.
+  # The tree sits OUTSIDE the granted $Root so "no sandbox ACE left"
+  # is exact, inherited ones included.
   if (-not $HooksExe) {
     Write-Host 'A33 SKIPPED: no test-hooks binary given (2nd argument)'
   } else {

@@ -48,64 +48,47 @@
 //! `SetNamedSecurityInfoW` on a directory re-propagates to every
 //! unprotected descendant, so a converge of a granted project root
 //! costs a walk of the whole tree. One batch routinely touches the
-//! same path several times — every deny target adds a `deny_fdc`
-//! row on its parent, a placeholder directory carries both
-//! `deny_delete` and `deny_fdc` — so the batch loops
-//! ([`Locked::apply_aces`], [`release_batch`] for release and crash
-//! recovery) run every per-row step exactly as before (capture,
+//! same path several times (every deny target adds a `deny_fdc` row
+//! on its parent), so the batch loops ([`Locked::apply_aces`],
+//! [`release_batch`]) run every per-row step in order (capture,
 //! guards, identity gate, row writes) and defer only the
 //! [`recompose_at`] to the path's LAST touch in the batch
 //! ([`last_touches`]). `recompose_at` reads the rows as they then
-//! stand, so the one write lands the same DACL the last of the
-//! repeated writes used to; the skipped ones were intermediate
-//! states holding a subset of those rows. Record-first is
-//! unaffected: a row still always precedes its write, only by more.
+//! stand; a row still always precedes its write.
 //!
 //! The converge itself skips the write when the path's DACL is
 //! already the composed one AND `converged_dacls` records that our
 //! last write of exactly that DACL ran to completion
-//! ([`ConvergedLedger`]). That table is the one place a row vouches
-//! for disk state, and only ever toward LESS trust: it can veto a
-//! skip the live DACL comparison would allow, never grant one the
-//! comparison refuses, and a missing, stale or unreadable row means
-//! "write".
+//! ([`ConvergedLedger`]). That table only ever lowers trust: it can
+//! veto a skip the live DACL comparison would allow, never grant
+//! one, and a missing, stale or unreadable row means "write".
 //!
 //! ## Write-intent journal
 //!
 //! Record-first covers a killed APPLY: the row outlives the unwritten
 //! ACE. A killed RELEASE is the mirror case and rows cannot cover it:
 //! release drops its `working_aces` row first and walks the tree
-//! second, so a broker killed mid-propagation (the caller's timeout
-//! on a large tree) leaves descendants still carrying the inherited
-//! sandbox ACE with no row anywhere for recovery to find — an ALLOW
-//! the next session never revokes. So every real DACL write is
-//! bracketed by a `write_intents` row ([`record_write_intent`] before
-//! the write, [`clear_write_intent`] once it has returned), and crash
-//! recovery re-runs the converge — forced, from the rows as they now
-//! stand — for each intent that survived ([`recover_write_intents`]).
-//! The journal adds a breadcrumb around the propagation only; no
-//! existing ordering changes.
+//! second, so a broker killed mid-propagation leaves descendants
+//! still carrying the inherited sandbox ACE with no row for recovery
+//! to find. So every real DACL write is bracketed by a
+//! `write_intents` row ([`record_write_intent`] before the write,
+//! [`clear_write_intent`] once it has returned), and crash recovery
+//! re-runs the converge, forced, for each intent that survived
+//! ([`recover_write_intents`]).
 //!
 //! The journal covers a write that STARTED. A release that fails
-//! before or without one — the path cannot be identified, or the
-//! converge returns an error — must not lose its rows either, or the
-//! ACE stays on disk with nothing recording it. So a release
+//! before or without one must not lose its rows either, so a release
 //! establishes where the ACE is before it changes any row
 //! ([`AceRelease::Unreadable`] changes none), and a converge that
 //! returns an error has the rows of every hold it was owed for put
-//! back ([`Undo`], [`AceRelease::Failed`]); the next release or
-//! recovery retries.
+//! back ([`Undo`], [`AceRelease::Failed`]).
 //!
 //! ## Release order: grants before denies
 //!
 //! A holder's DENY rows protect targets under trees its GRANT rows
 //! open up, and the sandbox account is shared between sessions. So a
 //! holder's deny rows are never released while one of its grants may
-//! still be on disk: crash recovery releases a dead holder's grants
-//! first, finishes interrupted writes second, and releases deny rows
-//! last — keeping them for the next pass while a grant of the same
-//! holder, or any interrupted write, is still pending
-//! ([`recover_with`]).
+//! still be on disk; [`recover_with`] has the order.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};

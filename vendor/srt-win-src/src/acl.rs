@@ -25,11 +25,10 @@
 //! when the DACL just read from disk already IS the composed target
 //! ([`aces_converged`]) AND the ledger shows our last write of that
 //! exact DACL ran to completion: the call re-propagates to every
-//! unprotected descendant, so an unchanged directory DACL would
-//! otherwise cost a full tree walk for nothing. Any doubt — a
-//! differing ACE, an unreadable ACL, no completion record (a write
-//! killed mid-propagation leaves the object itself looking
-//! converged) — falls through to the write.
+//! unprotected descendant, a full tree walk. Any doubt — a differing
+//! ACE, an unreadable ACL, no completion record (a write killed
+//! mid-propagation leaves the object itself looking converged) —
+//! falls through to the write.
 //!
 //! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
 //! callers are the ONE remaining `PROTECTED` consumer — they
@@ -477,21 +476,17 @@ fn ace_bytes(acl: *const ACL) -> Result<Vec<Vec<u8>>> {
 
 /// Whether writing the composed ACE list `want` over an object whose
 /// DACL currently holds `on_disk` would change nothing — the
-/// [`converge_sandbox_aces`] write-skip predicate, on plain bytes (see
-/// [`ace_bytes`]) so it is unit-testable.
+/// [`converge_sandbox_aces`] write-skip predicate, on plain bytes
+/// (see [`ace_bytes`]).
 ///
-/// `want` is what the converge would hand `SetNamedSecurityInfoW`:
-/// explicit ACEs only. The write stores exactly those, in that
-/// order, then (unprotected DACL) appends the ACEs it re-derives
-/// from the parent. So the disk already matches iff:
+/// The write stores `want` (explicit ACEs only), in order, then
+/// (unprotected DACL) appends the ACEs it re-derives from the
+/// parent. So the disk already matches iff:
 ///
 /// - its leading `want.len()` ACEs equal `want` byte for byte, in
-///   order — same type, flags, mask and SID, none of them inherited;
-/// - everything after that is an `INHERITED_ACE` — the kernel-derived
-///   tail the write would re-derive, never an extra explicit ACE;
-/// - on a `protected` DACL there is no tail at all: nothing is
-///   re-derived there, and the converge drops a stray
-///   inherited-flagged entry, so its presence means a write is due.
+///   order, none of them inherited;
+/// - everything after that is an `INHERITED_ACE`;
+/// - on a `protected` DACL there is no tail at all.
 ///
 /// Anything else — including an ACE too short to carry a header —
 /// is "not converged": the caller writes.
@@ -542,13 +537,11 @@ fn dacl_fingerprint(want: &BuiltAcl, protected: bool) -> Option<Vec<u8>> {
 /// state DB) because it must outlive this process.
 ///
 /// Comparing the on-disk DACL to the composed one proves only that
-/// the OBJECT is converged. `SetNamedSecurityInfoW` on a directory
-/// then walks the whole subtree, and a broker killed mid-walk (the
-/// caller's spawn timeout on a large tree) leaves the directory
+/// the OBJECT is converged: a broker killed while
+/// `SetNamedSecurityInfoW` walks the subtree leaves the directory
 /// converged over descendants that never received the inherited
-/// ACE — for a deny, files the sandbox can still reach. Rewriting
-/// heals that; skipping would make it permanent. So a write is
-/// skipped only against positive evidence that the last write of
+/// ACE — for a deny, files the sandbox can still reach. So a write
+/// is skipped only against positive evidence that the last write of
 /// this exact DACL RETURNED: [`Self::begin`] drops the record before
 /// every write, [`Self::complete`] stores it after, and anything in
 /// between (crash, kill, error, lost DB) reads as "not completed".
@@ -957,16 +950,13 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
 /// the final write is skipped when BOTH hold: the DACL read in step
 /// 1 already equals the composed one ([`dacl_converged`]), and the
 /// ledger shows the last write of that exact DACL completed. The
-/// read, the filter and the compose always run; only a provably
-/// redundant `SetNamedSecurityInfoW` (and the subtree re-propagation
-/// it triggers on a directory) is elided. Without a ledger — or on
-/// any mismatch or doubt — the write is unconditional, as before.
+/// read, the filter and the compose always run. Without a ledger —
+/// or on any mismatch or doubt — the write is unconditional.
 ///
-/// The skip also forgoes that re-propagation's side effect of
-/// re-syncing descendants whose inherited ACEs went stale behind our
-/// back (a file MOVED into the tree keeps its old ones); those are
-/// refreshed by the next converge that actually changes this DACL,
-/// exactly as for a path nobody re-stamps.
+/// The skip also forgoes the re-propagation's side effect of
+/// re-syncing descendants whose inherited ACEs went stale (a file
+/// MOVED into the tree keeps its old ones); those are refreshed by
+/// the next converge that actually changes this DACL.
 pub(crate) fn converge_sandbox_aces(
     canonical_path: &str,
     sandbox_sid: &str,

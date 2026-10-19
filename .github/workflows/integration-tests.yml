@@ -99,8 +99,7 @@ jobs:
           # Second, test-only binary with the fault-injection hooks
           # compiled in, for smoke-aces row A33 alone. Its own target
           # dir, so it can never replace the default-feature
-          # target\release\srt-win.exe every other step (and the TS
-          # suite) runs; release.yml never passes --features.
+          # target\release\srt-win.exe every other step runs.
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
