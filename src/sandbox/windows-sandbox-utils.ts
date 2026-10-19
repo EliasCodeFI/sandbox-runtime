@@ -941,8 +941,8 @@ export async function checkWindowsSandboxStatusAsync(
 /**
  * Query the WFP filter set under the given sublayer via live BFE
  * enumeration. `installed` means the BLOCK filters this version
- * requires are present on both connect layers (`outdated`: see
- * {@link WindowsWfpStatus}). Detection is **tag-based**
+ * requires are present on both connect layers; a set that is there
+ * but is not current reads `outdated`. Detection is **tag-based**
  * (providerData JSON); filters installed by other tooling without the
  * tag are not counted.
  *
