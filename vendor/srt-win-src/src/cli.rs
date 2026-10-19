@@ -1259,8 +1259,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      of the ports that stay blocked"
                 ));
             }
-            // A BLOCK fires at ALE_AUTH_CONNECT before any packet leaves:
-            // a fenced connect gives WSAEACCES, a MISSING fence connects.
+            // The host passes a loopback listener on a port no PERMIT covers, so
+            // a MISSING fence connects where an active one gives WSAEACCES.
             let r = install::read_cred().and_then(|c| {
                 let s = install::read_setup()?
                     .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
@@ -1346,7 +1346,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 anonymous_target.as_ref(),
             );
             let Some(report) = probe::Report::decode(code) else {
-                // Exit 1 (the runner's `Err` path) or an unmapped state.
+                // Not a report: exit 1 is the runner's own `Err` path, and
+                // anything else is an unmapped runner state.
                 finish(
                     json!({
                         "egress_probe": "error",

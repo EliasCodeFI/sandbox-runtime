@@ -327,8 +327,9 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
-/// The [`crate::wfp::FENCE_REVISION`] the last completed install
-/// wrote, or [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall.
+/// Registry value holding the [`crate::wfp::FENCE_REVISION`] the last
+/// completed install wrote, or
+/// [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall.
 const FENCE_REVISION_VALUE: &str = "FenceRevision";
 
 /// Registry value: 1 when the last completed `srt-win install` opened
@@ -404,8 +405,9 @@ pub fn fence_marked_removed() -> bool {
     )
 }
 
-/// What the last install recorded, not that the filters are still
-/// there. `Ok(None)` with no install, or one that predates the record.
+/// The fence revision the last install recorded; it does not show that
+/// the filters are still there. `Ok(None)` with no install, or with one
+/// that predates the record.
 pub fn read_fence_revision() -> Result<Option<u32>> {
     let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
         return Ok(None);

@@ -32,7 +32,8 @@ use windows::Win32::System::Threading::{
 };
 
 /// Residual: an off-loopback connect made while impersonating the
-/// anonymous token was not blocked. Expected wherever one can be aimed.
+/// anonymous token was not blocked. Expected on any machine with an
+/// off-loopback address: no filter is keyed on that token.
 pub const RESIDUAL_ANONYMOUS_EGRESS: &str = "anonymous-egress";
 
 pub const RESIDUAL_ANONYMOUS_LOOPBACK: &str = "anonymous-loopback";
@@ -42,7 +43,8 @@ const ANONYMOUS_SID: &str = "S-1-5-7";
 const IL_LOW: u32 = 0x1000;
 const IL_UNTRUSTED: u32 = 0;
 
-/// A refused or filtered connect returns at once; this bounds the rest.
+/// Bound on one connect. It only matters for a destination that does
+/// not answer: a refused or filtered connect returns at once.
 const CONNECT_TIMEOUT_SECS: i32 = 4;
 
 /// Result of one connect attempt. None is numbered zero, so an exit
@@ -58,8 +60,9 @@ pub enum Outcome {
     Refused = 3,
     Unreachable = 4,
     Skipped = 5,
-    /// No connect was made under the token shape (it could not be
-    /// assumed, or did not read back as assumed).
+    /// No connect was made under the token shape: it could not be
+    /// assumed, no socket could be created under it, or the thread's
+    /// token did not read back as the one assumed.
     Error = 6,
 }
 
@@ -323,7 +326,8 @@ impl SocketOrder {
 enum Expect {
     /// The anonymous token: its user is `ANONYMOUS LOGON`.
     Anonymous,
-    /// The token object set on the thread, and its mandatory level.
+    /// The token object set on the thread, and the mandatory level it
+    /// was given, if any.
     Token { id: LUID, integrity: Option<u32> },
 }
 
@@ -339,7 +343,8 @@ impl Drop for Assumed {
     }
 }
 
-/// u64 elements: the token property structs hold pointers.
+/// Room for a token property struct and the SID it points to; u64
+/// elements because the structs hold pointers.
 type TokenInfoBuf = [u64; 16];
 
 /// Read a token property into `buf` and return a view of it. `T`
