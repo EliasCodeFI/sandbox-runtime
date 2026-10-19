@@ -426,6 +426,7 @@ public static class SrtTok {
     new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp).Dispose();
   }
   static string Fail(string step) { return "TOKEN_FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
+  static string Threw(Exception e) { return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " "); }
   static string TokenSid(IntPtr token, int cls) {
     IntPtr buf = Marshal.AllocHGlobal(256), str = IntPtr.Zero;
     try {
@@ -580,7 +581,7 @@ public static class SrtTok {
       if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out own)) return "unreadable:" + Marshal.GetLastWin32Error();
       return "user=" + (TokenSid(own, TokenUser) ?? "unreadable") + " restricting=" + SidList(own, TokenRestrictedSids);
     } catch (Exception e) {
-      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+      return Threw(e);
     } finally {
       if (own != IntPtr.Zero) CloseHandle(own);
     }
@@ -643,7 +644,7 @@ public static class SrtTok {
         IntPtr dup;
         string failed = Build(shape, out dup);
         // "TOKEN_FAILED:<step>:<code>"
-        if (failed != null) return "create=FAILED:" + failed.Substring(13);
+        if (failed != null) return "create=FAILED:" + failed.Substring("TOKEN_FAILED:".Length);
         try {
           if (!SetThreadToken(IntPtr.Zero, dup)) return "create=ok impersonate=FAILED:" + Marshal.GetLastWin32Error();
         } finally {
@@ -657,7 +658,7 @@ public static class SrtTok {
       r += " loopback=" + ConnectNew(ip, port);
       return r;
     } catch (Exception e) {
-      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+      return Threw(e);
     } finally {
       if (assumed) RevertToSelf();
     }
