@@ -624,10 +624,7 @@ fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::Wf
     // A recorded loopback mode that cannot be read is treated as no
     // record: the non-elevated caller then reports closed, and `wfp
     // verify` / `exec` — which do fail on it — say why.
-    let recorded_loopback = match record {
-        Some(_) => install::read_allow_loopback().ok(),
-        None => None,
-    };
+    let recorded_loopback = record.and_then(|_| install::read_allow_loopback().ok());
     Ok(wfp::apply_recorded_loopback(st, recorded_loopback))
 }
 
@@ -1305,7 +1302,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // the repair. A record that says the filters were REMOVED
             // is not refused here: the probe then shows the missing
             // fence itself (exit 3).
-            let notice = allow_loopback.then(wfp::open_loopback_notice);
             if !install::fence_marked_removed() {
                 if let Err(hint) = install::require_current_fence() {
                     eprintln!("srt-win: error: wfp verify: {hint}");
@@ -1370,8 +1366,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Where the runner aimed the lowered-integrity attempts'
             // off-loopback half.
             let lowered_integrity_target = probe::lowered_off_loopback(
-                open_off_loopback_target.clone(),
-                anonymous_target.clone(),
+                open_off_loopback_target.as_ref(),
+                anonymous_target.as_ref(),
             );
             let Some(report) = probe::Report::decode(code) else {
                 // 1 is the runner's own anyhow `Err` path (`main()`
@@ -1445,7 +1441,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             });
             // Loopback is open: whatever the probes say about direct
             // egress, say what else is reachable.
-            if let Some(notice) = notice {
+            if allow_loopback {
+                let notice = wfp::open_loopback_notice();
                 eprintln!("srt-win: warning: wfp verify: {notice}");
                 doc["loopback_notice"] = json!(notice);
             }

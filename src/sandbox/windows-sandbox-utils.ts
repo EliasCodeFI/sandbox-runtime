@@ -2605,6 +2605,14 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
+ * `NO_PROXY` for a sandboxed child when `network.allowLocalBinding`
+ * is set: the loopback hosts, so proxy-aware clients connect to local
+ * servers directly. Without it `NO_PROXY` is not set at all and
+ * localhost requests go through the proxy.
+ */
+export const WINDOWS_LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1'
+
+/**
  * Build the spawn descriptor for running `command` inside the Windows
  * sandbox: an `argv` array plus the `env` to spawn it with.
  *
@@ -2622,14 +2630,6 @@ export function revokeWindowsAcl(opts: {
  * what we pass as `--env` — built here from the broker's `PATH` plus
  * the generated proxy set.
  */
-/**
- * `NO_PROXY` for a sandboxed child when `network.allowLocalBinding`
- * is set: the loopback hosts, so proxy-aware clients connect to local
- * servers directly. Without it `NO_PROXY` is not set at all and
- * localhost requests go through the proxy.
- */
-export const WINDOWS_LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1'
-
 export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
@@ -2825,6 +2825,7 @@ function interpretDependencyProbes(
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
+  const mode = (open: boolean): string => (open ? 'open' : 'closed')
 
   // 2. Sandbox user provisioned + credential readable.
   if (user.status === 'rejected') {
@@ -2877,7 +2878,7 @@ function interpretDependencyProbes(
     logForDebugging(
       `[Sandbox Windows] WFP installed: ${ws.filters} filters, ` +
         `proxy port range ${ws.portRange[0]}-${ws.portRange[1]}, ` +
-        `loopback ${ws.allowLoopback ? 'open' : 'closed'}`,
+        `loopback ${mode(ws.allowLoopback)}`,
     )
   }
 
@@ -2886,7 +2887,6 @@ function interpretDependencyProbes(
   // configured (nothing to compare). Both an elevated status
   // (`installed`, read off the filters) and a non-elevated one
   // (`cannot-read`, read off the install record) report the mode.
-  const mode = (open: boolean): string => (open ? 'open' : 'closed')
   const fenced =
     us.provisioned &&
     us.credPresent &&

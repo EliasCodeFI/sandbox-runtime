@@ -1083,7 +1083,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     rmSync(root, { recursive: true, force: true })
   })
 
-  const VERIFY_OK = {
+  const VERIFY_OK: WindowsWfpVerifyResult = {
     target: '',
     stderr: '',
     probes: {
@@ -1098,7 +1098,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     },
     residuals: [],
     warnings: [],
-  } as const
+  }
   const withLoopback = (allowLocalBinding?: boolean): SandboxRuntimeConfig => {
     const base = configOf({})
     return { ...base, network: { ...base.network, allowLocalBinding } }
@@ -1164,7 +1164,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     for (const open of [true, false]) {
       await SandboxManager.reset()
       // Leave the other mode verified, so this one has to be probed.
-      verify.mockResolvedValue(VERIFY_OK as unknown as WindowsWfpVerifyResult)
+      verify.mockResolvedValue(VERIFY_OK)
       await SandboxManager.initialize(withLoopback(!open))
       await SandboxManager.reset()
       const refusal = new WindowsSandboxError(
@@ -1182,7 +1182,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       // The refusal is not remembered as a pass: the same mode is
       // probed again once the install has been re-run.
       verify.mockClear()
-      verify.mockResolvedValue(VERIFY_OK as unknown as WindowsWfpVerifyResult)
+      verify.mockResolvedValue(VERIFY_OK)
       await SandboxManager.initialize(withLoopback(open))
       expect(verify.mock.calls.length).toBe(1)
       expect(await opensLoopback()).toBe(open)

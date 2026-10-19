@@ -911,7 +911,7 @@ pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T
 }
 
 /// Where each attempt is aimed. `None` skips that attempt.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Targets<'a> {
     /// The loopback probe target: a port no PERMIT covers.
     pub target: &'a str,
