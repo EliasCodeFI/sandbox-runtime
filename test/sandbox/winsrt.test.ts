@@ -3450,13 +3450,11 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
 // Group J — JVM proxy agent (JAVA_TOOL_OPTIONS=-javaagent:…)
 // ────────────────────────────────────────────────────────────────────
 //
-// JVMs ignore HTTPS_PROXY, so without the agent Maven/Gradle dial
-// their feed directly and hit the WFP fence. The env-composition
-// layer is covered on every platform by the "Windows wrapper" block in
-// java-proxy-agent.test.ts; here: the staging step (pure), then on
-// Windows the session plumbing — the sandbox user can read the staged
-// jar and nothing beside the original — and, where the runner has a
-// JDK and the jar was built, a real JVM through the real proxy.
+// The env-composition layer is covered on every platform by the
+// "Windows wrapper" block in java-proxy-agent.test.ts; here: the
+// staging step (pure), then on Windows the session plumbing and,
+// where the runner has a JDK and the jar was built, a real JVM
+// through the real proxy.
 
 describe('stageWindowsJavaAgentJar (pure, all platforms)', () => {
   it('copies the jar into a fresh directory holding nothing else', () => {
@@ -3853,12 +3851,11 @@ describe.if(isWindows)('Windows sandbox: JVM proxy agent (J)', () => {
     120_000,
   )
 
-  // The proof that matters: a JVM, which ignores HTTPS_PROXY and whose
-  // direct connects the WFP fence drops, reaches an allow-listed host —
-  // so it went through the proxy, with the session credential — and is
-  // refused BY THE PROXY for a host that is not on the list. Also the
-  // runtime check on leaving -Djava.net.preferIPv4Stack off: the JDK's
-  // default dual-stack socket has to match the loopback PERMIT.
+  // A JVM, which ignores HTTPS_PROXY and whose direct connects the WFP
+  // fence drops, reaches an allow-listed host — so it went through the
+  // proxy, with the session credential — and is refused BY THE PROXY
+  // for a host that is not on the list. Also the runtime check on
+  // leaving -Djava.net.preferIPv4Stack off.
   it.skipIf(JAVA === undefined || BUILT_AGENT_JAR === null)(
     'J4: a real JVM reaches an allowed host through the proxy and is refused for another',
     async () => {

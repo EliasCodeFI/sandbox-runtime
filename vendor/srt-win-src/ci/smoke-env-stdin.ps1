@@ -8,14 +8,11 @@
   (real user, full visibility of its own processes) and from INSIDE
   the sandbox (Win32_Process sweep as srt-sandbox).
 
-  Also proves the other half of what a JVM in the sandbox needs:
-  JAVA_TOOL_OPTIONS=-javaagent:<jar> (the JVM proxy agent, which reads
-  the token-bearing HTTPS_PROXY above from its own environment) rides
-  the SAME stdin frame - the TS wrapper composes the host's own
-  JAVA_TOOL_OPTIONS into it, which can hold -D secrets - arrives
+  Also proves that JAVA_TOOL_OPTIONS=-javaagent:<jar> rides the SAME
+  stdin frame (the TS wrapper composes the host's own
+  JAVA_TOOL_OPTIONS into it, which can hold -D secrets), arrives
   byte-for-byte, backslashes intact, and is on no command line. The
-  agent reaching a host through the filtering proxy needs that proxy,
-  which lives in the TS layer: see the J rows in
+  agent reaching a host through the proxy is covered by the J rows in
   test/sandbox/winsrt.test.ts.
 
   Self-contained: provisions the `srt-sandbox` account + WFP filters

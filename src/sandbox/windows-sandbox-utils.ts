@@ -472,29 +472,15 @@ export interface WindowsSandboxParams {
   caCertPath?: string
   /**
    * Path to the JVM proxy agent jar (see java-proxy-agent.ts);
-   * injected as `JAVA_TOOL_OPTIONS=-javaagent:<jar>`. JVMs ignore
-   * `HTTPS_PROXY`, so without it Maven, Gradle etc. dial their feed
-   * directly and hit the WFP fence. The agent reads the proxy
-   * endpoint and the per-session credential from `HTTP(S)_PROXY` in
-   * its own environment. `JAVA_TOOL_OPTIONS` itself carries no
-   * credential of ours, but the broker's own value is composed into
-   * it (as on macOS/Linux) and that can hold `-D` secrets — so it
-   * travels in the `--env-stdin` frame with the proxy URLs, never on
-   * argv.
+   * injected as `JAVA_TOOL_OPTIONS=-javaagent:<jar>`, composed with
+   * the broker's own value (as on macOS/Linux). That value can hold
+   * `-D` secrets, so it travels in the `--env-stdin` frame, never on
+   * argv. The path is emitted as given (native backslashes).
    *
-   * The path is emitted as given (native backslashes) — unlike
-   * {@link caCertPath} nothing here is a POSIX-looking path for
-   * msys2 to rewrite, and the JVM tokenizes `JAVA_TOOL_OPTIONS` on
-   * whitespace and quotes only.
-   *
-   * As with {@link caCertPath}, the caller is responsible for the
-   * sandbox user being able to read the jar — `sandbox-manager.ts`'s
-   * `initialize()` stages a copy ({@link stageWindowsJavaAgentJar})
-   * and adds its directory to the session's `acl grant` read-set. A
-   * JVM that cannot open its `-javaagent` jar refuses to start, so
-   * never pass a path the sandbox user was not granted. It also
-   * loads the jar as code, so never pass one the sandbox user could
-   * have written.
+   * The caller must make the jar readable to the sandbox user (see
+   * {@link stageWindowsJavaAgentJar}): a JVM that cannot open its
+   * `-javaagent` jar refuses to start. The JVM loads the jar as
+   * code, so never pass one the sandbox user could have written.
    */
   javaAgentJarPath?: string
   /**
@@ -2215,37 +2201,28 @@ export function revokeWindowsAcl(opts: {
  * return the copy's path, for `JAVA_TOOL_OPTIONS` to point at.
  *
  * The sandboxed child runs as a different account, so it can open the
- * jar only if granted. Granting where the jar already sits would hand
- * the sandbox user read on whatever else shares that directory (an
- * explicit `javaAgentJarPath` can point anywhere), and may not be
- * possible at all (an admin-owned install the broker cannot re-ACL).
- * Staging it gives a directory that holds nothing but the jar — the
- * same shape as the CA trust bundle's mkdtemp directory. The caller
- * adds `dirname(<returned path>)` to the session's `acl grant`
- * read-set AND to its `acl stamp` write-deny set.
+ * jar only if granted, and granting where the jar already sits would
+ * hand the sandbox user read on whatever else shares that directory.
+ * The caller adds `dirname(<returned path>)` to the session's
+ * `acl grant` read-set AND to its `acl stamp` write-deny set.
  *
  * INVARIANT: the staged directory must never be writable from inside
  * the sandbox — every JVM the sandbox starts loads this jar as code,
  * and the sandbox account is shared across sessions. Being under
  * `os.tmpdir()` does not give that by itself: an `allowWrite` root can
- * cover it, and %TEMP% can point somewhere Users-writable. Hence the
- * write-deny (which the broker composes ahead of any allow), and
- * {@link isUnswappedDirectory} below before anything is granted.
+ * cover it, and %TEMP% can point somewhere Users-writable.
  *
- * Best-effort: returns `undefined` when the copy or the check fails.
- * The caller then behaves as if no jar was found — no grant, and
- * `JAVA_TOOL_OPTIONS` is left alone (JVMs are not proxy-aware, as
- * before) — rather than failing the session. Remove the directory
- * with {@link removeStagedWindowsJavaAgentJar}.
+ * Best-effort: returns `undefined` when the copy or the check fails,
+ * and the caller then behaves as if no jar was found. Remove the
+ * directory with {@link removeStagedWindowsJavaAgentJar}.
  */
 export function stageWindowsJavaAgentJar(jarPath: string): string | undefined {
   let dir: string | undefined
   try {
     // Resolve the temp root first, so the path handed to the broker
-    // has no link left in it for a later swap to exploit and the
-    // realpath comparison in the check below is exact. The
-    // final-path lookup itself, as the broker makes it: it also
-    // resolves the 8.3 names %TEMP% is often spelled with.
+    // has no link left in it and the realpath comparison in the check
+    // below is exact. The native lookup also resolves the 8.3 names
+    // %TEMP% is often spelled with.
     // eslint-disable-next-line no-restricted-properties
     const root = fs.realpathSync.native(os.tmpdir())
     dir = fs.mkdtempSync(path.join(root, 'srt-java-agent-'))
@@ -2285,12 +2262,7 @@ export function stageWindowsJavaAgentJar(jarPath: string): string | undefined {
  * path — or at one of its parents — between creation and now. It does
  * NOT close the window after it: `srt-win acl grant`/`stamp` resolve
  * the path again when they run, so whoever can still rename entries
- * in the parent at that moment can still race the broker. The
- * write-deny the caller stamps on the directory (and the
- * delete-child deny the broker puts on its parent) is what removes
- * that ability from the sandbox account for the rest of the session;
- * only a no-follow, identity-checked open inside the broker would
- * close the first grant's window completely.
+ * in the parent at that moment can still race the broker.
  */
 export function isUnswappedDirectory(
   dir: string,
@@ -2435,30 +2407,21 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   })
 
   // JVMs ignore the proxy env vars above; the agent jar translates
-  // them into system properties + an Authenticator at JVM start (see
-  // java-proxy-agent.ts). The overlay REPLACES whatever
-  // JAVA_TOOL_OPTIONS the child's profile env would have carried (a
-  // machine-wide `-Dfile.encoding=…` is common on Windows), so the
-  // agent flag is composed against the broker's value — the same
-  // inherit-unless-denied rule as macOS/Linux — or against a
-  // mode:'mask' sentinel when the caller set one (macOS/Linux
-  // re-inject the real value over the sentinel; not copied). Without
-  // a jar the variable is left alone entirely: nothing of the
-  // broker's is forwarded and the child keeps its own value.
+  // them at JVM start (see java-proxy-agent.ts). The overlay REPLACES
+  // whatever JAVA_TOOL_OPTIONS the child's profile env would have
+  // carried, so the agent flag is composed against the broker's
+  // value (inherit unless denied, as on macOS/Linux) or against a
+  // mode:'mask' sentinel when the caller set one. Without a jar the
+  // variable is left alone: the child keeps its own value.
   //
-  // The inherited part is host environment content and may hold -D
-  // secrets, so the composed value is tagged secret below: it rides
-  // the --env-stdin frame, never argv. (The same tag drops
-  // JAVA_TOOL_OPTIONS from the broker's own spawn env — srt-win is
-  // not a JVM and has no use for it.)
+  // The inherited part may hold -D secrets, so the composed value is
+  // tagged secret below: it rides the --env-stdin frame, never argv.
+  // The same tag drops it from the broker's own spawn env.
   //
-  // No -Djava.net.preferIPv4Stack=true here (macOS adds it): Seatbelt
-  // matches the sockaddr a dual-stack socket passes to connect(), and
-  // ::ffff:127.0.0.1 is not "localhost". The WFP loopback PERMIT sits
-  // at ALE_AUTH_CONNECT_V4 on IP_REMOTE_ADDRESS 127.0.0.0/8 (and ::1
-  // at _V6): Windows classifies a dual-stack socket's IPv4 connect at
-  // the V4 layer with the plain IPv4 address, so the JVM's default
-  // socket already matches.
+  // No -Djava.net.preferIPv4Stack=true as on macOS: Windows
+  // classifies a dual-stack socket's IPv4 connect at the V4 layer
+  // with the plain IPv4 address, so the JVM's default socket already
+  // matches the WFP loopback PERMIT.
   const javaToolOptions =
     p.javaAgentJarPath !== undefined
       ? buildJavaToolOptions({
@@ -2495,7 +2458,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     ...gitCfg,
   }
   // Secret split: entries tagged token-bearing at the source, plus
-  // the composed JAVA_TOOL_OPTIONS (`secretKeySet`), must NOT ride argv — command lines are freely
+  // the composed JAVA_TOOL_OPTIONS (`secretKeySet`), must NOT ride
+  // argv — command lines are freely
   // readable by same-user sibling processes. They go over `srt-win
   // exec`'s own stdin instead (`--env-stdin`, length-prefixed JSON;
   // see `runner::decode_env_frame`). Everything else stays on

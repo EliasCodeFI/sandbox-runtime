@@ -1108,27 +1108,18 @@ async function initializeSteps(
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
         : [...acc.grantRead]
-      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
-      // It sits wherever the package was installed — unreadable to
-      // the sandbox user, and not a directory to grant wholesale —
-      // so a copy is staged in a directory of its own and that
-      // directory rides the read-set, exactly as the trust bundle's
-      // does. Read+execute only; released by the same revoke.
+      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at:
+      // a copy is staged in a directory of its own and that directory
+      // rides the read-set, as the trust bundle's does.
       //
       // The sandbox must never be able to WRITE there: every JVM it
       // starts loads this jar, and the sandbox account is shared
       // across sessions. A temp path does not guarantee that — an
       // allowWrite root may cover it, or %TEMP% may be Users-writable
       // — so the directory is also stamped with the session's write
-      // denies, as a protected path would be. The broker composes one
-      // DENY and one ALLOW per path, deny first, so the write-deny
-      // holds over any inherited modify grant while the read grant
-      // still works; reset()'s restore releases it with the other
-      // stamps. Like the grant, it is the library's own and not one
-      // of the config's, so it stays out of `acc`.
-      // Resolved here rather than with the proxies below (the lookup
-      // is cached, so that one is free) because the grant has to
-      // precede the first exec.
+      // denies; the broker composes the deny ahead of any allow. Like
+      // the grant, it is the library's own and stays out of `acc`.
+      // Resolved here because the grant has to precede the first exec.
       const denyWrite = [...acc.denyWrite]
       const jar = await getJavaProxyAgentJarPathAsync(
         runtimeConfig.javaAgentJarPath,
@@ -2459,8 +2450,8 @@ async function wrapWithSandboxOnce(
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
  * {@link wrapCommandWithSandboxWindows}). When `stdinPayload` is set
- * (network config with proxy auth or a JVM proxy agent), the caller MUST spawn with
- * stdin piped and write the payload immediately — it carries the
+ * (network config with proxy auth or a JVM proxy agent), the caller
+ * MUST spawn with stdin piped and write the payload immediately — it carries the
  * proxy env entries embedding the per-session auth token, which
  * must never appear on a command line (same-user siblings can
  * enumerate those freely). On
