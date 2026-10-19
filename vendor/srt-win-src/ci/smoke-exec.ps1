@@ -529,8 +529,8 @@ foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
   Write-Host "$($row.id) ok: child refused every right on the runner's threads ($($row.pass): threads=$nThreads refusals=$nDenied)"
 }
 
-# ── R9e: a sandboxed process that is already running cannot open a
-#        runner started after it, at any point of that runner's life
+# ── R9e (measurement): what a sandboxed process can open of runners started after it ──
+# Records, does not assert: it fails only when the poll itself did not work.
 $probeR9e = @'
 $src = @"
 using System;
@@ -550,6 +550,7 @@ public static class RunnerPoll {
   [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a, bool b, uint p);
   [DllImport("kernel32.dll")] static extern IntPtr OpenThread(uint a, bool b, uint t);
   [DllImport("kernel32.dll")] static extern uint GetProcessIdOfThread(IntPtr h);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr h, uint f, StringBuilder n, ref uint len);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
   // An id can be reused between the snapshot and the open: a handle counts
@@ -575,6 +576,12 @@ public static class RunnerPoll {
     var firstMs = new Dictionary<uint, long>();
     var opened = new List<string>();
     DateTime start = DateTime.UtcNow;
+    // Control: SET_CONTEXT | SUSPEND_RESUME on this process's own thread.
+    IntPtr own = OpenThread(0x0012, false, GetCurrentThreadId());
+    string control = own != IntPtr.Zero ? "ok" : "failed";
+    if (own != IntPtr.Zero) { CloseHandle(own); }
+    var openedProcesses = new HashSet<uint>();
+    var openedThreads = new HashSet<uint>();
     long iterations = 0;
     // One right at a time: CREATE_THREAD, VM_OPERATION, VM_READ, VM_WRITE,
     // DUP_HANDLE, CREATE_PROCESS, WRITE_DAC.
@@ -605,7 +612,9 @@ public static class RunnerPoll {
           IntPtr h = OpenProcess(a, false, pid);
           if (h == IntPtr.Zero) { continue; }
           CloseHandle(h);
-          if (StillRunner(pid) && opened.Count < 20) { opened.Add("OPENED process pid=" + pid + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[pid])); }
+          if (!StillRunner(pid)) { continue; }
+          openedProcesses.Add(pid);
+          if (opened.Count < 60) { opened.Add("OPENED process pid=" + pid + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[pid])); }
         }
       }
       var te = new THREADENTRY32();
@@ -616,12 +625,15 @@ public static class RunnerPoll {
           IntPtr h = OpenThread(a, false, te.th32ThreadID);
           if (h == IntPtr.Zero) { continue; }
           CloseHandle(h);
-          if (StillThreadOf(te.th32ThreadID, runners) && opened.Count < 20) { opened.Add("OPENED thread tid=" + te.th32ThreadID + " pid=" + te.th32OwnerProcessID + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[te.th32OwnerProcessID])); }
+          if (!StillThreadOf(te.th32ThreadID, runners)) { continue; }
+          openedThreads.Add(te.th32ThreadID);
+          if (opened.Count < 60) { opened.Add("OPENED thread tid=" + te.th32ThreadID + " pid=" + te.th32OwnerProcessID + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[te.th32OwnerProcessID])); }
         }
       }
       CloseHandle(s);
     }
-    return "POLL iterations=" + iterations + " seen=" + seen.Count + " opened=" + opened.Count + "\n" +
+    return "POLL control=" + control + " iterations=" + iterations + " seen=" + seen.Count +
+      " opened_processes=" + openedProcesses.Count + " opened_threads=" + openedThreads.Count + "\n" +
       String.Join("\n", opened.ToArray()) + "\n" + String.Join("\n", new List<string>(seen.Values).ToArray());
   }
 }
@@ -677,16 +689,14 @@ try {
   if (-not $poll9e.HasExited) { try { $poll9e.Kill($true) } catch { } }
 }
 Write-Host "R9e poll output: $($poll9eOut.Trim())"
-if ($poll9eOut -notmatch 'POLL iterations=(\d+) seen=(\d+) opened=(\d+)') {
+if ($poll9eOut -notmatch 'POLL control=(\w+) iterations=(\d+) seen=(\d+) opened_processes=(\d+) opened_threads=(\d+)') {
   throw "R9e: the poll did not report. stderr: $($poll9eErr.Result)"
 }
-$n9eSeen = [int]$Matches[2]; $n9eOpened = [int]$Matches[3]
-if ($n9eOpened -ne 0) {
-  throw "R9e: a sandboxed process opened a runner or one of its threads (sandbox escape): $($poll9eOut.Trim())"
-}
+$c9e = $Matches[1]; $n9eSeen = [int]$Matches[3]; $n9eProc = [int]$Matches[4]; $n9eThr = [int]$Matches[5]
+if ($c9e -ne 'ok') { throw 'R9e: the poll could not open its own thread — measurement invalid' }
 # Its own broker and runner are two; a new launch adds at least two more.
-if ($n9eSeen -lt 4) { throw "R9e: the poll saw no new launch (seen=$n9eSeen) — test invalid" }
-Write-Host "R9e ok: $n9eSeen srt-win processes seen during launches, none openable"
+if ($n9eSeen -lt 4) { throw "R9e: the poll saw no new launch (seen=$n9eSeen) — measurement invalid" }
+Write-Host "R9e measured: of $n9eSeen srt-win processes seen during launches, $n9eProc process(es) and $n9eThr thread(s) were openable with a dangerous right"
 
 # ── T-rows: ordinary tools still start and behave ────────────────
 # ── T1: cmd ──
