@@ -178,8 +178,8 @@ fn build_allow_acl(aces: &[(windows::Win32::Security::PSID, u32)]) -> Result<Vec
 }
 
 /// Give every current thread of this process the DACL shape
-/// [`install_broker_dacl`] gives the process: a thread's descriptor
-/// comes from the token's default DACL, not the process DACL.
+/// [`install_broker_dacl`] gives the process (the process DACL does
+/// not cover threads). Threads started later are not covered.
 pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows::Win32::System::Threading::{

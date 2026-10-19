@@ -60,7 +60,7 @@ if (-not (Test-Path $Exe)) {
 # (smoke-exec) / A-row (smoke-aces) / H-row (winsrt.test.ts) threw
 # mid-section before its `finally` ran.
 & $Exe acl recover --force
-# Before the uninstall below, which removes the group the kept write grants name.
+# Kept write grants go before the uninstall below, which removes the group they name.
 & $Exe acl forget --all
 # A profile read grant (smoke-profile-read.ps1, on its made-up profile
 # tree): the same refusal while one is recorded, and the same order.
