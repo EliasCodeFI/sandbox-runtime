@@ -3205,7 +3205,19 @@ mod tests {
             std::slice::from_ref(&fence)
         );
         assert!(!state(grandchild).0.iter().any(|a| a.sid == cap));
-        assert_eq!(below(), untouched, "forgetting restores what is below");
+        // A walk leaves its auto-inherited mark on what it visits and
+        // nothing takes it off again: the entries and the protection
+        // are what comes back.
+        type Seen = (Vec<AceView>, bool, bool);
+        type Kept<'a> = (&'a [AceView], bool);
+        fn lists(s: &(Seen, Seen)) -> (Kept<'_>, Kept<'_>) {
+            ((&s.0.0, s.0.2), (&s.1.0, s.1.2))
+        }
+        assert_eq!(
+            lists(&below()),
+            lists(&untouched),
+            "forgetting restores what is below"
+        );
 
         // The session writer: nothing to change, nothing written.
         let session = SbAceSet {
@@ -3224,7 +3236,7 @@ mod tests {
         apply_sandbox_aces_over(path, SB, session, None).unwrap();
         assert_eq!(write_counts(), before, "an unchanged list is not written");
         apply_sandbox_aces_over(path, SB, SbAceSet::default(), None).unwrap();
-        assert_eq!(below(), untouched);
+        assert_eq!(lists(&below()), lists(&untouched));
         // Protection is kept in the other direction too: a list that
         // blocks inheritance from above still does after an
         // object-only write, with the entries it had.
