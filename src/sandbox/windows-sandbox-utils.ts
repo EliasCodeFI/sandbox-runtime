@@ -1059,10 +1059,8 @@ export async function verifyWindowsWfpEgress(
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
-    // The launch itself failed for a reason only an administrator
-    // can fix (exit 18, empty stdout): report that, not the
-    // unparseable-output fallthrough below. Still a throw — nothing
-    // runs unsandboxed.
+    // Exit 18 comes with empty stdout: report the typed failure, not
+    // the unparseable-output fallthrough below.
     const seclogon = seclogonDisabledFrom(r, 'wfp')
     if (seclogon) throw seclogon
     let raw: { egress_probe: string; target: string }

@@ -727,16 +727,14 @@ try {
 
 # ── S-rows: Secondary Logon (seclogon) preflight + typed failure ─
 # Every launch is CreateProcessWithLogonW, which needs the seclogon
-# service. Hardened fleets set it to Disabled; `status` must say so
-# BEFORE a launch is attempted, and a launch must then fail with the
-# typed `seclogon_disabled` JSON line + exit 18 (never run the
-# command some other way). The invariant across all three states:
-# a `seclogon: ok` preflight means the launch works.
+# service. With it Disabled, `status` must say so BEFORE a launch is
+# attempted, and a launch must fail with the typed `seclogon_disabled`
+# JSON line + exit 18. The invariant across all three states: a
+# `seclogon: ok` preflight means the launch works.
 #
 # This reconfigures a machine-wide service, so it runs last (only
 # the uninstall follows) and restores the original start type and
-# run state in `finally`; S4 then proves launches work again, so the
-# smoke scripts that follow are not poisoned.
+# run state in `finally`; S4 then proves launches work again.
 function Seclogon-State {
   return (J @('status','--sublayer-guid',$Sublayer)).user.seclogon
 }
@@ -748,18 +746,13 @@ function Seclogon-Err {
   if (-not $line) { return $null }
   return $line | ConvertFrom-Json
 }
-# seclogon stops accepting SERVICE_CONTROL_STOP for a few milliseconds
-# after every launch it serviced: the broker has already returned (the
-# runner exited) while the service is still finishing that launch. A
-# Stop-Service issued straight after an exec fails with
-# ERROR_INVALID_SERVICE_CONTROL (1052) — "Cannot stop 'seclogon'
-# service". Wait until the service accepts STOP again, then stop it;
-# retry a stop that still loses the race.
+# seclogon refuses SERVICE_CONTROL_STOP for a few milliseconds after
+# every launch it serviced (Stop-Service fails with
+# ERROR_INVALID_SERVICE_CONTROL, 1052), so the stop is retried.
 #
 # The service also stays unstoppable for as long as a process it
-# launched is alive. An earlier row that left one behind would keep it
-# that way, so after a few seconds any process still owned by the
-# sandbox account is listed and ended, and the wait goes on.
+# launched is alive, so after a few seconds any process still owned
+# by the sandbox account is listed and ended, and the wait goes on.
 function Stop-Seclogon {
   param([int] $TimeoutSec = 60)
   $start    = [DateTime]::UtcNow
@@ -851,8 +844,7 @@ try {
   Write-Host "S3 ok: exec exits 18 with seclogon_disabled ($($e.message))"
 
   # ── S3b: wfp verify — same typed failure, no stdout verdict ────
-  # (the host's initialize() probe; previously exit 1 + empty stdout
-  # → "unparseable output"). The target is never dialled.
+  # (the host's initialize() probe). The target is never dialled.
   $vErrFile = Join-Path ([System.IO.Path]::GetTempPath()) "srt-smoke-s3b-$PID.err"
   $vout  = & $Exe wfp verify --target '127.0.0.1:9' 2>$vErrFile
   $vexit = $LASTEXITCODE

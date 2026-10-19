@@ -222,10 +222,8 @@ pub fn seclogon_state() -> SeclogonState {
 /// Typed error for [`spawn_runner`] when the Secondary Logon
 /// service cannot be used: its start type is Disabled (`missing ==
 /// false`) or it is not registered at all (`missing == true`).
-/// `CreateProcessWithLogonW` then fails before the runner exists —
-/// an environment condition only an administrator can change, not
-/// a security block — typed so callers can present an actionable
-/// message instead of a bare HRESULT.
+/// Typed so callers can present an actionable message instead of a
+/// bare HRESULT.
 #[derive(Debug)]
 pub struct SeclogonDisabled {
     pub missing: bool,
@@ -461,8 +459,7 @@ pub fn spawn_runner(
         // `ERROR_SERVICE_DISABLED` = the SCM refused to demand-start
         // seclogon. The read-only probe is consulted as well so the
         // typed error does not hinge on which code a given Windows
-        // build surfaces for a disabled or absent service: a failed
-        // launch with seclogon unusable has that as its cause.
+        // build surfaces for a disabled or absent service.
         let state = seclogon_state();
         if e.code() == ERROR_SERVICE_DISABLED.to_hresult()
             || matches!(state, SeclogonState::Disabled | SeclogonState::Missing)
