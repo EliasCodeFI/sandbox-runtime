@@ -401,6 +401,10 @@ enum AclCmd {
     /// grants could not be released) and prune them. Exits non-zero
     /// when a grant is still pending.
     Recover {
+        /// Drop the record of a dead holder's grant that can no longer
+        /// be located (its path is gone and its file id cannot be
+        /// looked up), then release that holder's deny ACEs. Each
+        /// dropped path is printed; its ACE may still be on disk.
         #[arg(long)]
         force: bool,
         /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
@@ -1437,12 +1441,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
                 db.release_aces(&sandbox_user_sid, state_db::KIND_DENY)
             })?;
+            // Denies whose ACE is still on disk (rows kept).
+            let kept = entries.iter().filter(|(_, r)| r.is_pending()).count();
+            let grant_pending = entries
+                .iter()
+                .any(|(_, r)| *r == state_db::AceRelease::GrantPending);
             eprintln!(
                 "srt-win: acl restore (deny-ace) — {} ACE(s){}; \
                  recovery revoked {} orphan ACE(s)",
                 entries.len(),
-                if failed > 0 {
-                    format!(", {failed} FAILED (ACE left in place)")
+                if kept > 0 {
+                    format!(", {kept} NOT RELEASED (ACE left in place)")
                 } else {
                     String::new()
                 },
@@ -1460,9 +1469,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .context("write --json restore result")?;
                 println!();
             }
-            if failed > 0 {
+            if grant_pending {
                 return Err(anyhow!(
-                    "acl restore: {failed} path(s) could not be \
+                    "acl restore: refused — the holder still has a grant \
+                     recorded; run `acl revoke` first (deny ACEs kept)"
+                ));
+            }
+            if failed > 0 || kept > 0 {
+                return Err(anyhow!(
+                    "acl restore: {kept} path(s) could not be \
                      restored (ACE left, fail-closed)"
                 ));
             }
@@ -1479,8 +1494,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })?;
             eprintln!(
                 "srt-win: acl recover — pruned {} dead broker(s), \
-                 revoked {} orphan ACE(s)",
-                report.dead_brokers, report.aces_revoked,
+                 revoked {} orphan ACE(s){}",
+                report.dead_brokers,
+                report.aces_revoked,
+                if report.grants_dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; dropped the record of {} grant(s) that could not \
+                         be located: {}",
+                        report.grants_dropped.len(),
+                        quoted_list(&report.grants_dropped),
+                    )
+                },
             );
             if json {
                 println!(
@@ -1489,6 +1515,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
                         "grantsPending": report.grants_pending,
+                        "grantsDropped": report.grants_dropped,
                     })
                 );
             }

@@ -1765,6 +1765,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       'reports "missing" for a path that is gone',
       () => reports('missing', join(dir, 'gone')),
     ],
+    ['reports "gone" for a path that exists again', () => reports('gone', dir)],
   ]
 
   /** `acl` subcommands spawned, in order. */
@@ -1777,7 +1778,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   beforeEach(() => {
     aclCalls = []
     aclResult = {}
-    winUtils.clearWindowsAclIncompleteRevokesForTesting()
     dir = mkdtempSync(join(tmpdir(), 'srt-acl-gate-'))
     mkdirSync(join(dir, 'secret'))
     spies = [
@@ -1829,7 +1829,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   afterEach(async () => {
     aclResult = {}
     await SandboxManager.reset()
-    winUtils.clearWindowsAclIncompleteRevokesForTesting()
     for (const s of spies) s.mockRestore()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -1944,59 +1943,24 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     }
   }
 
-  describe('after one incomplete revoke in this process', () => {
-    beforeEach(async () => {
-      await SandboxManager.initialize(config())
-      aclResult.revoke = reports('unreadable')
-      await SandboxManager.reset()
-      expect(aclCalls).toEqual(NO_RESTORE)
-      expect(winUtils.windowsAclIncompleteRevoke()).toEqual(['p'])
-      aclCalls = []
-      aclResult = {}
-    })
-
-    it('reset(): a later clean revoke → restore is still not spawned', async () => {
-      await SandboxManager.initialize(config())
-      await SandboxManager.reset()
-      expect(aclCalls).toEqual(NO_RESTORE)
-    })
-
-    it('initialize() failure cleanup: a later clean revoke → restore is still not spawned', async () => {
-      const e = await failingInitialize()
-      expect(e.code).toBe('acl_stamp_failed')
-      expect(aclCalls).toEqual(NO_RESTORE)
-    })
-
-    for (const [which, handler] of ON_THE_WAY_OUT) {
-      it(`${which}: a later clean revoke → restore is still not spawned`, async () => {
-        await SandboxManager.initialize(config())
-        const done = handler()()
-        expect(aclCalls).toEqual(NO_RESTORE)
-        await done
-        expect(aclCalls).toEqual(NO_RESTORE)
-      })
-    }
-
-    it('restoreWindowsAcl itself refuses for that holder, and only that holder', () => {
-      const o = { sandboxUserSid: SID, srtWin: STUB_SRT_WIN }
-      expect(winUtils.restoreWindowsAcl(o)).toBeUndefined()
-      expect(aclCalls).toEqual([])
-      expect(
-        winUtils.restoreWindowsAcl({ ...o, holderPid: process.pid + 1 }),
-      ).toEqual([])
-      expect(aclCalls).toEqual(['restore'])
-    })
+  it('reset(): a complete revoke after an incomplete one → restore runs', async () => {
+    await SandboxManager.initialize(config())
+    aclResult.revoke = reports('unreadable')
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual(NO_RESTORE)
+    aclCalls = []
+    aclResult = {}
+    await SandboxManager.initialize(config())
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual(WITH_RESTORE)
   })
 
-  it('revokeWindowsAcl followed by restoreWindowsAcl: an incomplete revoke blocks the restore', () => {
-    const o = { sandboxUserSid: SID, srtWin: STUB_SRT_WIN }
-    aclResult.revoke = reports('unreadable')
-    expect(winUtils.revokeWindowsAcl(o)?.map(e => e.status)).toEqual([
-      'revoked',
-      'unreadable',
-    ])
-    expect(winUtils.restoreWindowsAcl(o)).toBeUndefined()
-    expect(aclCalls).toEqual(['revoke'])
+  it('restoreWindowsAcl surfaces a refusal by srt-win', () => {
+    aclResult.restore = exit(1, '[{"path":"p","status":"grantPending"}]')
+    expect(
+      winUtils.restoreWindowsAcl({ sandboxUserSid: SID, srtWin: STUB_SRT_WIN }),
+    ).toEqual([{ path: 'p', status: 'grantPending' }])
+    expect(aclCalls).toEqual(['restore'])
   })
 
   it('revokeWindowsAclChecked names the paths whose grant may be left', () => {
