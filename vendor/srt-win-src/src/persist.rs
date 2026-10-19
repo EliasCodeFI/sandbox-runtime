@@ -648,7 +648,7 @@ pub(crate) fn converge_on(
         && acl::persistent_layout_ok(&aces, &t);
     // Settled: no write is outstanding for this path, and (with ACEs
     // wanted) a write of exactly this list completed on this object.
-    let settled = is_settled(record.as_ref(), want.is_empty(), &spec, cur.as_bytes());
+    let settled = is_settled(record.as_ref(), want.is_empty(), &spec, &cur.as_bytes());
     if same && settled {
         if want.is_empty() {
             conn.execute(
