@@ -415,29 +415,33 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
   })
 
-  it('NODE_USE_ENV_PROXY=1 rides the --env overlay with the HTTP proxy, over a masked value', () => {
+  it('NODE_USE_ENV_PROXY=1 rides the --env overlay with the HTTP proxy, unless the caller names it', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const envArgsOf = (
-      p: Parameters<typeof wrapCommandWithSandboxWindows>[0],
-    ) => {
-      const { argv } = wrapCommandWithSandboxWindows(p)
-      return argv.filter((_, i) => argv[i - 1] === '--env')
+    const proxied = {
+      command: 'node app.js',
+      httpProxyPort: 60080,
+      socksProxyPort: 60080,
+      proxyAuthToken: 'tok',
+      srtWin,
     }
-    const named = (envArgs: string[]) =>
-      envArgs.filter(e => e.startsWith('NODE_USE_ENV_PROXY='))
+    const named = (p: Parameters<typeof wrapCommandWithSandboxWindows>[0]) => {
+      const { argv } = wrapCommandWithSandboxWindows(p)
+      return argv
+        .filter((_, i) => argv[i - 1] === '--env')
+        .filter(e => e.toUpperCase().startsWith('NODE_USE_ENV_PROXY='))
+    }
+    expect(named(proxied)).toEqual(['NODE_USE_ENV_PROXY=1'])
     expect(
-      named(
-        envArgsOf({
-          command: 'node app.js',
-          httpProxyPort: 60080,
-          socksProxyPort: 60080,
-          proxyAuthToken: 'tok',
-          setEnvVars: { NODE_USE_ENV_PROXY: '0' },
-          srtWin,
-        }),
-      ),
-    ).toEqual(['NODE_USE_ENV_PROXY=1'])
-    expect(named(envArgsOf({ command: 'node app.js', srtWin }))).toEqual([])
+      named({ ...proxied, setEnvVars: { NODE_USE_ENV_PROXY: '0' } }),
+    ).toEqual(['NODE_USE_ENV_PROXY=0'])
+    // Windows reads names ignoring case: one entry, the caller's.
+    expect(
+      named({ ...proxied, setEnvVars: { node_use_env_proxy: '' } }),
+    ).toEqual(['node_use_env_proxy='])
+    expect(
+      named({ command: 'node app.js', socksProxyPort: 60081, srtWin }),
+    ).toEqual([])
+    expect(named({ command: 'node app.js', srtWin })).toEqual([])
   })
 })
 

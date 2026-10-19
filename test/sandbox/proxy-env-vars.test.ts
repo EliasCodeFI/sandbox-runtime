@@ -1,5 +1,4 @@
 import { describe, it, expect, spyOn } from 'bun:test'
-import { spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -12,18 +11,6 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
-
-/** Whether `node` on PATH reads NODE_USE_ENV_PROXY (22.21+, 24.5+). */
-const nodeReadsProxyEnv = ((): boolean => {
-  const r = spawnSync('node', ['-p', 'process.versions.node'], {
-    encoding: 'utf8',
-  })
-  if (r.status !== 0) return false
-  const [major = 0, minor = 0] = r.stdout.trim().split('.').map(Number)
-  return (
-    (major === 22 && minor >= 21) || (major === 24 && minor >= 5) || major > 24
-  )
-})()
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -87,92 +74,6 @@ describe('generateProxyEnvVars', () => {
     })
   })
 
-  describe('NODE_USE_ENV_PROXY', () => {
-    const NAME = 'NODE_USE_ENV_PROXY'
-    const named = (env: string[]) => env.filter(v => v.startsWith(`${NAME}=`))
-
-    it('is set wherever an HTTP proxy port is', () => {
-      const cases: Array<Parameters<typeof generateProxyEnvVars>> = [
-        [3128, 1080],
-        [3128, undefined],
-        [3128, 3128, undefined, 'tok'],
-        [3128, 1080, '/etc/srt/ca.crt', 'tok', true, 'Zm9v'],
-      ]
-      for (const args of cases) {
-        const env = generateProxyEnvVars(...args)
-        expect(named(env)).toEqual([`${NAME}=1`])
-        expect(env.some(v => v.startsWith('HTTPS_PROXY=http://'))).toBe(true)
-      }
-    })
-
-    it('is not set with a SOCKS port alone, or with no proxy', () => {
-      for (const args of [
-        [undefined, 1080],
-        [undefined, 1080, undefined, 'tok'],
-        [undefined, undefined],
-        [undefined, undefined, '/etc/srt/ca.crt'],
-      ] as Array<Parameters<typeof generateProxyEnvVars>>) {
-        const env = generateProxyEnvVars(...args)
-        expect(named(env)).toEqual([])
-        expect(env.some(v => v.startsWith('HTTPS_PROXY='))).toBe(false)
-      }
-    })
-
-    it.if(!isWindows && nodeReadsProxyEnv)(
-      'sandboxed node reaches the parent proxy with http.get and with fetch',
-      async () => {
-        let proxy: Server | undefined
-        const received: string[] = []
-        try {
-          proxy = createServer((req, res) => {
-            received.push(req.url ?? '')
-            res.writeHead(200)
-            res.end('ok')
-          })
-          proxy.on('connect', (req, sock) => {
-            received.push(req.url ?? '')
-            sock.end('HTTP/1.1 200 OK\r\n\r\n')
-          })
-          const proxyPort = await new Promise<number>((resolve, reject) => {
-            proxy!.on('error', reject)
-            proxy!.listen(0, '127.0.0.1', () =>
-              resolve((proxy!.address() as AddressInfo).port),
-            )
-          })
-
-          await SandboxManager.initialize({
-            network: {
-              allowedDomains: ['srt-test.local'],
-              deniedDomains: [],
-              httpProxyPort: proxyPort,
-            },
-            filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-          })
-
-          // fetch opens a CONNECT tunnel, which this proxy accepts and ends.
-          const wrapped = await SandboxManager.wrapWithSandbox(
-            `node -e "require('http').get('http://srt-test.local:8080/', r => fetch('http://srt-test.local:8081/').catch(() => {}).then(() => process.exit(r.statusCode === 200 ? 0 : 1))).on('error', () => process.exit(2))"`,
-          )
-          const result = await spawnAsync(wrapped, {
-            shell: true,
-            encoding: 'utf8',
-            timeout: 20000,
-          })
-
-          expect(result.status).toBe(0)
-          expect(received).toContain('http://srt-test.local:8080/')
-          expect(received).toContain('srt-test.local:8081')
-        } finally {
-          await SandboxManager.reset()
-          if (proxy) {
-            await new Promise<void>(r => proxy!.close(() => r()))
-          }
-        }
-      },
-      30000,
-    )
-  })
-
   describe('caCertPath', () => {
     it('sets all trust env vars to the CA path when provided', () => {
       const env = generateProxyEnvVars(3128, 1080, '/etc/srt/ca.crt')
@@ -211,18 +112,6 @@ describe('generateProxyEnvVars', () => {
         const tokens = entry!.slice(name.length + 1).split(',')
         expect(tokens).not.toContain('.local')
         expect(tokens).not.toContain('*.local')
-      }
-    })
-
-    it('names the IPv6 loopback with and without brackets', () => {
-      const env = generateProxyEnvVars(3128, 1080)
-      for (const name of ['NO_PROXY', 'no_proxy']) {
-        const tokens = env
-          .find(e => e.startsWith(`${name}=`))!
-          .slice(name.length + 1)
-          .split(',')
-        expect(tokens).toContain('::1')
-        expect(tokens).toContain('[::1]')
       }
     })
 
