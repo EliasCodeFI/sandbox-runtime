@@ -103,6 +103,8 @@ $v1dOut = & $Exe wfp verify --target $v1Tgt
 $v1dExit = $LASTEXITCODE
 $v1Lsn.Stop()
 Write-Host "V1: wfp verify --target $v1Tgt exit=$vexit stdout='$vout'"
+# The exit code first: only 0, 2 and 3 come with a probe report to parse.
+if ($vexit -notin 0, 2, 3) { throw "V1: wfp verify exited $vexit without a probe report. stdout: $vout" }
 $v = $vout | ConvertFrom-Json
 
 # ── V1c: lowered-integrity copies of the sandbox token are blocked ──

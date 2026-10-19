@@ -274,6 +274,8 @@ function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE
   Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  # The exit code first: only 0, 2 and 3 come with a probe report to parse.
+  if ($ec -notin 0, 2, 3) { throw "wfp verify --target ${tgt} exited $ec without a probe report. stdout: $out" }
   return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
 }
 $v = WfpVerify $probeTgt
