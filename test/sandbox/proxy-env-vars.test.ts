@@ -95,9 +95,6 @@ describe('generateProxyEnvVars', () => {
     const named = (env: string[]) => env.filter(v => v.startsWith(`${NAME}=`))
 
     it('is set wherever an HTTP proxy port is', () => {
-      // Node's fetch, http and https read HTTP_PROXY / HTTPS_PROXY only when
-      // asked to. Without it they connect directly, which the sandbox
-      // refuses for allowed and disallowed hosts alike.
       const cases: Array<Parameters<typeof generateProxyEnvVars>> = [
         [3128, 1080],
         [3128, undefined],
@@ -223,8 +220,7 @@ describe('generateProxyEnvVars', () => {
     })
 
     it('names the IPv6 loopback with and without brackets', () => {
-      // Node's fetch compares an entry with the host as the URL spells it,
-      // `[::1]`. The bare form is the one curl and others match.
+      // Node's fetch matches `[::1]`; curl and others match the bare form.
       const env = generateProxyEnvVars(3128, 1080)
       for (const name of ['NO_PROXY', 'no_proxy']) {
         const tokens = env

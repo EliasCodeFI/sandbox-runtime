@@ -826,9 +826,8 @@ export function generateProxyEnvVars(
   // direct getaddrinfo() and fail. Routing .local hostnames through the proxy
   // lets the parent resolve them (e.g. Kubernetes *.svc.cluster.local).
   //
-  // The IPv6 loopback is listed in both spellings: Node's `fetch` compares
-  // an entry with the host as the URL spells it, in brackets, and a bare
-  // `::1` does not match there.
+  // `[::1]` is for Node's `fetch`, which compares an entry with the host as
+  // the URL spells it, in brackets.
   const noProxyAddresses = [
     'localhost',
     '127.0.0.1',
@@ -855,13 +854,9 @@ export function generateProxyEnvVars(
       envVars.push(`GIT_CONFIG_PARAMETERS='http.proxyAuthMethod=basic'`)
     }
     // Node's built-in clients (`fetch`, `http`, `https`) read the variables
-    // above only when asked to, and otherwise connect directly, which the
-    // sandbox refuses. Releases that do not know the variable ignore it. It
-    // goes with the HTTP proxy only: those clients take no SOCKS URL.
-    //
-    // They match NO_PROXY by name and by single address, not by range, so a
-    // request to a private address goes to the proxy, which holds it to the
-    // allow list, where a direct connection would have been refused.
+    // above only when this is set, and take no SOCKS URL. They match NO_PROXY
+    // by name and by single address, not by range, so a request to a private
+    // address goes to the proxy.
     envVars.push('NODE_USE_ENV_PROXY=1')
   }
 

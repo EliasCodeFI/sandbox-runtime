@@ -428,9 +428,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     }
     const named = (envArgs: string[]) =>
       envArgs.filter(e => e.startsWith('NODE_USE_ENV_PROXY='))
-    // Node's built-in clients read HTTP_PROXY / HTTPS_PROXY only when
-    // asked to; the generated value follows setEnvVars, as the proxy
-    // variables do.
+    // The generated value follows setEnvVars, as the proxy variables do.
     expect(
       named(
         envArgsOf({
@@ -1909,12 +1907,9 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     async () => {
       // KEY: the request is made with an agent of the script's own,
       // which reads no proxy variable whatever NODE_USE_ENV_PROXY
-      // says, so it attempts a DIRECT connect. (Clearing the variable
-      // in the command is not enough: the runner hands the child every
-      // *_PROXY name in both cases, and `set` removes one.) The
-      // user-SID WFP filter must refuse it. This is the load-bearing
-      // proof that WFP — not the proxy env vars — is the real network
-      // boundary.
+      // says, so it attempts a DIRECT connect. The user-SID WFP filter
+      // must refuse it. This is the load-bearing proof that WFP — not
+      // the proxy env vars — is the real network boundary.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
         `node -e "const s=Date.now();const h=require('https');h.get('https://example.com',{agent:new h.Agent()},r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
