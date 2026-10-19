@@ -37,7 +37,8 @@
 //!
 //! A process DACL does not cover the process's **threads** (each takes its
 //! descriptor from the creating token's default DACL), so
-//! [`protect_own_threads`] and [`protect_future_threads`] give them the same.
+//! [`protect_own_threads`] and [`protect_future_threads`] give each thread
+//! the same DACL shape.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
@@ -207,8 +208,8 @@ fn build_protected_acl(full: u32) -> Result<Vec<u8>> {
 }
 
 /// Rewrite the DACL of every thread this process has to the shape
-/// [`install_broker_dacl`] gives the process. A thread whose DACL it cannot
-/// open counts only if every right in [`withheld_thread_rights`] is refused.
+/// [`install_broker_dacl`] gives the process. A thread whose DACL it cannot open
+/// counts as protected only if every [`withheld_thread_rights`] right is refused.
 pub fn protect_own_threads() -> Result<usize> {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
     use windows::Win32::System::Threading::{

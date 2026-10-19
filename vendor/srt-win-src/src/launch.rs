@@ -304,8 +304,8 @@ pub fn run_lockdown(
             )
         });
     }
-    // Order matters: the default DACL first (new threads start protected), then
-    // the sweep. Only now, or it would also land on the child's own objects.
+    // Order matters: the default DACL first, so new threads start protected, then
+    // the sweep. Not before the child exists: it would land on the child's objects.
     self_protect::protect_future_threads()
         .context("runner self-protect (default DACL for new threads)")?;
     let protected_threads = self_protect::protect_own_threads()
