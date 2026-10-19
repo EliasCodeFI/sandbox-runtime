@@ -125,8 +125,7 @@ function RExec {
   # 120s: a row that starts Windows PowerShell as the sandbox user can take
   # over 30s on some hosted runner images (powershell.exe is CPU-bound in
   # startup the whole time, then finishes). A limit only matters on a hang.
-  # -StdinText: give the broker a redirected stdin holding exactly this text,
-  # then close it. Without it the broker inherits this script's stdin.
+  # -StdinText: redirect the broker's stdin to exactly this text, then close it.
   param([string[]] $tail, [int] $TimeoutSec = 120, [string] $StdinText = $null)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
@@ -536,12 +535,6 @@ if ($r.out -match 'CHILD_DESK=Default') {
 Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
 
 # ── R13: the child's stdin cannot be used to impersonate ─────────
-# The egress BLOCK matches the sandbox account's SID, so a thread
-# running under any other identity would fall through to permit. A
-# pipe's SERVER end can ImpersonateNamedPipeClient whoever opened the
-# other end, and the real user's broker holds the other end of the
-# child's stdin. One compiled method does the whole sequence on a
-# single thread (impersonation is per-thread).
 $r13Lsn  = Bind-Listener (50003, 50004, 50005, 49997)
 $r13Port = $r13Lsn.LocalEndpoint.Port
 try {
@@ -584,8 +577,7 @@ Add-Type -TypeDefinition `$src
   if ($r.out -notmatch 'DIRECT=blocked') {
     throw "R13: probe did not report its direct connect. raw: $($r.raw)"
   }
-  # 3 = FILE_TYPE_PIPE: the handle probed really is the stdin pipe, so a
-  # failed impersonation is the pipe refusing, not a missing handle.
+  # 3 = FILE_TYPE_PIPE: a failed impersonation is the pipe refusing, not a missing handle.
   if ($r.out -notmatch 'STDIN_TYPE=3') {
     throw "R13: child stdin is not a pipe — impersonation probe is vacuous. raw: $($r.raw)"
   }
@@ -595,8 +587,7 @@ Add-Type -TypeDefinition `$src
   if ($r.out -notmatch 'IMPERSONATE=fail') {
     throw "R13: probe did not report an impersonation result. raw: $($r.raw)"
   }
-  # Sanity: the listener was live, so "blocked" is the fence and not a
-  # closed port.
+  # The listener was live, so "blocked" is the fence and not a closed port.
   $hc = [System.Net.Sockets.TcpClient]::new()
   try { $hc.Connect('127.0.0.1', $r13Port) } catch {
     throw "R13: broker-side connect to its own listener on $r13Port failed — test invalid"
@@ -607,12 +598,6 @@ Add-Type -TypeDefinition `$src
 }
 
 # ── R14: the child's stdin reads as end-of-file ──────────────────
-# The broker writes the launch spec to the runner's stdin and closes
-# it, so a child that reads stdin to the end must finish (a missing
-# EOF is the RExec timeout) having read none of the spec. `sort`
-# copies stdin to stdout and exits at EOF. A payload on the BROKER's
-# stdin shows what reaches the child from there: nothing, or exactly
-# the payload.
 $r14Payload = 'R14-STDIN-PAYLOAD-7f3a'
 $r = RExec @('--', $cmd, '/c', 'sort & echo R14-EOF-MARK') `
        -TimeoutSec 60 -StdinText "$r14Payload`r`n"

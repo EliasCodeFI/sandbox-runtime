@@ -9,12 +9,9 @@
 //! back to the broker's own stdio, waits, and returns the runner's
 //! exit code.
 //!
-//! **The sandbox side only ever holds pipe CLIENT ends.** A pipe's
-//! server end can `ImpersonateNamedPipeClient` whoever opened the
-//! other end, and here that is the real user. The write end of a
-//! `CreatePipe` pair is the client end, so stdout/stderr are such
-//! pairs; the read end is the server end, so stdin is built the
-//! other way round by [`make_stdin_pipe`].
+//! **The sandbox side only ever holds pipe CLIENT ends**: a server end can
+//! `ImpersonateNamedPipeClient` whoever opened the other end, here the real
+//! user. So stdin is not a `CreatePipe` pair (see [`make_stdin_pipe`]).
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -126,10 +123,8 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
     None
 }
 
-/// One pipe pair. The end the runner gets is inheritable; the
-/// broker's end is not, so the runner doesn't get a copy of it
-/// (which would keep the pipe open past the runner's exit and hang
-/// the pump).
+/// One pipe pair. The runner's end is inheritable; the broker's is not, or
+/// the runner's copy would keep the pipe open past its exit and hang the pump.
 struct PipePair {
     broker: OwnedHandle,
     runner: OwnedHandle,
@@ -175,14 +170,11 @@ const STDIN_PIPE_MODE: NAMED_PIPE_MODE = NAMED_PIPE_MODE(
 /// else can connect to the name or create a second server for it.
 const STDIN_PIPE_MAX_INSTANCES: u32 = 1;
 
-/// Server-side buffer. A write larger than this just blocks until
-/// the runner reads, same as with an anonymous pipe.
+/// Server-side buffer; a larger write blocks until the runner reads.
 const STDIN_PIPE_OUT_BUFFER: u32 = 64 * 1024;
 
-/// Access the client (read) end is opened with: read, plus
-/// `FILE_WRITE_ATTRIBUTES` — the rights the read end of a
-/// `CreatePipe` pair carries, so a child that sets the read/wait
-/// mode on its stdin keeps working. No data-write access.
+/// Read, plus `FILE_WRITE_ATTRIBUTES`: what the read end of a `CreatePipe`
+/// pair carries, so a child that sets the read mode on its stdin keeps working.
 const STDIN_CLIENT_ACCESS: u32 = GENERIC_READ.0 | FILE_WRITE_ATTRIBUTES.0;
 
 /// The client end is opened at the ANONYMOUS impersonation level, so
@@ -199,17 +191,9 @@ fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
     format!(r"\\.\pipe\srt-win-stdin-{pid}-{hex}")
 }
 
-/// The stdin pipe for the runner, built so the runner's end is the
-/// pipe's CLIENT end: the broker creates a named pipe, keeps the
-/// server end to write to, and opens the client end itself for the
-/// runner to read from.
-///
-/// The pipe is reachable only through these two handles: its DACL
-/// grants the broker's own user and nobody else, it rejects remote
-/// clients, and its single instance is taken by the client opened
-/// here.
-///
-/// There is no fallback: if any step fails the launch fails.
+/// The runner's stdin pipe, with the runner holding the CLIENT end: the broker
+/// keeps the server end of a named pipe and opens the client end itself. The
+/// DACL grants only the broker's user; if any step fails the launch fails.
 fn make_stdin_pipe() -> Result<PipePair> {
     make_stdin_pipe_named(&fresh_stdin_pipe_name()?)
 }
@@ -596,7 +580,6 @@ mod tests {
             n,
             r"\\.\pipe\srt-win-stdin-1234-abababababababababababababababab"
         );
-        // All 16 bytes land in the name, zero-padded.
         let mut r = [0u8; 16];
         r[15] = 0x0f;
         assert!(stdin_pipe_name(1, &r).ends_with("-0000000000000000000000000000000f"));
@@ -605,39 +588,28 @@ mod tests {
 
     #[test]
     fn stdin_pipe_flags() {
-        // Server end: outbound only (bit 0 = inbound access), first
-        // instance, synchronous.
         assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x3, 0x2);
         assert_ne!(STDIN_PIPE_OPEN_MODE.0 & 0x0008_0000, 0);
         assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x4000_0000, 0);
-        // Byte stream, blocking, remote clients rejected.
         assert_eq!(STDIN_PIPE_MODE.0, 0x8);
         assert_eq!(STDIN_PIPE_MAX_INSTANCES, 1);
-        // Client end: GENERIC_READ + FILE_WRITE_ATTRIBUTES, nothing
-        // that writes data; SQOS present with level ANONYMOUS (the
-        // level lives in bits 16-17) and no context-tracking /
-        // effective-only bits.
+        // SQOS present with level ANONYMOUS (bits 16-17), no other SQOS bit.
         assert_eq!(STDIN_CLIENT_ACCESS, 0x8000_0100);
         assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
     }
 
-    /// The pair reads like an anonymous pipe — data, then
-    /// `ERROR_BROKEN_PIPE` once the writer is gone — and the reader's
-    /// end can neither impersonate nor be joined by a second client.
+    /// The runner's end reads like an anonymous pipe and cannot impersonate.
     #[test]
     fn stdin_pipe_runner_end_is_a_client_end() {
         let name = fresh_stdin_pipe_name().unwrap();
         let pipe = make_stdin_pipe_named(&name).unwrap();
 
-        // A client end cannot impersonate.
         let imp = unsafe { ImpersonateNamedPipeClient(pipe.runner.raw()) };
         if imp.is_ok() {
             unsafe { RevertToSelf().unwrap() };
             panic!("ImpersonateNamedPipeClient succeeded on the runner's stdin end");
         }
 
-        // The single instance is taken: no second client, and no
-        // second server under the same name.
         let name_w = wstr(&name);
         let again = unsafe {
             CreateFileW(
@@ -659,8 +631,7 @@ mod tests {
             "a second server was created under the stdin pipe's name"
         );
 
-        // Write, close the server end, then read: the bytes arrive,
-        // followed by ERROR_BROKEN_PIPE (what a reader treats as EOF).
+        // ERROR_BROKEN_PIPE is what a reader treats as EOF.
         let payload = b"spec-bytes";
         let mut wrote = 0u32;
         unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
