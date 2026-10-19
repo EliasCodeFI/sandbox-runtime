@@ -1009,10 +1009,8 @@ const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
  *     without `-c http.sslBackend=openssl`. Revocation is disabled
  *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
  *     be WFP-fenced.
- *   - `http.sslBackend=openssl` when `opensslBackend` (Windows only)
- *     — for a child whose token Schannel refuses (the write-restricted
- *     token), so git's HTTPS transport keeps working. Emitted after
- *     the schannel knobs, which the OpenSSL backend ignores.
+ *   - `http.sslBackend=openssl` when `opensslBackend` — for a child
+ *     whose token Schannel refuses (the write-restricted token).
  *
  * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
  * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the

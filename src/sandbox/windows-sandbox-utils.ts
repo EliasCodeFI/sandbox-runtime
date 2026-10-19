@@ -2101,12 +2101,8 @@ export interface WindowsAclAceOutcome {
 }
 
 /**
- * The `acl revoke` statuses after which a grant is known to be off
- * disk, or legitimately still there for another holder. An
- * allow-list, so a status this code does not know fails closed: the
- * srt-win binary a host embeds can be newer or older than this file.
- * "missing" has a further condition — see
- * {@link windowsAclGrantReleased}.
+ * `acl revoke` statuses that show a grant released. An allow-list, so
+ * a status from a newer or older srt-win fails closed.
  */
 const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
   'revoked',
@@ -2118,13 +2114,9 @@ const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Whether one `acl revoke` outcome shows its grant released.
- *
- * "missing" counts only if the path really is gone: an older
- * srt-win reports a path it merely could not open as "missing" and
- * forgets it, with the ACE still on the object. The check does not
- * follow a link at the path, and any answer other than "no such
- * entry" (including an error from the check) counts as still there.
+ * Whether one `acl revoke` outcome shows its grant released. "missing"
+ * counts only if the path is really gone: an older srt-win reports a
+ * path it could not open as "missing", with the ACE still there.
  */
 function windowsAclGrantReleased(o: unknown): boolean {
   if (typeof o !== 'object' || o === null) return false
@@ -2141,18 +2133,14 @@ function windowsAclGrantReleased(o: unknown): boolean {
 }
 
 /**
- * Holders (by PID) for which a grant revoke in this process did not
- * complete, with the paths it reported as possibly still granted.
- * Never cleared: a later revoke that finds nothing to do proves
- * nothing (an older srt-win has already forgotten the path).
+ * Holders (by PID) whose grant revoke did not complete in this
+ * process, with the paths possibly still granted. Never cleared.
  */
 const windowsAclIncompleteRevokes = new Map<number, Set<string>>()
 
 /**
- * The paths whose grants an incomplete revoke by `holderPid` (default:
- * this process) may have left on disk — `undefined` if every revoke
- * so far completed. The list can be empty: a revoke that timed out or
- * printed nothing names no paths.
+ * Paths an incomplete revoke by `holderPid` may have left granted;
+ * `undefined` if every revoke completed. Can be empty.
  */
 export function windowsAclIncompleteRevoke(
   holderPid: number = process.pid,
@@ -2167,17 +2155,9 @@ export function clearWindowsAclIncompleteRevokesForTesting(): void {
 }
 
 /**
- * Release this holder's deny ACEs and remove the sandbox-user ACE
- * on any path whose refcount falls to zero. Best-effort (does not
- * throw on per-path anomalies); returns per-path outcomes for the
- * caller to surface. Returns `undefined` when `srt-win` itself
- * failed (no JSON to parse) or when the restore was refused.
- *
- * Call this only after {@link revokeWindowsAclChecked} reported
- * `complete`: the deny ACEs protect paths inside the granted trees
- * from the sandbox account, which every session shares. As a backstop
- * this function refuses (logs, spawns nothing) while a revoke for the
- * same holder has been incomplete in this process.
+ * Release this holder's deny ACEs. Best-effort; `undefined` when
+ * `srt-win` failed or the restore was refused. Call only after
+ * {@link revokeWindowsAclChecked} reported `complete`.
  */
 export function restoreWindowsAcl(opts: {
   sandboxUserSid: string
@@ -2394,9 +2374,7 @@ export interface WindowsAclRevokeResult {
 
 /**
  * {@link revokeWindowsAcl} that also reports whether the revoke
- * completed; gate {@link restoreWindowsAcl} on `complete`. An
- * incomplete revoke is remembered for the holder for the rest of the
- * process — see {@link windowsAclIncompleteRevoke}.
+ * completed; gate {@link restoreWindowsAcl} on `complete`.
  */
 export function revokeWindowsAclChecked(opts: {
   sandboxUserSid: string
@@ -2465,13 +2443,9 @@ function noteWindowsAclRevoke(
 }
 
 /**
- * Release this holder's grants and remove the sandbox-user ACE on
- * any path whose refcount falls to zero. Best-effort (does not
- * throw); logs anomalies.
- *
- * Do not follow this with {@link restoreWindowsAcl}: the returned
- * list does not say whether the revoke completed. Use
- * {@link revokeWindowsAclChecked} for that.
+ * Release this holder's grants. Best-effort (does not throw). Do not
+ * follow with {@link restoreWindowsAcl}: use
+ * {@link revokeWindowsAclChecked}, which says whether it completed.
  */
 export function revokeWindowsAcl(opts: {
   sandboxUserSid: string

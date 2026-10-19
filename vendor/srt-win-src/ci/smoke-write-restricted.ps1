@@ -104,8 +104,7 @@ $PortRange = '60080-60089'
 $PortLo    = 60080
 $PortHi    = 60089
 
-# Absolute: sandboxed children run these binaries for the probe rows
-# (`srt-win probe …`), and they do not share our cwd semantics.
+# Absolute: sandboxed children run these binaries and do not share our cwd.
 $ExeAbs = (Resolve-Path $Exe).Path
 $HooksAbs = $null
 if ($HooksExe) {
@@ -168,9 +167,7 @@ function Bind-OutOfRange {
   return $l
 }
 
-# Start `srt-win exec <tail>` without waiting. The broker forwards
-# only what it is told via --env, so pass PATH/PATHEXT — the same
-# overlay the TS wrapper builds.
+# The broker forwards only what it is told via --env, so pass PATH/PATHEXT.
 function Start-Sb { param([string[]] $tail)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
@@ -183,15 +180,13 @@ function Start-Sb { param([string[]] $tail)
   $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p = [System.Diagnostics.Process]::Start($psi)
-  # Drain both pipes concurrently so a full pipe buffer can't wedge
-  # WaitForExit.
+  # Drain both pipes concurrently so a full buffer can't wedge WaitForExit.
   return [pscustomobject]@{
     p = $p; so = $p.StandardOutput.ReadToEndAsync()
     se = $p.StandardError.ReadToEndAsync(); tail = $tail
   }
 }
-# Wait for a Start-Sb process. A timeout is reported as exit -1 with
-# the captured output, not thrown: the caller records the row.
+# A timeout is reported as exit -1, not thrown: the caller records the row.
 function Wait-Sb { param($h, [int] $TimeoutSec = 180)
   if (-not $h.p.WaitForExit($TimeoutSec * 1000)) {
     try { $h.p.Kill($true) } catch { }
@@ -208,21 +203,16 @@ function Wait-Sb { param($h, [int] $TimeoutSec = 180)
 function SbOff { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--') + $tail)) $TimeoutSec
 }
-# Sandboxed exec, write-restricted token.
 function SbOn { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--write-restricted-token', '--') + $tail)) $TimeoutSec
 }
-# Sandboxed exec, write-restricted token, with the session's write
-# roots (`--write-root` each): the token of a session that was given
-# those roots.
+# Sandboxed exec under the token of a session given these write roots.
 function SbRoots { param([string[]] $roots, [string[]] $tail, [int] $TimeoutSec = 180)
   $pre = @('--write-restricted-token')
   foreach ($r in $roots) { $pre += @('--write-root', $r) }
   Wait-Sb (Start-Sb ($pre + @('--') + $tail)) $TimeoutSec
 }
-# Session start with the option on: `acl grant --persistent`. Returns
-# the exit code, the output, and how many DACLs it wrote (-1 if the
-# summary line is missing).
+# Returns the exit code, the output, and how many DACLs it wrote (-1 if unknown).
 function Grant-P { param([string[]] $write, [string[]] $denyWrite = @(), [string[]] $denyRead = @())
   $json = @{ read = @(); write = @($write); denyRead = @($denyRead); denyWrite = @($denyWrite) } |
     ConvertTo-Json -Compress
@@ -234,8 +224,7 @@ function Grant-P { param([string[]] $write, [string[]] $denyWrite = @(), [string
   if ($raw -match '(\d+) DACL write\(s\)') { $writes = [int]$Matches[1] }
   return [pscustomobject]@{ exit = $code; raw = $raw; writes = $writes }
 }
-# What the session teardown runs: the per-session release. It must
-# leave persistent grants alone.
+# The per-session release; it must leave persistent grants alone.
 function End-Session {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
@@ -260,45 +249,21 @@ try { Start-Service seclogon -ea Stop } catch {
   Write-Host "smoke-write-restricted: WARNING: Start-Service seclogon: $_"
 }
 
-# Scratch tree at the system-drive root. The root and every test
-# directory get a protected DACL that is written whole, so the ACEs
-# listed for a directory are the only ones that apply to it: nothing
-# is inherited from the drive root, where Authenticated Users hold
-# Modify and BUILTIN\Users read, and the sandbox account is a member
-# of both.
-#
-# Every test directory carries full control for Administrators and
-# SYSTEM, and what its row adds. This script and the broker run
-# elevated as a member of Administrators, which is what lets them
-# seed, grant and clean up; the sandbox account is in neither, so it
-# gains nothing from the two entries.
+# Each test directory gets a protected DACL written whole, so nothing is inherited from the drive root.
 $root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
 $adm  = @('(A;OICI;FA;;;BA)', '(A;OICI;FA;;;SY)')
-# The root itself: the same two, and read for BUILTIN\Users on the
-# root only (no inheritance flags), so a sandboxed process can still
-# look a child up by name. No entry lets the sandbox account write.
+# Read for BUILTIN\Users on the root only, so a sandboxed process can look a child up by name.
 $rootAces = $adm + @('(A;;0x1200a9;;;BU)')
-# Modify, inherited by files and directories, as an ACE for `$who`
-# (an SDDL SID alias).
+# Modify, inherited by files and directories, for `$who` (an SDDL SID alias).
 function ModifyAce { param([string] $who) "(A;OICI;0x1301bf;;;$who)" }
-# The DACL of the SDDL string `$sd` in a form two of them can be
-# compared in: whether it is protected, then its ACEs, sorted so that
-# the comparison is of which ACEs are there and not of their order.
+# `$sd`'s DACL in comparable form: protected flag, then its ACEs sorted.
 function DaclOf { param([string] $sd)
   $prot = if ($sd -match 'D:[A-Z]*P[A-Z]*\(') { 'protected' } else { 'inheriting' }
   $aces = @([regex]::Matches($sd, '\([^)]*\)') | ForEach-Object Value | Sort-Object)
   return "$prot $($aces -join '')"
 }
 function Dacl { param([string] $p) DaclOf (Sddl $p) }
-# Give directory `$d` a protected DACL holding exactly `$aces` (SDDL
-# ACE strings, spelled the way a DACL is reported back).
-#
-# The DACL is built here and written in one call. icacls is not used:
-# what `/inheritance:r` leaves of the inherited ACEs differs between
-# Windows versions (removed on one, kept as explicit ACEs on another),
-# and a directory that keeps them is writable to the sandbox account
-# whatever its row meant to grant. The DACL is then read back, and a
-# directory that does not carry exactly `$aces` is a failed row.
+# Not icacls: what `/inheritance:r` leaves of inherited ACEs differs between Windows versions.
 function Set-OnlyAces { param([string] $d, [string[]] $aces)
   $want = "D:PAI$($aces -join '')"
   $sec = [System.Security.AccessControl.DirectorySecurity]::new()
@@ -319,16 +284,13 @@ function New-AclDir { param([string] $name, [string[]] $extraAces)
   Set-OnlyAces $d ($adm + $extraAces)
   return $d
 }
-# Seed the three files an A-row acts on. Created AFTER the directory
-# ACL is set so they inherit it.
+# Created AFTER the directory ACL is set so the files inherit it.
 function Seed-Dir { param([string] $d)
   'KEEP' | Set-Content -Encoding ASCII (Join-Path $d 'keep.txt')
   'DEL'  | Set-Content -Encoding ASCII (Join-Path $d 'del.txt')
   Remove-Item (Join-Path $d 'new.txt') -Force -ea SilentlyContinue
 }
-# One sandboxed cmd that appends to keep.txt, creates new.txt and
-# deletes del.txt. cmd's `del` exits 0 even when refused, so the
-# verdict is read from the files, not the exit code.
+# cmd's `del` exits 0 even when refused, so the verdict is read from the files.
 function Mutate { param([string] $d, [bool] $restricted)
   $line = "echo APPENDED>> `"$d\keep.txt`" & echo NEW> `"$d\new.txt`" & del /q `"$d\del.txt`""
   $tail = @($cmd, '/d', '/s', '/c', $line)
@@ -353,16 +315,12 @@ try {
   $script:grpSid = $us.user.group_sid
   if (-not $script:grpSid) { throw 'user status missing group_sid' }
   Write-Host "sandbox user provisioned (sid=$sbSid group=$($script:grpSid))"
-  # A persistent grant left by an earlier, interrupted run would make
-  # every option-off row below be refused.
+  # A grant left by an interrupted run would make every option-off row be refused.
   & $Exe acl forget --all 2>&1 | Out-Null
   New-Item -ItemType Directory -Path $root -Force | Out-Null
   Set-OnlyAces $root $rootAces
 
   # ── G: the token itself ──────────────────────────────────────────
-  # First, so every later row is read knowing what token it ran under.
-  # `probe token` exists only in the test-hooks build; it runs here as
-  # the sandboxed command, under a token the default build created.
   if (-not $HooksAbs) { Skip 'G (the child token''s restricting SIDs)' } else {
     $want = @($sbSid, 'S-1-1-0', 'S-1-5-12') | Sort-Object
     $r = SbOn @($HooksAbs, 'probe', 'token')
@@ -386,7 +344,6 @@ try {
       Fail 'G: the ordinary child token carries restricting SIDs (option off must be unchanged)'
     } else { Ok 'G: default child token has no restricting SIDs' }
   }
-  # For the log: the group view of the same token.
   $r = SbOn @($cmd, '/c', 'whoami /user /groups /fo csv /nh')
   Write-Host "G: whoami under the option (exit=$($r.exit)):`n$($r.out.Trim())"
 
@@ -396,8 +353,7 @@ try {
       @{ tag = 'BUILTIN\Users';       name = 'users'; ace = (ModifyAce 'BU') })) {
     $d = New-AclDir $case.name @($case.ace)
     Seed-Dir $d
-    # ON first: nothing in the directory is owned by the sandbox
-    # account yet.
+    # ON first: nothing in the directory is owned by the sandbox account yet.
     $r = Mutate $d $true
     $s = State $d
     Write-Host "A[$($case.tag)] ON : appended=$($s.appended) created=$($s.created) deleted=$($s.deleted)  out: $($r.out.Trim())"
@@ -407,13 +363,11 @@ try {
     if (-not ($s.appended -or $s.created -or $s.deleted)) {
       Ok "A[$($case.tag)]: write, create and delete denied with the option on"
     }
-    # Reads must be untouched.
     $r = SbOn @($cmd, '/c', "type `"$d\keep.txt`"")
     if ($r.out -notmatch 'KEEP') { Fail "A[$($case.tag)]: READ failed with the option on. raw: $($r.raw)" }
     else { Ok "A[$($case.tag)]: read still allowed with the option on" }
 
-    # OFF: the same three operations succeed — the baseline that makes
-    # the ON half mean something.
+    # OFF: the baseline that makes the ON half mean something.
     Seed-Dir $d
     $r = Mutate $d $false
     $s = State $d
@@ -425,17 +379,13 @@ try {
     }
   }
 
-  # A (observations, never failed): what stays writable by design.
-  # (1) A directory that grants Modify to Everyone — Everyone is in
-  #     the restricting list.
+  # A (observations, never failed): Everyone is in the restricting list.
   $d = New-AclDir 'everyone' @(ModifyAce 'WD')
   Seed-Dir $d
   $null = Mutate $d $true
   $s = State $d
   Write-Host "A-obs[Everyone] ON : appended=$($s.appended) created=$($s.created) deleted=$($s.deleted) (Everyone is a restricting SID; writable is expected)"
-  # (2) A file the sandbox account OWNS (created by the option-off run
-  #     above) in the Authenticated Users directory: can it re-grant
-  #     itself through the owner's implicit WRITE_DAC and then write?
+  # A file the sandbox account OWNS: can it re-grant itself via the owner's WRITE_DAC?
   $owned = Join-Path (Join-Path $root 'au') 'new.txt'
   if (Test-Path $owned) {
     $r = SbOn @($cmd, '/d', '/s', '/c',
@@ -490,17 +440,14 @@ try {
         Fail 'C: wfp verify --write-restricted-token did not report the token shape it probed'
       } else { Ok "C: wfp verify (write-restricted=$flag) reports blocked" }
     }
-    # The same connect from an ordinary sandboxed command. `probe
-    # connect` exits 0 = refused by the fence, 3 = connected.
+    # `probe connect` exits 0 = refused by the fence, 3 = connected.
     $r = SbOn @($ExeAbs, 'probe', 'connect', '--target', $tgt)
     if ($r.exit -eq 0) { Ok "C: out-of-range connect from a write-restricted child refused by the fence ($tgt)" }
     else { Fail "C: out-of-range connect from a write-restricted child was NOT refused (probe exit=$($r.exit); 3 = connected). raw: $($r.raw)" }
-    # The listener was live: the unsandboxed side reaches it.
     $c = [System.Net.Sockets.TcpClient]::new()
     try { $c.Connect('127.0.0.1', $outL.LocalEndpoint.Port) } finally { $c.Dispose() }
   } finally { $outL.Stop() }
 
-  # The permitted loopback range — the path to the host proxies.
   $inL = Bind-Listener ($PortHi..($PortLo + 5))
   $inPort = $inL.LocalEndpoint.Port
   try {
@@ -509,10 +456,6 @@ try {
     else { Fail "C: in-range loopback connect failed from a write-restricted child (probe exit=$($r.exit); want 3). raw: $($r.raw)" }
 
     # ── F: Schannel observation (never fails the run) ──────────────
-    # System32 curl.exe is a Schannel client. The listener accepts the
-    # TCP connect and stays silent, so with a working Schannel the
-    # request times out waiting for a ServerHello; if Schannel cannot
-    # acquire credentials it fails before sending anything.
     $observed = 0
     foreach ($mode in @('OFF', 'ON')) {
       $tail = @($curl, '-sS', '-m', '6', '--ssl-no-revoke', "https://127.0.0.1:$inPort/")
@@ -531,8 +474,6 @@ try {
   if ($r.exit -eq 0 -and $r.out -match 'D-CMD-OK') { Ok 'D: cmd starts' }
   else { Fail "D: cmd did not start. exit=$($r.exit) raw: $($r.raw)" }
 
-  # Windows PowerShell, plus a named mutex and event created and then
-  # opened by name in the session namespace.
   $n = [guid]::NewGuid().ToString('N')
   $ps = "Write-Output D-PS-OK; " +
         "`$m = New-Object System.Threading.Mutex(`$false, 'Local\srt-wr-m-$n'); " +
@@ -558,9 +499,7 @@ try {
     if ($r.exit -eq 0 -and $r.out -match 'D-NODE-OK') { Ok 'D: node starts' }
     else { Fail "D: node did not start. exit=$($r.exit) raw: $($r.raw)" }
 
-    # Two sandboxed node processes over a named pipe. libuv creates
-    # the pipe with no security attributes, i.e. the default
-    # descriptor built from the creating token's default DACL.
+    # libuv creates the pipe with the default descriptor from the token's default DACL.
     $pipe = "srt-wr-pipe-$n"
     $srvJs = @'
 const n=require('net');const p=String.raw`\\.\pipe\NAME`;const s=n.createServer(c=>{c.on('data',d=>{console.log('PIPE-SRV-GOT:'+d);c.end('pong');s.close()})});s.on('error',e=>{console.log('PIPE-SRV-ERR:'+e.code);process.exit(5)});s.listen(p,()=>console.log('PIPE-SRV-LISTENING'));setTimeout(()=>process.exit(7),90000).unref()
@@ -583,18 +522,13 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
           Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $bash) { Fail 'D: git-bash not found under Program Files\Git — row not run' }
   else {
-    # The command substitution makes bash fork, which is where an
-    # msys2 runtime needs its shared named objects.
+    # The command substitution makes bash fork, which needs msys2's shared named objects.
     $r = SbOn @($bash, '-c', 'echo D-BASH-$(echo FORK)-OK')
     if ($r.exit -eq 0 -and $r.out -match 'D-BASH-FORK-OK') { Ok 'D: git-bash starts and forks' }
     else { Fail "D: git-bash did not start or could not fork. exit=$($r.exit) raw: $($r.raw)" }
   }
 
   # ── E: the child cannot reach into the runner ────────────────────
-  # `probe parent-access` (test-hooks build only) runs as the lockdown
-  # child, whose parent is the default build's runner; it tries every
-  # write / code-execution / impersonation right on the runner process
-  # and on each of its threads.
   if (-not $HooksAbs) { Skip 'E (child cannot open the runner process or its threads)' } else {
     $r = SbOn @($HooksAbs, 'probe', 'parent-access')
     $a = JsonLine $r
@@ -817,9 +751,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $t = Try-Denied 'P4-DURING'
   if ($t.bad.Count -eq 0) { Ok 'P4: deny targets in PA (one real-user-owned, one sandbox-owned) hold during a session; the owner cannot take the deny off' }
   else { Fail "P4: during the session: $($t.bad -join '; '). raw: $($t.raw)" }
-  # Between sessions: after the per-session release the ACEs are
-  # still on disk; the next start (which does not list them again)
-  # writes nothing and they still hold.
+  # Between sessions: the next start writes nothing and the ACEs still hold.
   End-Session
   $denyAce = '\(D;[^)]*;;;' + [regex]::Escape($script:grpSid) + '\)'
   foreach ($f in @($denyF, $sbOwned)) {
@@ -832,8 +764,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   else { Fail "P4: in the next session: $($t.bad -join '; '). raw: $($t.raw)" }
 
   # ── P5: the real user and their own file ─────────────────────────
-  # A root that gives the real user no full-control ACE: SYSTEM, and
-  # modify for Authenticated Users.
   $pc = Join-Path $root 'pc'
   New-Item -ItemType Directory -Path $pc -Force | Out-Null
   Set-OnlyAces $pc @('(A;OICI;FA;;;SY)', (ModifyAce 'AU'))
@@ -868,7 +798,6 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   else { Fail "P7: an exec naming the forgotten root ran (exit=$($r.exit)). raw: $($r.raw)" }
 
   # ── P8: no ordinary token while a persistent grant exists ────────
-  # PB and PC are still granted.
   function Refused { param([string] $when)
     $r = SbOff @($cmd, '/d', '/s', '/c', "echo P8-RAN> `"$root\p8-ran.txt`" & echo P8-RAN")
     if ($r.exit -eq 20 -and $r.out -notmatch 'P8-RAN' -and $r.raw -match 'refusing to run' -and -not (Test-Path "$root\p8-ran.txt")) {
@@ -900,8 +829,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   elseif ($still) { Fail "P9: persistent ACEs remain after forget --all (database deleted) on: $($still -join ', ')" }
   elseif ((Sddl $pb) -match '\(A;OICI;RC;;;OW\)') { Fail "P9: PB still carries the OWNER RIGHTS ACE: $(Sddl $pb)" }
   else { Ok 'P9: forget --all removed every persistent ACE, from the marker alone' }
-  # Nothing of a grant stays, and nothing else went with it: each
-  # root's own DACL is the one it had before its first grant.
+  # Each root's own DACL is the one it had before its first grant.
   Write-Host "P9: PB Sddl=$(Sddl $pb)"
   Write-Host "P9: PC Sddl=$(Sddl $pc)"
   foreach ($c in @(@{ n = 'PB'; p = $pb; base = $pbBase }, @{ n = 'PC'; p = $pc; base = $pcBase })) {
@@ -915,11 +843,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $r = SbOff @($cmd, '/d', '/s', '/c', 'echo P9-RUNS')
   if ($r.exit -eq 0 -and $r.out -match 'P9-RUNS') { Ok 'P9: the ordinary token runs again' }
   else { Fail "P9: the ordinary token does not run after forget --all (exit=$($r.exit)). raw: $($r.raw)" }
-  # PB's own DACL names Administrators and SYSTEM only, so with the
-  # grant forgotten the sandbox account has no write access to it
-  # under any token. (A root whose own DACL lets Authenticated Users
-  # or BUILTIN\Users write stays writable to the ordinary token — rows
-  # A — and forgetting a grant does not change that.)
+  # PB's own DACL names Administrators and SYSTEM only: no write access under any token.
   $p9 = Join-Path $pb 'p9.txt'
   $r = SbOff @($cmd, '/d', '/s', '/c', "echo P9-W> `"$p9`"")
   if (-not (Test-Path -LiteralPath $p9)) { Ok 'P9: the ordinary token cannot write a root whose grant was forgotten' }

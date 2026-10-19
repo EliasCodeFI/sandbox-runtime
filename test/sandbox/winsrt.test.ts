@@ -589,8 +589,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       '--write-root',
       roots[1],
     ])
-    // srt-win options: before `--`, and the per-exec denies are
-    // still there, unchanged.
+    // srt-win options sit before `--`; the per-exec denies are unchanged.
     expect(at + 5).toBeLessThanOrEqual(on.argv.indexOf('--deny-write'))
     expect(on.argv.indexOf('--deny-write')).toBeLessThan(on.argv.indexOf('--'))
     // Nothing else changes.
@@ -860,7 +859,6 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     // Appended last, so every earlier entry keeps its index.
     expect(values(on)).toEqual([...values(off), 'http.sslBackend=openssl'])
     expect(on.GIT_CONFIG_COUNT).toBe(String(Number(off.GIT_CONFIG_COUNT) + 1))
-    // On its own (no safe dirs, no schannel knobs) it is still emitted.
     expect(buildGitConfigEnv({ safeDirs: [], opensslBackend: true })).toEqual({
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'http.sslBackend',
@@ -1693,8 +1691,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       denyRead: opts.denyRead,
       denyWrite: opts.denyWrite,
     })
-    // 2 = an input was skipped; 1 = a capability SID, a DACL read or
-    // a DACL write failed. Neither is a session.
+    // 2 = an input was skipped; 1 = a capability SID or DACL step failed.
     for (const status of [1, 2]) {
       spawnSyncSpy.mockRestore()
       spawnSpy.mockRestore()
@@ -1761,9 +1758,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
-    // 3 = the probe child connected (fence open for this token);
-    // 2 = unreachable; 1 = the probe child could not be created
-    // (e.g. the restricted token could not be built) → `error`.
+    // 3 = connected, 2 = unreachable, 1 = no probe child was created.
     for (const [status, probe, code] of [
       [3, 'connected', 'wfp_fence_inactive'],
       [2, 'unreachable', 'wfp_verify_inconclusive'],
@@ -2239,8 +2234,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Write root `dir`, deny on `dir/secret`; both proxy ports external
-  // so initialize() binds nothing.
   const config = (writeRestrictedToken?: boolean): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -2557,8 +2550,7 @@ function restoreGatedOnACompletedRevoke(
   const LAST_START_CALL = perSession ? 'stamp' : 'grant'
   const START_FAILED = perSession ? 'acl_stamp_failed' : 'acl_grant_failed'
   const SID = 'S-1-5-21-1'
-  // For direct helper calls; spawnSync is stubbed, so any existing
-  // file does.
+  // spawnSync is stubbed, so any existing file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
   const RAW_USER = {
     user: {
@@ -2615,8 +2607,6 @@ function restoreGatedOnACompletedRevoke(
     }),
   }
   type Revoke = [how: string, result: () => SyncResult]
-  // A revoke that exits 0 and lists one released path plus `path`
-  // with `status`.
   const reports = (status: string, path = 'p'): SyncResult =>
     exit(
       0,
@@ -2625,28 +2615,23 @@ function restoreGatedOnACompletedRevoke(
         { path, status },
       ]),
     )
-  // The ways a revoke does not complete. (Thunks: `dir` exists only
-  // inside a test.)
+  // Thunks: `dir` exists only inside a test.
   const INCOMPLETE_REVOKES: Revoke[] = [
-    // Partial: srt-win lists the paths it did revoke and exits 1.
     ['exits non-zero', () => exit(1, '[{"path":"p","status":"revoked"}]')],
     ['times out', () => TIMED_OUT],
     ['prints unparseable output', () => exit(0, 'not json')],
     ['prints JSON that is not a list', () => exit(0, '{}')],
     ['lists an outcome with no status', () => exit(0, '[{"path":"p"}]')],
-    // Statuses outside the allow-list — the last one is a status this
-    // code has never heard of.
+    // The last status is one this code has never heard of.
     ...['unreadable', 'failed', 'mismatch', 'someLaterStatus'].map(
       (st): Revoke => [`reports "${st}" for a path`, () => reports(st)],
     ),
-    // What an srt-win without "unreadable" says about a path it could
-    // not open.
+    // What an older srt-win says about a path it could not open.
     [
       'reports "missing" for a path that still exists',
       () => reports('missing', dir),
     ],
   ]
-  // The ways it does.
   const COMPLETE_REVOKES: Revoke[] = [
     ['releases nothing', () => exit(0, '[]')],
     ...['revoked', 'stillHeld', 'downgraded', 'relocated', 'noRow'].map(
@@ -2673,13 +2658,11 @@ function restoreGatedOnACompletedRevoke(
     mkdirSync(join(dir, 'secret'))
     spies = [
       spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      // The WFP probe binds a listener and is once-per-process; it is
-      // not what these tests are about.
+      // The WFP probe binds a listener and is once-per-process.
       spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
         outcome: 'blocked',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
-      // Async spawns: `user status` / `status` at initialize().
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -2706,7 +2689,6 @@ function restoreGatedOnACompletedRevoke(
         return child
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
-      // Sync spawns: every `acl` call.
       spyOn(child_process, 'spawnSync').mockImplementation(((
         _exe: string,
         argv: readonly string[],
@@ -2728,8 +2710,6 @@ function restoreGatedOnACompletedRevoke(
     rmSync(dir, { recursive: true, force: true })
   })
 
-  // Grant on `dir`, deny stamp on `dir/secret`; both proxy ports
-  // external so initialize() binds nothing.
   const config = (): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
@@ -2770,11 +2750,7 @@ function restoreGatedOnACompletedRevoke(
     return h[0] as () => unknown
   }
 
-  /**
-   * The listener registerCleanup() put on 'exit'. It is a function of
-   * its own, which starts with the handler the signals get and then
-   * removes what reset() only reaches after its first await.
-   */
+  /** The listener registerCleanup() put on 'exit'. */
   const exitListener = (): (() => unknown) => {
     const h = (process.listeners('exit') as unknown[]).filter(l =>
       /\bcleanupHandler\(\)/.test(String(l)),
@@ -2848,9 +2824,6 @@ function restoreGatedOnACompletedRevoke(
     }
   }
 
-  // Once a revoke was incomplete, a later revoke that finds nothing
-  // wrong must not unlock the restore: the grant the first one left
-  // may no longer be recorded anywhere.
   describe('after one incomplete revoke in this process', () => {
     beforeEach(async () => {
       await SandboxManager.initialize(config())
@@ -3191,8 +3164,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
-      // The session's token shape is the one the fence was verified
-      // for; a command cannot switch to the other one.
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
         SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
@@ -3233,8 +3204,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       proxyPortRange: PORT_RANGE,
       srtWin: TEST_SRT_WIN,
     })
-    // Long-form paths: the sandbox account cannot resolve an 8.3
-    // component of the runner's profile.
+    // Long-form paths: the sandbox account cannot resolve an 8.3 component.
     const rootA = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-a-')))
     const rootB = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-b-')))
     // No option set: the default.

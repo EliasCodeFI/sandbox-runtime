@@ -126,14 +126,9 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
 ///
-/// `write_restricted` builds the child token write-restricted (see
-/// [`crate::token`]), with `capability_sids` — the capability SIDs of
-/// the session's write roots — among its restricting SIDs, and is
-/// fail-closed: token creation and the runner's process and thread
-/// self-protect must all succeed or no child runs. The runner's own
-/// token is NOT write-restricted, so a child that could open the
-/// runner, or one of its threads, could write wherever
-/// `BUILTIN\Users` can.
+/// `write_restricted` is fail-closed: token creation and the runner's
+/// process and thread self-protect must all succeed, because the
+/// runner's own token is not write-restricted.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
@@ -323,10 +318,8 @@ pub fn run_lockdown(
             )
         });
     }
-    // Runner threads get the process's self-protect DACL before the
-    // child can run (it is still suspended). Here rather than at
-    // entry so it covers every thread the runner has started by the
-    // time the child first runs.
+    // Here rather than at entry, so it covers every thread the runner
+    // has started by the time the (still suspended) child first runs.
     if write_restricted {
         let n = self_protect::protect_own_threads()
             .context("runner thread self-protect (required with --write-restricted-token)")?;
