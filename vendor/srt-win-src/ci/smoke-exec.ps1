@@ -570,8 +570,11 @@ public static class RunnerPoll {
     return owner == 0 || runners.Contains(owner);
   }
   public static string Run(int seconds) {
-    var seen = new HashSet<uint>();
+    // pid -> "ppid first-seen-ms": which launch a process belongs to, and when.
+    var seen = new Dictionary<uint, string>();
+    var firstMs = new Dictionary<uint, long>();
     var opened = new List<string>();
+    DateTime start = DateTime.UtcNow;
     long iterations = 0;
     // One right at a time: CREATE_THREAD, VM_OPERATION, VM_READ, VM_WRITE,
     // DUP_HANDLE, CREATE_PROCESS, WRITE_DAC.
@@ -590,7 +593,11 @@ public static class RunnerPoll {
       for (bool ok = Process32FirstW(s, ref pe); ok; ok = Process32NextW(s, ref pe)) {
         if (String.Equals(pe.szExeFile, "srt-win.exe", StringComparison.OrdinalIgnoreCase)) {
           runners.Add(pe.th32ProcessID);
-          seen.Add(pe.th32ProcessID);
+          if (!seen.ContainsKey(pe.th32ProcessID)) {
+            long ms = (long)(DateTime.UtcNow - start).TotalMilliseconds;
+            firstMs[pe.th32ProcessID] = ms;
+            seen[pe.th32ProcessID] = "SEEN pid=" + pe.th32ProcessID + " ppid=" + pe.th32ParentProcessID + " first_ms=" + ms + " threads=" + pe.cntThreads;
+          }
         }
       }
       foreach (uint pid in runners) {
@@ -598,7 +605,7 @@ public static class RunnerPoll {
           IntPtr h = OpenProcess(a, false, pid);
           if (h == IntPtr.Zero) { continue; }
           CloseHandle(h);
-          if (StillRunner(pid) && opened.Count < 20) { opened.Add("OPENED process pid=" + pid + " access=0x" + a.ToString("x")); }
+          if (StillRunner(pid) && opened.Count < 20) { opened.Add("OPENED process pid=" + pid + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[pid])); }
         }
       }
       var te = new THREADENTRY32();
@@ -609,12 +616,13 @@ public static class RunnerPoll {
           IntPtr h = OpenThread(a, false, te.th32ThreadID);
           if (h == IntPtr.Zero) { continue; }
           CloseHandle(h);
-          if (StillThreadOf(te.th32ThreadID, runners) && opened.Count < 20) { opened.Add("OPENED thread tid=" + te.th32ThreadID + " pid=" + te.th32OwnerProcessID + " access=0x" + a.ToString("x")); }
+          if (StillThreadOf(te.th32ThreadID, runners) && opened.Count < 20) { opened.Add("OPENED thread tid=" + te.th32ThreadID + " pid=" + te.th32OwnerProcessID + " access=0x" + a.ToString("x") + " age_ms=" + ((long)(DateTime.UtcNow - start).TotalMilliseconds - firstMs[te.th32OwnerProcessID])); }
         }
       }
       CloseHandle(s);
     }
-    return "POLL iterations=" + iterations + " seen=" + seen.Count + " opened=" + opened.Count + "\n" + String.Join("\n", opened.ToArray());
+    return "POLL iterations=" + iterations + " seen=" + seen.Count + " opened=" + opened.Count + "\n" +
+      String.Join("\n", opened.ToArray()) + "\n" + String.Join("\n", new List<string>(seen.Values).ToArray());
   }
 }
 "@
@@ -643,11 +651,25 @@ try {
   }
   if (-not $ready) { throw "R9e: the polling process did not start. stderr: $($poll9eErr.Result)" }
   # New runners in every mode while the poll runs: exec, then the egress probe.
-  foreach ($i in 1..3) {
-    $r = RExec @('--', $cmd, '/c', 'echo R9E-LAUNCH')
-    if ($r.out -notmatch 'R9E-LAUNCH') { throw "R9e: a launch during the poll failed. raw: $($r.raw)" }
+  # Each broker's pid is printed: a runner's `ppid` in the poll output names it.
+  $launches9e = @(1..3 | ForEach-Object { , @('exec', '--env', "PATH=$($env:PATH)", '--', $cmd, '/c', 'echo R9E-LAUNCH') })
+  $launches9e += , @('wfp', 'verify', '--target', $v1Tgt)
+  foreach ($argv in $launches9e) {
+    $psiL = [System.Diagnostics.ProcessStartInfo]::new()
+    $psiL.FileName               = $Exe
+    $psiL.UseShellExecute        = $false
+    $psiL.RedirectStandardOutput = $true
+    $psiL.RedirectStandardError  = $true
+    foreach ($a in $argv) { $null = $psiL.ArgumentList.Add($a) }
+    $pL = [System.Diagnostics.Process]::Start($psiL)
+    $oL = $pL.StandardOutput.ReadToEndAsync()
+    $eL = $pL.StandardError.ReadToEndAsync()
+    if (-not $pL.WaitForExit(120000)) { try { $pL.Kill($true) } catch { }; throw "R9e: a launch during the poll hung ($($argv[0]))" }
+    Write-Host "R9e launch: mode=$($argv[0]) broker pid=$($pL.Id) exit=$($pL.ExitCode)"
+    if ($argv[0] -eq 'exec' -and $oL.Result -notmatch 'R9E-LAUNCH') {
+      throw "R9e: a launch during the poll failed. out: $($oL.Result) err: $($eL.Result)"
+    }
   }
-  $null = & $Exe wfp verify --target $v1Tgt
   $rest9e = $poll9e.StandardOutput.ReadToEndAsync()
   if (-not $poll9e.WaitForExit(120000)) { throw 'R9e: the polling process did not finish' }
   $poll9eOut = $rest9e.Result
