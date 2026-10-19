@@ -517,8 +517,21 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
     marker_add(canon, cur).with_context(|| format!("list '{canon}' in the persistent-grant marker"))
 }
 
+/// A kept deny on a multi-link file is refused, as a per-session one
+/// is: the links share one DACL and the rows are keyed by path.
+fn refuse_hardlinked_deny(canon: &str, ace: SbAce, links: u32, is_dir: bool) -> Result<()> {
+    if matches!(ace, SbAce::Deny(_)) && !is_dir && links > 1 {
+        bail!(
+            "deny refused: '{canon}' has {links} hardlink(s); the deny \
+             would be kept or removed through one name only"
+        );
+    }
+    Ok(())
+}
+
 fn record_deny(conn: &Connection, canon: &str, ace: SbAce, root: &str) -> Result<()> {
-    let id = path_id::capture_file_id(canon)?;
+    let (id, links, is_dir) = path_id::capture_id_and_links(canon)?;
+    refuse_hardlinked_deny(canon, ace, links, is_dir)?;
     let prior: Option<(String, Vec<u8>)> = conn
         .query_row(
             "SELECT mask, file_id FROM persistent_denies \
@@ -814,6 +827,17 @@ pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_deny_on_a_hardlinked_file_is_refused() {
+        let deny = SbAce::Deny(acl::DenyMask::WriteDeny);
+        let e = refuse_hardlinked_deny(r"\\?\C:\r\f", deny, 2, false).unwrap_err();
+        assert!(format!("{e:#}").contains("2 hardlink(s)"));
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r\f", deny, 1, false).is_ok());
+        // A directory's link count is not a hard-link count.
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r", deny, 3, true).is_ok());
+        assert!(refuse_hardlinked_deny(r"\\?\C:\r", SbAce::DenyFdc, 3, false).is_ok());
+    }
 
     #[test]
     fn capability_sid_format() {
