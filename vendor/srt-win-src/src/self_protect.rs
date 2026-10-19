@@ -204,7 +204,7 @@ pub fn protect_own_threads() -> Result<usize> {
         GetCurrentProcessId, OpenThread, THREAD_ACCESS_RIGHTS, THREAD_ALL_ACCESS,
     };
     /// `READ_CONTROL | WRITE_DAC` — what replacing a DACL needs.
-    const DACL_RW: u32 = 0x0002_0000 | 0x0004_0000;
+    const DACL_RW: u32 = READ_CONTROL | 0x0004_0000;
 
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
