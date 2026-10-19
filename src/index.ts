@@ -91,6 +91,7 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  FenceOutdatedError,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,

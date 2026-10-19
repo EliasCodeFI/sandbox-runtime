@@ -2081,10 +2081,20 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
 }
 
 /**
+ * {@link WindowsSandboxError} narrowed to `wfp_fence_outdated`: `exec`
+ * launched nothing because the install record shows no current fence.
+ */
+export interface FenceOutdatedError extends WindowsSandboxError {
+  readonly code: 'wfp_fence_outdated'
+  readonly drive?: undefined
+}
+
+/**
  * Parse a structured `srt-win exec` error from its stderr. `exec`
  * emits typed launch failures as a single JSON line
  * `{"code":…,"message":…}` alongside a distinct exit code —
- * `mapped_drive_cwd` is exit **16**. Embedders that spawn the
+ * `mapped_drive_cwd` is exit **16**, `wfp_fence_outdated` exit **19**.
+ * Embedders that spawn the
  * `{argv, env}` from {@link wrapCommandWithSandboxWindows} call
  * this on non-zero exit to surface an actionable
  * {@link WindowsSandboxError} instead of a bare status.
@@ -2097,7 +2107,7 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  */
 export function parseWindowsSandboxError(
   stderr: string,
-): MappedDriveCwdError | undefined {
+): MappedDriveCwdError | FenceOutdatedError | undefined {
   for (const line of stderr.split(/\r?\n/)) {
     const t = line.trim()
     if (!t.startsWith('{') || !t.includes('"code"')) continue
@@ -2119,6 +2129,13 @@ export function parseWindowsSandboxError(
           ),
           { drive: j.drive },
         ) as MappedDriveCwdError
+      }
+      if (j.code === 'wfp_fence_outdated') {
+        return new WindowsSandboxError(
+          'wfp_fence_outdated',
+          j.message ?? 'the installed network fence is not current',
+          'exec',
+        ) as FenceOutdatedError
       }
     } catch {
       // not our line

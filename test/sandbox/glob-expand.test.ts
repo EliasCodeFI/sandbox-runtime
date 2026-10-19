@@ -2307,6 +2307,19 @@ describe('parseWindowsSandboxError', () => {
     expect(err?.message).toContain('DRIVE_REMOTE')
   })
 
+  it('parses the wfp_fence_outdated line exec prints when it launches nothing', () => {
+    const message =
+      'the network fence on this machine is out of date (revision 2; this ' +
+      'build requires revision 3) — re-run `srt-win install` (one UAC prompt)'
+    const err = parseWindowsSandboxError(
+      JSON.stringify({ code: 'wfp_fence_outdated', message }) + '\n',
+    )
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect(err?.code).toBe('wfp_fence_outdated')
+    expect(err?.subcommand).toBe('exec')
+    expect(err?.message).toBe(message)
+  })
+
   it('returns undefined when no typed-error line present', () => {
     expect(parseWindowsSandboxError('srt-win: error: something\n')).toBe(
       undefined,

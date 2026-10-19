@@ -1203,7 +1203,11 @@ if ($r.raw -match 'U2-RAN') { throw "U2: child RAN against an out-of-date fence.
 if ($r.raw -notmatch '(?i)out of date' -or $r.raw -notmatch '(?i)srt-win install') {
   throw "U2: exec message lacks 'out of date' / reinstall hint. raw: $($r.raw)"
 }
-Write-Host 'U2 ok: exec exits 19 with the reinstall hint and does not launch'
+$u2typed = $r.raw -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -First 1
+if (-not $u2typed -or ($u2typed | ConvertFrom-Json).code -ne 'wfp_fence_outdated') {
+  throw "U2: exec refusal is not a typed {code: wfp_fence_outdated} line. raw: $($r.raw)"
+}
+Write-Host 'U2 ok: exec exits 19 with a typed error naming the reinstall, and does not launch'
 
 # U3: wfp verify refuses likewise, before probing.
 $u3Lsn = Bind-Listener (49980..49989)

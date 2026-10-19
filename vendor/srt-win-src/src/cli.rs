@@ -1640,7 +1640,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // The non-elevated broker cannot enumerate filters; the install
             // record's fence revision is what it can check before launching.
             if let Some(have) = install::fence_gap().context("read the install record")? {
-                eprintln!("srt-win: error: {}", wfp::outdated_hint(have));
+                eprintln!(
+                    "{}",
+                    json!({
+                        "code": "wfp_fence_outdated",
+                        "message": wfp::outdated_hint(have),
+                        "reason": wfp::outdated_reason(have),
+                    })
+                );
                 std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
             }
 
