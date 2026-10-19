@@ -424,8 +424,6 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
   })
 
   it('the --env overlay names each variable once ignoring case', () => {
-    // The generated list names each proxy variable in both cases (for
-    // Unix tools), and a caller may spell ours a third way.
     const srtWin = resolveSrtWin({ path: process.execPath })
     const { argv } = wrapCommandWithSandboxWindows({
       command: 'exit 0',
@@ -442,17 +440,12 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
     const names = envArgs.map(e => e.slice(0, e.indexOf('=')))
     expect(repeatedIgnoringCase(names)).toEqual([])
-    // The spelling the case-sensitive Cygwin/MSYS2 tools read: lower
-    // case for the ones wget and curl take, upper for rsync's.
     expect(envArgs).toContain('http_proxy=http://localhost:60080')
     expect(envArgs).toContain('all_proxy=http://localhost:60080')
     expect(envArgs).toContain('grpc_proxy=http://localhost:60080')
     expect(envArgs).toContain('ftp_proxy=socks5h://localhost:60081')
     expect(envArgs).toContain('RSYNC_PROXY=localhost:60081')
-    // Ours over the caller's, whatever the caller's spelling.
     expect(envArgs).toContain('https_proxy=http://localhost:60080')
-    // A name that is no proxy address keeps its spelling, as do the
-    // caller's own.
     expect(envArgs).toContain('NODE_USE_ENV_PROXY=1')
     expect(envArgs).toContain('Path=C:\\caller')
     expect(names).toContain('DOCKER_HTTP_PROXY')
@@ -1857,7 +1850,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     const allProxy = envArgs.find(e => e.startsWith('all_proxy='))
     expect(httpProxy).toMatch(/^http_proxy=http:\/\/.+:\d+$/)
     expect(allProxy).toMatch(/^all_proxy=http:\/\/.+:\d+$/)
-    // One name per variable: Windows reads names ignoring case.
     expect(
       repeatedIgnoringCase(envArgs.map(e => e.slice(0, e.indexOf('=')))),
     ).toEqual([])
@@ -1904,8 +1896,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   // ════════════════════════════════════════════════════════════════
   // Group N — one name per variable in the child's environment
   // ════════════════════════════════════════════════════════════════
-  // Windows reads names ignoring case. A block that spells one name two
-  // ways breaks every process start made through .NET.
 
   it('N1: no name is in the child environment twice ignoring case', async () => {
     const r = await runSandboxed('set')
@@ -1925,7 +1915,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   }, 60_000)
 
   it('N2: clearing a proxy variable clears it', async () => {
-    // `set "NAME="` removes one entry; a second spelling would stay.
     const r = await runSandboxed(
       'set "HTTPS_PROXY=" & set https_proxy & echo N2-DONE',
     )
@@ -1943,8 +1932,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   }, 150_000)
 
   it('N4: Start-Process -RedirectStandardOutput starts its command', async () => {
-    // Windows PowerShell builds that same table before it starts
-    // anything, so with a repeated name the command never ran.
     const r = await runSandboxed(
       `powershell -NoProfile -Command "$o = Join-Path $env:TEMP 'srt-n4-out.txt'; Start-Process cmd -ArgumentList '/c','echo N4-OK' -RedirectStandardOutput $o -Wait -NoNewWindow; Get-Content $o; Remove-Item $o"`,
       120_000,
@@ -2200,9 +2187,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it.skipIf(!existsSync(GIT_BASH))(
     'E6: git-bash sees one http_proxy, in lower case',
     async () => {
-      // The MSYS2 runtime reads names case-sensitively, so a second
-      // spelling is a second variable there, and it hands both on to
-      // every native program it starts.
       const r = await runSandboxed(
         `"${GIT_BASH}" -c "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; /usr/bin/env | /usr/bin/grep -c '^http_proxy='"`,
       )
@@ -2215,9 +2199,6 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it.skipIf(!existsSync(GIT_BASH))(
     'E7: .NET started from git-bash can load its environment',
     async () => {
-      // ProcessStartInfo copies the block into a case-insensitive table
-      // and throws "Item has already been added" on a name spelled two
-      // ways.
       const r = await runSandboxed(
         `"${GIT_BASH}" -c "powershell.exe -NoProfile -Command '(New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count'"`,
         120_000,

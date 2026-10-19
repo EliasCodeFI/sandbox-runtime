@@ -217,9 +217,7 @@ function Get-RepeatedEnvNames {
     ForEach-Object { $_.Name }
 }
 
-# ── R4b: a proxy variable given in upper case reaches the child ──
-# in lower case, once: the spelling Cygwin/MSYS2 programs read. Two
-# spellings in one block break .NET (R4d, R4e).
+# ── R4b: an upper-case proxy variable reaches the child in lower case, once ──
 $r = RExec @('--env', "HTTP_PROXY=http://127.0.0.1:$PortLo",
              '--', $cmd, '/c', 'set http')
 if ($r.exit -ne 0) { throw "R4b: 'set http' exited $($r.exit). out: $($r.out)" }
@@ -233,9 +231,6 @@ if ($n -ne 1) {
 }
 Write-Host 'R4b ok: an overlay proxy var reaches the child in lower case, once'
 
-# An overlay that spells names both ways, as a caller that serves
-# case-sensitive Unix tools would, plus a `*_PROXY` name that is a
-# switch and not an address.
 $bothCases = @(
   '--env', "HTTP_PROXY=http://127.0.0.1:$PortLo",
   '--env', "HTTPS_PROXY=http://127.0.0.1:$PortLo",
@@ -265,7 +260,6 @@ foreach ($name in 'http_proxy', 'https_proxy', 'all_proxy', 'grpc_proxy',
     throw "R4c: $name missing in child under that spelling. out: $($r.out)"
   }
 }
-# With one name, clearing it clears it.
 $r = RExec ($bothCases + @('--', $cmd, '/c',
   'set "NODE_USE_ENV_PROXY=" & set NODE_USE_ENV & echo R4C-DONE'))
 if ($r.out -notmatch 'R4C-DONE' -or $r.out -match '(?im)^NODE_USE_ENV_PROXY=') {
@@ -274,8 +268,6 @@ if ($r.out -notmatch 'R4C-DONE' -or $r.out -match '(?im)^NODE_USE_ENV_PROXY=') {
 Write-Host 'R4c ok: each name once ignoring case; a cleared variable is gone'
 
 # ── R4d: .NET can load the child's environment ───────────────────
-# ProcessStartInfo copies the block into a case-insensitive table and
-# throws "Item has already been added" on a name spelled two ways.
 $r = RExec ($bothCases + @('--', $pwsh, '-NoProfile', '-Command',
   "try { 'R4D-COUNT=' + (New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count } " +
   "catch { 'R4D-ERR: ' + `$_ }"))
@@ -285,8 +277,6 @@ if ($r.out -notmatch 'R4D-COUNT=\d+') {
 Write-Host 'R4d ok: ProcessStartInfo.EnvironmentVariables loads'
 
 # ── R4e: Windows PowerShell Start-Process with redirection ───────
-# The same table is built before anything is started, so with a
-# repeated name nothing starts.
 $r = RExec ($bothCases + @('--', $pwsh, '-NoProfile', '-Command',
   "`$o = Join-Path `$env:TEMP 'srt-r4e-out.txt'; " +
   "try { Start-Process cmd -ArgumentList '/c','echo R4E-OK' -RedirectStandardOutput `$o -Wait -NoNewWindow; Get-Content `$o } " +
@@ -297,15 +287,9 @@ if ($r.out -notmatch 'R4E-OK') {
 Write-Host 'R4e ok: Start-Process -RedirectStandardOutput starts its command'
 
 # ── R4f: an MSYS2 shell sees one name, and so does what it starts ─
-# The shell hands its case-sensitive environment on to a native child
-# as a Windows block, so a second spelling would reach R4d's failure
-# through it.
 $gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
 if (Test-Path $gitBash) {
-  # Two counts: the names that are http_proxy ignoring case, then the
-  # ones spelled in lower case. The script is one argument to `-c`: in
-  # an array literal `,` binds tighter than `+`, so a string joined
-  # there would be split in two, and bash would run only the first.
+  # One argument to `-c`: in an array literal `,` binds tighter than `+`.
   $script = "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; " +
             "/usr/bin/env | /usr/bin/grep -c '^http_proxy='"
   $r = RExec ($bothCases + @('--', $gitBash, '-c', $script))
@@ -313,8 +297,6 @@ if (Test-Path $gitBash) {
   if ($r.exit -ne 0 -or $counts.Count -ne 2 -or $counts[0] -ne '1' -or $counts[1] -ne '1') {
     throw "R4f: expected one http_proxy, in lower case, in the shell's environment; counts: $($counts -join ' / '). exit: $($r.exit). raw: $($r.raw)"
   }
-  # Only the proxy names are counted here: what else the shell's own
-  # startup adds to its environment is not this row's subject.
   $r = RExec ($bothCases + @('--', $gitBash, '-c', 'cmd.exe //c set'))
   $proxyLines = @($r.out -split "`r?`n" | Where-Object { $_ -match '(?i)^[^=]*_proxy=' })
   $repeated = @(Get-RepeatedEnvNames ($proxyLines -join "`n"))

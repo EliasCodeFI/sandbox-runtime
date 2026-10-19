@@ -358,12 +358,8 @@ pub fn run_lockdown(
 /// via `--env`; this function forwards the runner's environment
 /// (= the sandbox user's `LOGON_WITH_PROFILE` defaults) with the
 /// overlay applied on top to the child. No proxy value is invented,
-/// no inherited var is blanked. See [`merge_env`] for the one rule
-/// the block does enforce: no two names equal ignoring case.
-///
-/// Nothing else is added: consumers that need the broker's identity
-/// (e.g. the self-protect probe) discover it by walking the
-/// parent-process chain rather than via an environment variable.
+/// no inherited var is blanked. [`merge_env`] enforces the one rule: no
+/// two names equal ignoring case.
 fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     // Lossless base set — `env::vars()` PANICS on any entry whose
     // key or value is not valid UTF-8 (e.g. a PATH segment with an
@@ -388,26 +384,9 @@ fn encode_env_block(entries: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> V
     out
 }
 
-/// The entries of the child's environment: `inherited` with `overlay`
-/// applied on top, holding **no two names that are equal ignoring
-/// case**.
-///
-/// A block that spells one name two ways breaks programs that load it
-/// into a case-insensitive table (.NET's `Process.Start` throws
-/// `ArgumentException: Item has already been added`), and the second
-/// spelling survives `set "NAME="`.
-///
-/// - Among inherited entries that differ only by case, the first in
-///   the block is kept — the one `GetEnvironmentVariableW` returns.
-/// - An overlay entry replaces, name and value, whatever entry
-///   matches its name ignoring case, including an earlier overlay
-///   entry: the last `--env` wins.
-/// - The names in [`PROXY_NAME_SPELLING`] are then spelled as that
-///   table says. Every other name keeps the spelling it arrived with.
-///
-/// Entries are sorted case-insensitively by name, not by the strict
-/// collation the `CreateProcess` docs describe; the loader and
-/// `GetEnvironmentVariableW` don't enforce ordering.
+/// `inherited` with `overlay` applied on top, holding no two names equal
+/// ignoring case (.NET's `Process.Start` throws on such a block): the first
+/// inherited spelling is kept, and an overlay entry replaces name and value.
 fn merge_env(
     inherited: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     overlay: &[(String, String)],
@@ -444,8 +423,7 @@ fn merge_env(
 
 /// An environment name as Windows compares it: UTF-16 units, each
 /// upper-cased on its own. A unit with no single-unit upper-case form
-/// (a surrogate half, `ß`) stays as it is, so names that are not
-/// valid Unicode fold too and none is dropped.
+/// stays as it is, so names that are not valid Unicode fold too.
 fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -463,25 +441,9 @@ fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
         .collect()
 }
 
-/// The one spelling each proxy variable has in the child's
-/// environment.
-///
-/// A native Windows program looks names up ignoring case, so any one
-/// spelling serves it. A program on the Cygwin/MSYS2 runtime sees
-/// names case-sensitively, so the spelling is the one those read:
-/// wget reads only the lower-case names and curl reads `http_proxy`
-/// in lower case only, gRPC reads `grpc_proxy`, rsync reads only
-/// `RSYNC_PROXY`.
-///
-/// Both spellings cannot be handed to such a program: when it starts
-/// a native child it rebuilds a Windows block from its case-sensitive
-/// environment, and the duplicate reaches everything it starts. The
-/// cost: on that runtime, a script or program that reads only the
-/// upper-case form of a lower-case name here finds it unset.
-///
-/// A name that is not listed (`NODE_USE_ENV_PROXY` is a switch,
-/// `DOCKER_HTTP_PROXY` has upper-case readers only) keeps the
-/// spelling it was given.
+/// The one spelling each proxy variable has in the child's environment: the
+/// one the case-sensitive Cygwin/MSYS2 tools read. Both cannot be given: such
+/// a program hands the duplicate on to every native child it starts.
 const PROXY_NAME_SPELLING: &[&str] = &[
     "http_proxy",
     "https_proxy",
@@ -824,8 +786,7 @@ mod tests {
             .collect()
     }
 
-    /// The merged entries as `(name, value)` strings, having checked
-    /// that no two names are equal ignoring case.
+    /// The merged entries, checked to hold no two names equal ignoring case.
     fn merged(inherited: &[(&str, &str)], over: &[(&str, &str)]) -> Vec<(String, String)> {
         let entries: Vec<(String, String)> = merge_env(os(inherited), &overlay(over))
             .into_iter()
@@ -850,8 +811,6 @@ mod tests {
 
     #[test]
     fn env_overlay_with_both_spellings_yields_one_name() {
-        // What a caller that names each proxy variable in both cases
-        // sends.
         let entries = merged(
             &[("SystemRoot", r"C:\Windows")],
             &[
@@ -893,7 +852,6 @@ mod tests {
             ("rsync_proxy", "RSYNC_PROXY"),
             ("RSYNC_PROXY", "RSYNC_PROXY"),
         ] {
-            // From the overlay, and from the runner's own environment.
             let entries = merged(&[], &[(given, "v")]);
             assert_eq!(entries, vec![(spelled.to_string(), "v".to_string())]);
             let entries = merged(&[(given, "v")], &[]);
@@ -903,8 +861,6 @@ mod tests {
 
     #[test]
     fn env_other_names_keep_their_spelling_and_get_no_second_one() {
-        // Names that end in `_PROXY` but are not in the table, a name
-        // that merely extends the suffix, and an ordinary one.
         let over = [
             ("NODE_USE_ENV_PROXY", "1"),
             ("DOCKER_HTTP_PROXY", "http://localhost:60080"),
@@ -935,7 +891,6 @@ mod tests {
             ],
         );
         assert_eq!(entries.len(), 4, "{entries:?}");
-        // The overlay's value, under the overlay's spelling.
         assert_eq!(value_of(&entries, "PATH"), Some(r"C:\Windows"));
         assert_eq!(
             value_of(&entries, "https_proxy"),
@@ -947,8 +902,6 @@ mod tests {
 
     #[test]
     fn env_inherited_names_that_differ_by_case_yield_the_first() {
-        // A runner started with a block that already spells a name
-        // twice: the first is the one a lookup by name returns.
         let entries = merged(
             &[
                 ("HTTP_PROXY", "http://first:1"),

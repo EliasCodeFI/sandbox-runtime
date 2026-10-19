@@ -2250,9 +2250,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
-  //
-  // Merged ignoring case, as Windows reads names: `generated` names
-  // each proxy variable in both cases for Unix tools, and a caller's
+  // Merged ignoring case, as Windows reads names: a caller's
   // `Https_Proxy` is the same variable as ours.
   const overlay = mergeWindowsEnv(
     { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT },
@@ -2296,10 +2294,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 }
 
 /**
- * The one spelling each of these proxy variables has in a sandboxed
- * command's environment: the one the case-sensitive Cygwin/MSYS2 tools
- * read. Must match `PROXY_NAME_SPELLING` in
- * `vendor/srt-win-src/src/launch.rs`.
+ * The one spelling each proxy variable has in a sandboxed command's
+ * environment. Must match `PROXY_NAME_SPELLING` in launch.rs.
  */
 const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
   'http_proxy',
@@ -2312,15 +2308,9 @@ const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
 ]
 
 /**
- * Merge environment layers the way Windows reads names: ignoring case.
- * A later layer's entry replaces an earlier one, name and value, so the
- * result never holds two names that differ only by case (two such names
- * in one environment block make .NET's `Process.Start` throw). The
- * names in {@link WINDOWS_PROXY_NAME_SPELLING} are spelled as listed;
- * every other name keeps the spelling it was last given.
- *
- * `srt-win exec` enforces the same rule on what it is handed; doing it
- * here keeps the command line to one `--env` per variable.
+ * Merge environment layers ignoring case, as Windows reads names: a later
+ * layer's entry replaces an earlier one, name and value. Two names that
+ * differ only by case in one block make .NET's `Process.Start` throw.
  */
 export function mergeWindowsEnv(
   ...layers: Readonly<Record<string, string | undefined>>[]
