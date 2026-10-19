@@ -237,7 +237,10 @@ pub fn run() -> Result<u32> {
             open_off_loopback_target,
             open_loopback_target,
         } => {
-            crate::self_protect::protect_runner()?;
+            // Not `protect_runner()`: the probe puts other tokens on
+            // its own thread and reads them back, which a thread whose
+            // DACL shuts out the sandbox account refuses. This runner
+            // starts no child that could reach it.
             Ok(crate::probe::run(crate::probe::Targets {
                 target: &target,
                 anonymous: anonymous_target.as_deref(),
