@@ -122,7 +122,7 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// `env_overlay` is `(KEY, VALUE)` pairs overlaid on the runner's
 /// own environment when building the child's env block. Overlay
 /// wins on case-insensitive key conflict; everything else is
-/// passed through verbatim — so the broker's `PATH` + proxy vars
+/// passed through under one name each — so the broker's `PATH` + proxy vars
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
 pub fn run_lockdown(
@@ -199,8 +199,8 @@ pub fn run_lockdown(
         ));
     }
 
-    // 5) Env block — this process's own environment (verbatim) with
-    //    the overlay applied on top; see `build_env_block`.
+    // 5) Env block — this process's own environment with the overlay
+    //    applied on top; see `build_env_block`.
     let mut env = build_env_block(env_overlay);
 
     // 6) Command line + application name.
