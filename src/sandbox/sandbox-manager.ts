@@ -208,23 +208,17 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the ORDINARY child token only (`defaultToken` below:
-// the token `srt-win exec` builds without a flag, which a session
+// That holds for the ordinary child token only (the token a session
 // gets with `windows.writeRestrictedToken: false`). The WFP block
 // filter matches by an access check of the connecting token, and the
-// write-restricted token's restricting SIDs include the capability
-// SIDs of the session's write roots — a different token per session.
-// So under the write-restricted token (the default) every
-// initialize() probes, with that session's token, and nothing is
-// remembered.
-const windowsWfpVerified = { defaultToken: false }
-// The child-token shape initialize() verified the fence for, captured
-// like `srtWinSpawn` so the wrap path uses it rather than `config`:
-// updateConfig() swaps `config` live without re-verifying, and a
-// swapped-in `windows.writeRestrictedToken` must not change the token
-// a command runs under until the next initialize(). Outside a session
-// it is the option's default, so a wrap made there never gets the
-// ordinary token.
+// write-restricted token differs per session (it carries the
+// capability SIDs of the session's write roots), so under it (the
+// default) every initialize() probes.
+let windowsWfpVerified = false
+// The child-token shape initialize() verified the fence for. The wrap
+// path uses this rather than `config`, which updateConfig() swaps
+// live without re-verifying. Outside a session it is the option's
+// default, so a wrap made there never gets the ordinary token.
 let windowsWriteRestrictedToken = true
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
@@ -282,9 +276,8 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
-// 'restored'/'alreadyOriginal' are the pre- same-user-removal
-// srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-// post-. Either is non-anomalous.
+// An older srt-win reports 'restored'/'alreadyOriginal' where a
+// current one reports 'revoked'/'stillHeld'.
 const WINDOWS_ACL_RELEASE_OK = new Set([
   'revoked',
   'stillHeld',
@@ -309,32 +302,14 @@ function logWindowsAclOutcomes(
 }
 
 /**
- * The release-ordering gate, shared by every release path: the deny
- * restore runs only after a revoke that COMPLETED, and never again in
- * this process once one did not. Returns whether it may run.
- *
- * Revoke takes the ALLOW grants off, restore takes the DENY stamps
- * off. If the revoke failed, timed out, was only partial, or reported
- * a path whose grant it could not release, an ALLOW grant may still
- * be on disk — and the sandbox account is shared by every session, so
- * with the stamps gone another session's sandboxed process could
- * write this tree's deny targets (`.git/hooks`, settings files, …).
- * So the stamps stay: they name only the sandbox account's SID and
- * cost the real user nothing.
- *
- * The refusal lasts for the process: a later session's revoke that
- * finds nothing left to release does not show the earlier grant is
- * gone (an older srt-win forgets a path it could not open), so every
- * later reset() keeps its stamps too.
- *
- * What clears them afterwards depends on the srt-win in use. A
- * current one keeps the rows of a grant it could not release, held by
- * this process; once this process has exited, any `srt-win acl`
- * command retries those grants and takes this process's deny stamps
- * off only when all of them are released. An older one has already
- * dropped the row of such a grant: its crash recovery then removes
- * the deny stamps once this process is gone, and the leftover ALLOW
- * entry is recorded nowhere and has to be removed by hand.
+ * Whether the deny restore may run after `revoke`: only after a
+ * revoke that completed, and never again in this process once one did
+ * not. An ALLOW grant may then still be on disk, and the sandbox
+ * account is shared by every session, so with the DENY stamps gone
+ * another session's sandboxed process could write this tree's deny
+ * targets. A later revoke that finds nothing left to release does not
+ * show the earlier grant is gone (an older srt-win forgets a path it
+ * could not open).
  */
 function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   logWindowsAclOutcomes('grant revoke', revoke.outcomes)
@@ -359,6 +334,16 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
     { level: 'error' },
   )
   return false
+}
+
+function releaseWindowsSessionAcls(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+): void {
+  const o = { sandboxUserSid, srtWin }
+  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+  }
 }
 
 /**
@@ -1144,7 +1129,7 @@ async function initializeSteps(
           throw e
         }
       }
-      if (!windowsWfpVerified.defaultToken) {
+      if (!windowsWfpVerified) {
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1155,7 +1140,7 @@ async function initializeSteps(
           config = undefined
           throw e
         }
-        windowsWfpVerified.defaultToken = true
+        windowsWfpVerified = true
       }
     }
     windowsWriteRestrictedToken = writeRestricted
@@ -1259,10 +1244,8 @@ async function initializeSteps(
         acc.denyWrite.length > 0
       if (writeRestricted) {
         // One call: the write roots are granted persistently (kept at
-        // reset(); a root granted before costs one DACL read), the
-        // denies under them are converged with them, and the rest is
-        // per-session as below. A failure throws — there is no
-        // fallback to per-session grants.
+        // reset()), the denies under them are converged with them,
+        // and the rest is per-session as below. A failure throws.
         if (anyApplied) {
           grantWindowsAclPersistent({
             sandboxUserSid: sb,
@@ -1274,9 +1257,7 @@ async function initializeSteps(
           })
         }
         // The egress probe, under the token this session's commands
-        // get. Anything but a refused connect (including a probe
-        // child that could not be created) throws, so the session
-        // never starts with that token unfenced.
+        // get; anything but a refused connect throws.
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
           writeRestrictedToken: true,
@@ -1324,13 +1305,8 @@ async function initializeSteps(
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
-      // Restore only after a completed revoke — see
-      // windowsAclRestoreAllowed.
       if (windowsFsSbUserSid) {
-        const o = { sandboxUserSid: windowsFsSbUserSid, srtWin }
-        if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-          logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-        }
+        releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -2698,9 +2674,7 @@ async function wrapWithSandboxArgv(
     // via `computeWindowsFsAccessSet`.
     // The token shape is session-level: initialize() verified the
     // egress fence for exactly one shape, so a per-command override
-    // would run a shape nobody probed. Refuse it instead of ignoring
-    // it (silently dropping a request to tighten) or honoring it
-    // (running unverified).
+    // that differs is refused.
     const writeRestrictedToken = windowsWriteRestrictedToken
     const perCommandToken = customConfig?.windows?.writeRestrictedToken
     if (
@@ -2981,13 +2955,9 @@ async function reset(): Promise<void> {
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
     const srtWin = srtWinSpawn
-    // Restore only after a completed revoke — see
-    // windowsAclRestoreAllowed. (The 'exit'/signal handler lands
-    // here too: this part of reset() runs synchronously.)
-    const o = { sandboxUserSid: sb, srtWin }
-    if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-      logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
-    }
+    // The 'exit'/signal handler lands here too: this part of
+    // reset() runs synchronously.
+    releaseWindowsSessionAcls(sb, srtWin)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
