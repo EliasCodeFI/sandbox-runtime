@@ -1106,8 +1106,8 @@ async function initializeSteps(
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
         : [...acc.grantRead]
-      // The JVM proxy agent jar is staged in a directory of its own. Every JVM
-      // loads it as code, so the directory is write-denied as well as granted.
+      // Every JVM loads the staged agent jar as code, so its directory is
+      // write-denied as well as read-granted; both stay out of `acc`.
       const denyWrite = [...acc.denyWrite]
       const jar = await getJavaProxyAgentJarPathAsync(
         runtimeConfig.javaAgentJarPath,

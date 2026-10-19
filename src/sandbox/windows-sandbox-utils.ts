@@ -2227,7 +2227,7 @@ export function stageWindowsJavaAgentJar(jarPath: string): string | undefined {
 /**
  * True when `dir` is still the real directory `created` (its `lstat` right
  * after `mkdtemp`) describes, reached through no link. It does NOT close the
- * window after it: `srt-win acl grant`/`stamp` resolve the path again.
+ * window after the check: `srt-win acl grant`/`stamp` resolve the path again.
  */
 export function isUnswappedDirectory(
   dir: string,
@@ -2370,7 +2370,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   })
 
   // The overlay REPLACES the child's own JAVA_TOOL_OPTIONS, so the agent flag
-  // is composed against the broker's value, which may hold -D secrets.
+  // is composed with the broker's value. That may hold -D secrets, hence the
+  // secret tag below.
   const javaToolOptions =
     p.javaAgentJarPath !== undefined
       ? buildJavaToolOptions({
