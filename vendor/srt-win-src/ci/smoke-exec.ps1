@@ -439,15 +439,13 @@ public static class SrtTok {
       Marshal.FreeHGlobal(buf);
     }
   }
-  // Write one SID_AND_ATTRIBUTES, attributes 0, at index i of an array.
   static void PutSid(IntPtr array, int i, IntPtr sid) {
     int size = Marshal.SizeOf(typeof(SidAndAttributes));
     Marshal.WriteIntPtr(array, i * size, sid);
     Marshal.WriteInt32(array, i * size + IntPtr.Size, 0);
   }
   // Make the impersonation token for a shape other than "anonymous".
-  // Returns null on success, with the token in dup for the caller to
-  // close.
+  // Returns null on success; the caller closes dup.
   static string Build(string shape, out IntPtr dup) {
     dup = IntPtr.Zero;
     IntPtr own = IntPtr.Zero, restricted = IntPtr.Zero, psid = IntPtr.Zero;
@@ -467,7 +465,6 @@ public static class SrtTok {
         if (!CreateRestrictedToken(own, 0, 1, ref disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
         source = restricted;
       } else if (shape == "denyall") {
-        // The user SID and every group become deny-only.
         userBuf = Marshal.AllocHGlobal(256);
         if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
         GetTokenInformation(own, TokenGroups, IntPtr.Zero, 0, out ret);
@@ -487,8 +484,7 @@ public static class SrtTok {
         if (!CreateRestrictedTokenLists(own, 0, (uint)count, list, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
         source = restricted;
       } else if (shape == "narrow" || shape == "narrow-wr") {
-        // Ask for Everyone as the only restricting SID. 0x8 =
-        // WRITE_RESTRICTED.
+        // Everyone as the only restricting SID; 0x8 = WRITE_RESTRICTED.
         if (!ConvertStringSidToSidW("S-1-1-0", out psid)) return Fail("sid");
         list = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SidAndAttributes)));
         PutSid(list, 0, psid);
@@ -553,8 +549,6 @@ public static class SrtTok {
       Marshal.FreeHGlobal(buf);
     }
   }
-  // A token's SIDs of one class (groups or restricting SIDs), as
-  // "[sid,sid]".
   static string SidList(IntPtr token, int cls) {
     int ret;
     GetTokenInformation(token, cls, IntPtr.Zero, 0, out ret);
@@ -574,7 +568,6 @@ public static class SrtTok {
       Marshal.FreeHGlobal(buf);
     }
   }
-  // The process token: its user and its restricting SIDs.
   public static string Own() {
     IntPtr own = IntPtr.Zero;
     try {
@@ -586,8 +579,6 @@ public static class SrtTok {
       if (own != IntPtr.Zero) CloseHandle(own);
     }
   }
-  // The token the thread carries now: the impersonation level it reads
-  // back at, its user and its restricting SIDs.
   static string ThreadToken() {
     IntPtr cur = IntPtr.Zero, buf = Marshal.AllocHGlobal(8);
     try {
@@ -614,8 +605,6 @@ public static class SrtTok {
     Array.Copy(a, 0, sa, 4, 4);
     return sa;
   }
-  // One connect on a socket created now, under whatever token the
-  // thread carries.
   static string ConnectNew(string ip, int port) {
     byte[] sa = Sockaddr(ip, port);
     IntPtr s = socket(2, 1, 6);
@@ -628,11 +617,7 @@ public static class SrtTok {
       closesocket(s);
     }
   }
-  // Build and assume a shape, one step at a time, and say how far it
-  // got; then connect, on sockets created under it, to the off-loopback
-  // target (none when offIp is empty) and to the loopback one. Nothing
-  // here is judged: a level below impersonation is printed and the
-  // connects are still tried.
+  // Nothing here is judged: each step is printed and the connects still tried.
   public static string Observe(string shape, string offIp, int offPort, string ip, int port) {
     bool assumed = false;
     string r;
@@ -643,7 +628,6 @@ public static class SrtTok {
       } else {
         IntPtr dup;
         string failed = Build(shape, out dup);
-        // "TOKEN_FAILED:<step>:<code>"
         if (failed != null) return "create=FAILED:" + failed.Substring("TOKEN_FAILED:".Length);
         try {
           if (!SetThreadToken(IntPtr.Zero, dup)) return "create=ok impersonate=FAILED:" + Marshal.GetLastWin32Error();
@@ -814,27 +798,8 @@ try {
 }
 
 # ── R5k: what a child can do with its own token - OBSERVATIONS ────────
-# The filters name the sandbox account's SID. This row prints, for a
-# child launched WITH the write-restricted token and again for one
-# launched with the ordinary token, how far the child gets with each
-# token shape that could make a connect the filters do not attribute
-# to that SID, and what a connect on a socket created under the shape
-# does - to one of this machine's own off-loopback addresses and to an
-# out-of-range loopback port, both with a live listener. The shapes:
-#
-#   anonymous      ImpersonateAnonymousToken
-#   deny-only      a copy of the child's token, user SID deny-only
-#   deny-all       a copy with the user SID and every group deny-only
-#   low-integrity, untrusted-integrity
-#                  a copy at that mandatory level
-#   narrow         a copy whose restricting SIDs were asked to be
-#                  Everyone alone, so without the sandbox user's SID
-#   narrow-wr      the same, asked for with the write-restricted flag
-#
-# Every line starts `WRT obs:` and carries the child's own words (see
-# TokenProbeScript). Nothing here fails the script: a refusal by the
-# kernel is a result and is printed as one; a shape whose line the
-# child did not produce prints NOT EXERCISED with the reason.
+# How far a child (write-restricted, then ordinary token) gets with each token
+# shape, and what a connect under it does. Nothing here fails the script.
 $wrtShapes = [ordered]@{
   'anonymous'           = 'anonymous'
   'deny-only'           = 'denyonly'

@@ -1,17 +1,13 @@
-//! `srt-win probe parent-access` — a CI smoke hook, compiled only
-//! with the `test-hooks` cargo feature. It reports what the calling
-//! process's own token can open in its parent, so the check runs
-//! under exactly the token the sandboxed child gets. It changes no
-//! state.
+//! `srt-win probe parent-access` — a `test-hooks` CI smoke hook: reports
+//! what the calling process's own token can open in its parent, so the
+//! check runs under exactly the sandboxed child's token.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-/// Result of [`parent_access`].
 #[derive(Debug, Serialize)]
 pub struct ParentAccess {
     pub parent_pid: u32,
-    /// How many threads of the parent were probed.
     pub threads: usize,
     /// Every `<object>:<right>` open that **succeeded** — e.g.
     /// `process:PROCESS_VM_WRITE`, `thread:1234:THREAD_SET_CONTEXT`.
@@ -20,8 +16,7 @@ pub struct ParentAccess {
     pub errors: Vec<String>,
 }
 
-/// Process rights that let the holder write to, run code in, or take
-/// the token of the target.
+/// Rights that let the holder write to, run code in, or take the token of the target.
 const PROCESS_RIGHTS: &[(&str, u32)] = &[
     ("PROCESS_TERMINATE", 0x0001),
     ("PROCESS_CREATE_THREAD", 0x0002),
@@ -37,7 +32,6 @@ const PROCESS_RIGHTS: &[(&str, u32)] = &[
     ("WRITE_OWNER", 0x0008_0000),
 ];
 
-/// The thread-side equivalents.
 const THREAD_RIGHTS: &[(&str, u32)] = &[
     ("THREAD_TERMINATE", 0x0001),
     ("THREAD_SUSPEND_RESUME", 0x0002),
@@ -50,13 +44,9 @@ const THREAD_RIGHTS: &[(&str, u32)] = &[
     ("WRITE_OWNER", 0x0008_0000),
 ];
 
-/// Try to open this process's **parent** and each of the parent's
-/// threads with every right in [`PROCESS_RIGHTS`] / [`THREAD_RIGHTS`],
-/// one right per open, and report which opens succeeded. Run as the
-/// lockdown child, the parent is the runner, so an empty `opened`
-/// means the child has no handle-level way to write to the runner,
-/// run code in it, or impersonate it. Handles that do open are closed
-/// at once and never used.
+/// Try to open this process's parent and each of its threads with
+/// every right in [`PROCESS_RIGHTS`] / [`THREAD_RIGHTS`] and report
+/// which opens succeeded.
 pub fn parent_access() -> Result<ParentAccess> {
     use crate::util::{OwnedHandle, parent_pid_of, thread_ids_of};
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;

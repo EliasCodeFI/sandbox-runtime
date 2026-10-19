@@ -2326,7 +2326,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(r.probes.lowIntegrity).toBe('denied')
     expect(r.probes.plain).toBe('blocked')
     expect(r.residuals).toEqual([])
-    // Not mistaken for a skipped attempt.
     expect(r.warnings).toEqual([])
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
@@ -2336,7 +2335,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // A word this version does not know reads as `error`.
     const odd = await runVerify(0, verifyOut({ deny_only_probe: 'novel' }))
     expect(odd.probes.denyOnly).toBe('error')
   })

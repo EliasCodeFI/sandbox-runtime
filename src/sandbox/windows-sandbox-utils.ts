@@ -1105,9 +1105,8 @@ export function interpretWindowsWfpVerify(r: {
         `(stderr: ${JSON.stringify(r.stderr)})`,
     )
   }
-  // An outcome word this version does not know is not a result it
-  // can vouch for: it reads as `error`, never as one of the known
-  // words.
+  // An outcome word this version does not know reads as `error`, never
+  // as one of the known words.
   const outcome = (v: string | undefined): WindowsWfpProbeOutcome =>
     v === undefined
       ? 'skipped'

@@ -1087,10 +1087,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     }
                 }
                 match mv {
-                    // An install by a build with another setup
-                    // version: the same steps bring it to this one,
-                    // and rewrite the filter set at this build's
-                    // revision.
+                    // Another setup version: the same steps bring it to this
+                    // one and rewrite the filter set at this build's revision.
                     Some(v) if v != install::SETUP_VERSION => eprintln!(
                         "srt-win: existing install has setup version {v}; \
                          upgrading it to {} (fence={})",
@@ -1378,8 +1376,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Every document this arm prints says which token the
-            // probe was for.
             let finish = |mut doc: serde_json::Value, exit: i32| -> ! {
                 if write_restricted_token {
                     doc["write_restricted_token"] = json!(true);
@@ -1466,9 +1462,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     1,
                 );
             };
-            // Under the write-restricted token the report is the
-            // child's own, so an identity the kernel refused it is
-            // closed; see `probe::verdict`.
+            // Under the write-restricted token the report is the child's own,
+            // so an identity the kernel refused it is closed (`probe::verdict`).
             let verdict = probe::verdict(&report, write_restricted_token);
             for residual in &verdict.residuals {
                 eprintln!(
@@ -2553,7 +2548,6 @@ mod tests {
                 sub: ProbeCmd::Connect { .. }
             }
         ));
-        // What `wfp verify --write-restricted-token` sends the child.
         for extra in [&[][..], &["--anonymous-target", "192.0.2.7:1"][..]] {
             let mut argv = vec!["srt-win", "probe", "fence", "--target", "127.0.0.1:1"];
             argv.extend_from_slice(extra);

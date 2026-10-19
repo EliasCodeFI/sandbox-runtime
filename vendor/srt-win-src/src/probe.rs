@@ -61,10 +61,9 @@ pub enum Outcome {
     /// No connect was made under the token shape (it could not be
     /// assumed, or did not read back as assumed).
     Error = 6,
-    /// The kernel refused to put the token on the thread: the
-    /// impersonation call returned access-denied. The process cannot
-    /// present that identity at all, so there is no connect to fence.
-    /// The last value a field of [`BITS`] bits holds.
+    /// The kernel refused to put the token on the thread (access-denied
+    /// at the impersonation call): the process cannot present that
+    /// identity. The last value a field of [`BITS`] bits holds.
     Denied = 7,
 }
 
@@ -409,9 +408,8 @@ fn confirm_thread_token(expect: Expect) -> Result<()> {
     Ok(())
 }
 
-/// Context on the error of an impersonation call the kernel answered
-/// with access-denied: the process may not carry that token. Found
-/// again by [`connect_as`], which reports [`Outcome::Denied`] for it.
+/// Context marking an impersonation call the kernel answered with
+/// access-denied; [`connect_as`] reports [`Outcome::Denied`] for it.
 #[derive(Debug)]
 struct ImpersonationRefused(&'static str);
 
@@ -898,7 +896,6 @@ mod tests {
             windows::core::Error::from(ERROR_ACCESS_DENIED),
         );
         assert!(denied.downcast_ref::<ImpersonationRefused>().is_some());
-        // The mark survives context added on the way up.
         let wrapped = denied.context("assuming the token");
         assert!(wrapped.downcast_ref::<ImpersonationRefused>().is_some());
         let other = impersonation_error(
@@ -919,7 +916,6 @@ mod tests {
 
     use Outcome::*;
 
-    /// The verdict when the bare runner probed (the ordinary token).
     fn verdict_runner(r: &Report) -> Verdict {
         verdict(r, false)
     }
@@ -927,11 +923,8 @@ mod tests {
     #[test]
     fn verdict_denied_is_closed_only_for_the_child_token() {
         let all_blocked = report(Blocked, Blocked, Blocked, Blocked);
-        // Each attempt the fence must refuse, refused by the kernel
-        // instead: closed when the child's own token was probed,
-        // inconclusive when the runner stood in for it.
-        // (The anonymous attempts are not among them: refused or
-        // not, they never decide the exit.)
+        // Each attempt the fence must refuse, refused by the kernel instead:
+        // closed for the child's own token, inconclusive for the runner's.
         let mut cases = vec![report(Denied, Blocked, Blocked, Blocked)];
         for field in 0..4 {
             let mut l = [Blocked; 4];
@@ -944,8 +937,7 @@ mod tests {
             assert!(v.residuals.is_empty());
             assert_eq!(verdict(r, false).exit, EXIT_INCONCLUSIVE, "{r:?}");
         }
-        // Refused everywhere it can be: still fenced, no residual —
-        // a token that cannot be assumed leaves nothing open.
+        // A token that cannot be assumed leaves nothing open: no residual.
         let r = lowered(report(Blocked, Denied, Denied, Denied), [Denied; 4]);
         assert_eq!(
             verdict(&r, true),
@@ -954,8 +946,6 @@ mod tests {
                 residuals: vec![]
             }
         );
-        // A refusal elsewhere does not excuse a leak or an unmeasured
-        // attempt, and the other outcomes mean what they meant.
         for child_token in [true, false] {
             let leak = lowered(
                 report(Blocked, Denied, Blocked, Blocked),
@@ -967,7 +957,6 @@ mod tests {
                 [Error, Blocked, Blocked, Blocked],
             );
             assert_eq!(verdict(&odd, child_token).exit, EXIT_INCONCLUSIVE);
-            // A residual is still named beside a refusal.
             let v = verdict(&report(Blocked, Blocked, Denied, Connected), child_token);
             assert_eq!(v.exit, EXIT_FENCED);
             assert_eq!(v.residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
@@ -1069,7 +1058,6 @@ mod tests {
 
     #[test]
     fn verdict_anonymous_egress_is_a_residual_never_a_failure() {
-        // Under both child tokens alike.
         for child_token in [false, true] {
             for through in [Connected, Refused] {
                 let v = verdict(&report(Blocked, through, Blocked, Blocked), child_token);
