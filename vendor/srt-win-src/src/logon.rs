@@ -118,7 +118,7 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
 }
 
 /// Readiness of the Secondary Logon service (`seclogon`) that every
-/// `CreateProcessWithLogonW` routes through; the `seclogon` status field.
+/// `CreateProcessWithLogonW` routes through, as `srt-win status` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeclogonState {
