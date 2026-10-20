@@ -1601,11 +1601,15 @@ const childrenFirst = (paths: Iterable<string>): string[] =>
  * starts under that manifest until the pass is over, for however long the pass
  * is held up between its reading and a removal.
  *
- * The directories, worked out afresh, are still listed again before every
+ * INVARIANT: the directories, worked out afresh, are listed again before every
  * removal (in a pass of over {@link LISTS_BEFORE_EACH_REMOVAL_UP_TO}
  * candidates, whenever the listing is {@link LISTING_GOOD_FOR_MS} old), and
- * what has come to its name keeps what it names: the wrap that waits then finds
- * what it planned on and need not plan again.
+ * what has come to its name keeps what it names. The record above does not make
+ * this redundant. A wrap sees no record of a pass that could go on none, or only
+ * in a directory the wrap does not list (one inside another sandbox, which reads
+ * the shared places and cannot write them); and a pass is on no record in a
+ * directory that was made after it worked out where to go. Where the wrap does
+ * wait, it then finds what it planned on and need not plan again.
  *
  * A manifest is all that names its mount points, so its claim is dropped last,
  * and stays, for a later pass, when the pass turns back, a removal is refused,
