@@ -3819,6 +3819,11 @@ async function generateFilesystemArgs(
   if (!holds) {
     return undefined
   }
+  // A read deny that covers a manifest directory keeps the command out of it
+  // already. Bound on top of that, it could be read after all: other projects'
+  // paths, the pids of their sandboxes.
+  const isInReach = (dir: string): boolean =>
+    !isHiddenByTmpfs(dir, 'writes and reads')
   let started: string | undefined
   let onTheLine = 0
   if (manifest !== undefined) {
@@ -3836,7 +3841,7 @@ async function generateFilesystemArgs(
     // opened by a descriptor number that another wrap's file may have by then.
     args.splice(afterRootBind, 0, '--ro-bind', file, file)
     onTheLine = afterRootBind + 3
-    args.push('--ro-bind', dir, dir)
+    if (isInReach(dir)) args.push('--ro-bind', dir, dir)
   }
   if (names.length > 0 || emptySource !== undefined) {
     registerExitCleanupHandler()
@@ -3846,8 +3851,8 @@ async function generateFilesystemArgs(
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
     for (const manifestDir of manifestDirs) {
-      if (manifestDir !== manifest?.dir) {
-        const dir = canonicalForm(manifestDir)
+      const dir = canonicalForm(manifestDir)
+      if (manifestDir !== manifest?.dir && isInReach(dir)) {
         args.push('--ro-bind-try', dir, dir)
       }
     }

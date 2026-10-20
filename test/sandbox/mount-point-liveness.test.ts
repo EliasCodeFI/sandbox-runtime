@@ -28,6 +28,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
   countMounts,
   indexOfMount,
+  lastMountAt,
   manifestOf as recordedBy,
   RECORD_STEP,
   STEP_SHELL,
@@ -2809,6 +2810,81 @@ describe.if(isLinux)(
       expect(countMounts(command, '--ro-bind', HOME, HOME)).toBe(0)
       expect(countMounts(command, '--ro-bind', BASE, BASE)).toBe(0)
     }, 30000)
+
+    describe('under a read deny', () => {
+      let AREA: string // a write root outside HOME
+      let KEPT: string // where the manifests are kept, under TMP
+      const noRuntimeDirectory = { XDG_RUNTIME_DIR: undefined }
+
+      beforeEach(() => {
+        AREA = join(BASE, 'area')
+        mkdirSync(AREA)
+        KEPT = `${TMP}/srt-mount-points-${UID}`
+      })
+
+      it.each([
+        ['the one this wrap records in', (): string[] => [join(AREA, 'lock')]],
+        ['one it only keeps out of reach', (): string[] => []],
+      ] as const)(
+        'are not bound on top of it, where they could be read after all: %s',
+        (_, denyWithinAllow) => {
+          const command = wrapped(
+            {
+              readConfig: { denyOnly: [TMP] },
+              writeConfig: {
+                allowOnly: [AREA],
+                denyWithinAllow: denyWithinAllow(),
+              },
+            },
+            noRuntimeDirectory,
+          )
+          expect(lastMountAt(command, TMP)).toBe(`--tmpfs ${TMP}`)
+          expect(lastMountAt(command, KEPT)).toBeUndefined()
+        },
+        30000,
+      )
+
+      it('are bound where a write root brings them back into reach', () => {
+        const command = wrapped(
+          {
+            readConfig: { denyOnly: [HOME] },
+            writeConfig: { allowOnly: [TMP], denyWithinAllow: [] },
+          },
+          noRuntimeDirectory,
+        )
+        expect(lastMountAt(command, KEPT)).toBe(`--ro-bind-try ${KEPT} ${KEPT}`)
+      }, 30000)
+
+      it.if(BWRAP_CAN_NAMESPACE)(
+        'show a command nothing of the manifests, its own included',
+        () => {
+          // Run by the process that wrapped it, whose manifest goes with it.
+          const child = inAChild(
+            'run.ts',
+            [
+              `import { spawnSync } from 'node:child_process'`,
+              `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+              `const command = await wrapCommandWithSandboxLinux({`,
+              `  command: ${JSON.stringify(`echo started; ls -A ${TMP}`)},`,
+              `  needsNetworkRestriction: false,`,
+              `  readConfig: { denyOnly: [${JSON.stringify(TMP)}] },`,
+              `  writeConfig: {`,
+              `    allowOnly: [${JSON.stringify(AREA)}],`,
+              `    denyWithinAllow: [${JSON.stringify(join(AREA, 'lock'))}],`,
+              `  },`,
+              `})`,
+              `const run = spawnSync(command, { shell: true, encoding: 'utf8' })`,
+              `console.log(JSON.stringify([command, run.stdout + run.stderr]))`,
+            ],
+            noRuntimeDirectory,
+          )
+          const [command, said] = JSON.parse(child.stdout) as [string, string]
+          expect(dirname(recordedBy(command)!)).toBe(KEPT)
+          expect(said).toBe('started\n')
+        },
+        30000,
+      )
+    })
 
     it('are pinned above the manifest directory under the runtime directory', () => {
       const RUN = join(HOME, 'run', 'user')

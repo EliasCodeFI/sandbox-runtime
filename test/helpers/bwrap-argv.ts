@@ -25,12 +25,13 @@ export const RECORD_STEP =
   'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1" && shift'
 
 /** The mount flags this generator emits with a source and a destination. */
-const MOUNT_FLAGS = ['--bind', '--ro-bind']
+const MOUNT_FLAGS = ['--bind', '--ro-bind', '--ro-bind-try']
 
 /** How many words follow each mount flag this generator emits. */
 const MOUNT_ARITY: Record<string, number> = {
   '--bind': 2,
   '--ro-bind': 2,
+  '--ro-bind-try': 2,
   '--dev-bind': 2,
   '--tmpfs': 1,
   '--dev': 1,
