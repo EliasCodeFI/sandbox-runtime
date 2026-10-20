@@ -202,12 +202,12 @@ const ownManifests = new Map<
 /**
  * The mount points, and the directories they bind from, that no manifest names:
  * of wraps that could record them nowhere, and what a plan has made on the host
- * itself (`madeByAPlan`, which are among `paths`) until a manifest is published
- * that names it, which takes it out of here. No other process knows of them, so
- * they are this process's to remove once none of its wraps is outstanding, and
- * kept until then: in a pass like any other where there is a directory by then,
- * so that a path another process's manifest names is kept, and on its own word
- * where there is none.
+ * itself (`madeByAPlan`, which are among the other two) until a manifest is
+ * published that names it, which takes it out of here. No other process knows of
+ * them, so they are this process's to remove once none of its wraps is
+ * outstanding, and kept until then: in a pass like any other where there is a
+ * directory by then, so that a path another process's manifest names is kept,
+ * and on its own word where there is none.
  */
 const unrecorded = {
   paths: new Set<string>(),
@@ -215,18 +215,23 @@ const unrecorded = {
   madeByAPlan: new Set<string>(),
 }
 
-/** Has `source` removed at this process's own clean-up if no manifest keeps it. */
-export function keepTrackOfMountSource(source: string): void {
-  unrecorded.sources.add(source)
+function keepTrackOf(made: string, among: Set<string>): void {
+  // Else a wrap that could record it nowhere relies on it, whoever makes it now.
+  if (!among.has(made)) unrecorded.madeByAPlan.add(made)
+  among.add(made)
 }
 
 /**
- * The same for a mount point that a plan has made on the host itself, from then
- * until a manifest names it: the plan may come to nothing before that.
+ * Has what a plan has made on the host itself removed at this process's own
+ * clean-up, from then until a manifest names it: the plan may come to nothing
+ * before that.
  */
+export function keepTrackOfMountSource(source: string): void {
+  keepTrackOf(source, unrecorded.sources)
+}
+
 export function keepTrackOfMountPoint(mountPoint: string): void {
-  unrecorded.paths.add(mountPoint)
-  unrecorded.madeByAPlan.add(mountPoint)
+  keepTrackOf(mountPoint, unrecorded.paths)
 }
 
 /**
@@ -1063,9 +1068,10 @@ export function publishMountPointManifest(
       ownManifests.set(file, { commandKey, over: false })
       // Not what an earlier wrap could record nowhere and this one names too:
       // that wrap's sandbox may outlast this manifest.
-      for (const mountPoint of mountPoints) {
-        if (unrecorded.madeByAPlan.delete(mountPoint)) {
-          unrecorded.paths.delete(mountPoint)
+      for (const named of [...mountPoints, ...sources]) {
+        if (unrecorded.madeByAPlan.delete(named)) {
+          unrecorded.paths.delete(named)
+          unrecorded.sources.delete(named)
         }
       }
       return { dir, file, started: `${id}${STARTED_SUFFIX}` }
@@ -1081,11 +1087,11 @@ export function publishMountPointManifest(
       )
     }
   }
-  for (const mountPoint of mountPoints) {
-    unrecorded.paths.add(mountPoint)
-    unrecorded.madeByAPlan.delete(mountPoint)
-  }
+  for (const mountPoint of mountPoints) unrecorded.paths.add(mountPoint)
   for (const source of sources) unrecorded.sources.add(source)
+  for (const named of [...mountPoints, ...sources]) {
+    unrecorded.madeByAPlan.delete(named)
+  }
   return undefined
 }
 

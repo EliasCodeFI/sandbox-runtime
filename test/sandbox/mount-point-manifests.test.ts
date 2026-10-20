@@ -26,6 +26,7 @@ import {
   discardMountPointManifest,
   forgetMountPointManifestDirectory,
   keepTrackOfMountPoint,
+  keepTrackOfMountSource,
   liveMountPoints,
   mountPointManifestDirectories,
   namedMountPoints,
@@ -1148,7 +1149,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   /** Has this process fail to write its next manifest, as on a full disk. */
-  function unrecorded(paths: string[]): void {
+  function unrecorded(paths: string[], sources: string[] = []): void {
     const write = fs.writeFileSync
     const spy = spyOn(fs, 'writeFileSync').mockImplementation(((
       file: unknown,
@@ -1160,7 +1161,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       return (write as (...args: unknown[]) => void)(file, ...rest)
     }) as never)
     try {
-      expect(publishMountPointManifest(paths, [])).toBeUndefined()
+      expect(publishMountPointManifest(paths, sources)).toBeUndefined()
     } finally {
       spy.mockRestore()
     }
@@ -2619,21 +2620,30 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it.each([
-    ['left to bubblewrap to make', () => {}],
-    ['had made itself', () => keepTrackOfMountPoint(X)],
+    ['had no part in making', undefined],
+    ['had made itself', 'the first'],
+    ['had no part in making, and the other made,', 'the second'],
   ])(
     'keeps what one wrap %s and could not record, while another wrap that names it too is cleaned up after',
-    (_, planned) => {
+    (_, madeBy) => {
       // The sandbox of the first may be running over it, and only this process
       // knows: the manifest of the second is not all that names it.
-      planned()
+      const source = join(BASE, 'empty')
+      const planOf = (wrap: string): void => {
+        if (wrap !== madeBy) return
+        keepTrackOfMountPoint(X)
+        keepTrackOfMountSource(source)
+      }
       leftover(X)
-      unrecorded([X])
-      publishMountPointManifest([X], [], 'the second')
+      mkdirSync(source, { mode: 0o700 })
+      planOf('the first')
+      unrecorded([X], [source])
+      planOf('the second')
+      publishMountPointManifest([X], [source], 'the second')
       expect(collectMountPoints({ commandKey: 'the second' })).toEqual([])
-      expect(existsSync(X)).toBe(true)
+      expect([X, source].filter(existsSync)).toEqual([X, source])
       expect(named()).toEqual([X])
-      expect(collectMountPoints('all')).toEqual([X])
+      expect(collectMountPoints('all').sort()).toEqual([X, source].sort())
     },
   )
 
@@ -3010,13 +3020,18 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('names what a plan has made on the host itself from that moment, until a manifest names it', () => {
     const first = reads(namedMountPoints())
+    const source = join(BASE, 'empty')
     keepTrackOfMountPoint(X)
+    keepTrackOfMountSource(source)
     leftover(X)
+    mkdirSync(source, { mode: 0o700 })
     expect([...reads(namedMountPoints(first)).paths]).toEqual([X])
 
     // From then on it is the manifest's, and goes with that.
-    publishMountPointManifest([X], [], 'the command')
-    expect(collectMountPoints({ commandKey: 'the command' })).toEqual([X])
+    publishMountPointManifest([X], [source], 'the command')
+    expect(collectMountPoints({ commandKey: 'the command' }).sort()).toEqual(
+      [X, source].sort(),
+    )
     // What the user puts there afterwards is the user's.
     writeFileSync(X, '')
     expect(named()).toEqual([])
