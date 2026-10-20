@@ -261,7 +261,7 @@ describe('globToRegex', () => {
 
   it('agrees with a reference matcher over generated patterns and paths', () => {
     const piece = fc.constantFrom(
-      ...'[[]]--**??//az09+.^!\\',
+      ...'[[]]--**??//az09+,.^!\\',
       '**/',
       '[a-z]',
       '[z-a]',
@@ -273,10 +273,12 @@ describe('globToRegex', () => {
       '[!z-a]',
       '[!-a]',
       '[!]',
+      '[+--]',
+      '[--0]',
     )
     const pattern = fc.array(piece, { maxLength: 8 }).map(p => p.join(''))
     // A path like the pattern, so that a match is not rare, or any at all.
-    const char = fc.constantFrom(...'[]-*?/az09+.^!\\')
+    const char = fc.constantFrom(...'[]-*?/az09+,.^!\\')
     const pathFor = (p: string): fc.Arbitrary<string> =>
       fc.oneof(
         fc.array(char, { maxLength: 6 }).map(chars => chars.join('')),
