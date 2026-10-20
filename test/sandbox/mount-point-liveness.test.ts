@@ -2124,19 +2124,17 @@ describe.if(isLinux)(
 
     /**
      * Runs `then` when the wrap has decided where its mount points go and has
-     * yet to pin what lies above them: as it makes sure of the manifest
-     * directories for the second time in a plan. The first is before it reads
-     * them.
+     * yet to pin what lies above them: as it asks where the manifest directory
+     * really is, which is pinned too. It asks once in a plan.
      */
     function beforeThePins(then: () => void): { restore(): void } {
-      const mkdir = fs.mkdirSync
-      let times = 0
-      const spy = spyOn(fs, 'mkdirSync').mockImplementation(((
+      const native = fs.realpathSync.native
+      const spy = spyOn(fs.realpathSync, 'native').mockImplementation(((
         dir: unknown,
         ...rest: unknown[]
       ) => {
-        if (dir === runtime.manifestDir() && ++times % 2 === 0) then()
-        return (mkdir as (...args: unknown[]) => unknown)(dir, ...rest)
+        if (dir === runtime.manifestDir()) then()
+        return (native as (...args: unknown[]) => unknown)(dir, ...rest)
       }) as never)
       return { restore: () => spy.mockRestore() }
     }

@@ -662,11 +662,9 @@ function ensureManifestDirectory(): string | undefined {
  * - another user has the name, in a sticky directory: only that user or root
  *   can remove or rename it.
  *
- * With `recording`, the directory this wrap's manifest will go to is settled
- * first, so the wrap can pin what lies above it before it publishes. Throws
- * where it cannot tell whether one of them is there.
+ * Throws where it cannot tell whether one of them is there.
  */
-export function mountPointManifestDirectories(recording = false): string[] {
+export function mountPointManifestDirectories(): string[] {
   if (!onLinux()) {
     return []
   }
@@ -681,9 +679,6 @@ export function mountPointManifestDirectories(recording = false): string[] {
     if (isToBeBound(candidate)) {
       dirs.add(candidate)
     }
-  }
-  if (recording) {
-    ensureManifestDirectory()
   }
   if (manifestDirectory !== undefined && isToBeBound(manifestDirectory)) {
     dirs.add(manifestDirectory)
