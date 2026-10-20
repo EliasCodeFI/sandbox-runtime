@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, extname, join } from 'node:path'
 import {
   collectMountPoints,
   liveMountPoints,
@@ -217,10 +217,11 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
 
   // ---- the pass ------------------------------------------------------------
 
-  it('goes on record before the reading it decides on, stays there while it removes, and is off it afterwards', () => {
+  it('says what is finished and goes on record before the reading it decides on, stays there while it removes, and is off it afterwards', () => {
     leftover(LOCK)
     manifestOfADeadProcess([LOCK])
     const open = fs.openSync
+    const rename = fs.renameSync
     const unlink = fs.unlinkSync
     const seen: string[] = []
     const spies = [
@@ -228,10 +229,17 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
         file: unknown,
         ...rest: unknown[]
       ) => {
-        if (typeof file === 'string' && /\.(pass|claimed)$/.test(file)) {
+        if (typeof file === 'string' && /\.(pass|finished)$/.test(file)) {
           seen.push(file.endsWith('.pass') ? 'on record' : 'reads the claim')
         }
         return (open as (...args: unknown[]) => number)(file, ...rest)
+      }) as never),
+      spyOn(fs, 'renameSync').mockImplementation(((
+        from: string,
+        to: string,
+      ) => {
+        seen.push(`renames to ${extname(to)}`)
+        rename(from, to)
       }) as never),
       spyOn(fs, 'unlinkSync').mockImplementation(((file: string) => {
         if (file === LOCK)
@@ -245,6 +253,8 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       spies.forEach(spy => spy.mockRestore())
     }
     expect(seen).toEqual([
+      'renames to .claimed',
+      'renames to .finished',
       'on record',
       'reads the claim',
       'removes, with 1 on record',
@@ -304,8 +314,10 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       spy.mockRestore()
     }
     expect(existsSync(LOCK)).toBe(true)
-    // Its claim has gone back, for a wrap to read as before.
-    expect(readdirSync(DIR)).toEqual([basename(manifest)])
+    // What it has found finished stays so, and named, for the next.
+    expect(readdirSync(DIR)).toEqual([
+      basename(manifest).replace(/json$/, 'finished'),
+    ])
     expect(collectMountPoints()).toEqual([LOCK])
   })
 
@@ -549,7 +561,12 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     const gaveUp = new AbortController()
     const waiting = passesToEnd([passOf(anotherProcess())], gaveUp.signal)
     gaveUp.abort(new Error('gave up'))
-    await expect(waiting).rejects.toThrow('gave up')
+    expect(
+      await waiting.then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toEqual(new Error('gave up'))
   })
 
   it('is not waited for when it went on record after the wrap had listed them: it has read the manifest', async () => {
@@ -643,7 +660,12 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       readdirSync(DIR).some(name => name.endsWith('.json')),
     )
     gaveUp.abort(new Error('gave up'))
-    await expect(wrapping).rejects.toThrow('gave up')
+    expect(
+      await wrapping.then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toEqual(new Error('gave up'))
   })
 
   it('plans again when a forced clean-up has let go of its manifest while it waited', async () => {
@@ -667,15 +689,18 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     started(manifestOf(kept)!, { pid: deadPid(), start: '1' })
     const gaveUp = new AbortController()
     gaveUp.abort(new Error('gave up'))
-    await expect(
-      wrapCommandWithSandboxLinux({
+    expect(
+      await wrapCommandWithSandboxLinux({
         command: 'true',
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [] },
         writeConfig: { allowOnly: [AREA], denyWithinAllow: [LOCK] },
         abortSignal: gaveUp.signal,
-      }),
-    ).rejects.toThrow()
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toBeInstanceOf(Error)
     expect(existsSync(manifestOf(kept)!)).toBe(true)
     cleanupBwrapMountPoints()
     expect(existsSync(manifestOf(kept)!)).toBe(false)

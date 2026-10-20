@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import {
   chmodSync,
@@ -192,12 +192,17 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   /** The claims in the manifest directory, by name. */
   function claims(): string[] {
-    return readdirSync(DIR).filter(name => name.endsWith('.claimed'))
+    return readdirSync(DIR).filter(name => /\.(claimed|finished)$/.test(name))
   }
 
   /** The name a pass gives `manifest` when it claims it. */
   function claimOf(manifest: string): string {
     return basename(manifest).replace(/\.json$/, '.claimed')
+  }
+
+  /** And the one it gives that claim once it has found no process behind it. */
+  function finishedOf(manifest: string): string {
+    return basename(manifest).replace(/\.json$/, '.finished')
   }
 
   /**
@@ -369,7 +374,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         expect(collectMountPoints()).toEqual([])
         expect(existsSync(inside)).toBe(true)
         // Under its claim, which any later pass takes up.
-        expect(claims()).toEqual([claimOf(manifest)])
+        expect(claims()).toEqual([finishedOf(manifest)])
         expect(named()).toEqual([inside])
       } finally {
         chmodSync(readOnly, 0o755)
@@ -397,7 +402,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       try {
         expect(collectMountPoints('all')).toEqual([])
         expect(existsSync(inside)).toBe(true)
-        expect(claims()).toEqual([claimOf(manifest)])
+        expect(claims()).toEqual([finishedOf(manifest)])
       } finally {
         chmodSync(readOnly, 0o755)
       }
@@ -423,7 +428,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       pass.restore()
     }
     expect(existsSync(X)).toBe(true)
-    expect(claims()).toEqual([claimOf(manifest)])
+    expect(claims()).toEqual([finishedOf(manifest)])
 
     rmSync(stranger)
     expect(collectMountPoints('none')).toEqual([X])
@@ -654,7 +659,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     } finally {
       removal.restore()
     }
-    expect(seen).toEqual([{ manifest: false, claims: [claimOf(manifest)] }])
+    expect(seen).toEqual([{ manifest: false, claims: [finishedOf(manifest)] }])
     expect(readdirSync(DIR)).toEqual([])
   })
 
@@ -773,16 +778,15 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(claims()).toEqual([basename(claim)])
   })
 
-  it('leaves a manifest and its record that were given back while it removed what they name', () => {
-    // The pass that made the claim found a process on the record after this one
-    // had read it, and a sandbox now runs under the manifest again.
+  it('leaves a manifest and its record that are back at its own name while it removes what they name', () => {
+    // No pass gives back what it has found finished. Should the manifest be at
+    // its own name again all the same, a sandbox can start under it.
     const Y = join(BASE, 'second.lock')
     leftover(X)
     leftover(Y)
     const manifest = manifestOfADeadProcess([X, Y])
-    const claim = claimed(manifest)
     const removal = atTheRemovalOf(Y, () => {
-      fs.renameSync(claim, manifest)
+      fs.renameSync(join(DIR, finishedOf(manifest)), manifest)
       started(manifest, thisProcess())
     })
     try {
@@ -1334,7 +1338,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         injected?.restore()
       }
       expect(existsSync(X)).toBe(true)
-      expect(claims()).toEqual([claimOf(manifest)])
+      expect(claims()).toEqual([finishedOf(manifest)])
       expect(collectMountPoints()).toEqual([X])
     })
   }
@@ -1403,7 +1407,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const outer = manifestOfADeadProcess([Q])
     const inner = started(manifestOfADeadProcess(inside), thisProcess())
     expect(collectMountPoints()).toEqual([])
-    expect(claims()).toEqual([claimOf(outer)])
+    expect(claims()).toEqual([finishedOf(outer)])
 
     started(inner, { pid: deadPid(), start: '1' })
     expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
@@ -1419,7 +1423,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       chmodSync(Q, 0o555)
       try {
         expect(collectMountPoints()).toEqual([])
-        expect(claims()).toContain(claimOf(outer))
+        expect(claims()).toContain(finishedOf(outer))
       } finally {
         chmodSync(Q, 0o755)
       }
@@ -1579,6 +1583,230 @@ describe.if(isLinux)('The mount point manifests', () => {
       expect(collectMountPoints()).toEqual([X])
     }
   })
+
+  // ---- what a pass that can judge says for those that cannot ----
+
+  /** Has `manifest` finished by its name, as a pass that could judge it does. */
+  function finished(manifest: string): string {
+    const file = join(DIR, finishedOf(manifest))
+    fs.renameSync(manifest, file)
+    return file
+  }
+
+  it('keeps nothing for a manifest of another PID namespace that is finished by its name, and leaves that one to its own', () => {
+    const Y = join(BASE, 'second.lock')
+    leftover(X)
+    leftover(Y)
+    const theirs = finished(manifestOfADeadProcess([X, Y], { ns: 'pid:[1]' }))
+    manifestOfADeadProcess([X])
+    // A wrap still takes both for mount points, which they are.
+    expect(named()).toEqual([X, Y].sort())
+    expect(live()).toEqual([])
+    expect(collectMountPoints()).toEqual([X])
+    // What it names alone may be another file in that namespace's mounts.
+    expect(existsSync(Y)).toBe(true)
+    expect(readdirSync(DIR)).toEqual([basename(theirs)])
+  })
+
+  it('goes on no record for a manifest of another PID namespace that is finished by its name', () => {
+    leftover(X)
+    finished(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
+    const open = spyOn(fs, 'openSync')
+    try {
+      expect(collectMountPoints()).toEqual([])
+      expect(
+        open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
+      ).toEqual([])
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it('removes what such a manifest names alone once it is seven days old', () => {
+    leftover(X)
+    const theirs = finished(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
+    aged(theirs, 7 * 24 * 60 - 1)
+    expect(collectMountPoints()).toEqual([])
+    aged(theirs, 7 * 24 * 60 + 1)
+    expect(collectMountPoints()).toEqual([X])
+    expect(readdirSync(DIR)).toEqual([])
+  })
+
+  it('does not say of a claim it cannot judge that it is finished', () => {
+    leftover(X)
+    const claim = claimed(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
+    manifestOfADeadProcess([X])
+    expect(collectMountPoints()).toEqual([])
+    expect(existsSync(X)).toBe(true)
+    expect(readdirSync(DIR)).toEqual([basename(claim)])
+  })
+
+  it('does not say so of a claim with a process on its record either', () => {
+    leftover(X)
+    const claim = claimed(started(manifestOfADeadProcess([X]), thisProcess()))
+    collectMountPoints()
+    expect(claims()).toEqual([basename(claim)])
+  })
+
+  it('says so of a claim another pass left, and collects it', () => {
+    leftover(X)
+    const manifest = manifestOfADeadProcess([X])
+    claimed(manifest)
+    const seen: string[][] = []
+    const removal = atTheRemovalOf(X, () => seen.push(claims()))
+    try {
+      expect(collectMountPoints()).toEqual([X])
+    } finally {
+      removal.restore()
+    }
+    expect(seen).toEqual([[finishedOf(manifest)]])
+    expect(readdirSync(DIR)).toEqual([])
+  })
+
+  it("takes the record beside a manifest that is finished by its name for that one's", () => {
+    leftover(X)
+    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
+      pid: deadPid(),
+      start: '1',
+    })
+    const theirs = finished(manifest)
+    aged(recordOf(manifest))
+    expect(collectMountPoints()).toEqual([])
+    expect(readdirSync(DIR).sort()).toEqual(
+      [basename(theirs), basename(recordOf(manifest))].sort(),
+    )
+  })
+
+  it('does not say so of a manifest it only takes for finished by its age: whoever can ask goes on asking', () => {
+    leftover(X)
+    const theirs = aged(
+      manifestOfADeadProcess([X], { ns: 'pid:[1]' }),
+      7 * 24 * 60 + 1,
+    )
+    const seen: string[][] = []
+    const removal = atTheRemovalOf(X, () => seen.push(claims()))
+    try {
+      expect(collectMountPoints()).toEqual([X])
+    } finally {
+      removal.restore()
+    }
+    expect(seen).toEqual([[claimOf(theirs)]])
+    expect(readdirSync(DIR)).toEqual([])
+  })
+
+  it('goes by what it finds, not by the name, where it can ask: a process on the record keeps what the manifest names', () => {
+    leftover(X)
+    const theirs = finished(started(manifestOfADeadProcess([X]), thisProcess()))
+    manifestOfADeadProcess([X])
+    expect(live()).toEqual([X])
+    expect(collectMountPoints()).toEqual([])
+    expect(existsSync(X)).toBe(true)
+    expect(claims()).toEqual([basename(theirs)])
+  })
+
+  it('leaves a claim that could not be given the name to the next pass, with all it names', () => {
+    // Dropped at the claim's name, with X kept for a manifest of another
+    // namespace, a pass over that one would still take it for live.
+    leftover(X)
+    const manifest = manifestOfADeadProcess([X])
+    const rename = fs.renameSync
+    const spy = spyOn(fs, 'renameSync').mockImplementation(((
+      from: string,
+      to: string,
+    ) => {
+      if (to.endsWith('.finished')) {
+        throw Object.assign(new Error('EIO'), { code: 'EIO' })
+      }
+      rename(from, to)
+    }) as never)
+    try {
+      expect(collectMountPoints()).toEqual([])
+    } finally {
+      spy.mockRestore()
+    }
+    expect(existsSync(X)).toBe(true)
+    expect(named()).toEqual([X])
+    expect(collectMountPoints()).toEqual([X])
+    expect(readdirSync(DIR)).toEqual([])
+    expect(existsSync(manifest)).toBe(false)
+  })
+
+  it('finds by name one that the listing missed, and leaves its record', () => {
+    // Renamed while the directory was being listed. Taken for a record without
+    // a manifest it would be dropped, and a wrap would take X for the caller's.
+    leftover(X)
+    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
+      pid: deadPid(),
+      start: '1',
+    })
+    const theirs = finished(manifest)
+    for (const look of [named, () => collectMountPoints('none')]) {
+      const listing = missedByTheNextListing(basename(theirs))
+      try {
+        expect(look()).toEqual(look === named ? [X] : [])
+      } finally {
+        listing.restore()
+      }
+    }
+    expect(existsSync(recordOf(manifest))).toBe(true)
+  })
+
+  it('leaves a path to neither of two clean-ups that cannot judge each other, each of which would keep it for the other', async () => {
+    // Two processes that take themselves to be in PID namespaces of their own,
+    // each with a manifest that names X. Each meets the other once it has made
+    // its claims, and again once it has read and is about to remove or drop.
+    leftover(X)
+    const side = (me: string, other: string, ns: string): string => {
+      const file = join(BASE, `${me}.ts`)
+      const at = (who: string, where: string): string =>
+        JSON.stringify(join(BASE, `${who}.${where}`))
+      const meet = (where: string): string =>
+        `fs.writeFileSync(${at(me, where)}, ''); while (!fs.existsSync(${at(other, where)})) Bun.sleepSync(1)`
+      writeFileSync(
+        file,
+        [
+          `import { spyOn } from 'bun:test'`,
+          `import * as fs from 'node:fs'`,
+          `const readlink = fs.readlinkSync`,
+          `spyOn(fs, 'readlinkSync').mockImplementation((p, ...rest) =>`,
+          `  p === '/proc/self/ns/pid' ? ${JSON.stringify(ns)} : readlink(p, ...rest))`,
+          `const m = await import(${MODULE})`,
+          `m.publishMountPointManifest([${JSON.stringify(X)}], [])`,
+          meet('published'),
+          `const open = fs.openSync`,
+          `const unlink = fs.unlinkSync`,
+          `let met = 0`,
+          `spyOn(fs, 'openSync').mockImplementation((p, ...rest) => {`,
+          `  if (met === 0 && String(p).endsWith('.pass')) { met = 1; ${meet('claimed')} }`,
+          `  return open(p, ...rest)`,
+          `})`,
+          `spyOn(fs, 'unlinkSync').mockImplementation(p => {`,
+          `  if (met === 1) { met = 2; ${meet('read')} }`,
+          `  return unlink(p)`,
+          `})`,
+          `m.collectMountPoints()`,
+        ].join('\n'),
+      )
+      return file
+    }
+    const ended = [
+      side('one', 'other', 'pid:[1]'),
+      side('other', 'one', 'pid:[2]'),
+    ].map(
+      file =>
+        new Promise<number | null>(resolve =>
+          spawn(process.execPath, [file], {
+            env: { ...process.env, TMPDIR: TMP },
+            stdio: 'inherit',
+            timeout: 10000,
+            killSignal: 'SIGKILL',
+          }).on('exit', resolve),
+        ),
+    )
+    expect(await Promise.all(ended)).toEqual([0, 0])
+    expect(existsSync(X)).toBe(false)
+    expect(readdirSync(DIR)).toEqual([])
+  }, 15000)
 
   /** Has every directory be on a file system of that kind, or not say. */
   function onAFileSystemOf(type: number | bigint | Error): {
