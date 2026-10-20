@@ -1777,6 +1777,7 @@ export type LinuxUnheldLinkReason =
 function whyLinksAreNotHeld(
   helperInUse: boolean,
   config: SeccompConfig | undefined,
+  writable: WritablePlaces,
 ): LinuxUnheldLinkReason | undefined {
   if (!helperInUse) return 'no_helper'
   if (config?.holdsLinks !== undefined) {
@@ -1785,7 +1786,7 @@ function whyLinksAreNotHeld(
   // A path the caller gave need name the helper only inside the sandbox.
   const helper = config?.argv0
     ? null
-    : getApplySeccompBinaryPath(config?.applyPath)
+    : getApplySeccompBinaryPath(config?.applyPath, writable)
   if (helper === null || helper === config?.applyPath) return 'not_told'
   // THREAT: read, never run. This is outside any sandbox, and where the
   // library lies in a path the command may write (a checkout, a project's own
@@ -4008,6 +4009,7 @@ export async function wrapCommandWithSandboxLinux(
     const whyNotHeld = whyLinksAreNotHeld(
       applySeccompPrefix !== undefined,
       seccompConfig,
+      writable,
     )
     const {
       args: fsArgs,
