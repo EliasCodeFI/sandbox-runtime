@@ -14,7 +14,9 @@ const ARGS_FILE_ARGV0 = 'srt-args'
 export const STEP_SHELL = ((): string => {
   const bash =
     ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell)) ??
-    ['/bin/sh'].find(shell => basename(realpathSync(shell)) === 'bash')
+    ['/bin/sh'].find(
+      shell => existsSync(shell) && basename(realpathSync(shell)) === 'bash',
+    )
   return bash === undefined ? '/bin/sh -c' : `${bash} -p -c`
 })()
 

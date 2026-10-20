@@ -549,7 +549,12 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     const gaveUp = new AbortController()
     const waiting = passesToEnd([passOf(anotherProcess())], gaveUp.signal)
     gaveUp.abort(new Error('gave up'))
-    await expect(waiting).rejects.toThrow('gave up')
+    expect(
+      await waiting.then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toEqual(new Error('gave up'))
   })
 
   it('is not waited for when it went on record after the wrap had listed them: it has read the manifest', async () => {
@@ -643,7 +648,12 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       readdirSync(DIR).some(name => name.endsWith('.json')),
     )
     gaveUp.abort(new Error('gave up'))
-    await expect(wrapping).rejects.toThrow('gave up')
+    expect(
+      await wrapping.then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toEqual(new Error('gave up'))
   })
 
   it('plans again when a forced clean-up has let go of its manifest while it waited', async () => {
@@ -667,15 +677,18 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     started(manifestOf(kept)!, { pid: deadPid(), start: '1' })
     const gaveUp = new AbortController()
     gaveUp.abort(new Error('gave up'))
-    await expect(
-      wrapCommandWithSandboxLinux({
+    expect(
+      await wrapCommandWithSandboxLinux({
         command: 'true',
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [] },
         writeConfig: { allowOnly: [AREA], denyWithinAllow: [LOCK] },
         abortSignal: gaveUp.signal,
-      }),
-    ).rejects.toThrow()
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      ),
+    ).toBeInstanceOf(Error)
     expect(existsSync(manifestOf(kept)!)).toBe(true)
     cleanupBwrapMountPoints()
     expect(existsSync(manifestOf(kept)!)).toBe(false)
