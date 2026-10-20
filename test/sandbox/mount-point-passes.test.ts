@@ -885,16 +885,29 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
 
   // ---- a process that has exited and is not waited for -------------------------
 
+  /** Whether the shell started as `pid` has become the `sleep` it execs. */
+  const isSleep = (pid: number): boolean =>
+    readFileSync(`/proc/${pid}/comm`, 'utf8') === 'sleep\n'
+
   it('takes a process that has exited for gone, though nothing has asked after it yet', async () => {
     // The shell starts a child and becomes a program that never waits for one.
-    const parent = spawn('sh', ['-c', 'true & echo $!; exec sleep 600'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
+    // The child ends only then: a shell may wait for one that ends before.
+    const go = join(BASE, 'go')
+    const parent = spawn(
+      'sh',
+      [
+        '-c',
+        `(while [ ! -e ${go} ]; do sleep 0.02; done) & echo $!; exec sleep 600`,
+      ],
+      { stdio: ['ignore', 'pipe', 'ignore'] },
+    )
     others.push(parent)
     let said = ''
     parent.stdout.on('data', chunk => (said += String(chunk)))
     await until('the pid of the child', () => said.includes('\n'))
     const pid = Number(said)
+    await until('the shell to be gone', () => isSleep(parent.pid!))
+    writeFileSync(go, '')
     await until('the child to have exited', () =>
       / Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')),
     )
@@ -931,6 +944,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(true)
 
+      await until('the shell to be gone', () => isSleep(parent.pid!))
       process.kill(bwrap, 'SIGKILL')
       await until('bubblewrap to have exited', () =>
         / Z /.test(readFileSync(`/proc/${bwrap}/stat`, 'utf8')),
