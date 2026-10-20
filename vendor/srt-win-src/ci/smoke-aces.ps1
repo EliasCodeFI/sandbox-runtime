@@ -132,11 +132,16 @@ if ($k32::GetLongPathName($Root.FullName, $lp, 1024) -gt 0) {
 }
 Write-Host "smoke-aces: scratch=$Root"
 
+# The scratch-root grant has a holder of its own: `acl restore` is
+# refused while the restoring holder still has a grant recorded.
+$grantHolder = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
+  -ArgumentList @('-NoProfile','-Command','Start-Sleep 3600')
+
 try {
   # The sandbox user has no implicit access to the broker's
   # %TEMP%; grant the scratch root so reads/writes inside it
   # succeed BEFORE the per-row deny ACE is layered on.
-  Stdin @('acl','grant','--holder-pid',$PID,
+  Stdin @('acl','grant','--holder-pid',$grantHolder.Id,
           '--sandbox-user-sid',$sbSid) `
         "{`"write`":[`"$($Root -replace '\\','\\')`"]}"
 
@@ -252,6 +257,47 @@ try {
     & $Exe acl recover 2>&1 | Out-Null
   }
 
+  # ── A32: one path in BOTH deny lists keeps the read deny ────────
+  # One holder, one batch: unlike A13, where two holders meet and
+  # `effective_ace` takes the max over their rows.
+  $f32 = Join-Path $Root 'a32.txt'
+  'A32-DATA' | Set-Content -Encoding ASCII $f32
+  $d32 = Join-Path $Root 'a32dir'
+  $null = New-Item -ItemType Directory -Path $d32
+  $i32 = Join-Path $d32 'inside.txt'
+  'A32-INSIDE' | Set-Content -Encoding ASCII $i32
+  $h32 = Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden `
+         -ArgumentList '/c','timeout','/t','120','/nobreak'
+  try {
+    Stamp @{ denyRead = @($f32, $d32); denyWrite = @($f32, $d32) } $h32.Id
+    foreach ($p in @($f32, $i32)) {
+      $r = RExec @('--', $cmd, '/c', "type `"$p`"")
+      if ($r.exit -eq 0 -or $r.out -match 'A32-') {
+        throw "A32: '$p' is in denyRead and denyWrite and the child " +
+              "READ it. raw: $($r.raw)"
+      }
+    }
+    $r = RExec @('--', $cmd, '/c', "echo nope> `"$f32`"")
+    if ($r.exit -eq 0) {
+      throw "A32: child WRITE succeeded (should be denied). raw: $($r.raw)"
+    }
+  } finally {
+    Stop-Process -Id $h32.Id -Force -ea SilentlyContinue
+    & $Exe acl recover 2>&1 | Out-Null
+  }
+  # The same for one command's own lists, in the other order.
+  $r = RExec @('--deny-write', $f32, '--deny-read', $f32, '--',
+               $cmd, '/c', "type `"$f32`"")
+  if ($r.exit -eq 0 -or $r.out -match 'A32-') {
+    throw "A32: per-exec --deny-write and --deny-read on one file and " +
+          "the child READ it. raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$f32`"")
+  if ($r.out -notmatch 'A32-DATA') {
+    throw "A32: still denied once nothing holds it. raw: $($r.raw)"
+  }
+  Write-Host 'A32 ok: a path in both deny lists — read denied, write denied'
+
   # ── A28: per-exec error after stamp → PerExecRestore Drop runs ──
   $f28 = Join-Path $Root 'a28.txt'
   'A28-DATA' | Set-Content -Encoding ASCII $f28
@@ -314,48 +360,57 @@ try {
   }
   Write-Host 'A29 ok: per-exec broker hard-killed → recover reaps + restores'
 
-  # ── A30: hardlinks — a deny holds under every name of the file ──
+  # ── A30: hardlink guard — refuse any multi-link Deny target ─────
   # NTFS hardlinks share one security descriptor across distinct
-  # canonical paths, while `ace_holders` is PATH-keyed. A converge
-  # counts the rows of EVERY name of the file, so one name's release
-  # leaves what a holder of another still needs.
+  # canonical paths, but `ace_holders` is PATH-keyed. A Deny on
+  # one alias is invisible to a holder of another — releasing it
+  # would write the SHARED DACL back without the deny while the
+  # other holder's child is still running. `ensure_ace` refuses
+  # `links > 1` for ALL Deny callers (per-exec and session-level
+  # `acl stamp` alike — no `refuse_escalation` distinction under
+  # the additive-ACE model).
   $d30  = Join-Path $Root 'a30'
   New-Item -ItemType Directory -Path $d30 | Out-Null
   $f30  = Join-Path $d30 'orig.txt'
   $f30L = Join-Path $d30 'alias.txt'
   'A30-DATA' | Set-Content -Encoding ASCII $f30
   New-Item -ItemType HardLink -Path $f30L -Target $f30 | Out-Null
-  # (a) per-exec --deny-read on one name denies the other, and is
-  #     gone when the exec ends.
-  $r = RExec @('--deny-read', $f30L, '--', $cmd, '/c', "type `"$f30`"")
-  if ($r.out -match 'A30-DATA') {
-    throw "A30(a): read through the file's other name. raw: $($r.raw)"
+  # (a) per-exec --deny-read on a hardlinked file → refused.
+  $r = RExec @('--deny-read', $f30L, '--', $cmd, '/c', 'exit 0')
+  if ($r.exit -eq 0) {
+    throw ("A30(a): per-exec --deny-read on a hardlinked file " +
+           "SUCCEEDED — links>1 gate did not fire. raw: $($r.raw)")
+  }
+  if ($r.raw -notmatch '(?i)deny refused.*has 2 hardlink') {
+    throw "A30(a): expected hardlink refuse; got: $($r.raw)"
+  }
+  if (Has-SbAce $f30L) {
+    throw 'A30(a): hardlinked file was stamped despite refuse'
+  }
+  # (b) session-level `acl stamp` on the original → ALSO refused.
+  #     (Same chokepoint; under the additive-ACE model session
+  #     stamps go through ensure_ace too.)
+  $b30 = (ConvertTo-Json -Compress @{ denyWrite = @($f30) }) `
+         | & $Exe acl stamp --holder-pid $PID `
+                  --sandbox-user-sid $sbSid 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) {
+    throw ("A30(b): session acl stamp on a hardlinked file " +
+           "SUCCEEDED — expected refuse. out: $b30")
+  }
+  if ($b30 -notmatch '(?i)deny refused.*has 2 hardlink') {
+    throw "A30(b): expected hardlink refuse; got: $b30"
   }
   if (Has-SbAce $f30) {
-    throw 'A30(a): the per-exec deny outlived its exec'
+    throw 'A30(b): original was stamped despite refuse'
   }
-  # (b) A session holds one name. A per-exec deny on the other,
-  #     released as its exec ends, leaves the session's.
-  Stamp @{ denyWrite = @($f30) }
-  $r = RExec @('--deny-write', $f30L, '--', $cmd, '/c', 'exit 0')
-  if ($r.exit -ne 0) {
-    throw "A30(b): exec with --deny-write on the other name failed. raw: $($r.raw)"
-  }
-  if (-not (Has-SbAce $f30)) {
-    throw "A30(b): one name's release stripped the deny another name's holder needs"
-  }
-  Restore $PID
-  if (Has-SbAce $f30) {
-    throw 'A30(b): the deny outlived its last holder'
-  }
-  # The grant on $Root inherits into $d30: with no deny left, a child
-  # reads. Without this, (a) would pass for a child that never ran.
+  # The grant on $Root inherits into $d30, so a child without a
+  # deny can still read — confirms neither alias was stamped.
   $rR = RExec @('--', $cmd, '/c', "type `"$f30`"")
   if ($rR.out -notmatch 'A30-DATA') {
-    throw "A30: child denied read with no deny held. raw: $($rR.raw)"
+    throw "A30: child denied read — refuse leaked an ACE. raw: $($rR.raw)"
   }
-  Write-Host ('A30 ok: hardlinks — denied under every name; one ' +
-              "name's release leaves another's deny")
+  Write-Host ('A30 ok: hardlink guard — per-exec AND session ' +
+              'acl stamp refuse multi-link Deny targets')
 
   # ── A31: non-existent deny target → placeholder-create + stamp ──
   # `acl stamp` mkdirs each missing intermediate + creates an empty
@@ -439,9 +494,43 @@ try {
   }
   $a.RemoveAccessRule($rule) | Out-Null; Set-Acl $unw $a
   Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
+
+  # ── A33: restore is refused while its holder has a grant ────────
+  $d33 = Join-Path $Root 'a33'
+  New-Item -ItemType Directory -Path $d33 -Force | Out-Null
+  $f33 = Join-Path $d33 'secret.txt'
+  'A33' | Set-Content -Encoding ASCII $f33
+  $h33 = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
+    -ArgumentList @('-NoProfile','-Command','Start-Sleep 120')
+  try {
+    Stdin @('acl','grant','--holder-pid',$h33.Id,
+            '--sandbox-user-sid',$sbSid) `
+          "{`"write`":[`"$($d33 -replace '\\','\\')`"]}"
+    Stamp @{ denyWrite = @($f33) } $h33.Id
+    $out = & $Exe acl restore --holder-pid $h33.Id `
+             --sandbox-user-sid $sbSid --json 2>$null
+    $code = $LASTEXITCODE
+    $st = @(($out | ConvertFrom-Json) | ForEach-Object { $_.status } |
+            Sort-Object -Unique)
+    if ($code -eq 0 -or ($st -join ',') -ne 'grantPending') {
+      throw ("A33: restore with a grant recorded: exit=$code " +
+             "statuses=$($st -join ',') (want non-zero, grantPending)")
+    }
+    if (-not (Has-SbAce $f33)) {
+      throw 'A33: deny ACE removed by a refused restore'
+    }
+    Run @('acl','revoke','--holder-pid',$h33.Id,'--sandbox-user-sid',$sbSid)
+    Run @('acl','restore','--holder-pid',$h33.Id,'--sandbox-user-sid',$sbSid)
+    if (Has-SbAce $f33) {
+      throw 'A33: deny ACE still present after revoke + restore'
+    }
+    Write-Host ('A33 ok: restore refused while the holder has a grant, ' +
+                'released after revoke')
+  } finally { Stop-Process -Id $h33.Id -Force -ea SilentlyContinue }
 }
 finally {
-  & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
+  & $Exe acl revoke  --holder-pid $grantHolder.Id --sandbox-user-sid $sbSid 2>&1 | Out-Null
+  Stop-Process -Id $grantHolder.Id -Force -ea SilentlyContinue
   & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
   & $Exe acl recover 2>&1 | Out-Null
   if (Test-Path $Root) { Remove-Item -Recurse -Force $Root -ea SilentlyContinue }
