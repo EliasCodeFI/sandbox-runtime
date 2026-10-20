@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { globToRegex } from '../../src/sandbox/sandbox-utils.js'
+import { globToRegex } from '../../src/sandbox/glob-pattern.js'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
