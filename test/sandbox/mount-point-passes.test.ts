@@ -31,10 +31,11 @@ import {
 import { manifestOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
-  deadPid,
+  aDeadProcess,
   leftover,
   type Process,
   processAt,
+  recordOf,
   run,
   sleep,
   started,
@@ -417,10 +418,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   })
 
   it.each([
-    [
-      'its process is gone',
-      (): string => passOf({ pid: deadPid(), start: '1' }),
-    ],
+    ['its process is gone', (): string => passOf(aDeadProcess())],
     [
       'its pid is a later process',
       (): string => {
@@ -684,7 +682,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     // One that has run, whose caller has not cleaned up after it and may run it
     // again.
     const kept = await wrap()
-    started(manifestOf(kept)!, { pid: deadPid(), start: '1' })
+    started(manifestOf(kept)!, aDeadProcess())
     const gaveUp = new AbortController()
     gaveUp.abort(new Error('gave up'))
     expect(
@@ -826,7 +824,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     'asks after every run of a command line that has been run thousands of times: the %s may be the one that lasts',
     which => {
       leftover(LOCK)
-      const gone = Array<Process>(3000).fill({ pid: deadPid(), start: '1' })
+      const gone = Array<Process>(3000).fill(aDeadProcess())
       const manifest = manifestOfADeadProcess([LOCK])
       started(
         manifest,
@@ -843,8 +841,8 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   it('takes a record too long to be read to vouch, like any that cannot be read', () => {
     leftover(LOCK)
     const manifest = manifestOfADeadProcess([LOCK])
-    started(manifest, { pid: deadPid(), start: '1' })
-    const record = manifest.replace(/\.json$/, '.started')
+    started(manifest, aDeadProcess())
+    const record = recordOf(manifest)
     const line = fs.readFileSync(record, 'utf8')
     fs.writeFileSync(
       record,
@@ -868,7 +866,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       name => join(AREA, name),
     ) as [string, string, string]
     for (const mountPoint of [ended, running, notStarted]) leftover(mountPoint)
-    started(publish([ended]), { pid: deadPid(), start: '1' })
+    started(publish([ended]), aDeadProcess())
     started(publish([running]), anotherProcess())
     publish([notStarted])
 
@@ -885,7 +883,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       join(AREA, name),
     ) as [string, string, string]
     for (const mountPoint of [ended, named, other]) leftover(mountPoint)
-    started(publish([ended], 'a'), { pid: deadPid(), start: '1' })
+    started(publish([ended], 'a'), aDeadProcess())
     publish([named], 'b')
     publish([other], 'c')
     expect(collectMountPoints({ commandKey: 'b' }).sort()).toEqual(
@@ -947,10 +945,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       })
       others.push(parent)
       await until('the sandbox to be up', () => existsSync(up))
-      const record = readFileSync(
-        manifestOf(command)!.replace(/\.json$/, '.started'),
-        'utf8',
-      )
+      const record = readFileSync(recordOf(manifestOf(command)!), 'utf8')
       const bwrap = Number(/^\d+/.exec(record)![0])
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(true)
