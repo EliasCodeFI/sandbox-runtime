@@ -3739,20 +3739,6 @@ async function generateFilesystemArgs(
   // a reading taken after the last look at the host above. A directory it left
   // out (the one a placeholder is nested in, a pin) goes with its maker, and the
   // command is then refused its start or, once the pin is mounted, loses it.
-  //
-  // INVARIANT: a manifest directory must never be writable from inside a
-  // sandbox. A command that could delete a manifest could make a running
-  // sandbox's mount points look unused, and one that could write a manifest
-  // could name any path for a collect on the host to remove. This holds for
-  // every wrap that restricts writes, whether or not it names a manifest, and
-  // for every directory some process of this user keeps manifests in, so each
-  // is bound read-only (see mountPointManifestDirectories) with what lies above
-  // it pinned. Emitted after every allow and deny bind, like the two stores
-  // below.
-  //
-  // Each is bound where it really is, not at the name it was worked out as:
-  // bubblewrap makes a bind's destination by name inside the new root, and a
-  // link with an absolute target on the way leads nowhere from there.
   const names = [...mountPoints, ...mountPointsReliedOn()]
   const manifest = publishMountPointManifest(
     names,
@@ -3829,9 +3815,15 @@ async function generateFilesystemArgs(
   if (!holds) {
     return undefined
   }
-  // A read deny that covers a manifest directory keeps the command out of it
-  // already. Bound on top of that, it could be read after all: other projects'
-  // paths, the pids of their sandboxes.
+  // INVARIANT: no manifest directory is writable from inside a sandbox, whether
+  // or not the wrap names a manifest (see mountPointManifestDirectories). Each
+  // is bound read-only after every allow and deny bind, like the two stores
+  // below, and where it really is: bubblewrap makes a bind's destination by name
+  // inside the new root, and a link with an absolute target leads nowhere there.
+  //
+  // A read deny that covers one keeps the command out of it already. Bound on
+  // top of that, it could be read after all: other projects' paths, the pids of
+  // their sandboxes.
   const isInReach = (dir: string): boolean =>
     !isHiddenByTmpfs(dir, 'writes and reads')
   let started: string | undefined

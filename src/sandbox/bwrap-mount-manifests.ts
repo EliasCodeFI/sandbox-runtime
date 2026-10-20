@@ -6,71 +6,33 @@
  * a sandbox is bound over it detaches the mount inside that sandbox, and the
  * denied path can then be created on the host. So a mount point may be removed
  * only when no running sandbox relies on it, and no process can decide that by
- * counting for itself.
+ * counting for itself. README.md, "Write denies on paths that do not exist yet",
+ * tells it in full.
+ * What is kept in a per-user directory, and where its rules are:
  *
- * The sandbox vouches for itself. Each wrap writes a manifest, `<id>.json`, into
- * a per-user directory, naming its mount points and every mount point of
- * another sandbox that its own mounts lie in or bind from. The command line
- * it hands out is a shell that appends its own /proc/self/stat line to
- * `<id>.started` and then execs bubblewrap: the process on record is bubblewrap,
- * recorded before it has made a mount, and the wrap always passes
- * --die-with-parent, so the sandbox dies with it. A manifest is live while a
- * process with a recorded pid and start time exists, and while the process that
- * wrote it exists and has not let go of it (the command line may be run again
- * until then), which it does by claiming it. Any process can ask after both, so
- * cleanup is a garbage collect any process may run at any time.
+ * - `<id>.json`, a manifest: what a wrap relies on, written before its command
+ *   is handed out and bound by bubblewrap before it makes anything ({@link
+ *   publishMountPointManifest}).
+ * - `<id>.started`, its record: the command line appends its own
+ *   /proc/self/stat line and then execs bubblewrap, so the sandbox vouches for
+ *   itself ({@link recordVouches}, {@link isLive}).
+ * - `<id>.claimed` and `<id>.finished`, the names a clean-up gives a manifest
+ *   before it removes what that names, and `<process>.pass`, the clean-up's own
+ *   record, which wraps wait for ({@link collect}, which holds the invariants).
  *
- * bubblewrap binds the manifest before it makes a mount point, and a pass
- * claims a finished manifest, renaming it to `<id>.claimed`, before it removes
- * what that names. A command started after the claim fails having made nothing;
- * one that got past it has its record on disk, which the pass reads after the
- * claim. Whatever cannot be read or asked (a manifest, a record, /proc) counts
- * as live: only "no such process", one that has exited and a different start
- * time end a sandbox.
- *
- * A pass and a wrap each say what they are about before they look at what the
- * other has said. The pass puts itself on record, `<process>.pass`, and then
- * reads the manifests it decides on; the wrap publishes its manifest and then
- * lists the passes, and waits for those under way to end before it looks at the
- * host again and hands its command out. So either the pass has read the
- * manifest and keeps what it names, or the wrap has seen the pass and no
- * sandbox starts until that has removed what it set out to, however long it is
- * held up between its reading and a removal (see {@link collect}).
- *
+ * Whatever cannot be read or asked (a manifest, a record, /proc) counts as live.
  * A reading in doubt refuses every wrap of this user that restricts writes, so
- * NO LASTING STATE OF THE DIRECTORY REFUSES WRAPS FOR EVER. Every source of doubt
- * is either a condition of this process that clears by itself (EMFILE, ENFILE,
- * ENOMEM, EIO on a read), which the age of a file never ends, or a property of
- * what is at a name, which has an end: an hour, or the process on its record.
- * No sandboxed command can write the directory (see below), so what is there
- * and should not be comes from an accident on the host.
- *
- * Two processes protect each other only when each reads what the other writes,
- * and a mount point whose manifest is lost stays for good. So the directories
- * follow from the user id, not the environment, and the first survives a logout
- * and a reboot (see {@link sharedManifestDirectoryNames}).
+ * NO LASTING STATE OF THE DIRECTORY REFUSES WRAPS FOR EVER, AND NONE KEEPS WHAT
+ * IS LEFT FOR EVER: every source of doubt is a condition of this process that
+ * clears by itself, or a property of what is at a name, which has an end (an
+ * hour, seven days, the process on a record, the boot).
  *
  * INVARIANT: all of this rests on the sandboxed command, which has the same
  * uid, being unable to write OR CREATE a directory a pass believes: one it made
- * itself would pass every check of owner and mode. So every wrap that restricts
- * writes makes every one of them, binds it read-only and pins what lies above
- * it inside a write root, before it hands the command out (see {@link
+ * itself would pass every check of owner and mode (see {@link
  * mountPointManifestDirectories}). Not covered: a sandbox this library did not
  * start; a name, or one above it, that is a link inside a write root; a parent
  * that is not there, where the command may make it.
- *
- * /proc/PID is relative to a PID namespace, so a manifest records the namespace
- * that wrote it and only a process in that namespace judges it; to any other it
- * is live, for {@link OTHER_NAMESPACE_MAX_AGE_MS}. It records the boot too: no
- * process of an earlier one runs, where only this kernel reaches the directory.
- * NO LASTING STATE KEEPS WHAT IS LEFT FOR EVER.
- *
- * So a pass that can judge says what it found, for those that cannot: it renames
- * the claim of a manifest with no process left to `<id>.finished`, before the
- * reading it decides on, and they keep nothing on the word of a manifest at that
- * name. Else two passes that cannot judge each other's manifests would each keep
- * a path because the other's names it and drop their own, and nothing would name
- * the path any more (see {@link collect}).
  */
 
 import { randomBytes } from 'node:crypto'
@@ -1353,31 +1315,17 @@ function isEmptyMountPoint(p: string): boolean {
 /**
  * The mount points a sandbox that may still be running relies on, as the
  * manifests say at the moment of the call. For a caller that removes paths of
- * its own accord after a command: removing a mount point from under a running
- * sandbox lifts the deny there.
+ * its own accord after a command: removing one from under a running sandbox
+ * lifts the deny there. README.md, "Removing a path yourself", has the contract.
  *
- * `undefined` when it cannot tell: a manifest directory, its listing, a
- * manifest or a record without a manifest cannot be read or accounted for, so a
- * sandbox may be running on paths that cannot be listed. The caller must then
- * skip every removal of an empty file or an empty directory. It does not throw.
+ * `undefined` when it cannot tell: the caller must then skip every removal of an
+ * empty file or an empty directory. It does not throw. A snapshot, whose only
+ * safe use is to SKIP a removal.
  *
- * A snapshot that may be out of date by the time the caller acts. Its only safe
- * use is to SKIP a removal; a path not being in it never means the path is free
- * to write.
- *
- * A path is in the set only when both hold:
- *
- * - a manifest names it that is live by the clean-up's rule, or this process
- *   could record it nowhere;
- * - what is at the path now is still an empty placeholder, or cannot be looked
- *   at: an empty regular file of any mode with one link, or an empty directory,
- *   and the user's. So a stale or forged manifest never makes a caller spare a
- *   file with content.
- *
- * Paths are as the wraps recorded them: absolute, links above the last
- * component resolved. It answers for the directories this process believes
- * (see {@link believedManifestDirectories}), so a sandbox whose process keeps
- * manifests elsewhere is not seen. Makes nothing on the host. Empty off Linux.
+ * A path is in the set only while a live manifest names it (or this process
+ * could record it nowhere) AND what is there is still an empty placeholder of
+ * the user's, or cannot be looked at: a stale or forged manifest never makes a
+ * caller spare a file with content. Makes nothing on the host. Empty off Linux.
  */
 export function liveMountPoints(): ReadonlySet<string> | undefined {
   const spared = new Set<string>()
