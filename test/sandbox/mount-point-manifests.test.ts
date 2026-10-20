@@ -1211,7 +1211,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     ],
     [
       'a manifest that has arrived cannot be read',
-      () => planted('1-garbage.json', '{ not json'),
+      () => planted('1-garbage.json', '{}'),
     ],
   ] as const) {
     it(`stops removing, and keeps its claim, once ${what}`, () => {
