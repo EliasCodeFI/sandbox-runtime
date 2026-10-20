@@ -1509,8 +1509,10 @@ export async function passesToEnd(
     }
     await new Promise(resolve => setTimeout(resolve, pause))
     signal?.throwIfAborted()
-    const underWay = new Set(passesUnderWay())
-    left = left.filter(pass => underWay.has(pass))
+    // By its own name, which no other has: a directory that has two may be
+    // listed by the other one this time.
+    const underWay = new Set(passesUnderWay().map(pass => path.basename(pass)))
+    left = left.filter(pass => underWay.has(path.basename(pass)))
   }
 }
 

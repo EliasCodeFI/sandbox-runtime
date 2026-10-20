@@ -34,6 +34,7 @@ import {
   setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import { mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
   deadPid,
@@ -2102,6 +2103,29 @@ describe.if(isLinux)('The mount point manifests', () => {
         expect(mountPointManifestDirectories()).toEqual(
           expect.arrayContaining([PLACES[0]!, PLACES[2]!]),
         )
+      },
+    )
+
+    it.each([
+      ['names a mount point', ['absent.lock']],
+      ['names none', []],
+    ])(
+      'are bound once where two of the names lead to one place, by a wrap that %s',
+      async (_, denied) => {
+        rmSync(dirname(PLACES[0]!), { recursive: true })
+        symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+        forgetMountPointManifestDirectory()
+        const command = await wrapCommandWithSandboxLinux({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: {
+            allowOnly: [BASE],
+            denyWithinAllow: denied.map(name => join(BASE, name)),
+          },
+        })
+        expect(
+          mountsOf(command).filter(mount => mount.endsWith(` ${PLACES[2]!}`)),
+        ).toHaveLength(1)
       },
     )
 

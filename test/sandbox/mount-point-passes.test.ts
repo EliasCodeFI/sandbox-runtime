@@ -566,6 +566,17 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     expect(passesUnderWay()).toEqual([later])
   })
 
+  it('is waited for by whichever name its directory is listed', async () => {
+    // Two of the places may be one directory, and which of the names that goes
+    // by may differ from one listing to the next.
+    const listedAs = join(
+      BASE,
+      'the-other-name',
+      basename(passOf(anotherProcess())),
+    )
+    expect(await passesToEnd([listedAs], undefined, 200)).toBe(listedAs)
+  })
+
   // ---- the wrap ----------------------------------------------------------------
 
   it('holds back the command of a wrap that names a mount point, until it is over', async () => {

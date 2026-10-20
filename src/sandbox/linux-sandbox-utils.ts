@@ -3856,11 +3856,11 @@ async function generateFilesystemArgs(
     // The others need only be kept out of the command's reach, so one that has
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
-    for (const manifestDir of manifestDirs) {
-      const dir = canonicalForm(manifestDir)
-      if (manifestDir !== manifest?.dir && isInReach(dir)) {
-        args.push('--ro-bind-try', dir, dir)
-      }
+    // Each where it really is, once: two of the names may lead to one place.
+    const others = new Set(manifestDirs.map(canonicalForm))
+    if (manifest !== undefined) others.delete(canonicalForm(manifest.dir))
+    for (const dir of others) {
+      if (isInReach(dir)) args.push('--ro-bind-try', dir, dir)
     }
   }
 
