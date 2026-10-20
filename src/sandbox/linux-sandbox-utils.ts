@@ -998,10 +998,12 @@ export type LinuxSandboxProfileErrorCode =
   | 'too_many_mount_points'
   /**
    * The mount point manifests cannot be read, so a path cannot be told from a
-   * mount point a running sandbox relies on. It ends by itself: when this
-   * process has descriptors again, when what sits among them and is no manifest
-   * is an hour old, when the process on a record with no manifest has ended.
-   * `.cause` is the file and the reason, which the message holds too.
+   * mount point a running sandbox relies on; or one of their directories cannot
+   * be looked at, so it cannot be kept out of the command's reach. It ends by
+   * itself: when this process has descriptors again, when the file system
+   * answers again, when what sits among them and is no manifest is an hour old,
+   * when the process on a record with no manifest has ended. `.cause` is the
+   * reason, with the file where there is one, which the message holds too.
    */
   | 'mount_points_unreadable'
   /**
@@ -3524,12 +3526,20 @@ async function generateFilesystemArgs(
   // read-only bind protects one only while its name still leads to it, and
   // with the temp dir strictly inside a write root a command could otherwise
   // rename the temp dir aside and make the name again.
-  const manifestDirs =
-    writeConfig !== undefined
-      ? mountPointManifestDirectories(
-          mountPoints.length > 0 || emptySource !== undefined,
-        )
-      : []
+  let manifestDirs: string[] = []
+  if (writeConfig !== undefined) {
+    try {
+      manifestDirs = mountPointManifestDirectories(
+        mountPoints.length > 0 || emptySource !== undefined,
+      )
+    } catch (err) {
+      throw new LinuxSandboxProfileError(
+        'mount_points_unreadable',
+        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
+        errorText(err),
+      )
+    }
+  }
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),

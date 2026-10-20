@@ -666,16 +666,6 @@ function ensureManifestDirectory(): string | undefined {
   }
 }
 
-/** Whether `dir` is a real directory, not a link to one, and the user's. */
-function isOurDirectory(dir: string): boolean {
-  try {
-    const stat = fs.lstatSync(dir)
-    return stat.isDirectory() && stat.uid === process.getuid?.()
-  } catch {
-    return false
-  }
-}
-
 /**
  * Every directory a wrap must bind read-only because some process of this user
  * keeps manifests in it and a collect believes what it finds there: every
@@ -692,23 +682,29 @@ function isOurDirectory(dir: string): boolean {
  *   can remove or rename it.
  *
  * With `recording`, the directory this wrap's manifest will go to is settled
- * first, so the wrap can pin what lies above it before it publishes.
+ * first, so the wrap can pin what lies above it before it publishes. Throws
+ * where it cannot tell whether one of them is there.
  */
 export function mountPointManifestDirectories(recording = false): string[] {
   if (!onLinux()) {
     return []
   }
   const dirs = new Set<string>()
-  for (const candidate of sharedManifestDirectoryNames()) {
+  // A real directory, not a link to one, and the user's. An error of the moment
+  // is not "not there": left unbound on that, it is believed again a moment
+  // later, by this process and by every other.
+  const isToBeBound = (dir: string): boolean =>
+    isOurPrivateDirectory(dir, true, false, false)
+  for (const candidate of sharedManifestDirectoryNames(true)) {
     makeOurPrivateDirectory(candidate)
-    if (isOurDirectory(candidate)) {
+    if (isToBeBound(candidate)) {
       dirs.add(candidate)
     }
   }
   if (recording) {
     ensureManifestDirectory()
   }
-  if (manifestDirectory !== undefined && isOurDirectory(manifestDirectory)) {
+  if (manifestDirectory !== undefined && isToBeBound(manifestDirectory)) {
     dirs.add(manifestDirectory)
   }
   return [...dirs]

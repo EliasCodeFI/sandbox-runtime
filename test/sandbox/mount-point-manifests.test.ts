@@ -33,6 +33,7 @@ import {
   publishMountPointManifest,
   setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
+import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux } from '../helpers/platform.js'
 import {
@@ -2473,6 +2474,32 @@ describe.if(isLinux)('The mount point manifests', () => {
         look.restore()
       }
       expect(collectMountPoints().sort()).toEqual([X, Y].sort())
+    })
+
+    it('are not left unbound when one of them cannot be looked at: no command is handed out', async () => {
+      // One that this process binds and does not believe, so that no reading
+      // of its own is in doubt: a process that can write none of the first
+      // three believes it, with the command in it.
+      mountPointManifestDirectories()
+      const look = failingCall('lstatSync', NAMED[1]!, 'EIO')
+      try {
+        expect(named()).toEqual([])
+        expect(() => mountPointManifestDirectories()).toThrow('EIO')
+        const refused = await wrapCommandWithSandboxLinux({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: { allowOnly: [BASE], denyWithinAllow: [] },
+        }).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect((refused as { code?: string }).code).toBe(
+          'mount_points_unreadable',
+        )
+      } finally {
+        look.restore()
+      }
+      expect(mountPointManifestDirectories()).toContain(NAMED[1]!)
     })
 
     it('reads every directory again once it has claimed, not only where it claimed', () => {
