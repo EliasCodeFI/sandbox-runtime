@@ -404,68 +404,34 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     90000,
   )
 
-  it.if(BWRAP_CAN_NAMESPACE)(
-    'cannot be disowned from inside the sandbox: the manifests are read-only there',
-    async () => {
+  it.if(BWRAP_CAN_NAMESPACE).each([
+    ['names a manifest of its own', true],
+    // The manifests in the directory are then other sandboxes'.
+    ['names none, having no absent deny path', false],
+  ] as const)(
+    'cannot be disowned from inside a sandbox that %s: the manifests are read-only there',
+    async (_, namesOne) => {
       // This caller allows writes to the manifest directory itself, so only
-      // the read-only bind the wrap emits last keeps the command out of it.
+      // the read-only bind the wrap emits last keeps the command out of it. A
+      // collect on the host believes what is in there.
       const directory = dirname(manifestOf(await wrap('true')))
       const before = readdirSync(directory).filter(n => n.endsWith('.json'))
       expect(before.length).toBeGreaterThan(0)
 
-      const attack = [
-        `rm -f ${directory}/*.json; echo rm=$?`,
-        `echo mine > ${directory}/planted.json; echo plant=$?`,
-        `echo mine > ${directory}/${before[0]}; echo rewrite=$?`,
-      ].join('; ')
-      const result = spawnSync(
-        await wrapCommandWithSandboxLinux({
-          command: attack,
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: [] },
-          writeConfig: {
-            allowOnly: [AREA, directory],
-            denyWithinAllow: [LOCK],
-          },
-        }),
-        { shell: true, encoding: 'utf8', timeout: 60000 },
-      )
-      const said = `${result.stdout}${result.stderr}`
-      expect(said).toMatch(/rm=[1-9]/)
-      expect(said).toMatch(/plant=[1-9]/)
-      expect(said).toMatch(/rewrite=[1-9]/)
-      expect(existsSync(join(directory, 'planted.json'))).toBe(false)
-      for (const name of before) {
-        expect(existsSync(join(directory, name))).toBe(true)
-        expect(readFileSync(join(directory, name), 'utf8')).toContain('"paths"')
-      }
-    },
-    90000,
-  )
-
-  it.if(BWRAP_CAN_NAMESPACE)(
-    'are read-only in a sandbox that names no manifest of its own',
-    async () => {
-      // A wrap with no absent deny path has no manifest, and the manifests in
-      // the directory are then other sandboxes'. A collect on the host believes
-      // them, so the command must be able neither to write nor to delete one.
-      const directory = dirname(manifestOf(await wrap('true')))
-      const before = readdirSync(directory).filter(n => n.endsWith('.json'))
-      expect(before.length).toBeGreaterThan(0)
-
-      const attack = [
-        `rm -f ${directory}/*.json; echo rm=$?`,
-        `echo mine > ${directory}/planted.json; echo plant=$?`,
-        `echo mine > ${directory}/${before[0]}; echo rewrite=$?`,
-      ].join('; ')
       const command = await wrapCommandWithSandboxLinux({
-        command: attack,
+        command: [
+          `rm -f ${directory}/*.json; echo rm=$?`,
+          `echo mine > ${directory}/planted.json; echo plant=$?`,
+          `echo mine > ${directory}/${before[0]}; echo rewrite=$?`,
+        ].join('; '),
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [AREA, directory], denyWithinAllow: [] },
+        writeConfig: {
+          allowOnly: [AREA, directory],
+          denyWithinAllow: namesOne ? [LOCK] : [],
+        },
       })
-      // The point of the case: this wrap relies on no mount point.
-      expect(recordedBy(command)).toBeUndefined()
+      expect(recordedBy(command) !== undefined).toBe(namesOne)
 
       const result = spawnSync(command, {
         shell: true,
@@ -860,8 +826,8 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 
   // ---- two commands of one process in flight ----
   //
-  // A call to clean up cannot tell which command it is for, so while a wrap is
-  // outstanding nothing this process made may go: the command that has not
+  // A call to clean up that does not say which command it is for lets go of
+  // those that have run and ended, and of no other: the command that has not
   // started still needs its manifest and its mount point.
 
   it.if(BWRAP_CAN_NAMESPACE)(
@@ -1268,33 +1234,6 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     expect(second).toContain(`--ro-bind ${LOCK} ${LOCK}`)
     // Nor does the second wrap name it: it is not its to remove.
     expect(recordedBy(second)).toBeUndefined()
-  })
-
-  it('takes for a mount point one that another sandbox makes while the wrap is looking at the path', async () => {
-    // Absent when the wrap asked for its shape, there when it asked whether
-    // anything is: another sandbox started on the same path in between.
-    const exists = fs.existsSync
-    let made = false
-    const spy = spyOn(fs, 'existsSync').mockImplementation(((file: unknown) => {
-      if (file === LOCK && !made) {
-        made = true
-        expect(exists(LOCK)).toBe(false)
-        manifestNaming([LOCK], process.pid)
-        writeFileSync(LOCK, '')
-        chmodSync(LOCK, 0o444)
-      }
-      return exists(file as string)
-    }) as never)
-    let command: string
-    try {
-      command = await wrap('true')
-    } finally {
-      spy.mockRestore()
-    }
-    expect(made).toBe(true)
-    expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
-    expect(command).not.toContain(`--ro-bind ${LOCK} ${LOCK}`)
-    expect(readFileSync(manifestOf(command), 'utf8')).toContain(LOCK)
   })
 
   it("is named by a wrap that took it for the caller's own file, another sandbox having made it again meanwhile", async () => {

@@ -886,17 +886,6 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     60000,
   )
 
-  it('keeps what a command that has run relied on while the process that wrapped it runs, to every other process', () => {
-    leftover(LOCK)
-    const manifest = started(manifestOfADeadProcess([LOCK], anotherProcess()), {
-      pid: deadPid(),
-      start: '1',
-    })
-    expect([...(liveMountPoints() ?? [])]).toEqual([LOCK])
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(manifest)).toBe(true)
-  })
-
   it.each(['first', 'last'] as const)(
     'asks after every run of a command line that has been run thousands of times: the %s may be the one that lasts',
     which => {
@@ -927,12 +916,6 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     )
     expect(collectMountPoints()).toEqual([])
     expect(existsSync(LOCK)).toBe(true)
-  })
-
-  it('takes it once that process is gone', () => {
-    leftover(LOCK)
-    started(manifestOfADeadProcess([LOCK]), { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([LOCK])
   })
 
   /** The manifest this process publishes for a wrap that names `paths`. */

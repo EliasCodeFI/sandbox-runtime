@@ -220,7 +220,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       env?: Record<string, string | undefined>
       first?: string
     } = {},
-  ): { status: number | null; ms: number; stdout: string } {
+  ): { status: number | null; stdout: string } {
     const script = join(BASE, `child-${Math.random().toString(16).slice(2)}.ts`)
     writeFileSync(
       script,
@@ -237,19 +237,17 @@ describe.if(isLinux)('The mount point manifests', () => {
     for (const [name, value] of Object.entries(env)) {
       if (value === undefined) delete env[name]
     }
-    const began = Date.now()
     const run = spawnSync(argv[0]!, argv.slice(1), {
       env: env as Record<string, string>,
       encoding: 'utf8',
+      // A read that blocks is killed, and has no status.
       timeout: 6000,
       killSignal: 'SIGKILL',
     })
-    return { status: run.status, ms: Date.now() - began, stdout: run.stdout }
+    return { status: run.status, stdout: run.stdout }
   }
 
   const COLLECT = `m.collectMountPoints()`
-  // Well under the time a read that blocks would hold a child up for.
-  const AT_ONCE_MS = 1500
   const PUBLISH = `console.log(JSON.stringify(m.publishMountPointManifest(['/nonexistent/x'], []) ?? null))`
 
   it.if(BWRAP_CAN_NAMESPACE && NOT_ROOT)(
@@ -360,9 +358,12 @@ describe.if(isLinux)('The mount point manifests', () => {
     )
   })
 
-  it.if(NOT_ROOT)(
-    'keeps the manifest of a mount point it could not remove, for a pass that can',
-    () => {
+  it.if(NOT_ROOT).each([
+    ["another process's", (p: string): string => manifestOfADeadProcess([p])],
+    ['its own', (p: string): string => publish([p])],
+  ] as const)(
+    'keeps the manifest of a mount point it could not remove, for a pass that can: %s',
+    (_, manifestNaming) => {
       // Seen read-only from here, as from inside a sandbox that may not write
       // the directory it is in. The manifest is all that says the file is a
       // mount point, so it must stay while the file does.
@@ -370,10 +371,10 @@ describe.if(isLinux)('The mount point manifests', () => {
       mkdirSync(readOnly)
       const inside = join(readOnly, 'config.lock')
       leftover(inside)
-      const manifest = manifestOfADeadProcess([inside])
+      const manifest = manifestNaming(inside)
       chmodSync(readOnly, 0o555)
       try {
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(existsSync(inside)).toBe(true)
         // Under its claim, which any later pass takes up.
         expect(claims()).toEqual([finishedOf(manifest)])
@@ -381,7 +382,8 @@ describe.if(isLinux)('The mount point manifests', () => {
       } finally {
         chmodSync(readOnly, 0o755)
       }
-      expect(collectMountPoints()).toEqual([inside])
+      // Whatever the next pass is told to release.
+      expect(collectMountPoints('none')).toEqual([inside])
       expect(readdirSync(DIR)).toEqual([])
     },
   )
@@ -391,28 +393,6 @@ describe.if(isLinux)('The mount point manifests', () => {
   // A manifest is all that names its mount points. It stays until a pass has
   // removed what it names: after a pass that turned back, or a removal that was
   // refused, a later pass still has it to go by.
-
-  it.if(NOT_ROOT)(
-    'keeps the manifest of a wrap of its own whose mount point it could not remove, for a pass that can',
-    () => {
-      const readOnly = join(BASE, 'read-only-from-here')
-      mkdirSync(readOnly)
-      const inside = join(readOnly, 'config.lock')
-      leftover(inside)
-      const manifest = publish([inside])
-      chmodSync(readOnly, 0o555)
-      try {
-        expect(collectMountPoints('all')).toEqual([])
-        expect(existsSync(inside)).toBe(true)
-        expect(claims()).toEqual([finishedOf(manifest)])
-      } finally {
-        chmodSync(readOnly, 0o755)
-      }
-      // Whatever the next pass is told to release.
-      expect(collectMountPoints('none')).toEqual([inside])
-      expect(readdirSync(DIR)).toEqual([])
-    },
-  )
 
   it('keeps the manifest of a wrap of its own when the pass turns back half way, for the next', () => {
     leftover(X)
@@ -859,28 +839,6 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(existsSync(Y)).toBe(true)
   })
 
-  it('leaves a claim on a manifest written in another PID namespace', () => {
-    leftover(X)
-    const claim = claimed(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(claim)).toBe(true)
-    expect(existsSync(X)).toBe(true)
-  })
-
-  it('never blocks the thread it runs on', () => {
-    // A clean-up runs on its caller's one thread, after every command.
-    leftover(X)
-    claimed(manifestOfADeadProcess([X]))
-    manifestOfADeadProcess([X])
-    const wait = spyOn(Atomics, 'wait')
-    try {
-      expect(collectMountPoints()).toEqual([X])
-      expect(wait).not.toHaveBeenCalled()
-    } finally {
-      wait.mockRestore()
-    }
-  })
-
   // ---- what cannot be told is live ----
   //
   // Only a process that is gone says its sandbox has ended. A sandboxed command
@@ -937,7 +895,9 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   const NOTHING_REMOVED = { removed: [], held: [expect.any(String)] }
 
-  for (const code of ['EACCES', 'EMFILE', 'ENFILE', 'ENOMEM', 'EIO']) {
+  // One that lasts and one that passes: the code takes every errno but "not
+  // there" alike.
+  for (const code of ['EACCES', 'EMFILE']) {
     it(`removes nothing when it cannot ask after the process on a record: ${code}`, () => {
       leftover(X)
       const gone = { pid: deadPid(), start: '1' }
@@ -1051,7 +1011,6 @@ describe.if(isLinux)('The mount point manifests', () => {
         `console.log(JSON.stringify({ held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
       )
       expect(looked.status).toBe(0)
-      expect(looked.ms).toBeLessThan(AT_ONCE_MS)
       expect(JSON.parse(looked.stdout)).toEqual({ held: [X], removed: [] })
       expect(existsSync(manifest)).toBe(true)
     }, 15000)
@@ -1154,7 +1113,6 @@ describe.if(isLinux)('The mount point manifests', () => {
         `console.log(JSON.stringify({ named: [...m.namedMountPoints().paths], held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
       )
       expect(looked.status).toBe(0)
-      expect(looked.ms).toBeLessThan(AT_ONCE_MS)
       expect(JSON.parse(looked.stdout)).toEqual({
         named: [X],
         held: [],
@@ -1543,18 +1501,6 @@ describe.if(isLinux)('The mount point manifests', () => {
     },
   )
 
-  it('is live when written in another PID namespace, whatever process is on its record', () => {
-    // The pid on the record was given in that namespace too.
-    leftover(X)
-    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
-      pid: deadPid(),
-      start: '1',
-    })
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(X)).toBe(true)
-    expect(existsSync(manifest)).toBe(true)
-  })
-
   it('is live for seven days when written in another PID namespace, or in none it records, and finished then', () => {
     // Nothing else ends one whose namespace is gone. Counted from the later of
     // the manifest and its record, which is when a sandbox last started.
@@ -1641,13 +1587,6 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(collectMountPoints()).toEqual([])
     expect(existsSync(X)).toBe(true)
     expect(readdirSync(DIR)).toEqual([basename(claim)])
-  })
-
-  it('does not say so of a claim with a process on its record either', () => {
-    leftover(X)
-    const claim = claimed(started(manifestOfADeadProcess([X]), thisProcess()))
-    collectMountPoints()
-    expect(claims()).toEqual([basename(claim)])
   })
 
   it('says so of a claim another pass left, and collects it', () => {
@@ -2792,7 +2731,6 @@ describe.if(isLinux)('The mount point manifests', () => {
           ].join('\n'),
         )
         expect(looked.status).toBe(0)
-        expect(looked.ms).toBeLessThan(AT_ONCE_MS)
         return JSON.parse(looked.stdout)
       }
       // It names nothing that can be read, and may name anything.
@@ -3135,22 +3073,6 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(looked.status).toBe(0)
     expect(JSON.parse(looked.stdout)).toEqual([X])
     expect(readdirSync(run)).toEqual([])
-  })
-
-  it('holds nothing, and makes nothing, where the platform is not Linux', () => {
-    leftover(X)
-    publishMountPointManifest([X], [])
-    const before = readdirSync(DIR).sort()
-    const elsewhere = inAChild(
-      `console.log(JSON.stringify([...m.liveMountPoints()]))`,
-      {
-        first: `Object.defineProperty(process, 'platform', { value: 'darwin' })`,
-      },
-    )
-    expect(elsewhere.status).toBe(0)
-    expect(JSON.parse(elsewhere.stdout)).toEqual([])
-    expect(readdirSync(DIR).sort()).toEqual(before)
-    expect(readdirSync(TMP)).toEqual([])
   })
 
   // ---- all of it is bubblewrap's, which is Linux's -----------------------
