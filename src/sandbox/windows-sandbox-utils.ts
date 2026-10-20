@@ -2773,6 +2773,12 @@ function coveringWindowsPath(
  * rewritten, it would send the user's next git command to a directory with
  * hooks of the writer's own. So are the same names where it leads
  * ({@link windowsGitFileDirs}).
+ *
+ * THREAT: a link or junction is passed over, whatever its name. A sandboxed
+ * command can make one where nothing was, `srt-win` would put the deny on
+ * what it leads to (`.vscode` -> `.` closes the root), and to a share it would
+ * have this process, which no fence holds, call a server of the maker's
+ * choosing.
  */
 export function windowsMandatoryDenyPaths(
   cwd: string,
@@ -2800,6 +2806,7 @@ export function windowsMandatoryDenyPaths(
       return
     }
     for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue
       const name = normalizeCaseForComparison(entry.name)
       const full = path.join(dir, entry.name)
       if ((only ?? whole).has(name)) {
@@ -2818,8 +2825,9 @@ export function windowsMandatoryDenyPaths(
       }
     }
   }
-  walk(path.resolve(cwd), 1)
-  return [...new Set(found)].filter(p => writeRootOf(p) !== undefined)
+  const top = resolveWindowsPath(cwd)
+  if (top.state === 'resolved') walk(top.path, 1)
+  return found.filter(p => writeRootOf(p) !== undefined)
 }
 
 /**
@@ -2828,10 +2836,10 @@ export function windowsMandatoryDenyPaths(
  * directory's `commondir` names (relative to it).
  *
  * THREAT: a sandboxed command may have written both files. So nothing is read
- * at a path it could not write anyway, only a small regular file is read at
- * all, and a UNC or device form is dropped before it is so much as resolved:
- * that alone would have this process, which no fence holds, call a server of
- * the writer's choosing.
+ * at a path it could not write anyway, and only a small regular file is read
+ * at all. A UNC or device form is dropped before it is so much as resolved,
+ * and so is a path with a link on the way, looked for from the top down: see
+ * {@link windowsMandatoryDenyPaths}.
  */
 function windowsGitFileDirs(
   gitFile: string,
@@ -2849,6 +2857,15 @@ function windowsGitFileDirs(
   const follow = (from: string, named = ''): string | undefined => {
     if (named === '' || isUnprobedWindowsPath(named)) return undefined
     const dir = path.resolve(from, named)
+    const names = dir.split(path.sep)
+    try {
+      for (let n = 2; n <= names.length; n++) {
+        const above = names.slice(0, n).join(path.sep)
+        if (fs.lstatSync(above).isSymbolicLink()) return undefined
+      }
+    } catch {
+      return undefined
+    }
     return writeRootOf(dir) === undefined ? undefined : dir
   }
   const gitDir = follow(

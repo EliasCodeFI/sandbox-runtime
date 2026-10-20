@@ -199,7 +199,7 @@ let proxyAuthToken: string | undefined
 let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // The objects this session has put a write deny on, each by its path and
 // file index: see `windowsMandatoryDeniesDue`.
-const windowsWriteDenied = new Map<string, bigint | undefined>()
+let windowsWriteDenied = new Map<string, bigint | undefined>()
 // The sandbox user SID captured at initialize(). reset() uses this
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
@@ -1453,8 +1453,8 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      const writeDenied = acc.denyWrite.map(
-        p => [p, windowsFileIndexOf(p)] as const,
+      const writeDenied = new Map(
+        acc.denyWrite.map(p => [p, windowsFileIndexOf(p)]),
       )
       // One call, always made: it also records this process as a
       // session. Write roots are kept at reset(); a failure throws.
@@ -1471,7 +1471,7 @@ async function initializeSteps(
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
       windowsFsStampedSet = acc
-      for (const [p, index] of writeDenied) windowsWriteDenied.set(p, index)
+      windowsWriteDenied = writeDenied
       logForDebugging(
         `[Sandbox Windows] fs applied: ` +
           `${acc.grantWrite.length} grantWrite, ` +
@@ -2128,7 +2128,7 @@ function computeWindowsFsAccessSet(
 /** Which object is at `p`: undefined where that cannot be told. */
 function windowsFileIndexOf(p: string): bigint | undefined {
   try {
-    return fs.statSync(p, { bigint: true }).ino
+    return fs.lstatSync(p, { bigint: true }).ino
   } catch {
     return undefined
   }
@@ -2184,7 +2184,8 @@ function windowsMaskedFileDenies(
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed exactly on what {@link computeWindowsFsAccessSet} reads of
   // the config. The masked files are not session-wide: each wrap
-  // denies the ones the session has not stamped.
+  // denies the ones the session has not stamped. So with the mandatory
+  // denies, whose two settings each wrap reads anew.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {
@@ -2943,16 +2944,22 @@ async function wrapWithSandboxArgv(
     }
     // Kept with the write root like the session's own, so each is written
     // once and no command after this one pays for it.
-    const due = fsCfg?.disabled
-      ? new Map<string, undefined>()
-      : windowsMandatoryDeniesDue(cwd ?? process.cwd())
-    if (due.size > 0 && windowsFsSbUserSid !== undefined) {
+    const due = windowsMandatoryDeniesDue(cwd ?? process.cwd())
+    if (!fsCfg?.disabled && due.size > 0 && windowsFsSbUserSid !== undefined) {
       await grantWindowsAclPersistent({
         sandboxUserSid: windowsFsSbUserSid,
         read: [],
         write: [],
         denyRead: [],
-        denyWrite: [...due.keys()],
+        // With the session's write grants beneath them, which they outrank.
+        denyWrite: rankWindowsFsAccess({
+          allowRead: [],
+          allowWrite: [],
+          denyRead: [],
+          denyWrite: [...due.keys()],
+          credentialDeny: [],
+          held: windowsFsStampedSet,
+        }).denyWrite,
         srtWin: srtWinSpawn,
       })
       // As looked at before the write: one replaced since is due again.
@@ -3266,7 +3273,6 @@ async function reset(): Promise<void> {
     releaseWindowsSessionAcls(sb, srtWin)
   }
   windowsFsStampedSet = undefined
-  windowsWriteDenied.clear()
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined

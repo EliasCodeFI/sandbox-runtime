@@ -1396,7 +1396,6 @@ describe('rankWindowsFsAccess (pure, all platforms)', () => {
   })
 })
 
-// Run once per child-token mode; not on Windows, where the L-rows make the calls.
 describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
   let root: string
   const at = (rel: string): string => join(root, ...rel.split('/'))
@@ -1442,6 +1441,7 @@ describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
       'sub/.Git/Hooks/pre-push',
       'src/bashrc',
       'node_modules/pkg/.bashrc',
+      '.git/modules/x/.bashrc',
     ])
     const all = [
       '.MCP.json',
@@ -1496,6 +1496,33 @@ describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
     ])
   })
 
+  it('a link is passed over, at a name and on the way to one', () => {
+    plant({
+      'real/.bashrc': '',
+      'real/hooks/x': '',
+      'wt/.git': 'gitdir: ../linked/admin',
+      'wt2/.git': 'gitdir: ../real/admin',
+      'real/admin/hooks/x': '',
+      'real/pointer': '..',
+    })
+    for (const link of ['.vscode', '.git', 'linked']) {
+      symlinkSync(at('real'), at(link), 'junction')
+    }
+    symlinkSync(at('real/pointer'), at('real/admin/commondir'), 'junction')
+    const stats = spyOn(fs, 'lstatSync')
+    const found = denied()
+    const looked = stats.mock.calls.join()
+    stats.mockRestore()
+    expect(found).toEqual([
+      'real/.bashrc',
+      'real/admin/hooks',
+      'wt/.git',
+      'wt2/.git',
+    ])
+    // From the top down: nothing is looked at through the link.
+    expect(looked).not.toContain(at('linked/admin'))
+  })
+
   it.each([
     ['out of every write root', () => `gitdir: ${at('outside')}`],
     ['to a share', () => 'gitdir: //server/share/repo.git'],
@@ -1511,16 +1538,20 @@ describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
         'outside/hooks/x': '',
       })
       const looked = spyOn(fs, 'readdirSync')
+      const stats = spyOn(fs, 'lstatSync')
       try {
         expect(denied('in/wt', {}, ['in'])).toEqual(['in/wt/.git'])
         expect(looked.mock.calls.map(([dir]) => dir)).toEqual([at('in/wt')])
+        expect(stats.mock.calls.join()).not.toMatch(/server|GLOBALROOT/)
       } finally {
         looked.mockRestore()
+        stats.mockRestore()
       }
     },
   )
 })
 
+// Run once per child-token mode; not on Windows, where the L-rows make the calls.
 describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   const spies: Array<ReturnType<typeof spyOn>> = []
   let granted: Pick<WindowsAclGrantOptions, 'read' | 'write'> | undefined
@@ -1700,6 +1731,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   describe('the mandatory write denies', () => {
     const cwd = process.cwd()
     let hooks: string
+    let mine: string
     let config: string
     /** What one command run in `root` has stamped before it is wrapped. */
     const stampedFor = async (
@@ -1711,12 +1743,14 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       expect(argv).not.toContain('--deny-write')
       return writeDenies()
     }
+    // Apart, or the type checker takes `stamped` for undefined still.
     const writeDenies = (): readonly string[] => stamped?.denyWrite ?? []
 
     beforeEach(() => {
       hooks = join(root, '.git', 'hooks')
+      mine = join(hooks, 'mine')
       config = join(root, '.git', 'config')
-      mkdirSync(hooks, { recursive: true })
+      mkdirSync(mine, { recursive: true })
       writeFileSync(config, '')
     })
     afterEach(() => process.chdir(cwd))
@@ -1724,7 +1758,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     it("initialize() stamps the working directory's with the configured ones, and they rank alike", async () => {
       process.chdir(root)
       await SandboxManager.initialize(
-        configOf({ allowWrite: [root, join(hooks, 'mine')], denyWrite: [d] }),
+        configOf({ allowWrite: [root, mine], denyWrite: [d] }),
       )
       expect(stamped?.denyWrite).toEqual([d, config, hooks])
       expect(granted?.write).toEqual([root])
@@ -1732,9 +1766,10 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     })
 
     it('a command stamps what is new, or another object than the one stamped, once', async () => {
-      await SandboxManager.initialize(configOf({ allowWrite: [root] }))
+      await SandboxManager.initialize(configOf({ allowWrite: [root, mine] }))
       expect(stamped).toBeUndefined()
-      expect(await stampedFor()).toEqual([config, hooks])
+      // With the grant the session holds beneath one, which it outranks.
+      expect(await stampedFor()).toEqual([config, hooks, mine])
       expect(await stampedFor()).toEqual([])
 
       writeFileSync(join(root, '.mcp.json'), '{}')
@@ -1756,29 +1791,32 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       expect(await stampedFor()).toEqual([config, hooks])
     })
 
-    it.each<[string, Partial<SandboxRuntimeConfig['filesystem']>, boolean]>([
-      [
-        'allowGitConfig leaves .git\\config out',
-        { allowGitConfig: true },
-        true,
-      ],
-      ['filesystem.disabled leaves all out', { disabled: true }, false],
-      ['nothing is writable: none', { allowWrite: [] }, false],
-    ])('%s', async (_what, filesystem, hooksDenied) => {
-      await SandboxManager.initialize(
-        configOf({ allowWrite: [root], ...filesystem }),
-      )
-      expect(await stampedFor()).toEqual(hooksDenied ? [hooks] : [])
-    })
+    it.each([
+      ['initialize()', true],
+      ['a command', false],
+    ])(
+      '%s reads allowGitConfig and mandatoryDenySearchDepth',
+      async (_who, atInitialize) => {
+        writeFileSync(join(d, '.bashrc'), '')
+        if (atInitialize) process.chdir(root)
+        await SandboxManager.initialize({
+          ...configOf({ allowWrite: [root], allowGitConfig: true }),
+          mandatoryDenySearchDepth: 1,
+        })
+        expect(atInitialize ? stamped?.denyWrite : await stampedFor()).toEqual([
+          hooks,
+        ])
+      },
+    )
 
-    it('a command whose own configuration disables the file rules stamps none', async () => {
+    it("filesystem.disabled, the command's own or the session's, stamps none", async () => {
       const session = configOf({ allowWrite: [root] })
+      const disabled = { filesystem: { ...session.filesystem, disabled: true } }
       await SandboxManager.initialize(session)
-      expect(
-        await stampedFor({
-          filesystem: { ...session.filesystem, disabled: true },
-        }),
-      ).toEqual([])
+      expect(await stampedFor(disabled)).toEqual([])
+      await SandboxManager.reset()
+      await SandboxManager.initialize({ ...session, ...disabled })
+      expect(await stampedFor()).toEqual([])
     })
   })
 
@@ -5850,14 +5888,23 @@ describe.if(isWindows)(
             mkdirSync(dirname(at(rel)), { recursive: true })
             writeFileSync(at(rel), ORIGINAL)
           }
+          // One kept root inside another: what holds the outer one could
+          // move the inner one aside.
           await SandboxManager.initialize(
-            createFsTestConfig({ allowWrite: [root] }),
+            createFsTestConfig({ allowWrite: [root, at('sub/repo')] }),
           )
         })
 
-        afterEach(async () => {
+        /** Ends the session and has both roots forgotten. */
+        async function forget(): Promise<void> {
           await SandboxManager.reset()
-          spawnSync(exe, ['acl', 'forget', root], { encoding: 'utf8' })
+          for (const kept of [at('sub/repo'), root]) {
+            spawnSync(exe, ['acl', 'forget', kept], { encoding: 'utf8' })
+          }
+        }
+
+        afterEach(async () => {
+          await forget()
           rmSync(root, { recursive: true, force: true })
         })
 
@@ -5889,9 +5936,10 @@ describe.if(isWindows)(
             'M1',
             [
               // First, so that what follows would show it.
-              'icacls .bashrc /grant *S-1-1-0:F',
+              'icacls .bashrc /reset',
               'icacls .git\\hooks /reset /t',
               'takeown /f .git\\config',
+              'icacls .git\\config /reset',
               'echo W>.bashrc',
               'echo W>.git\\config',
               'echo W>.git\\hooks\\pre-commit',
@@ -5927,24 +5975,38 @@ describe.if(isWindows)(
         it('M2: what one command makes is denied to the next, and so is what the host puts in place of a denied file', async () => {
           await run('M2a', 'mkdir made\\.git\\hooks & echo W>.mcp.json')
           expect(contentOf('.mcp.json')).toBe('W')
+          // A deny put on what this leads to would close the root.
+          symlinkSync(root, at('.vscode'), 'junction')
           writeFileSync(at('.git/config.lock'), 'REPLACED')
           renameSync(at('.git/config.lock'), at('.git/config'))
 
           await run(
             'M2b',
             // The sandbox account owns the first two.
-            'icacls made\\.git\\hooks /reset /t & icacls .mcp.json /grant *S-1-1-0:F & ' +
-              'echo X>made\\.git\\hooks\\pre-commit & echo X>.mcp.json & echo X>.git\\config',
+            'icacls made\\.git\\hooks /reset /t & icacls .mcp.json /reset & ' +
+              'echo X>made\\.git\\hooks\\pre-commit & echo X>.mcp.json & echo X>.git\\config & ' +
+              'echo X>plain.txt',
           )
           expect(contentOf('made/.git/hooks/pre-commit')).toBeUndefined()
           expect(contentOf('.mcp.json')).toBe('W')
           expect(contentOf('.git/config')).toBe('REPLACED')
+          expect(contentOf('plain.txt')).toBe('X')
         }, 120_000)
 
-        it('M3: the host goes on writing all of it', async () => {
+        it('M3: the host goes on writing all of it, and `acl forget` takes all of it off', async () => {
           await run('M3', 'rem')
           writeFileSync(at('.git/hooks/pre-commit'), 'HOST')
           writeFileSync(at('.bashrc'), 'HOST')
+          const aclOf = (rel: string): string =>
+            spawnSync('icacls', [at(rel)], { encoding: 'utf8' }).stdout
+          const kept = ['.git', 'sub', 'sub/repo', 'sub/repo/.git']
+          for (const rel of kept) {
+            expect(aclOf(rel)).toMatch(/:\(DENY\)\((D|DE)\)/)
+          }
+          await forget()
+          for (const rel of [...kept, '.', '.bashrc', '.git/hooks']) {
+            expect(aclOf(rel)).not.toContain('(DENY)')
+          }
           renameSync(at('sub'), at('moved'))
           expect(contentOf('moved/repo/.git/hooks/pre-commit')).toBe(ORIGINAL)
         }, 120_000)
