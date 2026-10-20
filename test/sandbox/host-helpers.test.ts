@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -465,10 +466,13 @@ describe('programs run on the host are found outside the allowed write paths', (
         writeConfig: { allowOnly: [project], denyWithinAllow: [] },
       })
 
-      expect(wrapped).toContain(`${realSocat} TCP-LISTEN:3128`)
-      expect(wrapped).toContain(`${realSocat} TCP-LISTEN:1080`)
+      // Each relay names socat twice: for both families, and for IPv4 alone.
+      for (const port of [3128, 1080]) {
+        expect(wrapped).toContain(`${realSocat} TCP6-LISTEN:${port},`)
+        expect(wrapped).toContain(`${realSocat} TCP4-LISTEN:${port},`)
+      }
       expect(wrapped).not.toContain(projectBin)
-      expect(wrapped).not.toMatch(/(^|[\s'"])socat TCP-LISTEN/)
+      expect(wrapped).not.toMatch(/(^|[\s'"])socat TCP\d?-LISTEN/)
       expect(existsSync(marker)).toBe(false)
     })
 
@@ -555,7 +559,9 @@ describe('programs run on the host are found outside the allowed write paths', (
       })
 
       expect(firstWord(wrapped)).toBe(join(projectBin, 'bwrap'))
-      expect(wrapped).toContain(`${join(projectBin, 'socat')} TCP-LISTEN:3128`)
+      expect(wrapped).toContain(
+        `${join(projectBin, 'socat')} TCP6-LISTEN:3128,`,
+      )
       expect(existsSync(marker)).toBe(false)
     })
 
@@ -591,14 +597,16 @@ describe('programs run on the host are found outside the allowed write paths', (
         'bwrap runs on the host and was not found on PATH',
       )
       expect(restricted.errors[0]).toContain(join(projectBin, 'bwrap'))
-      // The same PATH with nothing restricted: that copy is the one to run.
-      expect(checkLinuxDependencies().errors).toEqual([])
       // One that is nowhere gets the plain message.
       process.env.PATH = tools
       expect(
         checkLinuxDependencies({ allowedWritePaths: [project] }).errors,
       ).toEqual(['bubblewrap (bwrap) not installed'])
+      // The copy passed over was not asked its version either.
       expect(existsSync(marker)).toBe(false)
+      // The first PATH with nothing restricted: that copy is the one to run.
+      process.env.PATH = `${projectBin}:${tools}`
+      expect(checkLinuxDependencies().errors).toEqual([])
     })
 
     it('warns about a helper named outright that the sandboxed command may write', () => {
@@ -635,7 +643,11 @@ describe('programs run on the host are found outside the allowed write paths', (
           seccompConfig: { applyPath },
         }).warnings,
       ).toEqual([])
-      expect(existsSync(marker)).toBe(false)
+      // A directive is followed: the bwrap it names is asked its version. The
+      // check runs nothing else.
+      expect([
+        ...new Set(readFileSync(marker, 'utf8').trim().split('\n')),
+      ]).toEqual([bwrapPath])
     })
 
     it('SandboxManager judges by the configuration it is initialized with', async () => {

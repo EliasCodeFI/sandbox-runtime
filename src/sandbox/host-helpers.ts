@@ -1,5 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { realPathOf } from '../utils/real-path.js'
 import {
   isExecutableFile,
   isPathQualified,
@@ -59,7 +60,7 @@ function writableForms(
     if (spelled === '/') return undefined
     let resolved: string
     try {
-      resolved = fs.realpathSync(spelled)
+      resolved = realPathOf(spelled)
     } catch {
       continue
     }
