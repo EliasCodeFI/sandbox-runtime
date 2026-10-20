@@ -127,30 +127,25 @@ export function wayTo(
   return { real, rest }
 }
 
-/** As many missing names as one way is followed up from again. */
-const MAX_MISSING_NAMES_PASSED = 40
-
 /**
  * {@link wayTo}, followed on where it goes up again at once from a name that
  * is not there (`missing/../x`): a directory made at that name lets the way
  * pass, and a link made there leads it elsewhere. `passed` holds each such
- * name, and `rest` no `.` or empty name. ELOOP past the number of them.
+ * name, `rest` no `.` or empty name, and `shut` whether `real` lets nobody
+ * look (EACCES). ELOOP past as many of them as links.
  */
 export function wayPastMissingNames(
   folded: string,
   watcher?: WayWatcher,
-): { real: string; rest: string[]; notThere?: unknown; passed: string[] } {
+): { real: string; rest: string[]; shut: boolean; passed: string[] } {
   const passed: string[] = []
   let onward = folded
-  while (passed.length <= MAX_MISSING_NAMES_PASSED) {
+  while (passed.length <= MAX_LINKS) {
     const { real, rest, notThere } = wayTo(onward, watcher)
     const names = rest.filter(name => name !== '' && name !== '.')
-    if (
-      names[1] !== '..' ||
+    const shut =
       (notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES'
-    ) {
-      return { real, rest: names, notThere, passed }
-    }
+    if (shut || names[1] !== '..') return { real, rest: names, shut, passed }
     passed.push(`${real}/${names[0]}`)
     onward = [real, ...names.slice(2)].join('/')
   }

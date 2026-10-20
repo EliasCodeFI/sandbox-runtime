@@ -1,41 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import { afterEach, beforeEach, expect, it, mock, spyOn } from 'bun:test'
+import type { Mock } from 'bun:test'
 import * as childProcess from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs'
+import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
-import {
-  getGlobalNpmPathsAsync,
-  resetGlobalNpmPathsForTesting,
-} from '../../src/sandbox/generate-seccomp-filter.js'
-import {
-  describeUnavailableHostHelper,
-  findHostHelper,
-  hostSearchPath,
-} from '../../src/sandbox/host-helpers.js'
-import {
-  LinuxSandboxProfileError,
-  checkLinuxDependencies,
-  cleanupBwrapMountPoints,
-  wrapCommandWithSandboxLinux,
-} from '../../src/sandbox/linux-sandbox-utils.js'
-import {
-  startMacOSSandboxLogMonitor,
-  wrapCommandWithSandboxMacOS,
-} from '../../src/sandbox/macos-sandbox-utils.js'
+import { dirname, join } from 'node:path'
+import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
+import * as hostHelpers from '../../src/sandbox/host-helpers.js'
+import * as javaAgent from '../../src/sandbox/java-proxy-agent.js'
+import * as linux from '../../src/sandbox/linux-sandbox-utils.js'
+import * as macos from '../../src/sandbox/macos-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { whichSync } from '../../src/utils/which.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
@@ -44,759 +22,491 @@ import { isLinux, isWindows } from '../helpers/platform.js'
  * `allowWrite` whose `node_modules/.bin` leads PATH, holding files named like
  * the helpers. Each leaves a marker behind if run; no test may find it.
  */
-describe('programs run on the host are found outside the allowed write paths', () => {
-  const savedPath = process.env.PATH ?? ''
-  const savedCwd = process.cwd()
-  // A made-up helper name for the cases that are about the search alone.
-  const HELPER = 'srt-test-helper'
-
-  let base: string
-  let project: string
-  let projectBin: string
-  let safe: string
-  let marker: string
-
-  // An executable that leaves the marker behind if anything ever runs it.
-  function plant(file: string): string {
-    writeFileSync(file, `#!/bin/sh\necho "$0" >> '${marker}'\nexit 0\n`)
-    chmodSync(file, 0o755)
-    return file
-  }
-
-  function dir(...parts: string[]): string {
-    const made = join(base, ...parts)
-    mkdirSync(made, { recursive: true })
-    return made
-  }
-
-  beforeEach(() => {
-    // Other suites wrap without cleaning up, and the active count is shared.
-    cleanupBwrapMountPoints({ force: true })
-    base = realpathSync(mkdtempSync(join(tmpdir(), 'host-helpers-')))
-    marker = join(base, 'a-planted-file-was-run')
-    project = dir('project')
-    projectBin = dir('project', 'node_modules', '.bin')
-    safe = dir('safe')
-  })
-
-  afterEach(() => {
-    process.env.PATH = savedPath
-    process.chdir(savedCwd)
-    cleanupBwrapMountPoints({ force: true })
-    rmSync(base, { recursive: true, force: true })
-  })
-
-  describe('findHostHelper', () => {
-    it('passes over a copy in the writable directory, however early on PATH', () => {
-      plant(join(projectBin, HELPER))
-      plant(join(safe, HELPER))
-      process.env.PATH = `${projectBin}:${safe}`
-
-      // The plain search, for what runs inside the sandbox, takes the first.
-      expect(whichSync(HELPER)).toBe(join(projectBin, HELPER))
-
-      const search = findHostHelper(HELPER, [project])
-
-      expect(search.path).toBe(join(safe, HELPER))
-      expect(search.skipped).toEqual([
-        {
-          path: join(projectBin, HELPER),
-          reason: `inside the allowed write path ${project}`,
-          writePath: project,
-        },
-      ])
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it.if(isLinux)(
-      'finds the real bwrap, socat and rg behind planted ones',
-      () => {
-        for (const helper of ['bwrap', 'socat', 'rg']) {
-          const real = whichSync(helper)
-          expect(real).not.toBeNull()
-          plant(join(projectBin, helper))
-          process.env.PATH = `${projectBin}:${savedPath}`
-
-          expect(whichSync(helper)).toBe(join(projectBin, helper))
-          expect(findHostHelper(helper, [project]).path).toBe(real)
-
-          process.env.PATH = savedPath
-        }
-        expect(existsSync(marker)).toBe(false)
-      },
-    )
-
-    it('finds nothing when the only copies are writable, and says which and why', () => {
-      const empty = dir('empty')
-      plant(join(projectBin, 'bwrap'))
-      process.env.PATH = `${projectBin}:${empty}`
-
-      const search = findHostHelper('bwrap', [project])
-
-      expect(search.path).toBeNull()
-      expect(search.skipped.map(s => s.path)).toEqual([
-        join(projectBin, 'bwrap'),
-      ])
-      const refusal = describeUnavailableHostHelper('bwrap', search)
-      expect(refusal).toContain('bwrap runs on the host')
-      expect(refusal).toContain(join(projectBin, 'bwrap'))
-      expect(refusal).toContain(`inside the allowed write path ${project}`)
-      expect(refusal).toContain('bwrapPath')
-      expect(describeUnavailableHostHelper('socat', search)).toContain(
-        'socatPath',
-      )
-      expect(describeUnavailableHostHelper('rg', search)).toContain(
-        'ripgrep.command',
-      )
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('never uses a relative PATH entry, the empty one included', () => {
-      const cwd = dir('cwd')
-      plant(join(cwd, HELPER))
-      plant(join(dir('cwd', 'bin'), HELPER))
-      plant(join(safe, HELPER))
-      process.chdir(cwd)
-      process.env.PATH = `:.:bin:${safe}`
-
-      // The plain search reads the empty entry as the current directory.
-      expect(whichSync(HELPER)).toBe(join(cwd, HELPER))
-
-      const search = findHostHelper(HELPER, [project])
-
-      expect(search.path).toBe(join(safe, HELPER))
-      expect(search.skipped).toEqual([
-        {
-          path: join(cwd, HELPER),
-          reason: 'an empty PATH entry means the current directory',
-        },
-        {
-          path: join(cwd, HELPER),
-          reason: 'the PATH entry . is relative',
-        },
-        {
-          path: join(cwd, 'bin', HELPER),
-          reason: 'the PATH entry bin is relative',
-        },
-      ])
-    })
-
-    it('passes over a link in a safe directory that leads to a writable file', () => {
-      const linked = dir('linked')
-      const target = plant(join(project, 'built-helper'))
-      symlinkSync(target, join(linked, HELPER))
-      plant(join(safe, HELPER))
-      process.env.PATH = `${linked}:${safe}`
-
-      expect(whichSync(HELPER)).toBe(join(linked, HELPER))
-
-      const search = findHostHelper(HELPER, [project])
-
-      expect(search.path).toBe(join(safe, HELPER))
-      expect(search.skipped).toEqual([
-        {
-          path: join(linked, HELPER),
-          reason: `resolves to ${target}, inside the allowed write path ${project}`,
-          writePath: project,
-        },
-      ])
-    })
-
-    it('passes over a PATH entry that is a link kept in the writable directory', () => {
-      // The link leads to a safe directory today; whoever may write the
-      // directory it sits in decides where it leads tomorrow.
-      plant(join(safe, HELPER))
-      const elsewhere = dir('elsewhere')
-      plant(join(elsewhere, HELPER))
-      symlinkSync(safe, join(project, 'tools'))
-      process.env.PATH = `${join(project, 'tools')}:${elsewhere}`
-
-      const search = findHostHelper(HELPER, [project])
-
-      expect(search.path).toBe(join(elsewhere, HELPER))
-      expect(search.skipped).toEqual([
-        {
-          path: join(project, 'tools', HELPER),
-          reason: `inside the allowed write path ${project}`,
-          writePath: project,
-        },
-      ])
-    })
-
-    it('passes over that link when PATH reaches it through an alias of the directory', () => {
-      // Neither the spelling nor the file it resolves to is inside the
-      // project; the link followed on the way is.
-      plant(join(safe, HELPER))
-      const elsewhere = dir('elsewhere')
-      plant(join(elsewhere, HELPER))
-      symlinkSync(safe, join(project, 'tools'))
-      symlinkSync(project, join(base, 'alias'))
-      process.env.PATH = `${join(base, 'alias', 'tools')}:${elsewhere}`
-
-      const search = findHostHelper(HELPER, [project])
-
-      expect(search.path).toBe(join(elsewhere, HELPER))
-      expect(search.skipped).toEqual([
-        {
-          path: join(base, 'alias', 'tools', HELPER),
-          reason: `reached through the link ${join(project, 'tools')}, inside the allowed write path ${project}`,
-          writePath: project,
-        },
-      ])
-    })
-
-    it('is not switched off by an allowed write path that links to the root', () => {
-      // The command can make such a link wherever one allowed write path lies
-      // inside another. The wrap binds nothing for it.
-      plant(join(projectBin, HELPER))
-      plant(join(safe, HELPER))
-      const dist = join(project, 'dist')
-      symlinkSync('/', dist)
-      process.env.PATH = `${projectBin}:${safe}`
-
-      expect(findHostHelper(HELPER, [project, dist])).toEqual({
-        path: join(safe, HELPER),
-        skipped: [
-          {
-            path: join(projectBin, HELPER),
-            reason: `inside the allowed write path ${project}`,
-            writePath: project,
-          },
-        ],
-      })
-      expect(hostSearchPath([project, dist])).toBe(safe)
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('does not count where an allowed write path that is a link leads', () => {
-      // Nothing is bound for it there either; counting it would let the
-      // command rule out every copy by linking to where they are kept.
-      plant(join(projectBin, HELPER))
-      plant(join(safe, HELPER))
-      const dist = join(project, 'dist')
-      symlinkSync(safe, dist)
-      process.env.PATH = `${projectBin}:${safe}`
-
-      expect(findHostHelper(HELPER, [project, dist]).path).toBe(
-        join(safe, HELPER),
-      )
-      expect(hostSearchPath([project, dist])).toBe(safe)
-    })
-
-    it('compares against a directory named with glob characters and a trailing slash', () => {
-      const named = dir('w[1]')
-      plant(join(named, HELPER))
-      plant(join(safe, HELPER))
-      process.env.PATH = `${named}:${safe}`
-
-      expect(findHostHelper(HELPER, [`${named}/`]).path).toBe(
-        join(safe, HELPER),
-      )
-    })
-
-    it('passes over nothing when no writes are restricted', () => {
-      plant(join(projectBin, HELPER))
-      plant(join(safe, HELPER))
-      process.env.PATH = `${projectBin}:${safe}`
-
-      expect(findHostHelper(HELPER, undefined)).toEqual({
-        path: join(projectBin, HELPER),
-        skipped: [],
-      })
-      // An empty list restricts everything: nothing is writable to pass over.
-      expect(findHostHelper(HELPER, [])).toEqual({
-        path: join(projectBin, HELPER),
-        skipped: [],
-      })
-    })
-
-    it('passes over nothing when the policy lets the command write everywhere', () => {
-      // With '/' allowed there is no place outside the write paths to prefer.
-      // The helper is still found in this process, by an absolute path.
-      plant(join(projectBin, HELPER))
-      plant(join(safe, HELPER))
-      const cwd = dir('cwd')
-      plant(join(cwd, HELPER))
-      process.chdir(cwd)
-
-      process.env.PATH = `${projectBin}:${safe}`
-      expect(findHostHelper(HELPER, ['/', project])).toEqual({
-        path: join(projectBin, HELPER),
-        skipped: [],
-      })
-
-      process.env.PATH = `:${safe}`
-      const fromEmptyEntry = findHostHelper(HELPER, ['/'])
-      expect(fromEmptyEntry.path).toBe(join(cwd, HELPER))
-      expect(isAbsolute(fromEmptyEntry.path!)).toBe(true)
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('looks again at a remembered result under the write paths of each call', () => {
-      const first = dir('first')
-      const second = dir('second')
-      plant(join(first, HELPER))
-      plant(join(second, HELPER))
-      process.env.PATH = `${first}:${second}`
-
-      expect(findHostHelper(HELPER, [project]).path).toBe(join(first, HELPER))
-      expect(findHostHelper(HELPER, [project]).path).toBe(join(first, HELPER))
-
-      // The write paths now cover what was found: it is not returned again.
-      const widened = findHostHelper(HELPER, [project, first])
-      expect(widened.path).toBe(join(second, HELPER))
-      expect(widened.skipped.map(s => s.path)).toEqual([join(first, HELPER)])
-
-      // And narrowed back, either copy will do; the one in hand is kept.
-      expect(findHostHelper(HELPER, [project]).path).toBe(join(second, HELPER))
-
-      // A remembered file that is gone is searched for again.
-      rmSync(join(second, HELPER))
-      expect(findHostHelper(HELPER, [project]).path).toBe(join(first, HELPER))
-    })
-  })
-
-  describe.if(isLinux)('wrapCommandWithSandboxLinux', () => {
-    const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-    let realBwrap: string
-    let realSocat: string
-    let realRg: string
-
-    beforeEach(() => {
-      realBwrap = whichSync('bwrap')!
-      realSocat = whichSync('socat')!
-      realRg = whichSync('rg')!
-      expect(realBwrap).not.toBeNull()
-      expect(realSocat).not.toBeNull()
-      expect(realRg).not.toBeNull()
-      for (const helper of ['bwrap', 'socat', 'rg']) {
-        plant(join(projectBin, helper))
-      }
-      // Something only the scan finds: a shell startup file below the cwd.
-      mkdirSync(join(project, 'nested'))
-      writeFileSync(join(project, 'nested', '.bashrc'), '')
-      process.chdir(project)
-    })
-
-    const firstWord = (wrapped: string): string => wrapped.split(' ')[0]!
-
-    it('names the real bubblewrap by its absolute path and scans with the real ripgrep', async () => {
-      process.env.PATH = `${projectBin}:${savedPath}`
-
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo wrapped-ok',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-      })
-
-      expect(firstWord(wrapped)).toBe(realBwrap)
-      expect(isAbsolute(firstWord(wrapped))).toBe(true)
-      expect(wrapped).not.toContain(projectBin)
-      // Only the scan finds the nested file: the real ripgrep ran.
-      expect(wrapped).toContain(join(project, 'nested', '.bashrc'))
-      expect(existsSync(marker)).toBe(false)
-
-      if (BWRAP_CAN_NAMESPACE) {
-        const run = childProcess.spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
-        })
-        expect(run.stdout).toBe('wrapped-ok\n')
-        expect(run.status).toBe(0)
-        expect(existsSync(marker)).toBe(false)
-      }
-    })
-
-    it('agrees with its own binds about an allowed write path that links to the root', async () => {
-      process.env.PATH = `${projectBin}:${savedPath}`
-      const dist = join(project, 'dist')
-      symlinkSync('/', dist)
-
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo wrapped-ok',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [project, dist], denyWithinAllow: [] },
-      })
-
-      expect(wrapped).toContain(`--bind ${project} ${project}`)
-      expect(wrapped).not.toContain(`--bind ${dist}`)
-      expect(firstWord(wrapped)).toBe(realBwrap)
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('runs no planted bubblewrap while building a wrap, whatever the options', async () => {
-      // Building a wrap may ask bubblewrap about itself (its version, its
-      // help): that question goes to the copy the wrap runs, never to PATH's.
-      process.env.PATH = `${projectBin}:${savedPath}`
-
-      for (const options of [
-        {},
-        { allowAllUnixSockets: true },
-        { enableWeakerNestedSandbox: true },
-        { allowAllUnixSockets: true, enableWeakerNestedSandbox: true },
-      ]) {
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: 'echo wrapped-ok',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: [] },
-          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-          ...options,
-        })
-        expect(firstWord(wrapped)).toBe(realBwrap)
-        expect(existsSync(marker)).toBe(false)
-      }
-    })
-
-    it('starts the listeners inside the sandbox with the real socat', async () => {
-      process.env.PATH = `${projectBin}:${savedPath}`
-      const httpSocket = join(base, 'http.sock')
-      const socksSocket = join(base, 'socks.sock')
-      writeFileSync(httpSocket, '')
-      writeFileSync(socksSocket, '')
-
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo wrapped-ok',
-        needsNetworkRestriction: true,
-        httpSocketPath: httpSocket,
-        socksSocketPath: socksSocket,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-      })
-
-      // Each relay names socat twice: for both families, and for IPv4 alone.
-      for (const port of [3128, 1080]) {
-        expect(wrapped).toContain(`${realSocat} TCP6-LISTEN:${port},`)
-        expect(wrapped).toContain(`${realSocat} TCP4-LISTEN:${port},`)
-      }
-      expect(wrapped).not.toContain(projectBin)
-      expect(wrapped).not.toMatch(/(^|[\s'"])socat TCP\d?-LISTEN/)
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('refuses, by a typed error, when bubblewrap is only to be had from the writable directory', async () => {
-      // Everything else the wrap needs, and no bwrap, outside the project.
-      const tools = dir('tools')
-      for (const needed of ['rg', 'socat', 'bash']) {
-        symlinkSync(whichSync(needed)!, join(tools, needed))
-      }
-      process.env.PATH = `${projectBin}:${tools}`
-
-      let thrown: unknown
-      try {
-        await wrapCommandWithSandboxLinux({
-          command: 'echo never-run',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: [] },
-          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-        })
-      } catch (error) {
-        thrown = error
-      }
-
-      expect(thrown).toBeInstanceOf(LinuxSandboxProfileError)
-      const refusal = thrown as LinuxSandboxProfileError
-      expect(refusal.code).toBe('host_helper_unavailable')
-      expect(refusal.message).toStartWith(
-        'bwrap runs on the host and was not found on PATH',
-      )
-      expect(refusal.message).toContain(join(projectBin, 'bwrap'))
-      expect(refusal.message).toContain('bwrapPath')
-      // The same as fields, for a caller that words its own message.
-      expect(refusal.cause).toEqual({
-        helper: 'bwrap',
-        skipped: [
-          {
-            path: join(projectBin, 'bwrap'),
-            reason: `inside the allowed write path ${project}`,
-            writePath: project,
-          },
-        ],
-      })
-      expect(existsSync(marker)).toBe(false)
-
-      // The same for the scan's ripgrep.
-      rmSync(join(tools, 'rg'))
-      symlinkSync(realBwrap, join(tools, 'bwrap'))
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        wrapCommandWithSandboxLinux({
-          command: 'echo never-run',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: [] },
-          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-        }),
-      ).rejects.toMatchObject({
-        name: 'LinuxSandboxProfileError',
-        code: 'host_helper_unavailable',
-        message: expect.stringContaining(join(projectBin, 'rg')),
-      })
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('uses bwrapPath, socatPath and a ripgrep command with a directory part as given', async () => {
-      // Named outright, even inside the write path: a directive, not looked up.
-      const tools = dir('tools')
-      symlinkSync(whichSync('bash')!, join(tools, 'bash'))
-      process.env.PATH = tools
-      const httpSocket = join(base, 'http.sock')
-      const socksSocket = join(base, 'socks.sock')
-      writeFileSync(httpSocket, '')
-      writeFileSync(socksSocket, '')
-
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo wrapped-ok',
-        needsNetworkRestriction: true,
-        httpSocketPath: httpSocket,
-        socksSocketPath: socksSocket,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [project], denyWithinAllow: [] },
-        bwrapPath: join(projectBin, 'bwrap'),
-        socatPath: join(projectBin, 'socat'),
-        ripgrepConfig: { command: realRg },
-      })
-
-      expect(firstWord(wrapped)).toBe(join(projectBin, 'bwrap'))
-      expect(wrapped).toContain(
-        `${join(projectBin, 'socat')} TCP6-LISTEN:3128,`,
-      )
-      expect(existsSync(marker)).toBe(false)
-    })
-
-    it('resolves from the whole PATH when the policy lets the command write everywhere', async () => {
-      process.env.PATH = `${safe}:${savedPath}`
-      symlinkSync(realBwrap, join(safe, 'bwrap'))
-
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo wrapped-ok',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
-      })
-
-      expect(firstWord(wrapped)).toBe(join(safe, 'bwrap'))
-    })
-  })
-
-  describe.if(isLinux)('the dependency check', () => {
-    it('reports a required helper found only inside a writable path as an error naming it', () => {
-      const tools = dir('tools')
-      symlinkSync(whichSync('socat')!, join(tools, 'socat'))
-      plant(join(projectBin, 'bwrap'))
-      process.env.PATH = `${projectBin}:${tools}`
-
-      const restricted = checkLinuxDependencies({
-        allowedWritePaths: [project],
-      })
-
-      expect(restricted.errors).toHaveLength(1)
-      // Embedders tell the check's errors apart by these opening words.
-      expect(restricted.errors[0]).toStartWith(
-        'bwrap runs on the host and was not found on PATH',
-      )
-      expect(restricted.errors[0]).toContain(join(projectBin, 'bwrap'))
-      // One that is nowhere gets the plain message.
-      process.env.PATH = tools
-      expect(
-        checkLinuxDependencies({ allowedWritePaths: [project] }).errors,
-      ).toEqual(['bubblewrap (bwrap) not installed'])
-      // The copy passed over was not asked its version either.
-      expect(existsSync(marker)).toBe(false)
-      // The first PATH with nothing restricted: that copy is the one to run.
-      process.env.PATH = `${projectBin}:${tools}`
-      expect(checkLinuxDependencies().errors).toEqual([])
-    })
-
-    it('warns about a helper named outright that the sandboxed command may write', () => {
-      const bwrapPath = plant(join(projectBin, 'bwrap'))
-      const socatPath = plant(join(projectBin, 'socat'))
-      const applyPath = plant(join(projectBin, 'apply-seccomp'))
-
-      const named = checkLinuxDependencies({
-        bwrapPath,
-        socatPath,
-        seccompConfig: { applyPath },
-        allowedWritePaths: [project],
-      })
-
-      expect(named.errors).toEqual([])
-      expect(named.warnings).toEqual([
-        `bwrapPath ${bwrapPath} is inside the allowed write path ${project}: the sandboxed command can replace that file`,
-        `socatPath ${socatPath} is inside the allowed write path ${project}: the sandboxed command can replace that file`,
-        `seccomp.applyPath ${applyPath} is inside the allowed write path ${project}: the sandboxed command can replace that file`,
-      ])
-      // Outside the write paths, or with nothing restricted: no warning.
-      expect(
-        checkLinuxDependencies({
-          bwrapPath,
-          socatPath,
-          seccompConfig: { applyPath },
-          allowedWritePaths: [safe],
-        }).warnings,
-      ).toEqual([])
-      expect(
-        checkLinuxDependencies({
-          bwrapPath,
-          socatPath,
-          seccompConfig: { applyPath },
-        }).warnings,
-      ).toEqual([])
-      // A directive is followed: the bwrap it names is asked its version. The
-      // check runs nothing else.
-      expect([
-        ...new Set(readFileSync(marker, 'utf8').trim().split('\n')),
-      ]).toEqual([bwrapPath])
-    })
-
-    it('SandboxManager judges by the configuration it is initialized with', async () => {
-      const tools = dir('tools')
-      for (const needed of ['bwrap', 'socat']) {
-        symlinkSync(whichSync(needed)!, join(tools, needed))
-      }
-      plant(join(projectBin, 'rg'))
-      // initialize() starts the socat bridges on the host: not with this one.
-      plant(join(projectBin, 'socat'))
-      process.env.PATH = `${projectBin}:${tools}`
-
-      const config = {
-        network: { allowedDomains: [], deniedDomains: [] },
-        filesystem: { denyRead: [], allowWrite: [project], denyWrite: [] },
-      }
-      // initialize() refuses to start with a helper it would never run.
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(SandboxManager.initialize(config)).rejects.toThrow(
-        /Sandbox dependencies not available: rg runs on the host and was not found on PATH outside the paths the sandboxed command may write\. Passed over: .*node_modules\/\.bin\/rg/,
-      )
-      await SandboxManager.reset()
-
-      // A ripgrep named outright is used as given, and warned about.
-      await SandboxManager.initialize({
-        ...config,
-        ripgrep: { command: join(projectBin, 'rg') },
-      })
-      try {
-        const named = SandboxManager.checkDependencies()
-        expect(named.errors).toEqual([])
-        expect(named.warnings).toEqual([
-          `ripgrep.command ${join(projectBin, 'rg')} is inside the allowed write path ${project}: the sandboxed command can replace that file`,
-        ])
-      } finally {
-        await SandboxManager.reset()
-      }
-      expect(existsSync(marker)).toBe(false)
-    })
-  })
-
-  // `npm root -g` is run to find a global install of this package. npm is a
-  // script and looks `node` up by name, so the rule is put to a PATH.
-  describe.if(!isWindows)(
-    'the PATH given to a program that searches it itself',
-    () => {
-      afterEach(() => {
-        resetGlobalNpmPathsForTesting()
-      })
-
-      it('leaves out what a host helper would not be taken from', () => {
-        const linked = join(safe, 'into-the-project')
-        symlinkSync(projectBin, linked)
-        process.env.PATH = [
-          projectBin,
-          'relative',
-          '',
-          linked,
-          safe,
-          '/usr/bin',
-        ].join(':')
-
-        expect(hostSearchPath([project])).toBe([safe, '/usr/bin'].join(':'))
-        // A directory nobody can write, whose `node` links to a file somebody
-        // can: left out only for a child that looks `node` up.
-        const shims = dir('shims')
-        plant(join(project, 'node'))
-        symlinkSync(join(project, 'node'), join(shims, 'node'))
-        process.env.PATH = [shims, safe].join(':')
-        expect(hostSearchPath([project])).toBe([shims, safe].join(':'))
-        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
-
-        // A dangling link into where the command may write counts the same.
-        const dangling = dir('dangling')
-        symlinkSync(join(project, 'not-there-yet'), join(dangling, 'npm'))
-        process.env.PATH = [dangling, safe].join(':')
-        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
-
-        // `..` in an entry is resolved through the file system, not by its
-        // spelling: through a link, this one's `node` is another directory's.
-        const elsewhere = dir('elsewhere', 'bin')
-        symlinkSync(join(project, 'node'), join(base, 'elsewhere', 'node'))
-        symlinkSync(elsewhere, join(safe, 'jump'))
-        process.env.PATH = [`${safe}/jump/..`, safe].join(':')
-        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
-
-        // An empty PATH would mean the current directory to a shell.
-        process.env.PATH = `${projectBin}::.`
-        expect(hostSearchPath([project])).toBe('/dev/null')
-
-        // Nothing restricted: the program inherits the PATH as it is.
-        expect(hostSearchPath(undefined)).toBeUndefined()
-        expect(hostSearchPath(['/'])).toBeUndefined()
-      })
-
-      it('keeps an npm the sandboxed command could have written from being run', async () => {
-        plant(join(projectBin, 'npm'))
-        plant(join(projectBin, 'node'))
-        process.env.PATH = `${projectBin}:${savedPath}`
-
-        resetGlobalNpmPathsForTesting()
-        await getGlobalNpmPathsAsync(hostSearchPath([project], ['npm', 'node']))
-        expect(existsSync(marker)).toBe(false)
-
-        // The control: asked with the PATH as it is, the planted one answers.
-        resetGlobalNpmPathsForTesting()
-        await getGlobalNpmPathsAsync()
-        expect(existsSync(marker)).toBe(true)
-      })
-    },
+const { findHostHelper, hostSearchPath, writablePlaces } = hostHelpers
+const unavailable = hostHelpers.describeUnavailableHostHelper
+const warning = hostHelpers.writableNamedHelperWarning
+const posix = it.if(!isWindows)
+const onLinux = it.if(isLinux)
+const BWRAP_CAN_NAMESPACE = isLinux && bwrapCanNamespace()
+const savedPath = process.env.PATH ?? ''
+const savedCwd = process.cwd()
+const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+const base = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'host-helpers-')))
+const marker = `${base}/a-planted-file-was-run`
+const project = `${base}/project`
+const projectBin = `${project}/node_modules/.bin`
+const safe = `${base}/safe`
+const elsewhere = `${base}/elsewhere`
+// A made-up helper name for the cases that are about the search alone.
+const HELPER = 'srt-test-helper'
+const planted = `${projectBin}/${HELPER}`
+const outside = `${safe}/${HELPER}`
+const writable = [project]
+const inProject = `inside the allowed write path ${project}`
+const replaceable = 'the sandboxed command can replace that file'
+
+// An executable that leaves the marker behind if anything ever runs it.
+function plant(file: string): string {
+  fs.mkdirSync(dirname(file), { recursive: true })
+  const script = `#!/bin/sh\necho "$0" >> '${marker}'\n`
+  fs.writeFileSync(file, script, { mode: 0o755 })
+  return file
+}
+
+function link(target: string, file: string): void {
+  fs.mkdirSync(dirname(file), { recursive: true })
+  fs.symlinkSync(target, file)
+}
+
+// What the search passes over when a helper's only copy is the planted one,
+// and what is then said.
+const skipped = (helper: string): hostHelpers.SkippedHostHelper[] => [
+  { path: `${projectBin}/${helper}`, reason: inProject, writePath: project },
+]
+const refusal = (helper: string, option: string): string =>
+  unavailable(helper, option, { path: null, skipped: skipped(helper) })
+
+beforeEach(async () => {
+  // Other suites leave a configuration, and wraps they did not clean up.
+  await SandboxManager.reset()
+  for (const name of [HELPER, 'bwrap', 'socat', 'rg', 'bash', 'npm', 'node'])
+    plant(`${projectBin}/${name}`)
+  plant(outside)
+  plant(`${elsewhere}/${HELPER}`)
+  link(planted, `${base}/linked/${HELPER}`)
+  link(elsewhere, `${project}/tools`)
+  link(project, `${base}/alias`)
+  link(`${project}/node_modules/../../safe/${HELPER}`, `${base}/up/${HELPER}`)
+  link('/', `${project}/dist`)
+  // Something only the scan finds: a shell startup file below the cwd.
+  fs.mkdirSync(`${project}/nested`)
+  fs.writeFileSync(`${project}/nested/.bashrc`, '')
+})
+
+afterEach(async () => {
+  mock.restore()
+  Object.defineProperty(process, 'platform', platform)
+  process.env.PATH = savedPath
+  process.chdir(savedCwd)
+  seccomp.resetGlobalNpmPathsForTesting()
+  await SandboxManager.reset()
+  const ran = fs.existsSync(marker) && fs.readFileSync(marker, 'utf8')
+  fs.rmSync(base, { recursive: true, force: true })
+  expect(ran).toBe(false)
+})
+
+posix.each<[string, Parameters<typeof writablePlaces>[0], string[]]>([
+  ['writes anywhere', 'anywhere', []],
+  ['the root among them', [project, '/'], []],
+  ['a pattern that starts from the root', [project, '/*/bin'], []],
+  ['a pattern', [`${project}/src/**/*.ts`], [`${project}/src`]],
+  ['a name that reads as a pattern', [`${safe}/w[1]`], [safe]],
+  ['a trailing slash', [`${project}/`], [project]],
+  ['an entry that is not there', [`${base}/absent`], [`${base}/absent`]],
+  // The command can make such a link wherever one entry lies inside another,
+  // and the wrap binds nothing for it: it switches nothing off, widens nothing.
+  ['a link to the root', [`${project}/dist`], [`${project}/dist`]],
+  ['a link out of its place', [`${project}/tools`], [`${project}/tools`]],
+])('writablePlaces: %s', (_, allowed, places) => {
+  expect(writablePlaces(allowed)).toEqual(places)
+})
+
+posix('writablePlaces: no policy known yet', () => {
+  process.chdir(elsewhere)
+  fs.rmSync(elsewhere, { recursive: true })
+  const defaults = writablePlaces(undefined)
+  expect(defaults).toContain('/dev/null')
+  process.chdir(safe)
+  expect(writablePlaces(undefined)).toEqual([safe, ...defaults])
+})
+
+// What, the PATH entry it is found through, the place that rules it out.
+posix.each([
+  ['a copy in it', projectBin, undefined],
+  ['a link to a file in it', `${base}/linked`, planted],
+  // It leads out today; whoever may write the directory it is kept in decides
+  // where it leads tomorrow.
+  ['a PATH entry that is a link kept in it', `${project}/tools`, undefined],
+  ['that link through an alias', `${base}/alias/tools`, `${project}/tools`],
+  ['a link that goes up from it', `${base}/up`, `${project}/node_modules`],
+])('the search passes over %s', (_, entry, through) => {
+  const path = `${entry}/${HELPER}`
+  const reason = (through ? `leads through ${through}, ` : '') + inProject
+  const skipped = [{ path, reason, writePath: project }]
+  process.env.PATH = `${entry}:${safe}`
+  // The plain search, for what runs inside the sandbox, takes the first.
+  expect(whichSync(HELPER)).toBe(path)
+  expect(findHostHelper(HELPER, writable)).toEqual({ path: outside, skipped })
+  expect(hostSearchPath(writable, [HELPER])).toBe(safe)
+  // With writes allowed everywhere no place is better than another.
+  expect(findHostHelper(HELPER, [])).toEqual({ path, skipped: [] })
+  process.env.PATH = entry
+  expect(findHostHelper(HELPER, writable)).toEqual({ path: null, skipped })
+  // Named outright it is used as given, and warned about.
+  expect(findHostHelper(path, writable)).toEqual({ path, skipped: [] })
+  expect(warning('o', path, writable)).toBe(
+    `o ${path} ${through ? '' : 'is '}${reason}: ${replaceable}`,
   )
+})
 
-  describe('macOS: fixed locations, no search', () => {
-    it('starts the wrapped command with /usr/bin/env', () => {
-      const wrapped = wrapCommandWithSandboxMacOS({
-        command: 'true',
-        needsNetworkRestriction: false,
-        readConfig: undefined,
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-        unsetEnvVars: ['GH_TOKEN'],
-      })
+posix('the search never uses a relative PATH entry, nor the empty one', () => {
+  plant(`${elsewhere}/bin/${HELPER}`)
+  process.chdir(elsewhere)
+  process.env.PATH = `:.:bin:${safe}`
+  const skipped = ['', '.', 'bin'].map(entry => ({
+    path: `${entry || '.'}/${HELPER}`,
+    reason: `the PATH entry '${entry}' is relative`,
+  }))
+  for (const places of [writable, []]) {
+    expect(findHostHelper(HELPER, places)).toEqual({ path: outside, skipped })
+    expect(hostSearchPath(places, [])).toBe(safe)
+  }
+})
 
-      expect(wrapped.startsWith('/usr/bin/env -u GH_TOKEN ')).toBe(true)
-      expect(wrapped).toContain(' /usr/bin/sandbox-exec -p ')
-    })
+posix('the search takes the first program outside', () => {
+  fs.mkdirSync(`${project}/no-program/${HELPER}`, { recursive: true })
+  // By path segment: this one is beside the project, not in it.
+  const path = plant(`${project}-tools/${HELPER}`)
+  process.env.PATH = `${project}/no-program:${project}-tools:${safe}`
+  expect(findHostHelper(HELPER, writable)).toEqual({ path, skipped: [] })
+  expect(findHostHelper(project, writable)).toEqual({ path: null, skipped: [] })
+  // `..` in an entry is the file system's to read: after a link, this one's
+  // copy is another directory's.
+  link(elsewhere, `${safe}/jump`)
+  link(planted, `${base}/${HELPER}`)
+  process.env.PATH = `${safe}/jump/..:${safe}`
+  expect(findHostHelper(HELPER, writable).skipped).toHaveLength(1)
+  expect(hostSearchPath(writable, [HELPER])).toBe(safe)
+})
 
-    it('spawns the log monitor as /usr/bin/log', () => {
-      const child = Object.assign(new EventEmitter(), {
-        stdout: new EventEmitter(),
-        stderr: new EventEmitter(),
-        kill: () => true,
-      })
-      const spawnSpy = spyOn(childProcess, 'spawn').mockReturnValue(
-        child as never,
-      )
-      try {
-        const stop = startMacOSSandboxLogMonitor(
-          () => {},
-          undefined,
-          key => key,
-        )
-        stop()
+onLinux('the search passes over what it cannot follow', () => {
+  // A name that is no text: the kernel finds the file, the walk stops.
+  const odd = Buffer.concat([Buffer.from(`${safe}/`), Buffer.of(0xff)])
+  fs.copyFileSync(planted, odd)
+  fs.symlinkSync(odd, `${safe}/odd`)
+  process.env.PATH = safe
+  expect(findHostHelper('odd', writable).skipped).toEqual([
+    { path: `${safe}/odd`, reason: 'it could not be followed to a file' },
+  ])
+})
 
-        expect(spawnSpy).toHaveBeenCalledTimes(1)
-        expect(spawnSpy.mock.calls[0]?.[0]).toBe('/usr/bin/log')
-        expect(spawnSpy.mock.calls[0]?.[1]?.[0]).toBe('stream')
-      } finally {
-        spawnSpy.mockRestore()
-      }
-    })
+posix('hostSearchPath leaves out what no helper would be taken from', () => {
+  // Whatever bears the name is judged: the command could supply the rest.
+  link(`${project}/not-there-yet`, `${base}/dangling-in/${HELPER}`)
+  link(`${base}/nowhere`, `${base}/dangling-out/${HELPER}`)
+  link(HELPER, `${base}/loop/${HELPER}`)
+  const copies = ['dangling-in', 'dangling-out', 'loop'].map(d => join(base, d))
+  const all = [projectBin, `${base}/absent`, ...copies, safe, '/usr/bin']
+  process.env.PATH = all.join(':')
+  expect(hostSearchPath(writable, []).split(':')).toEqual(all.slice(2))
+  expect(hostSearchPath(writable, ['x', HELPER])).toBe(`${safe}:/usr/bin`)
+  expect(hostSearchPath([], [HELPER]).split(':')).toEqual(all)
+  // An empty PATH would mean the current directory to a shell.
+  process.env.PATH = projectBin
+  expect(hostSearchPath(writable, [])).toBe('/dev/null')
+  delete process.env.PATH
+  expect(hostSearchPath(writable, [])).toBe('/dev/null')
+})
+
+posix('the refusal says what was passed over, why, and what lifts it', () => {
+  const none = { path: null, skipped: [] }
+  expect(unavailable('rg', 'o', none)).toBe('rg was not found on PATH')
+  expect(unavailable('/x/rg', 'o', none)).toBe(
+    '/x/rg is not an executable file',
+  )
+  expect(unavailable('rg', 'o', none, 'not installed')).toBe('not installed')
+  const two = ['/w/rg', './rg'].map(path => ({ path, reason: 'why' }))
+  expect(unavailable('rg', 'o', { path: null, skipped: two }, 'unused')).toBe(
+    'rg was not found on PATH outside the paths the sandboxed command may write. ' +
+      'Passed over: /w/rg (why); ./rg (why). Install it outside those paths, ' +
+      'put the directory that holds it on PATH, or name it by its path with o.',
+  )
+})
+
+posix('the warning is about a file, and one the command may write', () => {
+  process.chdir(projectBin)
+  expect(warning('o', `./${HELPER}`, writable)).toBe(
+    `o ./${HELPER} is ${inProject}: ${replaceable}`,
+  )
+  // A bare name names no file: argv0 mode's applyPath.
+  for (const file of [HELPER, undefined, outside, `${base}/absent`])
+    expect(warning('o', file, writable)).toBeUndefined()
+})
+
+const NAMES = ['rg', 'bwrap', 'socat', 'bash']
+const real = Object.fromEntries(NAMES.map(name => [name, whichSync(name)!]))
+const config = {
+  network: { allowedDomains: [], deniedDomains: [] },
+  filesystem: { denyRead: [], allowWrite: [project], denyWrite: [] },
+}
+// Never run: for a socket any path that is there will do.
+const RELAYED = {
+  needsNetworkRestriction: true,
+  httpSocketPath: safe,
+  socksSocketPath: elsewhere,
+}
+const NAMED = {
+  bwrapPath: `${projectBin}/bwrap`,
+  socatPath: `${projectBin}/socat`,
+  binShell: `${projectBin}/bash`,
+  ripgrepConfig: { command: real.rg },
+}
+
+// A directory of links to the real programs named, and to no other.
+function tools(names: string[], dir = `${base}/real`): string {
+  fs.mkdirSync(dir, { recursive: true })
+  for (const name of names) link(real[name], `${dir}/${name}`)
+  return dir
+}
+
+// The project is marked literal, which counts like any other entry, and the
+// link to the root is among the write paths.
+function wrap(
+  params: Partial<linux.LinuxSandboxParams> = {},
+  allowOnly = [`${project}/dist`],
+): Promise<string> {
+  return linux.wrapCommandWithSandboxLinux({
+    command: 'echo wrapped-ok',
+    needsNetworkRestriction: false,
+    writeConfig: {
+      allowOnly,
+      literalAllowOnly: [project],
+      denyWithinAllow: [],
+    },
+    ...params,
   })
+}
+
+onLinux.each<[string, Partial<linux.LinuxSandboxParams>]>([
+  ['the real ones', {}],
+  // It may ask bubblewrap about itself: the copy it runs, never PATH's.
+  ['the real ones, relayed', { ...RELAYED, allowAllUnixSockets: true }],
+  ['the ones named outright, as given', { ...RELAYED, ...NAMED }],
+])('a wrap names its programs by their paths: %s', async (_, params) => {
+  const { bwrapPath = real.bwrap, binShell = real.bash } = params
+  process.chdir(project)
+  process.env.PATH = `${projectBin}:${savedPath}`
+  const wrapped = await wrap(params)
+  expect(wrapped).toStartWith(`${bwrapPath} `)
+  expect(wrapped).toContain(` -- ${binShell} -c `)
+  // Each relay names socat twice: for both families, and for IPv4 alone.
+  expect([...(wrapped.match(/[^\s'"]*socat(?= TCP\d-LISTEN)/g) ?? [])]).toEqual(
+    Array(params.httpSocketPath ? 4 : 0).fill(params.socatPath ?? real.socat),
+  )
+  // Its own binds agree about the link.
+  expect(wrapped).toContain(`--bind ${project} ${project}`)
+  expect(wrapped).not.toContain(`--bind ${project}/dist`)
+  // Only the scan finds the nested file: the real ripgrep ran.
+  expect(wrapped).toContain(`${project}/nested/.bashrc`)
+  if (BWRAP_CAN_NAMESPACE && !params.httpSocketPath) {
+    const options = { shell: true, encoding: 'utf8' } as const
+    expect(childProcess.spawnSync(wrapped, options).stdout).toBe('wrapped-ok\n')
+  }
+})
+
+onLinux.each([
+  ['bwrap', 'bwrapPath', undefined],
+  ['socat', 'socatPath', undefined],
+  ['bash', 'binShell', undefined],
+  [HELPER, 'binShell', HELPER],
+])('a wrap refuses for want of %s', async (helper, option, binShell) => {
+  // Everything else it needs is there, outside the project.
+  process.env.PATH = `${projectBin}:${tools(NAMES.filter(n => n !== helper))}`
+  // Before anything is scanned: a ripgrep named outright would be run.
+  const ripgrepConfig = { command: plant(`${base}/named-rg`) }
+  const error: unknown = await wrap({
+    ...RELAYED,
+    binShell,
+    ripgrepConfig,
+  }).catch((thrown: unknown) => thrown)
+  expect(error).toBeInstanceOf(linux.LinuxSandboxProfileError)
+  expect(error).toMatchObject({
+    code: 'host_helper_unavailable',
+    message: refusal(helper, option),
+    // The same as fields, for a caller that words its own message.
+    cause: { helper, skipped: skipped(helper) },
+  })
+})
+
+onLinux('a wrap goes on without a ripgrep, and says so', async () => {
+  // The policy counts, not the working directory.
+  process.chdir(safe)
+  process.env.PATH = `${projectBin}:${tools(['bwrap', 'bash'])}`
+  const { result, warnings } = await withCapturedWarnings(() =>
+    wrap({}, [safe]),
+  )
+  expect(warnings.join()).toContain(
+    `ripgrep scan failed: LinuxSandboxProfileError: ${refusal('rg', 'ripgrep.command')}`,
+  )
+  // What needs no scan is still denied.
+  expect(result).toContain(`--ro-bind /dev/null ${safe}/.bashrc`)
+})
+
+onLinux('a wrap that restricts no write searches the whole PATH', async () => {
+  process.chdir(project)
+  process.env.PATH = `${tools(['bwrap'], `${project}/real`)}:${savedPath}`
+  expect(
+    await wrap({ writeConfig: undefined, unsetEnvVars: ['X'] }),
+  ).toStartWith(`${project}/real/bwrap `)
+})
+
+onLinux.each([
+  ['checkDependencies', SandboxManager.checkDependencies],
+  ['checkDependenciesAsync', SandboxManager.checkDependenciesAsync],
+])('%s, with no configuration, judges by the cwd', async (_, check) => {
+  const refusals = [
+    refusal('rg', 'ripgrep.command'),
+    refusal('bwrap', 'bwrapPath'),
+    refusal('socat', 'socatPath'),
+  ]
+  process.chdir(project)
+  process.env.PATH = `${projectBin}:${tools([])}`
+  expect((await check()).errors).toEqual(refusals)
+  expect(linux.checkLinuxDependencies().errors).toEqual(refusals.slice(1))
+  expect(linux.getLinuxDependencyStatus().hasBwrap).toBe(false)
+  // A configuration that cannot be read counts as none.
+  SandboxManager.updateConfig({
+    ...config,
+    filesystem: { allowWrite: [{}] },
+  } as never)
+  expect((await check()).errors).toEqual(refusals)
+  // Of a helper that is nowhere it says what it always said.
+  process.env.PATH = `${base}/real`
+  expect((await check()).errors).toEqual([
+    'ripgrep (rg) not found',
+    'bubblewrap (bwrap) not installed',
+    'socat not installed',
+  ])
+})
+
+onLinux(
+  'the manager judges by its configuration, and hands it on',
+  async () => {
+    process.env.PATH = `${projectBin}:${tools(['bwrap', 'socat'])}`
+    expect(await SandboxManager.initialize(config).catch(String)).toBe(
+      `Error: Sandbox dependencies not available: ${refusal('rg', 'ripgrep.command')}`,
+    )
+    const lookups = [
+      spyOn(seccomp, 'getApplySeccompBinaryPath'),
+      spyOn(seccomp, 'getApplySeccompBinaryPathAsync'),
+      spyOn(javaAgent, 'getJavaProxyAgentJarPathAsync'),
+    ]
+    // The bridges run on the host: not the planted socat.
+    process.env.PATH = `${projectBin}:${savedPath}`
+    await SandboxManager.initialize(config)
+    await wrap()
+    linux.getLinuxDependencyStatus({ writable })
+    expect(lookups.map(lookup => lookup.mock.calls.length)).toEqual([3, 1, 1])
+    for (const call of lookups.flatMap(lookup => lookup.mock.calls))
+      expect(call[1]).toContain(project)
+  },
+)
+
+onLinux('the dependency check warns of a helper named outright', () => {
+  const { bwrapPath, socatPath, binShell: applyPath } = NAMED
+  const command = `${projectBin}/rg`
+  SandboxManager.updateConfig({
+    ...config,
+    ...{ bwrapPath, socatPath, ripgrep: { command }, seccomp: { applyPath } },
+  })
+  expect(SandboxManager.checkDependencies()).toEqual({
+    errors: [],
+    warnings: [
+      `ripgrep.command ${command} is ${inProject}: ${replaceable}`,
+      `bwrapPath ${bwrapPath} is ${inProject}: ${replaceable}`,
+      `socatPath ${socatPath} is ${inProject}: ${replaceable}`,
+      `seccomp.applyPath ${applyPath} is ${inProject}: ${replaceable}`,
+    ],
+  })
+  // The bwrap it names is asked its version. The check runs nothing else.
+  expect(fs.readFileSync(marker, 'utf8').split(`${bwrapPath}\n`).join('')).toBe(
+    '',
+  )
+  fs.rmSync(marker)
+})
+
+// `npm root -g` is asked for a global install of this package. npm is a script
+// and looks `node` up by name, so the rule is put to a PATH. Here neither file
+// is in one of the package's own locations, and an npm outside the project
+// answers.
+function npmAnswers(): Mock<typeof hostSearchPath> {
+  const script = `#!/bin/sh\necho '${base}/global'\n`
+  fs.writeFileSync(`${safe}/npm`, script, { mode: 0o755 })
+  link(`${projectBin}/node`, `${base}/linked/node`)
+  process.env.PATH = `${projectBin}:${base}/linked:${safe}:${savedPath}`
+  const existed = fs.existsSync
+  spyOn(fs, 'existsSync').mockImplementation(
+    file =>
+      (String(file).startsWith(base) ||
+        !/(apply-seccomp|\.jar)$/.test(String(file))) &&
+      existed(file),
+  )
+  return spyOn(hostHelpers, 'hostSearchPath')
+}
+
+// Lookups are remembered by the path named: an absent one, each time another.
+let lookups = 0
+const absent = (): string => `${base}/absent-${lookups++}`
+
+posix.each<(places?: string[]) => unknown>([
+  seccomp.getGlobalNpmPaths,
+  seccomp.getGlobalNpmPathsAsync,
+  places => seccomp.getApplySeccompBinaryPath(absent(), places),
+  places => seccomp.getApplySeccompBinaryPathAsync(absent(), places),
+  places => javaAgent.getJavaProxyAgentJarPathAsync(absent(), places),
+])('npm is looked up outside the write paths, and once: %#', async ask => {
+  const searchPath = npmAnswers()
+  // With no policy known the working directory counts.
+  for (const places of [writable, undefined]) {
+    if (!places) process.chdir(project)
+    seccomp.resetGlobalNpmPathsForTesting()
+    await ask(places)
+    await ask(places)
+  }
+  expect(
+    searchPath.mock.results.map(({ value }) => String(value).split(':')[0]),
+  ).toEqual([safe, safe])
+})
+
+posix.each([
+  seccomp.getApplySeccompBinaryPath,
+  seccomp.getApplySeccompBinaryPathAsync,
+])('a global install the command may write is passed over: %#', async find => {
+  const helper = plant(
+    `${base}/global/@anthropic-ai/sandbox-runtime/vendor/seccomp/${process.arch}/apply-seccomp`,
+  )
+  npmAnswers()
+  const named = absent()
+  expect(await find(named, [project, `${base}/global`])).toBeNull()
+  // Remembered by the places it was judged by, too.
+  expect(await find(named, writable)).toBe(helper)
+})
+
+posix('on Windows npm is given the environment as it is', () => {
+  const execSync = spyOn(childProcess, 'execSync').mockReturnValue('')
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  seccomp.getGlobalNpmPaths(writable)
+  expect(execSync.mock.calls[0]?.[1]?.env).toBe(process.env)
+})
+
+posix(
+  'macOS: the shell, under sandbox-exec, is found on the whole PATH',
+  () => {
+    process.env.PATH = `${projectBin}:${savedPath}`
+    const wrapped = macos.wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: [project], denyWithinAllow: [] },
+    })
+    expect(wrapped).toMatch(/^\/usr\/bin\/env .* \/usr\/bin\/sandbox-exec -p /s)
+    expect(wrapped).toContain(` ${projectBin}/bash -c `)
+  },
+)
+
+posix('macOS: the log monitor is spawned as /usr/bin/log', () => {
+  const child = new EventEmitter() as never
+  const spawn = spyOn(childProcess, 'spawn').mockReturnValue(child)
+  macos.startMacOSSandboxLogMonitor(mock(), undefined, String)
+  expect(spawn.mock.calls[0]?.[0]).toBe('/usr/bin/log')
 })
