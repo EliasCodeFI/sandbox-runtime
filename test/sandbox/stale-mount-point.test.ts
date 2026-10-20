@@ -7,9 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
-  readlinkSync,
   realpathSync,
   rmSync,
   rmdirSync,
@@ -23,8 +21,17 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  leftover,
+  namedBy,
+  type Process,
+  thisProcess,
+  wrapIn,
+  wrapLine,
+  writeManifest,
+} from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
-import { countMounts, lastMountAt, manifestOf } from '../helpers/bwrap-argv.js'
+import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -83,85 +90,17 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  async function wrap(denyPaths: string[], command = 'true'): Promise<string> {
-    return wrapCommandWithSandboxLinux({
-      command,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [] },
-      writeConfig: { allowOnly: [AREA], denyWithinAllow: denyPaths },
-    })
-  }
+  const wrap = (denyPaths: string[], command = 'true'): Promise<string> =>
+    wrapIn(AREA, command, denyPaths)
 
-  /**
-   * What bwrap's ensure_file(dest, 0444) leaves on the host, and what
-   * somebody's own empty read-only file looks like.
-   */
-  function plantEmptyReadOnlyFile(p: string): void {
-    writeFileSync(p, '')
-    chmodSync(p, 0o444)
-  }
-
-  /**
-   * The manifest of a wrap that named `paths`, written a minute ago by `pid`,
-   * by default a process that is gone. Returns where it is written.
-   */
-  function manifestNaming(
-    paths: string[],
-    writer: { pid: number; start: string } = { pid: deadPid(), start: '1' },
-  ): string {
-    const dir = runtime.manifestDir()
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-    chmodSync(dir, 0o700)
-    const file = join(
-      dir,
-      `${writer.pid}-${Math.random().toString(16).slice(2).padEnd(16, '0')}.json`,
-    )
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 1,
-        ...writer,
-        ns: readlinkSync('/proc/self/ns/pid'),
-        created: Date.now() - 60_000,
-        paths,
-        sources: [],
-      }),
-      { mode: 0o600 },
-    )
-    return file
-  }
-
-  /** A pid nothing in this PID namespace has. */
-  function deadPid(): number {
-    let pid = 4194000
-    while (existsSync(`/proc/${pid}`)) pid--
-    return pid
-  }
-
-  /** This process, as a manifest names its writer: running, so it is live. */
-  function thisProcess(): { pid: number; start: string } {
-    const stat = readFileSync('/proc/self/stat', 'utf8')
-    return {
-      pid: process.pid,
-      start: stat
-        .slice(stat.lastIndexOf(')') + 1)
-        .trim()
-        .split(' ')[19]!,
-    }
-  }
+  /** One that `writer` wrote, by default a process that is gone. */
+  const manifestNaming = (paths: string[], writer?: Process): string =>
+    writeManifest(runtime.manifestDir(), paths, writer)
 
   /** What a killed process leaves: the file, and the manifest that names it. */
   function plantLeftover(p: string): string {
-    plantEmptyReadOnlyFile(p)
+    leftover(p)
     return manifestNaming([p])
-  }
-
-  /** The mount points the wrap named in its manifest, none without one. */
-  function namedBy(command: string): string[] {
-    const file = manifestOf(command)
-    return file === undefined
-      ? []
-      : (JSON.parse(readFileSync(file, 'utf8')) as { paths: string[] }).paths
   }
 
   // 0444 is what bubblewrap makes from 0.5.0, 0666 less the umask before.
@@ -213,7 +152,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     [
       'an empty read-only file with a second link',
       (p: string) => {
-        plantEmptyReadOnlyFile(p)
+        leftover(p)
         linkSync(p, `${p}.other-name`)
       },
     ],
@@ -256,7 +195,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   it.each([0o444, 0o644])(
     "is the caller's own where no manifest names it: bound onto itself, named by the wrap nowhere, and never removed (mode %o)",
     async mode => {
-      plantEmptyReadOnlyFile(LOCK)
+      leftover(LOCK)
       chmodSync(LOCK, mode)
       // A manifest that names something else changes nothing about it.
       manifestNaming([join(GIT_DIR, 'other.lock')])
@@ -278,7 +217,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   it("is the caller's own at a mandatory deny path as well, beside the mount points the wrap makes for the others", async () => {
     const project = join(AREA, 'repo')
     const own = join(project, '.mcp.json')
-    plantEmptyReadOnlyFile(own)
+    leftover(own)
     const cwd = process.cwd()
     process.chdir(project)
     let command: string
@@ -305,8 +244,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     async () => {
       const project = join(AREA, 'repo')
       const mandatory = join(project, '.mcp.json')
-      plantEmptyReadOnlyFile(mandatory)
-      plantEmptyReadOnlyFile(LOCK)
+      leftover(mandatory)
+      leftover(LOCK)
       const before = [mandatory, LOCK].map(p => lstatSync(p).ino)
 
       const attempts = [mandatory, LOCK]
@@ -361,7 +300,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       if (file === LOCK && !made) {
         made = true
         manifestNaming([LOCK], thisProcess())
-        plantEmptyReadOnlyFile(LOCK)
+        leftover(LOCK)
       }
       return exists(file as string)
     }) as never)
@@ -409,7 +348,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   // ---- an empty read-only file that a live manifest names ----------------
 
   it('stays, covered and named, for as long as the manifest of a running sandbox names it, and goes once none does', async () => {
-    plantEmptyReadOnlyFile(LOCK)
+    leftover(LOCK)
     // Of another wrap, whose writer is running: live.
     const live = manifestNaming([LOCK], thisProcess())
 
@@ -432,7 +371,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
   it('leaves an empty read-only file alone where no sandbox could have made it: outside every allowed write path', async () => {
     const outsideFile = join(OUTSIDE, 'config.lock')
-    plantEmptyReadOnlyFile(outsideFile)
+    leftover(outsideFile)
 
     const command = await wrap([outsideFile])
 
@@ -483,13 +422,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
           `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(
             join(import.meta.dir, '../helpers/isolated/library.ts'),
           )}`,
-          `const command = await wrapCommandWithSandboxLinux({`,
-          `  command: 'true',`,
-          `  needsNetworkRestriction: false,`,
-          `  readConfig: { denyOnly: [] },`,
-          `  writeConfig: { allowOnly: [${JSON.stringify(AREA)}], denyWithinAllow: [${JSON.stringify(LOCK)}] },`,
-          `})`,
-          `const r = spawnSync(command, { shell: true, timeout: 15000 })`,
+          wrapLine([AREA], 'true', [LOCK]),
+          `const r = spawnSync(wrapped, { shell: true, timeout: 15000 })`,
           `if (r.status !== 0) process.exit(3)`,
           `process.kill(process.pid, 'SIGKILL')`,
         ].join('\n'),
@@ -569,17 +503,10 @@ describe.if(isLinux)(
       rmSync(BASE, { recursive: true, force: true })
     })
 
-    async function wrap(
+    const wrap = (
       denyPaths: string[] = [],
       command = 'echo hello',
-    ): Promise<string> {
-      return wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [AREA], denyWithinAllow: denyPaths },
-      })
-    }
+    ): Promise<string> => wrapIn(AREA, command, denyPaths)
 
     /**
      * Like wrap(), but with the temp dir the sources are minted under writable

@@ -35,6 +35,16 @@ import {
 } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import {
+  deadPid,
+  leftover,
+  recordOf,
+  started,
+  startOf,
+  statLine,
+  thisProcess,
+  writeManifest,
+} from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
 import {
   makePlaces,
@@ -87,87 +97,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /** What bubblewrap leaves on the host for `--ro-bind /dev/null <absent>`. */
-  function leftover(p: string): void {
-    writeFileSync(p, '')
-    chmodSync(p, 0o444)
-  }
-
-  /** A pid nothing in this PID namespace has. */
-  function deadPid(): number {
-    for (let pid = 4194000; pid > 1; pid--) {
-      if (!existsSync(`/proc/${pid}`)) return pid
-    }
-    throw new Error('no free pid')
-  }
-
-  /**
-   * The manifest of a wrap whose process is gone and which is long past its
-   * grace: what a killed process leaves. `fields` overrides what it says.
-   */
-  function manifestOfADeadProcess(
+  /** What a killed process leaves in DIR. `fields` overrides what it says. */
+  const manifestOfADeadProcess = (
     paths: string[],
     fields: Record<string, unknown> = {},
-  ): string {
-    const pid = deadPid()
-    const file = join(DIR, `${pid}-${Math.random().toString(16).slice(2)}.json`)
-    const body: Record<string, unknown> = {
-      version: 1,
-      pid,
-      start: '1',
-      ns: OWN_NAMESPACE,
-      created: Date.now() - 60_000,
-      paths,
-      sources: [],
-      ...fields,
-    }
-    for (const [key, value] of Object.entries(body)) {
-      if (value === undefined) delete body[key]
-    }
-    writeFileSync(file, JSON.stringify(body), { mode: 0o600 })
-    return file
-  }
-
-  /** Field 22 of a /proc/PID/stat line: when that process started. */
-  function startOf(stat: string): string {
-    return stat
-      .slice(stat.lastIndexOf(')') + 1)
-      .trim()
-      .split(' ')[19]!
-  }
-
-  /** This process, which is running, as a manifest or a record names one. */
-  function thisProcess(): { pid: number; start: string } {
-    return {
-      pid: process.pid,
-      start: startOf(readFileSync('/proc/self/stat', 'utf8')),
-    }
-  }
-
-  /**
-   * The line the wrapper shell records for a process, with a name that holds
-   * what a careless reading would trip over.
-   */
-  function statLine(who: { pid: number; start: string }): string {
-    const after = ['S', ...Array<string>(18).fill('0'), who.start, '0', '0']
-    return `${who.pid} (a) b (c) ${after.join(' ')}\n`
-  }
-
-  /** Where the started record of `manifest` is. */
-  function recordOf(manifest: string): string {
-    return manifest.replace(/\.json$/, '.started')
-  }
-
-  /** Puts `manifest` on record as started by those processes, in that order. */
-  function started(
-    manifest: string,
-    ...by: { pid: number; start: string }[]
-  ): string {
-    writeFileSync(recordOf(manifest), by.map(statLine).join(''), {
-      mode: 0o600,
-    })
-    return manifest
-  }
+  ): string => writeManifest(DIR, paths, fields)
 
   /** The manifest this process publishes for a wrap that names `paths`. */
   function publish(paths: string[], sources: string[] = []): string {
@@ -3053,19 +2987,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(theirs, { mode: 0o700 })
     chmodSync(theirs, 0o700)
     leftover(X)
-    const manifest = manifestOfADeadProcess([X], {
-      pid: process.pid,
-      start: readFileSync('/proc/self/stat', 'utf8')
-        .split(') ')
-        .pop()!
-        .split(' ')[19],
-    })
-    writeFileSync(
-      join(theirs, '4242-0123456789abcdef.json'),
-      readFileSync(manifest, 'utf8'),
-      { mode: 0o600 },
-    )
-    rmSync(manifest)
+    writeManifest(theirs, [X], thisProcess())
     const run = join(BASE, 'run')
     mkdirSync(run, { mode: 0o700 })
     const looked = inAChild(

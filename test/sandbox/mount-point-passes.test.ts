@@ -30,6 +30,19 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { manifestOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import {
+  deadPid,
+  leftover,
+  type Process,
+  processAt,
+  run,
+  sleep,
+  started,
+  until,
+  wrapIn,
+  writeManifest,
+  writeScript,
+} from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -86,34 +99,6 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /** What bubblewrap leaves on the host for `--ro-bind /dev/null <absent>`. */
-  function leftover(p: string): void {
-    writeFileSync(p, '')
-    chmodSync(p, 0o444)
-  }
-
-  /** A pid nothing in this PID namespace has. */
-  function deadPid(): number {
-    for (let pid = 4194000; pid > 1; pid--) {
-      if (!existsSync(`/proc/${pid}`)) return pid
-    }
-    throw new Error('no free pid')
-  }
-
-  type Process = { pid: number; start: string }
-
-  /** That process as a manifest, a record or a pass names one. */
-  function processAt(pid: number): Process {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    return {
-      pid,
-      start: stat
-        .slice(stat.lastIndexOf(')') + 1)
-        .trim()
-        .split(' ')[19]!,
-    }
-  }
-
   /** Another process of this user, which runs until the test is over. */
   function anotherProcess(): Process {
     const other = spawn('sleep', ['600'], { stdio: 'ignore' })
@@ -121,38 +106,9 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     return processAt(other.pid!)
   }
 
-  /** What a killed process leaves: its manifest, long past its grace. */
-  function manifestOfADeadProcess(paths: string[], writer?: Process): string {
-    const { pid, start } = writer ?? { pid: deadPid(), start: '1' }
-    const file = join(DIR, `${pid}-${Math.random().toString(16).slice(2)}.json`)
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 1,
-        pid,
-        start,
-        ns: OWN_NAMESPACE,
-        boot: OWN_BOOT,
-        created: Date.now() - 60_000,
-        paths,
-        sources: [],
-      }),
-      { mode: 0o600 },
-    )
-    return file
-  }
-
-  /** Puts `manifest` on record as started by those processes. */
-  function started(manifest: string, ...by: Process[]): string {
-    const line = (who: Process): string =>
-      `${who.pid} (bwrap) ${['S', ...Array<string>(18).fill('0'), who.start, '0'].join(' ')}\n`
-    writeFileSync(
-      manifest.replace(/\.json$/, '.started'),
-      by.map(line).join(''),
-      { mode: 0o600 },
-    )
-    return manifest
-  }
+  /** What a killed process leaves in DIR, or one that `writer` wrote. */
+  const manifestOfADeadProcess = (paths: string[], writer?: Process): string =>
+    writeManifest(DIR, paths, { boot: OWN_BOOT, ...writer })
 
   /** Puts a pass of `who` on record, as the library names one. */
   function passOf(
@@ -178,42 +134,11 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   const passes = (): string[] =>
     readdirSync(DIR).filter(name => name.endsWith('.pass'))
 
-  function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
-  }
+  const wrap = (command = 'true', deny = [LOCK]): Promise<string> =>
+    wrapIn(AREA, command, deny)
 
-  async function until(what: string, holds: () => boolean): Promise<void> {
-    const deadline = Date.now() + 30000
-    while (!holds()) {
-      if (Date.now() > deadline)
-        throw new Error(`timed out waiting for ${what}`)
-      await sleep(10)
-    }
-  }
-
-  function wrap(command = 'true', deny = [LOCK]): Promise<string> {
-    return wrapCommandWithSandboxLinux({
-      command,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [] },
-      writeConfig: { allowOnly: [AREA], denyWithinAllow: deny },
-    })
-  }
-
-  function run(command: string): { status: number | null; said: string } {
-    const r = spawnSync(command, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 30000,
-    })
-    return { status: r.status, said: `${r.stdout}${r.stderr}` }
-  }
-
-  function script(name: string, lines: string[]): string {
-    const file = join(BASE, name)
-    writeFileSync(file, lines.join('\n'))
-    return file
-  }
+  const script = (name: string, lines: string[]): string =>
+    writeScript(BASE, name, lines)
 
   // ---- the pass ------------------------------------------------------------
 
