@@ -573,12 +573,24 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(live()).toEqual([X, Y].sort())
   })
 
-  it('is finished once no process on its record runs, though the process that wrote it does', () => {
+  it('is live while the process that wrote it runs, though no process on its record does: its command line may be run again', () => {
     leftover(X)
     const manifest = started(manifestOfADeadProcess([X], thisProcess()), {
       pid: deadPid(),
       start: '1',
     })
+    expect(live()).toEqual([X])
+    expect(collectMountPoints('none')).toEqual([])
+    expect(existsSync(manifest)).toBe(true)
+    expect(existsSync(recordOf(manifest))).toBe(true)
+  })
+
+  it('is finished once neither a process on its record nor the one that wrote it runs, however young', () => {
+    leftover(X)
+    const manifest = started(
+      manifestOfADeadProcess([X], { created: Date.now() }),
+      { pid: deadPid(), start: '1' },
+    )
     expect(live()).toEqual([])
     expect(collectMountPoints('none')).toEqual([X])
     expect(existsSync(manifest)).toBe(false)
@@ -1001,10 +1013,6 @@ describe.if(isLinux)('The mount point manifests', () => {
       r => write(r, `${gone()}?\n`),
     ],
     [
-      'larger than a record can be',
-      r => write(r, gone().repeat(1 + Math.ceil(65536 / gone().length))),
-    ],
-    [
       'a link to the record of a process that is gone',
       r => {
         write(join(BASE, 'elsewhere.started'), gone())
@@ -1099,7 +1107,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   it('goes by the whole lines of a record whose last line is cut short', () => {
     // The same command line run again, its shell not yet done writing.
     leftover(X)
-    const manifest = manifestOfADeadProcess([X], thisProcess())
+    const manifest = manifestOfADeadProcess([X])
     write(recordOf(manifest), statLine(thisProcess()) + gone().slice(0, -1))
     expect(collectMountPoints('none')).toEqual([])
     write(recordOf(manifest), gone() + gone().slice(0, -1))

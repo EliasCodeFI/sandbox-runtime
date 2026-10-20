@@ -12,10 +12,13 @@ import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
   discardMountPointManifest,
+  holdsMountPointManifest,
   keepTrackOfMountSource,
   kindOfMountPoint,
   mountPointManifestDirectories,
   namedMountPoints,
+  passesToEnd,
+  passesUnderWay,
   publishMountPointManifest,
   removePrivateManifestDirectory,
   type MountPointManifest,
@@ -994,7 +997,9 @@ export type LinuxSandboxProfileErrorCode =
   /**
    * Other sandboxes' mount points kept being made or removed under what the
    * profile relies on, or their manifests kept moving while they were read,
-   * each time the wrap planned it. Passing: wrap again.
+   * each time the wrap planned it; or another process's clean-up is held up
+   * half way (stopped, or starved), and `.cause` is its record, named for its
+   * pid. Passing: wrap again.
    */
   | 'mount_points_changed'
 
@@ -1061,7 +1066,7 @@ function shellForSteps(): string[] {
   if (stepShell === undefined) {
     const isBash = (shell: string): boolean => {
       try {
-        return path.basename(fs.realpathSync(shell)) === 'bash'
+        return path.basename(realPathOf(shell)) === 'bash'
       } catch {
         return false
       }
@@ -1076,8 +1081,9 @@ function shellForSteps(): string[] {
 
 /**
  * Thrown by the wrap when the host changed its working directory while the
- * mandatory denies were looked for. Nothing has been handed out or left on
- * the host by then. `SandboxManager` starts the wrap over.
+ * mandatory denies were looked for, or while a clean-up was waited for. Nothing
+ * has been handed out by then, and the wrap has let go of what it had named.
+ * `SandboxManager` starts the wrap over.
  */
 export class WorkingDirectoryChanged extends Error {
   constructor() {
@@ -1253,15 +1259,18 @@ function registerExitCleanupHandler(): void {
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
  * directory. It is also called on process exit as a safety net.
  *
- * A command that has run is judged by its own record: every call, in any
- * process, collects what it relied on once it has ended, whatever else is
- * outstanding. What only this process can say is that a command which has NOT
- * started is over, and what it releases of those:
+ * A wrapped command may be run, and run again, until this process lets go of
+ * it: no other process collects what it relies on while this one runs. Every
+ * call lets go of the commands that have run and ended, whatever else is
+ * outstanding. What only the caller can say is that a command which has NOT
+ * started is over, and what the call releases of those:
  *
  * - with no `commandId`: none until it has been called once for every wrap
  *   handed out, since nothing can tell which command the call is for;
  * - with the `commandId` its wrap was given: that command's, at once;
  * - with `force`: all, because the process or session is ending.
+ *
+ * A command line let go of is refused its start from then on.
  *
  * The --args profiles go when none is outstanding. A mount point goes only when
  * no running sandbox relies on it, which each sandbox's own process answers
@@ -1274,11 +1283,24 @@ export function cleanupBwrapMountPoints(opts?: {
   force?: boolean
   commandId?: string
 }): void {
+  cleanUpAfter(opts ?? {}, 'ended')
+}
+
+/**
+ * {@link cleanupBwrapMountPoints}. `otherwise` is what is released with wraps
+ * still outstanding and no command named: the commands that have ended when it
+ * is the caller who says that one is over, none when it is a wrap that came to
+ * nothing giving its place in the count back.
+ */
+function cleanUpAfter(
+  opts: { force?: boolean; commandId?: string },
+  otherwise: 'ended' | 'none',
+): void {
   if (process.platform !== 'linux') {
     return
   }
   let release: OwnManifestRelease
-  if (opts?.force) {
+  if (opts.force) {
     activeSandboxCount = 0
     forcedCleanups++
     release = 'all'
@@ -1289,15 +1311,16 @@ export function cleanupBwrapMountPoints(opts?: {
     release =
       activeSandboxCount === 0
         ? 'all'
-        : opts?.commandId !== undefined
+        : opts.commandId !== undefined
           ? { commandKey: opts.commandId }
-          : 'none'
+          : otherwise
     if (release !== 'all') {
       logForDebugging(
         `[Sandbox Linux] ${activeSandboxCount} sandbox(es) of this process still outstanding - ` +
           (release === 'none'
             ? 'keeping what this process made'
-            : `releasing only what ${opts?.commandId} relied on`),
+            : 'releasing only what the commands that have ended relied on' +
+              (release === 'ended' ? '' : `, and ${opts.commandId}`)),
       )
     }
   }
@@ -1317,7 +1340,7 @@ export function cleanupBwrapMountPoints(opts?: {
       closeBwrapArgsProfile(argsFd)
     }
   }
-  if (opts?.force) {
+  if (opts.force) {
     removePrivateManifestDirectory()
   }
 }
@@ -3719,11 +3742,11 @@ async function generateFilesystemArgs(
       `Sandbox profile relies on ${names.length} mount points, more than one manifest holds; reduce the write denies on paths that do not exist`,
     )
   }
-  // From here a clean-up keeps what the manifest names. Until here any of it
-  // could go, or be made again by a sandbox that no reading above knew of. So
-  // the wrap looks again, this once, and plans afresh if anything is amiss.
-  // What cannot be looked at counts as there: bubblewrap does not start on what
-  // it cannot bind.
+  // From here a clean-up that reads the manifests keeps what this one names.
+  // Until here any of it could go, or be made again by a sandbox that no
+  // reading above knew of. So the wrap looks again, this once, and plans afresh
+  // if anything is amiss. What cannot be looked at counts as there: bubblewrap
+  // does not start on what it cannot bind.
   const isThere = (relied: string, asDirectory: boolean): boolean => {
     try {
       return fs.statSync(relied).isDirectory() || !asDirectory
@@ -3733,7 +3756,43 @@ async function generateFilesystemArgs(
   }
   let holds = false
   try {
+    // INVARIANT: no command is handed out while a clean-up is under way that
+    // may have read the manifests before this one was among them. It is on
+    // record by now, and what it set out to remove goes whenever its process
+    // gets to it: under a sandbox that has started, that lifts the deny. So it
+    // is waited for, and the look at the host comes after. Asked without giving
+    // the thread back first, which is all there is to it but for a moment now
+    // and then.
+    if (manifest !== undefined) {
+      let heldUp: string | undefined
+      try {
+        const underWay = passesUnderWay()
+        heldUp =
+          underWay.length > 0
+            ? await passesToEnd(underWay, abortSignal)
+            : undefined
+      } catch (err) {
+        if (abortSignal?.aborted) throw err
+        throw new LinuxSandboxProfileError(
+          'mount_points_unreadable',
+          `The mount point manifests cannot be listed (${errorText(err)}), so a clean-up that is about to remove what the profile relies on cannot be told`,
+          errorText(err),
+        )
+      }
+      if (heldUp !== undefined) {
+        throw new LinuxSandboxProfileError(
+          'mount_points_changed',
+          `A clean-up of mount points by another process is held up (${heldUp}, named for its pid), and what it set out to remove may go from under a sandbox started now`,
+          heldUp,
+        )
+      }
+      // One plan, one working directory, on both sides of this await too.
+      if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
+    }
     holds =
+      // Else let go of during the wait, by a forced clean-up: no command starts
+      // under it any more.
+      (manifest === undefined || holdsMountPointManifest(manifest.file)) &&
       [...boundFrom].every(relied => isThere(relied, false)) &&
       [...madeIn].every(relied => isThere(relied, true)) &&
       mountPointsReliedOn(manifest?.file).every(dir => names.includes(dir)) &&
@@ -4279,8 +4338,9 @@ export async function wrapCommandWithSandboxLinux(
     // Its place in the count goes back through the clean-up: a command that
     // ended meanwhile left to this wrap what goes when none is outstanding.
     // After a forced cleanup the count is of other wraps only: one taken from
-    // it has a command that has not started refused its start.
-    if (forcedCleanups === countedAfter) cleanupBwrapMountPoints()
+    // it has a command that has not started refused its start. It says nothing
+    // of the other commands: one that has run may be run again.
+    if (forcedCleanups === countedAfter) cleanUpAfter({}, 'none')
     throw error
   }
 }

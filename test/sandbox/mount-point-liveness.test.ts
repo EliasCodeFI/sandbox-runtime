@@ -737,7 +737,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   ] as const) {
     it(`takes them in /bin/sh where bash is at neither, which is ${sh}: ${begins}`, async () => {
       const access = fs.accessSync
-      const realpath = fs.realpathSync
+      const realpath = fs.realpathSync.native
       const spies = [
         spyOn(fs, 'accessSync').mockImplementation(((
           file: unknown,
@@ -748,7 +748,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
           }
           return (access as (...args: unknown[]) => void)(file, mode)
         }) as never),
-        spyOn(fs, 'realpathSync').mockImplementation(((
+        spyOn(fs.realpathSync, 'native').mockImplementation(((
           file: unknown,
           ...rest: unknown[]
         ) =>
@@ -759,9 +759,6 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
                 ...rest,
               )) as never),
       ]
-      // The library resolves every other path through `.native`, which a spy
-      // does not carry over.
-      Object.assign(fs.realpathSync, { native: realpath.native })
       try {
         // The shell is found once, so in a copy of the library of its own.
         const fresh = (await import(
@@ -1016,10 +1013,10 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 
   // ---- which command a clean-up is for ----
   //
-  // A command that ran is judged by its record alone: any clean-up collects it
-  // once it has ended. Of one that never started, only the caller can say that
-  // it is over, so these commands never start. What each holds on to is a mount
-  // point a killed process left, which the wrap covers and names.
+  // A command that ran and has ended is let go of by any clean-up call of its
+  // process. Of one that never started, only the caller can say that it is
+  // over, so these commands never start. What each holds on to is a mount point
+  // a killed process left, which the wrap covers and names.
 
   function leftByAKilledProcess(mountPoint: string): void {
     writeFileSync(mountPoint, '')

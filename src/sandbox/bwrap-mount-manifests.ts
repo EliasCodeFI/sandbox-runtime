@@ -14,17 +14,28 @@
  * it hands out is a shell that appends its own /proc/self/stat line to
  * `<id>.started` and then execs bubblewrap: the process on record is bubblewrap,
  * recorded before it has made a mount, and the wrap always passes
- * --die-with-parent, so the sandbox dies with it. A manifest with a record is
- * live exactly while a process with a recorded pid and start time exists, which
- * any process can ask, so cleanup is a garbage collect any process may run at
- * any time.
+ * --die-with-parent, so the sandbox dies with it. A manifest is live while a
+ * process with a recorded pid and start time exists, and while the process that
+ * wrote it exists and has not let go of it (the command line may be run again
+ * until then), which it does by claiming it. Any process can ask after both, so
+ * cleanup is a garbage collect any process may run at any time.
  *
  * bubblewrap binds the manifest before it makes a mount point, and a pass
  * claims a finished manifest, renaming it to `<id>.claimed`, before it removes
  * what that names. A command started after the claim fails having made nothing;
  * one that got past it has its record on disk, which the pass reads after the
  * claim. Whatever cannot be read or asked (a manifest, a record, /proc) counts
- * as live: only "no such process" and a different start time end a sandbox.
+ * as live: only "no such process", one that has exited and a different start
+ * time end a sandbox.
+ *
+ * A pass and a wrap each say what they are about before they look at what the
+ * other has said. The pass puts itself on record, `<process>.pass`, and then
+ * reads the manifests it decides on; the wrap publishes its manifest and then
+ * lists the passes, and waits for those under way to end before it looks at the
+ * host again and hands its command out. So either the pass has read the
+ * manifest and keeps what it names, or the wrap has seen the pass and no
+ * sandbox starts until that has removed what it set out to, however long it is
+ * held up between its reading and a removal (see {@link collect}).
  *
  * A reading in doubt refuses every wrap of this user that restricts writes, so
  * NO LASTING STATE OF THE DIRECTORY REFUSES WRAPS FOR EVER. Every source of doubt
@@ -71,6 +82,7 @@ const MANIFEST_VERSION = 1
 const MANIFEST_SUFFIX = '.json'
 const STARTED_SUFFIX = '.started'
 const CLAIMED_SUFFIX = '.claimed'
+const PASS_SUFFIX = '.pass'
 
 /**
  * A manifest this young counts as live with no started record yet, so that a
@@ -113,10 +125,31 @@ const UNREADABLE_MANIFEST_MAX_AGE_MS = 60 * 60 * 1000
  */
 const OTHER_NAMESPACE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
+/**
+ * A pass removes nothing more once it has been on record for this long, and
+ * leaves the rest to the next: an ordinary one takes milliseconds.
+ */
+const PASS_GOOD_FOR_MS = 2 * 1000
+
+/**
+ * A pass that cannot be asked after (another PID namespace's) counts as under
+ * way until its record is this old: well past {@link PASS_GOOD_FOR_MS}.
+ */
+const PASS_MAX_AGE_MS = 60 * 1000
+
+/**
+ * For how long a wrap waits for the passes under way before it gives up: past
+ * {@link PASS_GOOD_FOR_MS}, so that only one that is held up outlasts it.
+ */
+const WAITS_FOR_PASSES_MS = 5 * 1000
+
 /** The largest file read as a manifest; a real one is a few kilobytes. */
 const MANIFEST_MAX_BYTES = 1024 * 1024
 
-/** The largest started record read: a line of some 300 bytes for each run. */
+/**
+ * How much of a started record is read, from its end: a line of some 300 bytes
+ * for each run, so the last two hundred runs of one command line.
+ */
 const RECORD_MAX_BYTES = 64 * 1024
 
 /**
@@ -128,7 +161,7 @@ const TEMPORARY_SUFFIX = '.tmp'
 const ManifestSchema = z.object({
   /**
    * INVARIANT for every later version: it may add fields, and keeps these, the
-   * three file names and what they mean, so a reader takes a later version by
+   * four file names and what they mean, so a reader takes a later version by
    * the fields it knows. A manifest that is not read puts everything in doubt,
    * which would refuse every wrap of an older process for as long as a newer
    * one is at work beside it. A change that cannot keep to this takes another
@@ -198,17 +231,24 @@ export function keepTrackOfMountSource(source: string): void {
 
 /**
  * Which of this process's own manifests a collect may release. Only the caller
- * knows that a command is over:
+ * knows that a command is over, and will not be run again:
  *
  * - `all`: no wrap of this process is outstanding, or the process is ending;
- * - `none`: some are, and nothing says which is over, so only what other
- *   processes have finished with is collected;
- * - one command: that command is over, whatever else is running.
+ * - `ended`: some are, and the caller says one is over and not which, so those
+ *   that have run and ended are;
+ * - one command: that command, whatever else is running, and those that have
+ *   run and ended;
+ * - `none`: the caller has said nothing, so only what other processes have
+ *   finished with is collected.
  *
- * A released manifest whose command has not started is collected, and the
- * command is then refused its start.
+ * A released manifest is collected once no process on its record runs, and its
+ * command line is refused its start from then on.
  */
-export type OwnManifestRelease = 'all' | 'none' | { commandKey: string }
+export type OwnManifestRelease =
+  | 'all'
+  | 'ended'
+  | 'none'
+  | { commandKey: string }
 
 let manifestDirectory: string | undefined
 // Whether that is the last resort below, which no other process knows of.
@@ -258,10 +298,15 @@ function ownProcess(): { pid: number; start: string } {
 
 /**
  * Whether the process with that pid and start time is running. Only "no such
- * process" and a start time that differs say no: a sandboxed command can use up
- * what this user may open, and a /proc that cannot be read must not make a live
- * sandbox's mount points collectable. An unknown `start` leaves the pid alone
- * to go by.
+ * process", a process that has exited and a start time that differs say no: a
+ * sandboxed command can use up what this user may open, and a /proc that cannot
+ * be read must not make a live sandbox's mount points collectable. An unknown
+ * `start` leaves the pid alone to go by.
+ *
+ * One that has exited stays in /proc until its parent asks after it. Where that
+ * is a process 1 that never asks, as in many a container, it stays for good,
+ * and so would what its sandbox relied on. It has let go of its namespaces and
+ * sent its children their signal by then, like one that is gone.
  */
 function isRunning(pid: number, start: string): boolean {
   let stat: string
@@ -270,6 +315,10 @@ function isRunning(pid: number, start: string): boolean {
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code
     return code !== 'ENOENT' && code !== 'ESRCH'
+  }
+  // Field 3, the first after the comm: Z is a zombie, X and x are dead.
+  if (/^ [ZXx] /.test(stat.slice(stat.lastIndexOf(')') + 1))) {
+    return false
   }
   const found = startTimeFromProcStat(stat)
   return found === undefined || !/^\d+$/.test(start) || found === start
@@ -665,8 +714,13 @@ function isOwnReadableFile(file: string): boolean {
  * of the user's, no larger than `max`, is read, through a descriptor opened
  * without following a link and without blocking. Throws {@link NotOurs} for
  * anything else that is there, and the error itself where that cannot be told.
+ * With `itsLastLines`, of a larger one the whole lines in its last `max` bytes.
  */
-function readOwnFile(file: string, max: number): string | undefined {
+function readOwnFile(
+  file: string,
+  max: number,
+  itsLastLines = false,
+): string | undefined {
   let fd: number
   try {
     fd = fs.openSync(
@@ -682,10 +736,21 @@ function readOwnFile(file: string, max: number): string | undefined {
   }
   try {
     const stat = fs.fstatSync(fd)
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.size > max) {
+    if (
+      !stat.isFile() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.size > max && !itsLastLines)
+    ) {
       throw new NotOurs(`${file} is not a small regular file of this user's`)
     }
-    return fs.readFileSync(fd, 'utf8')
+    if (stat.size <= max) {
+      return fs.readFileSync(fd, 'utf8')
+    }
+    const end = Buffer.alloc(max)
+    const text = end
+      .subarray(0, fs.readSync(fd, end, 0, max, stat.size - max))
+      .toString('utf8')
+    return text.slice(text.indexOf('\n') + 1)
   } finally {
     fs.closeSync(fd)
   }
@@ -726,9 +791,13 @@ function readManifest(file: string): Manifest | undefined {
 
 /**
  * Whether a process on the started record is running, or `undefined` with no
- * whole line on record. A record that cannot be read, is not the user's small
- * regular file, or holds a line that is no /proc/PID/stat line vouches: only a
- * process that is gone says its sandbox has ended.
+ * whole line on record. A record that cannot be read, is not the user's regular
+ * file, or holds a line that is no /proc/PID/stat line vouches: only a process
+ * that is gone says its sandbox has ended.
+ *
+ * A command line may be run again and again, and each run adds its line. Of a
+ * record past {@link RECORD_MAX_BYTES} the last runs are asked after: refusing
+ * to read it would keep what it vouches for named for ever.
  *
  * Not so an `orphan`, which has no manifest that can be read: it names no path,
  * so it protects none. Only a process that can be asked after vouches there, and
@@ -743,7 +812,7 @@ function readManifest(file: string): Manifest | undefined {
 function recordVouches(record: string, orphan = false): boolean | undefined {
   let lines: string[]
   try {
-    const text = readOwnFile(record, RECORD_MAX_BYTES)
+    const text = readOwnFile(record, RECORD_MAX_BYTES, true)
     if (text === undefined) {
       return undefined
     }
@@ -767,9 +836,11 @@ function recordVouches(record: string, orphan = false): boolean | undefined {
  * Whether a sandbox that named this manifest may be running, or may yet start.
  * None of another boot is, whatever else the manifest says. Only a process in
  * the PID namespace that wrote it can tell; to any other it is live until {@link
- * OTHER_NAMESPACE_MAX_AGE_MS}. With a started record, the record alone says.
- * With none, no sandbox has got past a claim, and one the caller has not
- * released is live while it is young or its writer runs.
+ * OTHER_NAMESPACE_MAX_AGE_MS}. A process on its started record that runs keeps
+ * it live, whatever else. With none, no sandbox is past a claim, and one at its
+ * own name that the caller has not released is live while its writer runs (its
+ * command line may be run yet, for the first time or again), or while it is
+ * young and has no record.
  */
 function isLive(manifest: Manifest): boolean {
   if (
@@ -789,13 +860,14 @@ function isLive(manifest: Manifest): boolean {
     )
   }
   const vouched = recordVouches(manifest.record)
-  if (vouched !== undefined) {
-    return vouched
+  if (vouched === true) {
+    return true
   }
   return (
     !manifest.claimed &&
     !manifest.released &&
-    (Date.now() - manifest.created < MANIFEST_GRACE_MS ||
+    ((vouched === undefined &&
+      Date.now() - manifest.created < MANIFEST_GRACE_MS) ||
       isRunning(manifest.pid, manifest.start))
   )
 }
@@ -1119,6 +1191,16 @@ function readManifests(dirs: readonly string[]): Reading {
         if (olderThan(file, UNREADABLE_MANIFEST_MAX_AGE_MS)) {
           reading.spent.push(file)
         }
+      } else if (file.endsWith(PASS_SUFFIX)) {
+        // Left by a process killed during its pass. One that is only overdue
+        // may be under way yet, to those who can ask after it.
+        const state = stateOfPass(file, oneKernel.includes(path.dirname(file)))
+        if (
+          state === 'over' ||
+          (state === 'overdue' && olderThan(file, OTHER_NAMESPACE_MAX_AGE_MS))
+        ) {
+          reading.spent.push(file)
+        }
       } else if (file.endsWith(STARTED_SUFFIX) && !listed.has(idOf(file))) {
         // Asked for at its own name first, and the record read last. Only a
         // claim given back can then pass between the two names unseen, and a
@@ -1275,6 +1357,152 @@ export function liveMountPoints(): ReadonlySet<string> | undefined {
   return spared
 }
 
+/** In the name of every pass of this copy of the library, to tell its own. */
+const ownPassMark = randomBytes(8).toString('hex')
+
+/** The records of the pass this copy of the library is making, while it is. */
+let ownPassOnRecord: readonly string[] = []
+
+/** The number in `pid:[4026531836]`, and the boot id without its hyphens. */
+const inAPassName = {
+  ns: (): string => /\d+/.exec(ownPidNamespace() ?? '')?.[0] ?? '',
+  boot: (): string => (ownBootId() ?? '').replace(/-/g, ''),
+}
+
+/**
+ * Puts a pass of this process on record in each of `dirs`, until {@link
+ * takePassOffRecord}. `false`, with nothing left there, where it could not be
+ * in one of them: nothing may then be removed on a manifest's word.
+ *
+ * The name says whose it is: the pid, its start time, its PID namespace and the
+ * boot, each left empty where it cannot be read. In the name, so that a pass is
+ * on record whole or not at all and a listing is all it takes to judge one.
+ */
+function putPassOnRecord(dirs: readonly string[]): boolean {
+  const { pid, start } = ownProcess()
+  const name = `${pid}-${start}-${inAPassName.ns()}-${inAPassName.boot()}-${ownPassMark}${randomBytes(4).toString('hex')}${PASS_SUFFIX}`
+  ownPassOnRecord = dirs.map(dir => path.join(dir, name))
+  try {
+    for (const file of ownPassOnRecord) {
+      fs.closeSync(fs.openSync(file, 'wx', 0o600))
+    }
+    return true
+  } catch (e) {
+    takePassOffRecord()
+    logForDebugging(
+      `[Sandbox Linux] The clean-up of mount points could not be put on record (${String(e)}) - leaving what the manifests name where it is`,
+      { level: 'warn' },
+    )
+    return false
+  }
+}
+
+/** One that stays behind is dropped by the next pass, of any process. */
+function takePassOffRecord(): void {
+  const files = ownPassOnRecord
+  ownPassOnRecord = []
+  files.forEach(drop)
+}
+
+/**
+ * Whether the pass on record at `file` may still remove something.
+ *
+ * A process of this kernel and PID namespace is asked after, and only one that
+ * is gone says `over`. One of an earlier boot is, where only this kernel reaches
+ * the directory (`oneKernel`), and so is one of this copy of the library that
+ * it is not making now: a pass does not give the thread back.
+ *
+ * Any other, and a name that is none of ours, goes by its age, and is `overdue`
+ * past {@link PASS_MAX_AGE_MS}: not to be waited for from here, and not known to
+ * be over either. Its record is left for those who can ask.
+ */
+function stateOfPass(
+  file: string,
+  oneKernel: boolean,
+): 'under way' | 'over' | 'overdue' {
+  const byItsAge = (): 'under way' | 'over' | 'overdue' => {
+    try {
+      return Date.now() - fs.lstatSync(file).mtimeMs > PASS_MAX_AGE_MS
+        ? 'overdue'
+        : 'under way'
+    } catch (e) {
+      return isAbsenceErrno(e) ? 'over' : 'under way'
+    }
+  }
+  const [pid, start, ns, boot, mark] =
+    /^(\d+)-(\d*)-(\d*)-([0-9a-f]*)-([0-9a-f]+)\.pass$/
+      .exec(path.basename(file))
+      ?.slice(1) ?? []
+  if (pid === undefined || start === undefined || mark === undefined) {
+    return byItsAge()
+  }
+  if (mark.startsWith(ownPassMark)) {
+    return ownPassOnRecord.includes(file) ? 'under way' : 'over'
+  }
+  if (boot === '' || boot !== inAPassName.boot()) {
+    if (!oneKernel) return byItsAge()
+    if (boot !== '' && inAPassName.boot() !== '') return 'over'
+  }
+  if (ns === '' || ns !== inAPassName.ns()) {
+    return byItsAge()
+  }
+  return isRunning(Number(pid), start) ? 'under way' : 'over'
+}
+
+/**
+ * The passes on record that may be under way. Throws where the directories
+ * cannot be told or listed.
+ */
+export function passesUnderWay(): string[] {
+  if (!onLinux()) {
+    return []
+  }
+  const dirs = believedManifestDirectories()
+  const oneKernel = dirs.filter(isReachedByOneKernel)
+  return filesIn(dirs).filter(
+    file =>
+      file.endsWith(PASS_SUFFIX) &&
+      stateOfPass(file, oneKernel.includes(path.dirname(file))) === 'under way',
+  )
+}
+
+/**
+ * Resolves once none of `passes` is under way any more, with `undefined`, or
+ * with one that still is after `waitMs`: its process is held up (stopped, or
+ * starved), and what it set out to remove may go at any moment after.
+ *
+ * For a wrap that has published its manifest, with what {@link passesUnderWay}
+ * listed after that. Every pass that did not read the manifest is among them
+ * (see {@link collect}); one that goes on record later has read it, and is not
+ * waited for. Rejects like {@link passesUnderWay}, and with `signal`'s reason
+ * once that is aborted.
+ */
+export async function passesToEnd(
+  passes: readonly string[],
+  signal?: AbortSignal,
+  waitMs = WAITS_FOR_PASSES_MS,
+): Promise<string | undefined> {
+  const deadline = performance.now() + waitMs
+  let left = passes
+  for (let pause = 1; ; pause = Math.min(pause * 2, 50)) {
+    if (left.length === 0 || performance.now() >= deadline) {
+      return left[0]
+    }
+    await new Promise(resolve => setTimeout(resolve, pause))
+    signal?.throwIfAborted()
+    const underWay = new Set(passesUnderWay())
+    left = left.filter(pass => underWay.has(pass))
+  }
+}
+
+/**
+ * Whether the manifest this process published at `file` is still its to start a
+ * command under: not once a clean-up has been told that its command is over.
+ */
+export function holdsMountPointManifest(file: string): boolean {
+  return ownManifests.get(file)?.over === false
+}
+
 /**
  * Release the manifests of the wraps of this process that `release` says are
  * over, and remove every mount point no live manifest names, from any process,
@@ -1289,13 +1517,12 @@ export function collectMountPoints(
   }
   // Recorded first and kept whatever becomes of this pass, so a later pass
   // knows these commands are over even when told to release nothing.
-  for (const own of ownManifests.values()) {
-    if (
+  for (const [file, own] of ownManifests) {
+    own.over ||=
       release === 'all' ||
-      (release !== 'none' && own.commandKey === release.commandKey)
-    ) {
-      own.over = true
-    }
+      (release !== 'none' &&
+        ((release !== 'ended' && own.commandKey === release.commandKey) ||
+          recordVouches(`${idOf(file)}${STARTED_SUFFIX}`) === false))
   }
   // Made first: with one of the first places to write in, what the environment
   // names is not believed.
@@ -1347,16 +1574,23 @@ const childrenFirst = (paths: Iterable<string>): string[] =>
  * mount point from under a sandbox that started in between.
  *
  * A pass gives back the claims it made itself, and only when that reading finds
- * a process on the record. So what remains is a manifest that comes to its own
- * name after the reading, published or given back, whose sandbox reaches its
- * bind on a path a claimed manifest names too. The directories, worked out
- * afresh, are listed again before every removal (in a pass of over {@link
- * LISTS_BEFORE_EACH_REMOVAL_UP_TO} candidates, whenever the listing is {@link
- * LISTING_GOOD_FOR_MS} old), and what has come to its name keeps what it names,
- * so the pass would have to be held up between a listing and the removal that
- * follows it for as long as a sandbox takes to start (for a directory a wrap
- * only relies on: until that wrap, having published, has looked at it again,
- * and its command is then refused its start).
+ * a process on the record, which every reading after the claim finds too. So
+ * what remains is a manifest published after the reading, whose sandbox would
+ * reach its bind on a path a claimed manifest names too.
+ *
+ * INVARIANT: the pass is on record in every directory it can write from before
+ * that reading until after its last removal, and removes nothing where it could
+ * not be put there. A wrap lists the passes once it has published, and hands no
+ * command out while one is under way (see {@link passesToEnd}). So the wrap of
+ * a manifest that the reading missed finds the pass on record, and no sandbox
+ * starts under that manifest until the pass is over, for however long the pass
+ * is held up between its reading and a removal.
+ *
+ * The directories, worked out afresh, are still listed again before every
+ * removal (in a pass of over {@link LISTS_BEFORE_EACH_REMOVAL_UP_TO}
+ * candidates, whenever the listing is {@link LISTING_GOOD_FOR_MS} old), and
+ * what has come to its name keeps what it names: the wrap that waits then finds
+ * what it planned on and need not plan again.
  *
  * A manifest is all that names its mount points, so its claim is dropped last,
  * and stays, for a later pass, when the pass turns back, a removal is refused,
@@ -1389,7 +1623,49 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
       claims ||= manifest.claimed || own.size > 0
     }
   }
-  const reading = claims ? readManifests(dirs) : before
+  // Nothing to remove, or nothing that may be: not worth a record, which every
+  // wrap that is about to hand its command out would wait for.
+  if (
+    before.inDoubt !== undefined ||
+    (!claims &&
+      !(unrecordedToo && unrecorded.paths.size + unrecorded.sources.size > 0))
+  ) {
+    if (before.inDoubt !== undefined) {
+      logForDebugging(
+        `[Sandbox Linux] A sandbox may be running on mount points that cannot be listed - leaving every mount point where it is (${before.inDoubt})`,
+        { level: 'warn' },
+      )
+    }
+    return []
+  }
+  const writable = dirs.filter(dir => isOurPrivateDirectory(dir))
+  try {
+    // Off the record it claims in no directory: the claims it has made go back,
+    // and what is left to remove is what this process could record nowhere,
+    // which no wrap elsewhere knows for a mount point or waits for.
+    return removeWhatIsFinished(
+      dirs,
+      putPassOnRecord(writable) ? writable : [],
+      own,
+      unrecordedToo,
+    )
+  } finally {
+    takePassOffRecord()
+  }
+}
+
+/**
+ * The rest of {@link collect}, for as long as the pass is on record: `own` are
+ * the claims it has made, `writable` the directories it can claim in.
+ */
+function removeWhatIsFinished(
+  dirs: readonly string[],
+  writable: readonly string[],
+  own: ReadonlySet<string>,
+  unrecordedToo: boolean,
+): string[] {
+  const since = performance.now()
+  const reading = readManifests(dirs)
   if (reading.inDoubt !== undefined) {
     logForDebugging(
       `[Sandbox Linux] A sandbox may be running on mount points that cannot be listed - leaving every mount point where it is (${reading.inDoubt})`,
@@ -1405,7 +1681,6 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
     }
   }
   const finished: Manifest[] = []
-  const writable = dirs.filter(dir => isOurPrivateDirectory(dir))
   for (const manifest of reading.manifests) {
     if (
       manifest.claimed &&
@@ -1468,6 +1743,14 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
   const removed: string[] = []
   const notRemoved = new Set<string>()
   for (const candidate of childrenFirst(candidates.keys())) {
+    // To a process that cannot ask after this one the pass is over by its age.
+    if (performance.now() - since > PASS_GOOD_FOR_MS) {
+      logForDebugging(
+        '[Sandbox Linux] The clean-up of mount points has taken too long - leaving the rest to the next',
+        { level: 'warn' },
+      )
+      return removed
+    }
     if (
       performance.now() - listedAt >= goodFor &&
       !newcomersKeepWhatTheyName()
