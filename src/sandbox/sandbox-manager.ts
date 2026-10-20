@@ -1630,9 +1630,7 @@ function isSandboxingEnabled(): boolean {
  * what is wrong with it. POSIX only, like the search.
  */
 function hostWritablePlaces(): WritablePlaces {
-  if (config?.filesystem.disabled || getPlatform() === 'windows') {
-    return writablePlaces('anywhere')
-  }
+  if (getPlatform() === 'windows') return writablePlaces('anywhere')
   try {
     return writablePlaces(config && writeRootsOf(getFsWriteConfig()))
   } catch {

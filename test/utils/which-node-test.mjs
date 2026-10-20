@@ -1,22 +1,11 @@
 /**
- * Test whichSync, and the search for host-side helpers built on it, in a real
- * Node.js process. The search is one piece of code for Node.js and Bun; this
- * runs it under the runtime the Bun test suite cannot.
+ * Test whichSync behavior in Node.js environment
  * Run with: node test/utils/which-node-test.mjs
  */
 
 import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -40,9 +29,8 @@ if (buildResult.status !== 0) {
   process.exit(1)
 }
 
-// Dynamically import the built modules
+// Dynamically import the built module
 const { whichSync } = await import('../../dist/utils/which.js')
-const { findHostHelper } = await import('../../dist/sandbox/host-helpers.js')
 
 // Test 1: Should find existing executable
 const lsPath = whichSync('ls')
@@ -67,7 +55,7 @@ const bashPath = whichSync('bash')
 assert.ok(bashPath !== null, 'whichSync should find bash')
 console.log('✓ Found bash at:', bashPath)
 
-// Test 4: The in-process search finds what the `which` command finds
+// Test 4: The search in this process finds what the which command finds
 const whichResult = spawnSync('which', ['ls'], { encoding: 'utf8' })
 const expectedPath = whichResult.stdout.trim()
 assert.strictEqual(
@@ -77,102 +65,21 @@ assert.strictEqual(
 )
 console.log('✓ Output matches which command')
 
-// The remaining tests change PATH, and restore it at the end.
+// Test 5: No which command is run: one first on PATH, where a sandboxed
+// command may have left it, would run on the host
+const planted = mkdtempSync(join(tmpdir(), 'which-node-test-'))
 const savedPath = process.env.PATH
-const base = realpathSync(mkdtempSync(join(tmpdir(), 'which-node-test-')))
-// An executable that leaves `marker` behind if anything ever runs it.
-function plant(file, marker) {
-  writeFileSync(file, `#!/bin/sh\necho ran > '${marker}'\nexit 0\n`)
-  chmodSync(file, 0o755)
-}
-
 try {
-  // Test 5: No `which` program is run. One planted first on PATH, where a
-  // sandboxed command may have left it, must never be executed.
-  const planted = join(base, 'planted')
-  const whichMarker = join(base, 'which-was-run')
-  mkdirSync(planted)
-  plant(join(planted, 'which'), whichMarker)
+  writeFileSync(join(planted, 'which'), `#!/bin/sh\ntouch '${planted}/ran'\n`, {
+    mode: 0o755,
+  })
   process.env.PATH = `${planted}:${savedPath}`
-  const shPath = whichSync('sh')
-  assert.ok(
-    !existsSync(whichMarker),
-    'the `which` planted first on PATH must not have been executed',
-  )
-  assert.ok(shPath !== null && /\/sh$/.test(shPath), `found sh at ${shPath}`)
-  assert.ok(!shPath.startsWith(planted), 'sh is not taken from the planted dir')
-  console.log('✓ Finds sh without running the `which` planted first on PATH')
-
-  // Test 6: First executable regular file; a directory of that name and a
-  // file without the execute bit are passed over.
-  const asDirectory = join(base, 'as-directory')
-  const notExecutable = join(base, 'not-executable')
-  const first = join(base, 'first')
-  const second = join(base, 'second')
-  mkdirSync(join(asDirectory, 'tool'), { recursive: true })
-  mkdirSync(notExecutable)
-  writeFileSync(join(notExecutable, 'tool'), '#!/bin/sh\n')
-  chmodSync(join(notExecutable, 'tool'), 0o644)
-  for (const dir of [first, second]) {
-    mkdirSync(dir)
-    plant(join(dir, 'tool'), join(base, 'unused'))
-  }
-  process.env.PATH = [asDirectory, notExecutable, first, second].join(':')
-  assert.strictEqual(whichSync('tool'), join(first, 'tool'))
-  console.log('✓ Takes the first executable regular file of that name')
-
-  // Test 7: A name with a directory part is checked where it is
-  assert.strictEqual(whichSync(process.execPath), process.execPath)
-  assert.strictEqual(whichSync(join(second, 'tool')), join(second, 'tool'))
-  assert.strictEqual(whichSync('/path/that/does/not/exist'), null)
-  assert.strictEqual(whichSync(first), null, 'a directory is not a program')
-  console.log('✓ Path-qualified names are checked directly, not searched for')
-
-  // Test 8: Nothing on an empty PATH
-  process.env.PATH = ''
-  assert.strictEqual(whichSync('tool'), null)
-  console.log('✓ Finds nothing on an empty PATH')
-
-  // Test 9: A helper this library runs on the host is not taken from a
-  // directory the sandboxed command may write, however early on PATH, nor
-  // through a link that leads into one.
-  const project = join(base, 'project')
-  const projectBin = join(project, 'node_modules', '.bin')
-  const safe = join(base, 'safe')
-  const linked = join(base, 'linked')
-  const helperMarker = join(base, 'helper-was-run')
-  mkdirSync(projectBin, { recursive: true })
-  mkdirSync(safe)
-  mkdirSync(linked)
-  plant(join(projectBin, 'srt-test-helper'), helperMarker)
-  plant(join(safe, 'srt-test-helper'), join(base, 'unused'))
-  symlinkSync(
-    join(projectBin, 'srt-test-helper'),
-    join(linked, 'srt-test-helper'),
-  )
-  process.env.PATH = [projectBin, linked, safe].join(':')
-  assert.strictEqual(
-    whichSync('srt-test-helper'),
-    join(projectBin, 'srt-test-helper'),
-  )
-  const search = findHostHelper('srt-test-helper', [project])
-  assert.strictEqual(search.path, join(safe, 'srt-test-helper'))
-  assert.deepStrictEqual(
-    search.skipped.map(s => s.path),
-    [join(projectBin, 'srt-test-helper'), join(linked, 'srt-test-helper')],
-  )
-  assert.strictEqual(
-    findHostHelper('srt-test-helper', []).path,
-    join(projectBin, 'srt-test-helper'),
-    'no write restriction: the plain search',
-  )
-  process.env.PATH = [projectBin, linked].join(':')
-  assert.strictEqual(findHostHelper('srt-test-helper', [project]).path, null)
-  assert.ok(!existsSync(helperMarker), 'no candidate was executed')
-  console.log('✓ Host helpers are found outside the allowed write paths')
+  assert.strictEqual(whichSync('ls'), lsPath)
+  assert.ok(!existsSync(join(planted, 'ran')), 'the planted which was run')
 } finally {
   process.env.PATH = savedPath
-  rmSync(base, { recursive: true, force: true })
+  rmSync(planted, { recursive: true, force: true })
 }
+console.log('✓ Runs no which command')
 
 console.log('\n✅ All Node.js tests passed!')

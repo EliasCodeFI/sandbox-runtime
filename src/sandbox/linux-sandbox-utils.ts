@@ -3708,9 +3708,6 @@ export async function wrapCommandWithSandboxLinux(
     )
     const bwrapBinary =
       bwrapPath ?? requireHostHelper('bwrap', 'bwrapPath', writable)
-    // THREAT: the shell starts the relays and the seccomp helper, so one the
-    // command could write would decide whether the filter is ever applied.
-    const shell = requireHostHelper(binShell || 'bash', 'binShell', writable)
     const relayed = needsNetworkRestriction && httpSocketPath && socksSocketPath
     const socat = relayed
       ? (socatPath ?? requireHostHelper('socat', 'socatPath', writable))
@@ -3980,7 +3977,10 @@ export async function wrapCommandWithSandboxLinux(
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
-    // By its full path since bwrap doesn't use $PATH
+    // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+    // THREAT: the shell starts the relays and the seccomp helper, so one the
+    // command could write would decide whether the filter is ever applied.
+    const shell = requireHostHelper(binShell || 'bash', 'binShell', writable)
     bwrapArgs.push('--', shell, '-c')
 
     // With network restrictions, route the command through buildSandboxCommand

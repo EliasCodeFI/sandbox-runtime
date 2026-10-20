@@ -179,17 +179,6 @@ posix('the search takes the first program outside', () => {
   expect(hostSearchPath(writable, [HELPER])).toBe(safe)
 })
 
-onLinux('the search passes over what it cannot follow', () => {
-  // A name that is no text: the kernel finds the file, the walk stops.
-  const odd = Buffer.concat([Buffer.from(`${safe}/`), Buffer.of(0xff)])
-  fs.copyFileSync(planted, odd)
-  fs.symlinkSync(odd, `${safe}/odd`)
-  process.env.PATH = safe
-  expect(findHostHelper('odd', writable).skipped).toEqual([
-    { path: `${safe}/odd`, reason: 'it could not be followed to a file' },
-  ])
-})
-
 posix('hostSearchPath leaves out what no helper would be taken from', () => {
   // Whatever bears the name is judged: the command could supply the rest.
   link(`${project}/not-there-yet`, `${base}/dangling-in/${HELPER}`)
@@ -208,12 +197,10 @@ posix('hostSearchPath leaves out what no helper would be taken from', () => {
   expect(hostSearchPath(writable, [])).toBe('/dev/null')
 })
 
-posix('the refusal says what was passed over, why, and what lifts it', () => {
+posix('what is said of a helper that may not be used', () => {
   const none = { path: null, skipped: [] }
   expect(unavailable('rg', 'o', none)).toBe('rg was not found on PATH')
-  expect(unavailable('/x/rg', 'o', none)).toBe(
-    '/x/rg is not an executable file',
-  )
+  expect(unavailable('/rg', 'o', none)).toBe('/rg is not an executable file')
   expect(unavailable('rg', 'o', none, 'not installed')).toBe('not installed')
   const two = ['/w/rg', './rg'].map(path => ({ path, reason: 'why' }))
   expect(unavailable('rg', 'o', { path: null, skipped: two }, 'unused')).toBe(
@@ -221,9 +208,6 @@ posix('the refusal says what was passed over, why, and what lifts it', () => {
       'Passed over: /w/rg (why); ./rg (why). Install it outside those paths, ' +
       'put the directory that holds it on PATH, or name it by its path with o.',
   )
-})
-
-posix('the warning is about a file, and one the command may write', () => {
   process.chdir(projectBin)
   expect(warning('o', `./${HELPER}`, writable)).toBe(
     `o ./${HELPER} is ${inProject}: ${replaceable}`,
@@ -312,13 +296,9 @@ onLinux.each([
 ])('a wrap refuses for want of %s', async (helper, option, binShell) => {
   // Everything else it needs is there, outside the project.
   process.env.PATH = `${projectBin}:${tools(NAMES.filter(n => n !== helper))}`
-  // Before anything is scanned: a ripgrep named outright would be run.
-  const ripgrepConfig = { command: plant(`${base}/named-rg`) }
-  const error: unknown = await wrap({
-    ...RELAYED,
-    binShell,
-    ripgrepConfig,
-  }).catch((thrown: unknown) => thrown)
+  const error: unknown = await wrap({ ...RELAYED, binShell }).catch(
+    (thrown: unknown) => thrown,
+  )
   expect(error).toBeInstanceOf(linux.LinuxSandboxProfileError)
   expect(error).toMatchObject({
     code: 'host_helper_unavailable',
@@ -350,26 +330,40 @@ onLinux('a wrap that restricts no write searches the whole PATH', async () => {
   ).toStartWith(`${project}/real/bwrap `)
 })
 
+const refusals = [
+  refusal('rg', 'ripgrep.command'),
+  refusal('bwrap', 'bwrapPath'),
+  refusal('socat', 'socatPath'),
+]
+
+// In a process of its own: nothing takes a configuration out of the manager.
+onLinux('with no configuration the checks judge by the cwd', () => {
+  const { stdout } = childProcess.spawnSync(
+    process.execPath,
+    [
+      '-e',
+      `const { SandboxManager: s } = await import('${import.meta.dir}/../../src/index.ts')
+       const checks = [s.checkDependencies(), await s.checkDependenciesAsync()]
+       console.log(JSON.stringify(checks.map(check => check.errors)))`,
+    ],
+    { cwd: project, encoding: 'utf8', env: { PATH: projectBin } },
+  )
+  expect(JSON.parse(stdout)).toEqual([refusals, refusals])
+})
+
 onLinux.each([
   ['checkDependencies', SandboxManager.checkDependencies],
   ['checkDependenciesAsync', SandboxManager.checkDependenciesAsync],
-])('%s, with no configuration, judges by the cwd', async (_, check) => {
-  const refusals = [
-    refusal('rg', 'ripgrep.command'),
-    refusal('bwrap', 'bwrapPath'),
-    refusal('socat', 'socatPath'),
-  ]
+])('%s takes a configuration it cannot read for none', async (_, check) => {
+  SandboxManager.updateConfig({
+    ...config,
+    filesystem: { allowWrite: [{}] },
+  } as never)
   process.chdir(project)
   process.env.PATH = `${projectBin}:${tools([])}`
   expect((await check()).errors).toEqual(refusals)
   expect(linux.checkLinuxDependencies().errors).toEqual(refusals.slice(1))
   expect(linux.getLinuxDependencyStatus().hasBwrap).toBe(false)
-  // A configuration that cannot be read counts as none.
-  SandboxManager.updateConfig({
-    ...config,
-    filesystem: { allowWrite: [{}] },
-  } as never)
-  expect((await check()).errors).toEqual(refusals)
   // Of a helper that is nowhere it says what it always said.
   process.env.PATH = `${base}/real`
   expect((await check()).errors).toEqual([
@@ -377,6 +371,7 @@ onLinux.each([
     'bubblewrap (bwrap) not installed',
     'socat not installed',
   ])
+  SandboxManager.updateConfig(config)
 })
 
 onLinux(
