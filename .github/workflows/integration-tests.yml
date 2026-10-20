@@ -185,34 +185,15 @@ jobs:
       # those differ between ripgrep releases: for an unreadable directory
       # that sits exactly at --max-depth, 14.1.1 prints "Permission denied"
       # and exits 2, where 15.2.0 passes over it and exits 0. 14.1.1 is the
-      # release most installations have, so it is the one the main run uses,
-      # taken from the upstream release instead of whichever version the
-      # package archive serves that day. Each checksum is the one upstream
-      # publishes beside the archive, and a mismatch fails the step.
+      # release most installations have, so it is the one the main run uses.
       - name: Install ripgrep 14.1.1 (Linux)
         if: matrix.os == 'linux'
         run: |
-          case "${{ matrix.arch }}" in
-            x86-64)
-              asset=ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
-              sha256=4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e
-              ;;
-            arm64)
-              asset=ripgrep-14.1.1-aarch64-unknown-linux-gnu.tar.gz
-              sha256=c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f
-              ;;
-            *)
-              echo "::error::no ripgrep archive is pinned for ${{ matrix.arch }}"
-              exit 1
-              ;;
-          esac
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/$asset"
-          echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/ripgrep-14.1.1"
-          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/ripgrep-14.1.1" --strip-components=1
+          .github/scripts/install-ripgrep.sh 14.1.1 \
+            4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e \
+            c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f
           # Ahead of everything already on PATH, for every later step.
           echo "$RUNNER_TEMP/ripgrep-14.1.1" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/ripgrep-14.1.1/rg" --version
 
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
@@ -336,25 +317,9 @@ jobs:
       - name: Install ripgrep 15.2.0 (Linux)
         if: matrix.os == 'linux'
         run: |
-          case "${{ matrix.arch }}" in
-            x86-64)
-              asset=ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz
-              sha256=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
-              ;;
-            arm64)
-              asset=ripgrep-15.2.0-aarch64-unknown-linux-gnu.tar.gz
-              sha256=a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
-              ;;
-            *)
-              echo "::error::no ripgrep archive is pinned for ${{ matrix.arch }}"
-              exit 1
-              ;;
-          esac
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/$asset"
-          echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/ripgrep-15.2.0"
-          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/ripgrep-15.2.0" --strip-components=1
-          "$RUNNER_TEMP/ripgrep-15.2.0/rg" --version
+          .github/scripts/install-ripgrep.sh 15.2.0 \
+            33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c \
+            a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
 
       # Every suite under test/ that names ripgrep or the mandatory-deny scan
       # it implements, less those whose result does not depend on rg here:
@@ -369,32 +334,35 @@ jobs:
         run: |
           export PATH="$RUNNER_TEMP/ripgrep-15.2.0:$PATH"
           rg --version
-          bun test \
-            test/utils/ripgrep.test.ts \
-            test/sandbox/mandatory-deny-paths.test.ts \
-            test/sandbox/filesystem-disabled.test.ts \
-            test/sandbox/linux-ancestor-pin.test.ts \
-            test/sandbox/linux-bwrap-args-file.test.ts \
-            test/sandbox/linux-file-above-deny.test.ts \
-            test/sandbox/linux-mount-plan-record.test.ts \
-            test/sandbox/literal-path-entries.test.ts \
-            test/sandbox/read-deny-glob.test.ts \
-            test/sandbox/readonly-deny-dir-binds.test.ts \
-            test/sandbox/readonly-deny-dir-stubs.test.ts \
-            test/sandbox/stale-mount-point.test.ts \
+          suites=(
+            test/utils/ripgrep.test.ts
+            test/sandbox/mandatory-deny-paths.test.ts
+            test/sandbox/filesystem-disabled.test.ts
+            test/sandbox/linux-ancestor-pin.test.ts
+            test/sandbox/linux-bwrap-args-file.test.ts
+            test/sandbox/linux-file-above-deny.test.ts
+            test/sandbox/linux-mount-plan-record.test.ts
+            test/sandbox/literal-path-entries.test.ts
+            test/sandbox/read-deny-glob.test.ts
+            test/sandbox/readonly-deny-dir-binds.test.ts
+            test/sandbox/readonly-deny-dir-stubs.test.ts
+            test/sandbox/stale-mount-point.test.ts
             test/sandbox/symlinked-deny-paths.test.ts
+          )
+          # `bun test` takes these as filters and passes over one that matches
+          # nothing, so a suite that was renamed has to fail the step here.
+          ls "${suites[@]}" > /dev/null
+          bun test "${suites[@]}"
 
-      # Everything above runs the library under Bun. `npm run test:node` is
-      # the part of the tree that runs the built package under Node: the
-      # whichSync fallback, and the control-fd suite, which starts dist/cli.js
-      # with the node on PATH. It runs on each release line from the engines
-      # floor up. Only these steps repeat, so the job matrix stays as it is.
-      - name: Run the tests that use Node (Node 22)
+      - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
-        run: |
-          node --version
-          npm run test:node
+        run: node test/utils/which-node-test.mjs
 
+      # Everything above ran with Node 22 on PATH. `npm run test:node` is the
+      # part of the tree that runs the library under Node: the whichSync
+      # fallback, and the suites that start `node` themselves. Only it repeats
+      # on 24, the line above, so the job matrix stays as it is. Later lines,
+      # which `engines` also admits, are not run.
       - name: Setup Node.js 24
         if: matrix.os != 'windows'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

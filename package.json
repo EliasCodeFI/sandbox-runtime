@@ -20,7 +20,7 @@
     "build:srt-proxy-node": "bun build src/proxy-main.ts --target=node --format=esm --outfile dist/srt-proxy.mjs",
     "clean": "rm -rf dist",
     "test": "bun test",
-    "test:node": "node test/utils/which-node-test.mjs && bun test test/control-fd.test.ts",
+    "test:node": "node test/utils/which-node-test.mjs && bun test test/control-fd.test.ts test/utils/real-path.test.ts test/sandbox/default-write-paths.test.ts test/sandbox/rules-through-links-on-every-runtime.test.ts test/sandbox/tls-terminate-tunnel-ends.test.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",

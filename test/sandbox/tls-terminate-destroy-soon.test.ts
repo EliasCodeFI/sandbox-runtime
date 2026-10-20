@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { createServer, type AddressInfo } from 'node:net'
 import { join } from 'node:path'
-import { connect, type TLSSocket } from 'node:tls'
+import type { TLSSocket } from 'node:tls'
+import { tlsConnect as connect } from '../helpers/tls-connect.js'
 import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import { serverTlsOn } from '../../src/sandbox/tls-terminate-proxy.js'
@@ -62,7 +63,7 @@ async function lateClientOf(
     let ended = false
     c.pause()
     setTimeout(() => c.resume(), 300)
-    c.on('data', (d: Buffer) => {
+    c.on('data', d => {
       read += d.length
       c.pause()
       setTimeout(() => c.resume(), 5)

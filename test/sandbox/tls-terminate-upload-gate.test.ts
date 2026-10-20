@@ -6,11 +6,8 @@ import {
   type AddressInfo,
   type Socket,
 } from 'node:net'
-import {
-  connect as tlsConnect,
-  createServer as createTlsServer,
-  type TLSSocket,
-} from 'node:tls'
+import { createServer as createTlsServer, type TLSSocket } from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { createByteBudget } from '../../src/sandbox/emitted-connection.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'

@@ -21,11 +21,7 @@ import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import type { Server, AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
 import { connect as netConnect } from 'node:net'
-import {
-  connect as tlsConnect,
-  type ConnectionOptions,
-  type TLSSocket,
-} from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -366,16 +362,14 @@ describe('SigV4 re-signing through the TLS-terminating proxy', () => {
       })
       raw.on('error', () => {})
       raw.once('data', () => {
-        // `connect` from 'node:tls' is untyped under the Bun type package
-        // with @types/node 22, so the options and the socket are typed here.
-        const tls: TLSSocket = tlsConnect(
+        const tls = tlsConnect(
           // SNI cannot carry an IP literal; the CA is pinned, so skip the
           // hostname identity check instead.
           {
             socket: raw,
             ca: CA_PEM,
             checkServerIdentity: () => undefined,
-          } satisfies ConnectionOptions,
+          },
           () => {
             tls.write(
               `DELETE /bucket/key HTTP/1.1\r\n` +

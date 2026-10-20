@@ -8,11 +8,8 @@ import { connect } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import {
-  connect as tlsConnect,
-  type ConnectionOptions,
-  type TLSSocket,
-} from 'node:tls'
+import type { TLSSocket } from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 
@@ -759,14 +756,8 @@ describe('client aborts through the TLS-terminating path', () => {
       })
       raw.on('error', () => {})
       raw.once('data', () => {
-        // `connect` from 'node:tls' is untyped under the Bun type package
-        // with @types/node 22, so the options and the socket are typed here.
-        const tls: TLSSocket = tlsConnect(
-          {
-            socket: raw,
-            ca: CA_PEM,
-            servername: 'localhost',
-          } satisfies ConnectionOptions,
+        const tls = tlsConnect(
+          { socket: raw, ca: CA_PEM, servername: 'localhost' },
           () => fn(tls, () => resolve()),
         )
         tls.on('error', () => resolve())
