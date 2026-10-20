@@ -1323,6 +1323,46 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     90000,
   )
 
+  it('leaves no directory that its mount points bind from, when all the process did was a wrap that came to nothing', () => {
+    // Refused for a doubt that comes up once the directory is made. No plan
+    // held, which is what else has the clean-up at exit set up.
+    const TMP = join(BASE, 'tmp-of-its-own')
+    mkdirSync(TMP)
+    mkdirSync(runtime.manifestDir(), { recursive: true, mode: 0o700 })
+    const junk = JSON.stringify(join(runtime.manifestDir(), '4242-00.json'))
+    const isOne = (name: string): boolean => name.startsWith('claude-empty-')
+    const ended = spawnSync(
+      process.execPath,
+      [
+        writeScript(
+          'comes-to-nothing.ts',
+          [
+            `const fs = require('node:fs')`,
+            `const mkdtemp = fs.mkdtempSync`,
+            `fs.mkdtempSync = (prefix, ...rest) => {`,
+            `  if (String(prefix).includes('claude-empty-')) fs.writeFileSync(${junk}, '{}')`,
+            `  return mkdtemp(prefix, ...rest)`,
+            `}`,
+            `const { wrapCommandWithSandboxLinux } = await import(${LIBRARY})`,
+            `const refused = await (async () => {`,
+            wrapLine([AREA], 'true', [join(AREA, 'absent', 'config.lock')]),
+            `})().then(() => undefined, error => error)`,
+            `console.log(refused?.code, fs.readdirSync(${JSON.stringify(TMP)}).filter(${String(isOne)}).length)`,
+            `fs.rmSync(${junk})`,
+          ].join('\n'),
+        ),
+      ],
+      {
+        env: { ...process.env, TMPDIR: TMP },
+        encoding: 'utf8',
+        timeout: 60000,
+        cwd: import.meta.dir,
+      },
+    )
+    expect(ended.stdout).toBe('mount_points_unreadable 1\n')
+    expect(readdirSync(TMP).filter(isOne)).toEqual([])
+  })
+
   it('lets go of the mount points of a wrap that produced no command', async () => {
     // Left where a process killed before its cleanup would leave it, with the
     // manifest it would leave, so that both processes below name it.

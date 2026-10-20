@@ -31,6 +31,7 @@ import {
   namedMountPoints,
   type NamedMountPoints,
   publishMountPointManifest,
+  removePrivateManifestDirectory,
   setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
@@ -2401,6 +2402,31 @@ describe.if(isLinux)('The mount point manifests', () => {
       expect(mountPointManifestDirectories()).toContain(NAMED[1]!)
     })
 
+    it.each([
+      ['/run/user/UID, which one of them is in', () => dirname(PLACES[1]!)],
+      [
+        'the one only this process knows',
+        () => {
+          taken([...PLACES, ...NAMED])
+          return recordedIn()
+        },
+      ],
+    ])('cannot be told while %s cannot be looked at', (_, which) => {
+      try {
+        const look = failingCall('lstatSync', which(), 'EIO')
+        try {
+          expect(() => mountPointManifestDirectories()).toThrow('EIO')
+        } finally {
+          look.restore()
+        }
+      } finally {
+        collectMountPoints('all')
+        removePrivateManifestDirectory()
+        rmSync(DIR, { recursive: true, force: true })
+        mkdirSync(DIR, { mode: 0o700 })
+      }
+    })
+
     it('reads every directory again once it has claimed, not only where it claimed', () => {
       // Published in another directory since the first reading, and claimed
       // there by another pass that its sandbox got past.
@@ -3046,9 +3072,12 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('does nothing at all where the platform is not Linux', () => {
     // Every clean-up after a command, on every platform, comes through here.
-    // Off Linux it must make nothing.
+    // Off Linux it must make nothing. One manifest to collect, one to hold by.
+    const Y = join(BASE, 'second.lock')
     leftover(X)
+    leftover(Y)
     manifestOfADeadProcess([X])
+    writeManifest(DIR, [Y], thisProcess())
     const before = readdirSync(DIR).sort()
     const elsewhere = inAChild(
       [
