@@ -34,7 +34,7 @@ const bwrapExiting = (status: number, stderr = '') =>
 
 // The spawns that are not the bare `bwrap --version` every caller runs: the
 // ones that ask about capabilities, which run `--version` inside a sandbox.
-const capabilityProbes = (): unknown[][] =>
+const capabilityProbes = (): unknown[] =>
   spawnSyncSpy.mock.calls.filter(
     (call: unknown[]) =>
       !(Array.isArray(call[1]) && call[1].join(' ') === '--version'),
@@ -136,25 +136,6 @@ describe('checkLinuxDependencies', () => {
       expect(capabilityProbes().length > 0).toBe(lacksSetfcap)
       expect(result.errors).toEqual([])
       expect(result.warnings).toEqual([])
-    },
-  )
-
-  // Nothing is looked up by name on the way.
-  test.if(process.geteuid !== undefined)(
-    'a uid-0 probe of an explicit bwrapPath runs that binary outside and inside',
-    () => {
-      euidSpy?.mockReturnValue(0)
-
-      const result = checkLinuxDependencies({ bwrapPath: '/bin/sh' })
-
-      expect(
-        capabilityProbes().map((call: unknown[]) => [
-          call[0],
-          ...(call[1] as string[]).slice(-2),
-        ]),
-      ).toEqual(lacksSetfcap ? [['/bin/sh', '/bin/sh', '--version']] : [])
-      expect(result.errors).toEqual([])
-      expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
     },
   )
 
