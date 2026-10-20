@@ -2794,6 +2794,7 @@ async function wrapWithSandboxOnce(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        alsoWritable: hostWritablePlaces(),
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       }).catch((err: unknown) => {

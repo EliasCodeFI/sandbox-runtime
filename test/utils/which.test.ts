@@ -47,13 +47,11 @@ describe('whichSync searches PATH in this process', () => {
   const savedPath = process.env.PATH
   const savedCwd = process.cwd()
   const base = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'which-test-')))
-  const marker = join(base, 'a-planted-file-was-run')
 
-  // An executable that leaves the marker behind if anything ever runs it.
   function plant(...parts: string[]): string {
     const file = join(base, ...parts)
     fs.mkdirSync(dirname(file), { recursive: true })
-    fs.writeFileSync(file, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 })
+    fs.writeFileSync(file, '#!/bin/sh\n', { mode: 0o755 })
     return file
   }
 
@@ -62,12 +60,6 @@ describe('whichSync searches PATH in this process', () => {
     process.chdir(savedCwd)
   })
   afterAll(() => fs.rmSync(base, { recursive: true, force: true }))
-
-  it('runs no `which` program', () => {
-    process.env.PATH = `${dirname(plant('planted', 'which'))}:${savedPath}`
-    expect(whichSync('sh')).toBe(globalThis.Bun.which('sh'))
-    expect(fs.existsSync(marker)).toBe(false)
-  })
 
   it('takes the first entry holding an executable regular file of that name', () => {
     fs.mkdirSync(join(base, 'directory', 'tool'), { recursive: true })

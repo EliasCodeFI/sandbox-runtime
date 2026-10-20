@@ -50,7 +50,8 @@ export function pathCandidates(
  *
  * Every `PATH` entry counts, the ones a sandboxed command may write among
  * them, so this is for a program that runs with the sandbox's authority. One
- * that runs with more is found with `findHostHelper`.
+ * that runs with more is found with `findHostHelper`. POSIX only: it knows
+ * nothing of `PATHEXT`.
  *
  * @param bin - The name of the executable to find
  * @returns The path to the executable, or null if not found

@@ -1,5 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { getPlatform } from '../utils/platform.js'
 import { wayTo } from '../utils/real-path.js'
 import {
   isExecutableFile,
@@ -38,9 +39,10 @@ export type WritablePlaces = readonly string[]
 /**
  * Where a sandboxed command may write, in the form a location is compared
  * against: each allowed write path (`writeRootsOf` a write config) as
- * `normalizePathForSandbox` spells it, symlinks resolved, a pattern by the
- * directory it starts from. `denyWithinAllow` is not subtracted: passing over
- * more is the safe side.
+ * `normalizePathForSandbox` spells it, symlinks resolved. On Linux each is a
+ * name, as it is to the wrap; elsewhere one that reads as a pattern counts by
+ * the directory it starts from. `denyWithinAllow` is not subtracted: passing
+ * over more is the safe side.
  *
  * - `'anywhere'`, said outright, or a list that names `/`: nowhere, since no
  *   place is then better than another. A file's permissions are not judged.
@@ -56,17 +58,19 @@ export function writablePlaces(
 ): WritablePlaces {
   if (allowedWritePaths === 'anywhere') return []
   const places = new Set<string>()
+  const literal = getPlatform() === 'linux'
   const cwd = workingDirectory()
   for (const allowed of allowedWritePaths ?? [
     ...(cwd === undefined ? [] : [cwd]),
     ...getDefaultWritePaths(),
   ]) {
-    const normalized = normalizePathForSandbox(allowed)
+    const normalized = normalizePathForSandbox(allowed, { literal })
     // `~` under an empty $HOME is the empty spelling, which names no place.
     if (!path.isAbsolute(normalized)) continue
-    const place = containsGlobChars(normalized)
-      ? globPatternBaseDir(normalized)
-      : normalized
+    const place =
+      !literal && containsGlobChars(normalized)
+        ? globPatternBaseDir(normalized)
+        : normalized
     if (globBaseDirIsRoot(place)) return []
     places.add(place)
   }

@@ -11,6 +11,7 @@ import * as javaAgent from '../../src/sandbox/java-proxy-agent.js'
 import * as linux from '../../src/sandbox/linux-sandbox-utils.js'
 import * as macos from '../../src/sandbox/macos-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import * as platformUtils from '../../src/utils/platform.js'
 import { whichSync } from '../../src/utils/which.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
@@ -89,6 +90,11 @@ afterEach(async () => {
   process.env.PATH = savedPath
   process.chdir(savedCwd)
   seccomp.resetGlobalNpmPathsForTesting()
+  // The manager keeps its configuration: one that names nothing of this file's.
+  SandboxManager.updateConfig({
+    ...config,
+    filesystem: { ...config.filesystem, allowWrite: [] },
+  })
   await SandboxManager.reset()
   const ran = fs.existsSync(marker) && fs.readFileSync(marker, 'utf8')
   fs.rmSync(base, { recursive: true, force: true })
@@ -98,9 +104,6 @@ afterEach(async () => {
 posix.each<[string, Parameters<typeof writablePlaces>[0], string[]]>([
   ['writes anywhere', 'anywhere', []],
   ['the root among them', [project, '/'], []],
-  ['a pattern that starts from the root', [project, '/*/bin'], []],
-  ['a pattern', [`${project}/src/**/*.ts`], [`${project}/src`]],
-  ['a name that reads as a pattern', [`${safe}/w[1]`], [safe]],
   ['a trailing slash', [`${project}/`], [project]],
   ['an entry that is not there', [`${base}/absent`], [`${base}/absent`]],
   ['a home directory with no name', ['~', project], [project]],
@@ -111,6 +114,17 @@ posix.each<[string, Parameters<typeof writablePlaces>[0], string[]]>([
 ])('writablePlaces: %s', (_, allowed, places) => {
   spyOn(os, 'homedir').mockReturnValue('')
   expect(writablePlaces(allowed)).toEqual(places)
+})
+
+posix('writablePlaces: what reads as a pattern is a name on Linux', () => {
+  const names = [`${project}/src/**/*.ts`, `${safe}/w[1]`, '/x[1]']
+  const entries = names.map(name => `${name}/`)
+  const on = spyOn(platformUtils, 'getPlatform').mockReturnValue('linux')
+  expect(writablePlaces(entries)).toEqual(names)
+  on.mockReturnValue('macos')
+  expect(writablePlaces(entries.slice(0, 2))).toEqual([`${project}/src`, safe])
+  // It starts from the root.
+  expect(writablePlaces(entries)).toEqual([])
 })
 
 posix('writablePlaces: no policy known yet', () => {
@@ -327,9 +341,12 @@ onLinux('a wrap goes on without a ripgrep, and says so', async () => {
 onLinux('a wrap that restricts no write searches the whole PATH', async () => {
   process.chdir(project)
   process.env.PATH = `${tools(['bwrap'], `${project}/real`)}:${savedPath}`
-  expect(
-    await wrap({ writeConfig: undefined, unsetEnvVars: ['X'] }),
-  ).toStartWith(`${project}/real/bwrap `)
+  const unrestricted = { writeConfig: undefined, unsetEnvVars: ['X'] }
+  expect(await wrap(unrestricted)).toStartWith(`${project}/real/bwrap `)
+  // But for where the session's earlier commands could write.
+  expect(await wrap({ ...unrestricted, alsoWritable: writable })).toStartWith(
+    `${real.bwrap} `,
+  )
 })
 
 const refusals = [
@@ -373,7 +390,6 @@ onLinux.each([
     'bubblewrap (bwrap) not installed',
     'socat not installed',
   ])
-  SandboxManager.updateConfig(config)
 })
 
 onLinux(
@@ -393,7 +409,14 @@ onLinux(
     await SandboxManager.initialize(config)
     await wrap()
     linux.getLinuxDependencyStatus({ writable })
-    expect(lookups.map(lookup => lookup.mock.calls.length)).toEqual([3, 1, 1])
+    // A call's own, narrower write paths do not clear the session's.
+    const own = { ...config.filesystem, allowWrite: [elsewhere] }
+    expect(
+      await SandboxManager.wrapWithSandbox('true', undefined, {
+        filesystem: own,
+      }),
+    ).toStartWith(`${real.bwrap} `)
+    expect(lookups.map(lookup => lookup.mock.calls.length)).toEqual([4, 1, 1])
     for (const call of lookups.flatMap(lookup => lookup.mock.calls))
       expect(call[1]).toContain(project)
   },

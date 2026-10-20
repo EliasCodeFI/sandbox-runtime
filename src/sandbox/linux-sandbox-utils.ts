@@ -105,6 +105,12 @@ export interface LinuxSandboxParams {
   bwrapPath?: string
   /** Absolute path to the socat binary (default: "socat", found likewise) */
   socatPath?: string
+  /**
+   * Where commands wrapped before this one could write, beyond `writeConfig`:
+   * the session's places, when `writeConfig` is one call's own. No host helper
+   * is taken from there either.
+   */
+  alsoWritable?: WritablePlaces
   /** Filesystem unix socket bound by the Linux violation monitor. When set,
    *  the socket is bind-mounted into the sandbox and apply-seccomp is told
    *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
@@ -549,8 +555,8 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
-  writable: WritablePlaces = writablePlaces(undefined),
+  abortSignal: AbortSignal | undefined,
+  writable: WritablePlaces,
 ): Promise<string[]> {
   const cwd = process.cwd()
   // Use provided signal or create a fallback controller
@@ -2188,7 +2194,8 @@ async function generateFilesystemArgs(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
+  abortSignal: AbortSignal | undefined,
+  writable: WritablePlaces,
 ): Promise<{ args: string[]; mandatoryDenyArgs: number }> {
   const args: string[] = []
   const startedIn = workingDirectory()
@@ -2701,7 +2708,7 @@ async function generateFilesystemArgs(
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
-        writablePlaces(writeRootsOf(writeConfig)),
+        writable,
       )),
     ]
     // INVARIANT: one plan, one working directory. A relative entry is resolved
@@ -3647,6 +3654,7 @@ export async function wrapCommandWithSandboxLinux(
     seccompConfig,
     bwrapPath,
     socatPath,
+    alsoWritable = [],
     observeSocketPath,
     abortSignal,
   } = params
@@ -3701,9 +3709,10 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
-    const writable = writablePlaces(
-      writeConfig ? writeRootsOf(writeConfig) : 'anywhere',
-    )
+    const writable = [
+      ...writablePlaces(writeConfig ? writeRootsOf(writeConfig) : 'anywhere'),
+      ...alsoWritable,
+    ]
     const bwrapBinary =
       bwrapPath ?? requireHostHelper('bwrap', 'bwrapPath', writable)
 
@@ -3884,6 +3893,7 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      writable,
     )
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
