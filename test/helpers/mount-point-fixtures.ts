@@ -1,3 +1,4 @@
+import { expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
@@ -8,7 +9,10 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  LinuxSandboxProfileError,
+  wrapCommandWithSandboxLinux,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import { manifestOf } from './bwrap-argv.js'
 
 /** A process as a manifest, a started record or a pass names one. */
@@ -99,6 +103,16 @@ export function started(manifest: string, ...by: Process[]): string {
 }
 
 /** The mount points the wrap named in its manifest, none without one. */
+/** The code the wrap was refused with. */
+export async function refusal(wrapping: Promise<string>): Promise<unknown> {
+  const thrown: unknown = await wrapping.then(
+    () => 'the wrap resolved',
+    (error: unknown) => error,
+  )
+  expect(thrown).toBeInstanceOf(LinuxSandboxProfileError)
+  return (thrown as LinuxSandboxProfileError).code
+}
+
 export function namedBy(command: string): string[] {
   const file = manifestOf(command)
   return file === undefined

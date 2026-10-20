@@ -10,6 +10,8 @@ import {
 import { isLinux } from '../helpers/platform.js'
 import { countMounts, mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { refusal } from '../helpers/mount-point-fixtures.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 const REPO_ROOT = join(import.meta.dir, '../..')
 const V9FS_MAGIC = 0x01021997
@@ -55,6 +57,9 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   let DIR: string // a directory in it, holding the absent deny paths
   const savedCwd = process.cwd()
   const spies: Array<{ mockRestore(): void }> = []
+  // Empty at the start of each case: a plan reads what is in it before it looks
+  // at the parent, with the calls that are stood in for here.
+  const runtime = usePrivateManifestDirectory()
 
   const CAN_RUN = bwrapCanNamespace()
   // Directories of another's that this user cannot write: not root's view.
@@ -354,7 +359,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     it('plans it when the parent is swapped once it is open', async () => {
       swapOnce(
         'fstatSync',
-        () => true,
+        fd => real.readlinkSync(`/proc/self/fd/${String(fd)}`) === DIR,
         () => {
           fs.renameSync(DIR, join(ROOT, 'aside'))
           fs.symlinkSync('/usr', DIR)
@@ -402,7 +407,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       }
       if (drive) onWindowsDrive()
       stub('closeSync', () => {
-        opened.push([])
+        if (opened.length === 1) opened.push([])
         return undefined
       })
 
@@ -426,6 +431,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     beforeEach(onWindowsDrive)
 
     const listing = () => fs.readdirSync(DIR).sort()
+    /** What is no manifest: every reading is in doubt while it is there. */
+    const junk = () => join(runtime.manifestDir(), '1-junk.json')
 
     it('makes the mount point itself, and the clean-up removes it', async () => {
       const leaf = join(DIR, 'policy.json')
@@ -497,30 +504,16 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
             const absent = join(DIR, denied)
             const own = join(DIR, 'own.empty')
             fs.writeFileSync(own, '')
-            // What is no manifest puts the readings in doubt, from the moment
-            // the mount point is made: the plan has read the manifests by then.
-            const manifests = join(
-              process.env['XDG_RUNTIME_DIR']!,
-              'srt-mount-points',
-            )
-            fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
+            // In doubt from the moment the mount point is made: the plan has
+            // read the manifests by then.
             stub(makes, p => {
-              if (names(p, join(DIR, made))) {
-                fs.writeFileSync(join(manifests, '1-junk.json'), '{}')
-              }
+              if (names(p, join(DIR, made))) fs.writeFileSync(junk(), '{}')
               return undefined
             })
-            try {
-              const refused = await wrap([absent, own]).then(
-                () => undefined,
-                (error: unknown) => error,
-              )
-              expect((refused as { code?: string }).code).toBe(
-                'mount_points_unreadable',
-              )
-            } finally {
-              fs.rmSync(join(manifests, '1-junk.json'))
-            }
+            expect(await refusal(wrap([absent, own]))).toBe(
+              'mount_points_unreadable',
+            )
+            fs.rmSync(junk())
             expect(listing()).toEqual([made, 'own.empty'].sort())
             if (by === 'a forced clean-up') {
               cleanupBwrapMountPoints({ force: true })
@@ -537,27 +530,14 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     )
 
     it('makes nothing while the manifests cannot be read, when no clean-up would remove it either', async () => {
-      const manifests = join(
-        process.env['XDG_RUNTIME_DIR']!,
-        'srt-mount-points',
-      )
-      fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
-      fs.writeFileSync(join(manifests, '1-junk.json'), '{}')
-      try {
-        const refused = await wrap([
-          join(DIR, 'policy.json'),
-          join(DIR, 'absent', 'policy.json'),
-        ]).then(
-          () => undefined,
-          (error: unknown) => error,
-        )
-        expect((refused as { code?: string }).code).toBe(
-          'mount_points_unreadable',
-        )
-        expect(listing()).toEqual([])
-      } finally {
-        fs.rmSync(join(manifests, '1-junk.json'))
-      }
+      fs.mkdirSync(runtime.manifestDir(), { recursive: true, mode: 0o700 })
+      fs.writeFileSync(junk(), '{}')
+      expect(
+        await refusal(
+          wrap([join(DIR, 'policy.json'), join(DIR, 'absent', 'policy.json')]),
+        ),
+      ).toBe('mount_points_unreadable')
+      expect(listing()).toEqual([])
     })
 
     it('covers a file with a directory in a folder that takes subfolders and no files', async () => {

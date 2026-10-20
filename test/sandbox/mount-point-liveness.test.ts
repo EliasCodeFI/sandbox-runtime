@@ -37,6 +37,7 @@ import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
   namedBy,
   processAt,
+  refusal,
   run,
   sleep,
   startOf,
@@ -1063,16 +1064,6 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   })
 
   // ---- what a wrap cannot tell, it does not guess ----
-
-  /** What the wrap was refused with. */
-  async function refusal(wrapping: Promise<string>): Promise<unknown> {
-    const thrown: unknown = await wrapping.then(
-      () => 'the wrap resolved',
-      (error: unknown) => error,
-    )
-    expect(thrown).toBeInstanceOf(LinuxSandboxProfileError)
-    return (thrown as LinuxSandboxProfileError).code
-  }
 
   it("refuses to wrap when it cannot read another sandbox's manifest", async () => {
     // Taken for the caller's own, the file would be bound onto itself and named
@@ -2134,15 +2125,17 @@ describe.if(isLinux)(
     /**
      * Runs `then` when the wrap has decided where its mount points go and has
      * yet to pin what lies above them: as it makes sure of the manifest
-     * directories.
+     * directories for the second time in a plan. The first is before it reads
+     * them.
      */
     function beforeThePins(then: () => void): { restore(): void } {
       const mkdir = fs.mkdirSync
+      let times = 0
       const spy = spyOn(fs, 'mkdirSync').mockImplementation(((
         dir: unknown,
         ...rest: unknown[]
       ) => {
-        if (dir === runtime.manifestDir()) then()
+        if (dir === runtime.manifestDir() && ++times % 2 === 0) then()
         return (mkdir as (...args: unknown[]) => unknown)(dir, ...rest)
       }) as never)
       return { restore: () => spy.mockRestore() }
@@ -2334,9 +2327,16 @@ describe.if(isLinux)(
       expect(readdirSync(runtime.manifestDir())).toEqual([])
       expect(emptySources()).toEqual([])
 
-      // Before it publishes: what it made goes once a clean-up can tell. The
-      // manifests are read first, so the doubt comes as that is made.
+      // The manifests are read first: in doubt from the start, it makes nothing.
       const junk = join(runtime.manifestDir(), '4242-00.json')
+      writeFileSync(junk, 'no manifest')
+      expect(await refusal(wrap('true', [LEAF]))).toBe(
+        'mount_points_unreadable',
+      )
+      expect(emptySources()).toEqual([])
+      rmSync(junk)
+
+      // In doubt from when it made something: that goes once a clean-up can tell.
       const mkdtemp = fs.mkdtempSync
       const spy = spyOn(fs, 'mkdtempSync').mockImplementation(((
         ...args: unknown[]
@@ -2345,8 +2345,8 @@ describe.if(isLinux)(
         return (mkdtemp as (...args: unknown[]) => unknown)(...args)
       }) as never)
       try {
-        expect(await wrap('true', [LEAF]).catch((e: Error) => e.name)).toBe(
-          'LinuxSandboxProfileError',
+        expect(await refusal(wrap('true', [LEAF]))).toBe(
+          'mount_points_unreadable',
         )
       } finally {
         spy.mockRestore()

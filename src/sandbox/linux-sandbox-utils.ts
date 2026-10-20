@@ -2258,6 +2258,19 @@ async function generateFilesystemArgs(
   // The mount points on the host this wrap relies on: placeholders bwrap makes
   // for absent deny paths, and another sandbox's that this wrap covers again.
   const mountPoints: string[] = []
+  // Where the manifests are kept, each made if it can be.
+  let manifestDirs: string[] = []
+  const makeManifestDirs = (recording: boolean): void => {
+    try {
+      manifestDirs = mountPointManifestDirectories(recording)
+    } catch (err) {
+      throw new LinuxSandboxProfileError(
+        'mount_points_unreadable',
+        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
+        errorText(err),
+      )
+    }
+  }
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
   const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
@@ -2794,6 +2807,11 @@ async function generateFilesystemArgs(
     // INVARIANT: one plan, one working directory. A relative entry is resolved
     // against it on both sides of the await above, the only one here.
     if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
+
+    // Before any reading of them. What the environment names is believed only
+    // while none of the others can be written, and what this wrap found named
+    // there its own manifest would carry to where every process believes it.
+    makeManifestDirs(false)
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -3530,19 +3548,9 @@ async function generateFilesystemArgs(
   // read-only bind protects one only while its name still leads to it, and
   // with the temp dir strictly inside a write root a command could otherwise
   // rename the temp dir aside and make the name again.
-  let manifestDirs: string[] = []
-  if (writeConfig !== undefined) {
-    try {
-      manifestDirs = mountPointManifestDirectories(
-        mountPoints.length > 0 || emptySource !== undefined,
-      )
-    } catch (err) {
-      throw new LinuxSandboxProfileError(
-        'mount_points_unreadable',
-        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
-        errorText(err),
-      )
-    }
+  // With a manifest to come, where it goes is settled now, to be pinned too.
+  if (mountPoints.length > 0 || emptySource !== undefined) {
+    makeManifestDirs(true)
   }
   const pinArgs = ancestorPinArgs(
     [

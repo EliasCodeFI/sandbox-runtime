@@ -34,13 +34,17 @@ import {
   removePrivateManifestDirectory,
   setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  cleanupBwrapMountPoints,
+  wrapCommandWithSandboxLinux,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import { mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
   aDeadProcess,
   deadPid,
   leftover,
+  namedBy,
   recordOf,
   started,
   startOf,
@@ -2116,6 +2120,7 @@ describe.if(isLinux)('The mount point manifests', () => {
             denyWithinAllow: denied.map(name => join(BASE, name)),
           },
         })
+        cleanupBwrapMountPoints({ force: true })
         expect(
           mountsOf(command).filter(mount => mount.endsWith(` ${PLACES[2]!}`)),
         ).toHaveLength(1)
@@ -2258,6 +2263,26 @@ describe.if(isLinux)('The mount point manifests', () => {
       for (const place of [...PLACES, ...NAMED]) {
         expect(lstatSync(place).mode & 0o40777).toBe(0o40700)
       }
+    })
+
+    it('are made before a wrap reads any, which believes nothing the environment names that no clean-up would', async () => {
+      // Forged, or left by a process that could write nowhere else: it names a
+      // directory of the user's own. And what is no manifest.
+      const own = join(BASE, 'own')
+      mkdirSync(own)
+      at(NAMED[1]!, () => manifestOfADeadProcess([own]))
+      writeFileSync(join(NAMED[0]!, '4242-00.json'), '{}')
+      const command = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        writeConfig: {
+          allowOnly: [BASE],
+          denyWithinAllow: [join(own, 'absent.lock')],
+        },
+      })
+      expect(namedBy(command)).toEqual([join(own, 'absent.lock')])
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(own)).toBe(true)
     })
 
     it('are believed in each of the three, whichever this process writes in', () => {
