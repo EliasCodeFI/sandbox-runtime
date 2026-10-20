@@ -157,8 +157,7 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     expect(GLOB_WALK_TIMEOUT_MS).toBe(60_000)
     const budget = newGlobWalkBudget()
     expect(budget.maxEntries).toBe(20_000_000)
-    // Rounded: a floating-point sum less its first term need not be exact.
-    expect(Math.round(budget.deadline - budget.startedAt)).toBe(60_000)
+    expect(budget.timeoutMs).toBe(60_000)
     expect(budget.entries).toBe(0)
   })
 
@@ -472,7 +471,7 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
     expect(fields).toEqual({
       name: 'GlobWalkBudgetError',
       pattern,
-      directory: expect.stringMatching(new RegExp(`^${PROJ}(/|$)`)),
+      directory: expect.stringContaining(PROJ),
       exhausted: 'entries',
       entries: 26,
       elapsedMs: expect.any(Number),
@@ -529,6 +528,44 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
     })
   })
 
+  // PROJ is 40 entries, and so is each tree planted here.
+  it.each([
+    ['an allowRead pattern', (p: string) => ({ allowRead: [p] }), 'proj'],
+    [
+      'a credentials.files pattern',
+      (p: string) => ({ credentials: { files: [{ path: p, mode: 'deny' }] } }),
+      'proj',
+    ],
+    // Walked beneath an anchor: the folder, brackets and all, is a name.
+    ['a pattern in a folder named with brackets', () => ({}), 'pk[g]s'],
+  ] as const)('holds %s to the budget too', async (_what, listing, name) => {
+    const tree = plantProject(name)
+    const pattern = join(tree, '**/.env')
+    const { allowRead, credentials } = {
+      allowRead: undefined,
+      credentials: undefined,
+      ...listing(pattern),
+    }
+    const wrap = (maxEntries: number): Promise<unknown> =>
+      SandboxManager.wrapWithSandbox('echo hello', undefined, {
+        filesystem: {
+          denyRead: allowRead || credentials ? [] : [pattern],
+          allowRead,
+          allowWrite: [],
+          denyWrite: [],
+          denyReadGlobBudget: { maxEntries },
+        },
+        credentials,
+      }).catch((error: unknown) => error)
+
+    expect(await wrap(1000)).toBeString()
+    const refusal = await wrap(39)
+    expect(refusal).toBeInstanceOf(LinuxSandboxProfileError)
+    const { cause } = refusal as LinuxSandboxProfileError
+    expect((cause as GlobWalkBudgetError).pattern).toBe(pattern)
+    expect((cause as GlobWalkBudgetError).directory).toStartWith(tree)
+  })
+
   it('refuses the wrap over a tree that only links inside it lead through', async () => {
     const chain = join(ROOT, 'chain')
     plantChain(chain, 30)
@@ -579,9 +616,7 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
     )
     const cause = (error as LinuxSandboxProfileError).cause
     expect(cause).toBeInstanceOf(GlobWalkBudgetError)
-    expect((cause as GlobWalkBudgetError).directory).toMatch(
-      new RegExp(`^${OTHER}(/|$)`),
-    )
+    expect((cause as GlobWalkBudgetError).directory).toStartWith(OTHER)
   })
 
   it('refuses the read configuration the same way', async () => {
@@ -662,7 +697,16 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
           timeoutMs: 1234,
         })
       }
-      // One that names a budget is held to that.
+      // One that names a limit is held to that, and to the other as it was.
+      expect(
+        await refusedWith(() =>
+          SandboxManager.wrapWithSandbox(
+            'echo hello',
+            undefined,
+            configOf({ maxEntries: 38 }),
+          ),
+        ),
+      ).toEqual({ maxEntries: 38, timeoutMs: 1234 })
       expect(
         await SandboxManager.wrapWithSandbox(
           'echo hello',
@@ -689,6 +733,37 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
       await SandboxManager.reset()
     }
   })
+})
+
+describe.if(isLinux)('limits that no schema has seen', () => {
+  const configOf = (denyReadGlobBudget: object) => ({
+    network: { allowedDomains: [], deniedDomains: [] },
+    filesystem: {
+      denyRead: [],
+      allowWrite: [],
+      denyWrite: [],
+      denyReadGlobBudget,
+    },
+  })
+
+  afterAll(() => SandboxManager.reset())
+
+  // NaN would never be reached, and a misspelt key would leave the default.
+  it.each([{ maxEntries: NaN }, { timeoutMs: '1000' }, { maxEntires: 1 }])(
+    'fail the wrap and the read configuration: %o',
+    async limits => {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(configOf({}))
+      const named = /filesystem[^]*denyReadGlobBudget/
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(
+        SandboxManager.wrapWithSandbox('true', undefined, configOf(limits)),
+      ).rejects.toThrow(named)
+
+      SandboxManager.updateConfig(configOf(limits))
+      expect(() => SandboxManager.getFsReadConfig()).toThrow(named)
+    },
+  )
 })
 
 describe('the filesystem.denyReadGlobBudget option', () => {

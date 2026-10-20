@@ -984,8 +984,8 @@ export const FilesystemConfigSchema = z.object({
     .strict()
     .optional()
     .describe(
-      'Linux: what expanding the denyRead globs of one configuration may spend, all of them together, ' +
-        'before the wrap is refused: directory entries looked at (default 20,000,000) and ' +
+      'Linux: what expanding the globs of one read configuration may spend, all of them together, ' +
+        'before the wrap is refused: directory entries read (default 20,000,000) and ' +
         'milliseconds (default 60,000).',
     ),
   allowWrite: z

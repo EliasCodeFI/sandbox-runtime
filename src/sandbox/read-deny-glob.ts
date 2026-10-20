@@ -1,7 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
-  type GlobWalkBudget,
-  type GlobWalkListings,
+  type GlobWalkOptions,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -60,6 +59,11 @@ function collapseReadDenyLocations({
   return kept
 }
 
+type ReadDenyGlobOptions = Pick<
+  GlobWalkOptions,
+  'anchor' | 'budget' | 'listings'
+>
+
 /**
  * Expand a read-deny glob into the paths bwrap should mount over, collapsed
  * against `reExposedPaths` (the caller's allowRead and allowWrite entries).
@@ -86,11 +90,7 @@ export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: {
-    anchor?: string
-    budget?: GlobWalkBudget
-    listings?: GlobWalkListings
-  } = {},
+  opts: ReadDenyGlobOptions = {},
 ): string[] {
   return finish(
     expandReadDenyGlobLinuxSteps(
@@ -107,19 +107,13 @@ export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: {
-    anchor?: string
-    budget?: GlobWalkBudget
-    listings?: GlobWalkListings
-  } = {},
+  opts: ReadDenyGlobOptions = {},
 ): Steps<string[]> {
   const startedAt = performance.now()
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
-    anchor: opts.anchor,
-    budget: opts.budget,
-    listings: opts.listings,
+    ...opts,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
