@@ -5888,6 +5888,10 @@ describe.if(isWindows)(
           await run(
             'M1',
             [
+              // First, so that what follows would show it.
+              'icacls .bashrc /grant *S-1-1-0:F',
+              'icacls .git\\hooks /reset /t',
+              'takeown /f .git\\config',
               'echo W>.bashrc',
               'echo W>.git\\config',
               'echo W>.git\\hooks\\pre-commit',
@@ -5928,7 +5932,9 @@ describe.if(isWindows)(
 
           await run(
             'M2b',
-            'echo X>made\\.git\\hooks\\pre-commit & echo X>.mcp.json & echo X>.git\\config',
+            // The sandbox account owns the first two.
+            'icacls made\\.git\\hooks /reset /t & icacls .mcp.json /grant *S-1-1-0:F & ' +
+              'echo X>made\\.git\\hooks\\pre-commit & echo X>.mcp.json & echo X>.git\\config',
           )
           expect(contentOf('made/.git/hooks/pre-commit')).toBeUndefined()
           expect(contentOf('.mcp.json')).toBe('W')
