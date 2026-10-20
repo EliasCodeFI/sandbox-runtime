@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { connect, createServer, type Socket } from 'node:net'
 import type { Writable } from 'node:stream'
-import { connect as tlsConnect } from 'node:tls'
+import { tlsConnect } from './helpers/tls-connect.js'
 import { encodeFrame } from '../src/sandbox/decider-client.js'
 import { generateCa } from '../src/sandbox/mitm-ca.js'
 import { SERVES_EMITTED_CONNECTIONS } from './helpers/emitted-connections.js'
@@ -319,7 +319,7 @@ describe('srt-proxy entry', () => {
                 'GET /x HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n',
               ),
             )
-            t.on('data', (y: Buffer) => (out += y))
+            t.on('data', y => (out += y))
             t.on('close', () => resolve(out))
             t.on('error', reject)
           }

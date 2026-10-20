@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 // skipped where this runtime cannot terminate it in-process.
 import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { connect, type AddressInfo } from 'node:net'
-import { connect as tlsConnect } from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 
@@ -52,7 +52,7 @@ describe('a body that keeps arriving after a deny', () => {
             }, i * 10)
           }
         })
-        t.on('data', (d: Buffer) => (out += d))
+        t.on('data', d => (out += d))
         t.on('close', () => resolve(out))
         t.on('error', () => resolve(out))
       })

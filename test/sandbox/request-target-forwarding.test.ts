@@ -4,10 +4,8 @@ import { test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
 import type { LookupFunction, Socket } from 'node:net'
-import {
-  connect as tlsConnect,
-  createServer as createTlsServer,
-} from 'node:tls'
+import { createServer as createTlsServer } from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

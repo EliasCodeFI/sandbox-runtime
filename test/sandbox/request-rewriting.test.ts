@@ -11,7 +11,7 @@ import {
 } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Server } from 'node:net'
-import { connect as tlsConnect } from 'node:tls'
+import { tlsConnect } from '../helpers/tls-connect.js'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -207,7 +207,7 @@ function viaTls(
           ),
         )
       })
-      t.on('data', (d: Buffer) => (raw += d))
+      t.on('data', d => (raw += d))
       t.on('error', reject)
       t.on('close', () => resolve(parse(raw)))
     }
