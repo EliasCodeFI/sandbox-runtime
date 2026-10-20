@@ -109,6 +109,7 @@ import {
   containsGlobChars,
   globBaseDirIsRoot,
   globPatternBaseDir,
+  isUncPath,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   walkGlobPatternSteps,
@@ -1453,8 +1454,11 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
+      // A share is not looked at (see isUncPath). No mandatory deny is on one.
       const writeDenied = new Map(
-        acc.denyWrite.map(p => [p, windowsFileIndexOf(p)]),
+        acc.denyWrite
+          .filter(p => !isUncPath(p))
+          .map(p => [p, windowsFileIndexOf(p)]),
       )
       // One call, always made: it also records this process as a
       // session. Write roots are kept at reset(); a failure throws.

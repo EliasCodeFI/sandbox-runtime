@@ -2827,7 +2827,8 @@ export function windowsMandatoryDenyPaths(
   }
   const top = resolveWindowsPath(cwd)
   if (top.state === 'resolved') walk(top.path, 1)
-  return found.filter(p => writeRootOf(p) !== undefined)
+  // Sorted: the order a directory is listed in differs from disk to disk.
+  return found.filter(p => writeRootOf(p) !== undefined).sort()
 }
 
 /**

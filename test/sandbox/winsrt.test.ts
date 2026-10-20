@@ -1521,6 +1521,8 @@ describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
     ])
     // From the top down: nothing is looked at through the link.
     expect(looked).not.toContain(at('linked/admin'))
+    // The working directory is the host's word, and is resolved.
+    expect(denied('linked')).toEqual(['real/.bashrc'])
   })
 
   it.each([
@@ -1528,7 +1530,7 @@ describe('windowsMandatoryDenyPaths (pure, all platforms)', () => {
     ['to a share', () => 'gitdir: //server/share/repo.git'],
     ['to a device', () => 'gitdir: \\\\?\\GLOBALROOT\\Device\\x'],
     ['nowhere', () => 'not a pointer'],
-    ['somewhere after 4 KiB', () => `gitdir: ../in\n${'#'.repeat(4096)}`],
+    ['somewhere after 4 KiB', () => `gitdir: ..\n${'#'.repeat(4096)}`],
   ])(
     'a `.git` file that leads %s is denied alone, and nothing there is read',
     (_where, content) => {
@@ -1757,10 +1759,14 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
 
     it("initialize() stamps the working directory's with the configured ones, and they rank alike", async () => {
       process.chdir(root)
+      const share = '\\\\server\\share\\x'
+      const stats = spyOn(fs, 'lstatSync')
+      spies.push(stats)
       await SandboxManager.initialize(
-        configOf({ allowWrite: [root, mine], denyWrite: [d] }),
+        configOf({ allowWrite: [root, mine], denyWrite: [d, share] }),
       )
-      expect(stamped?.denyWrite).toEqual([d, config, hooks])
+      expect(stamped?.denyWrite).toEqual([d, share, config, hooks])
+      expect(stats.mock.calls.join()).not.toContain('server')
       expect(granted?.write).toEqual([root])
       expect(await stampedFor()).toEqual([])
     })
@@ -1780,6 +1786,11 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       renameSync(`${config}.lock`, config)
       expect(await stampedFor()).toEqual([config])
       expect(await stampedFor()).toEqual([])
+
+      // The next session starts from what it stamps itself.
+      await SandboxManager.reset()
+      await SandboxManager.initialize(configOf({ allowWrite: [root] }))
+      expect(await stampedFor()).toHaveLength(3)
     })
 
     it('a command that could not have them stamped is not wrapped, and the next tries again', async () => {
