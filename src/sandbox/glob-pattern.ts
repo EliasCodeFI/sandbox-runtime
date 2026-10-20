@@ -216,13 +216,16 @@ const CARET = '^'.charCodeAt(0)
  *   So there they are written as one range (`[^/-9]`, `[^/a-c]`). That leaves
  *   a `-` beside a `,` or a `.`, which the line above keeps apart.
  *
- * A `^` that is a member goes last, where neither takes it to negate.
+ * In a set that is not negated a `^` goes last, where neither takes it to
+ * negate. Beyond ASCII nothing is moved: sorted by code unit, the halves of
+ * two characters outside the basic plane would part.
  */
 function setToRegex(members: string, negated: boolean): string {
   const ranges = setRanges(members) ?? []
   if (negated) ranges.push([SEPARATOR, SEPARATOR])
+  const isAscii = ([, to]: (typeof ranges)[number]): boolean => to < 0x80
   const merged: typeof ranges = []
-  for (const [from, to] of ranges.sort(([a], [b]) => a - b)) {
+  for (const [from, to] of ranges.filter(isAscii).sort(([a], [b]) => a - b)) {
     const last = merged[merged.length - 1]
     if (last !== undefined && from <= last[1] + (negated ? 1 : 0)) {
       last[1] = Math.max(last[1], to)
@@ -235,7 +238,7 @@ function setToRegex(members: string, negated: boolean): string {
   let dash = ''
   let caret = ''
   let rest = ''
-  for (let [from, to] of merged) {
+  for (let [from, to] of [...merged, ...ranges.filter(r => !isAscii(r))]) {
     if (from === DASH || to === DASH) {
       dash = '-'
       if (from === to) continue
@@ -249,10 +252,9 @@ function setToRegex(members: string, negated: boolean): string {
     }
     rest += from === to ? member(from) : `${member(from)}-${member(to)}`
   }
-  if (negated) return `[^${dash}${rest}]`
+  const body = dash + rest + caret
   // Alone in its set, the `-` is as well written without one.
-  if (rest + caret === '') return '-'
-  return `[${dash}${rest}${caret}]`
+  return body === '-' ? body : `[${negated ? '^' : ''}${body}]`
 }
 
 /** The regular expression for what `token` matches. */

@@ -1006,7 +1006,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         join(root, 'outside', 'cert9x.pem'),
       ])
       // A negated set is one character of a name, whatever it leaves out.
-      expect(found('*/cert[!s]x.pem')).toEqual([
+      expect(found('*/cert[!s/]x.pem')).toEqual([
         join(root, 'outside', 'cert9x.pem'),
       ])
       expect(found('*/cert[^0-8]x.pem')).toEqual([

@@ -25,6 +25,7 @@ const SETS = [
   ...TRICKY,
   ...TRICKY.flatMap(a => TRICKY.map(b => a + b)),
   ...['--0', '+--', '+-9', 'a-c.', '0-9', 'x^-z', '[:alpha:', '$', 'cab'],
+  ...['\\-a', '-+.', ',.-'],
 ].flatMap(body => [`[${body}]`, `[!${body}]`])
 
 describe('a bracket set, as it is written', () => {
@@ -47,6 +48,9 @@ describe('a bracket set, as it is written', () => {
     ['[x^-z]', '[_-z^]'],
     ['[!\\]', '[^/\\\\]'],
     ['[-]', '-'],
+    // Beyond ASCII as written, after the rest.
+    ['[😀😁a]', '[a😀😁]'],
+    ['[!😀😁]', '[^/😀😁]'],
   ])('%s is %s', (set, regex) => {
     expect(globToRegex(`/d/${set}`)).toBe(`^/d/${regex}$`)
   })
@@ -60,22 +64,25 @@ describe('a bracket set, as it is written', () => {
       bodies = bodies.flatMap(body => TRICKY.map(char => body + char))
       for (const glob of bodies.flatMap(b => [`[${b}]`, `[!${b}]`])) {
         const regex = globToRegex(glob).slice(1, -1)
-        // Text, or a `-` or `^` that needs no set.
+        // Text, or a `-` that needs no set.
         if (!regex.startsWith('[')) continue
         const set = regex.slice(1, -1)
         // Apart from the `-`, which has to stand first, no two neighbours of
         // a negated set are written apart.
-        const ends = [...set.replace(/^\^-?/, '').replace(/\\\\/g, '\\')]
-          .filter((char, i, all) => char !== '-' && all[i + 1] !== '-')
-          .map(char => char.charCodeAt(0))
-        const starts = [...set.replace(/^\^-?/, '').replace(/\\\\/g, '\\')]
-          .filter((char, i, all) => char !== '-' && all[i - 1] !== '-')
-          .map(char => char.charCodeAt(0))
+        const rest = [...set.replace(/^\^-?/, '').replace(/\\\\/g, '\\')]
+        const codes = (beside: -1 | 1): number[] =>
+          rest
+            .filter((char, i) => char !== '-' && rest[i + beside] !== '-')
+            .map(char => char.charCodeAt(0))
+        const ends = codes(1)
         if (
           !wellFormed.test(set) ||
           /\[[.:=]/.test(set) ||
+          set.startsWith('^') !== /^\[[!^]/.test(glob) ||
           (set.startsWith('^') &&
-            starts.slice(1).some((start, i) => start <= ends[i]! + 1))
+            codes(-1)
+              .slice(1)
+              .some((start, i) => start <= ends[i]! + 1))
         ) {
           bad.push(`${glob} is written ${regex}`)
         }
@@ -132,7 +139,7 @@ describe.if(isMacOS)('a bracket set, as a sandbox profile reads it', () => {
       const matches = new RegExp(globToRegex(`x${set}`))
       // A `-` cannot be written into a range with its neighbours, and with
       // one of them a negated set is read as `[^/]` in a deny: wider.
-      const widened = /^\^x\[\^-(.*,|\.)/.test(matches.source)
+      const widened = /^\^x\[\^-.*(,|\.-)/.test(matches.source)
       const wrong = RULES.flatMap(rule =>
         NAMES.filter(
           name =>
