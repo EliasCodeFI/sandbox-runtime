@@ -269,6 +269,10 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       const shut = join(PROJ, 'shut')
       expect(countMounts(result, '--ro-bind', shut, shut)).toBe(1)
       expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+      // Made a link, the missing name would lead to another `shut`.
+      expect(
+        countMounts(result, '--ro-bind', '/dev/null', join(PROJ, 'gone')),
+      ).toBe(target.startsWith('gone') ? 1 : 0)
     },
   )
 

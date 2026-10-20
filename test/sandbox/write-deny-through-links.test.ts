@@ -541,7 +541,18 @@ describe.if(isLinux)('where no link is held', () => {
   it('a wrap that throws names none', async () => {
     const throwing = { allowAllUnixSockets: true, binShell: 'no-such-shell' }
     const refusal = await wrapLinux(inRoot(['first']), throwing).catch(String)
-    expect(refusal).toContain("'no-such-shell' not found")
+    expect(refusal).toContain('no-such-shell')
+    expect(listed()).toEqual([])
+  })
+
+  it('what the way goes up from is pinned all the same where the command can replace no link on it', async () => {
+    fs.symlinkSync(`${ROOT}/${LINKS.up}`, join(OUTSIDE, 'up'))
+    const wrapped = await wrapLinux([join(OUTSIDE, 'up')], {
+      seccompConfig: { holdsLinks: false },
+    })
+    for (const dir of inRoot(['in', 'in/to'])) {
+      expect(wrapped).toContain(`--ro-bind ${dir} ${dir} `)
+    }
     expect(listed()).toEqual([])
   })
 

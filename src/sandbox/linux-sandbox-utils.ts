@@ -2176,12 +2176,15 @@ async function generateFilesystemArgs(
   // What the ways to the denied paths depend on; see followLinks.
   const linksToDenies = new Map<string, string>()
   const leftOnTheWay = new Set<string>()
-  /** Returns the directory the walk to `name` could not look in, if any. */
-  const noteLinksTo = (name: string): string | undefined => {
-    const { links, left, unsearched } = followLinks(name)
+  /**
+   * Returns what stands in for `name` where the walk to it could not look in
+   * a directory: that directory, and the missing names it went up from before.
+   */
+  const noteLinksTo = (name: string): string[] | undefined => {
+    const { links, left, passed, unsearched } = followLinks(name)
     for (const [link, target] of links) linksToDenies.set(link, target)
     for (const dir of left) leftOnTheWay.add(dir)
-    return unsearched
+    return unsearched === undefined ? undefined : [unsearched, ...passed]
   }
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
@@ -2690,17 +2693,17 @@ async function generateFilesystemArgs(
 
     // Each deny path as both loops below take it. A directory the walk could
     // not look in stands in for the path: bound read-only, it keeps its mode.
-    const rawDenyPaths = denyPaths.map(pathPattern => {
+    const rawDenyPaths = denyPaths.flatMap(pathPattern => {
       const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
       // Both loops skip it.
       if (rawPath.startsWith('/dev/')) return rawPath
-      const unsearched = noteLinksTo(rawPath)
-      if (unsearched === undefined) return rawPath
+      const instead = noteLinksTo(rawPath)
+      if (instead === undefined) return rawPath
       logForDebugging(
-        `[Sandbox Linux] Write deny path ${rawPath} cannot be looked at; denying ${unsearched} whole instead`,
+        `[Sandbox Linux] Write deny path ${rawPath} cannot be looked at; denying ${instead[0]} whole instead`,
         { level: 'warn' },
       )
-      return unsearched
+      return instead
     })
 
     // Duplicate deny entries must be collapsed: a duplicate
