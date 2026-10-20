@@ -3,6 +3,15 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOf } from '../utils/real-path.js'
+import {
+  denyGlobRegex,
+  globToRegex,
+  globTokenToRegex,
+  GlobTokenKind,
+  parseGlob,
+  type GlobToken,
+} from './glob-pattern.js'
 import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
@@ -85,7 +94,7 @@ export function* properAncestors(absolutePath: string): Generator<string> {
  */
 export function pathSpellings(candidatePath: string): string[] {
   try {
-    const resolved = fs.realpathSync(candidatePath)
+    const resolved = realPathOf(candidatePath)
     if (resolved !== candidatePath) return [candidatePath, resolved]
   } catch {
     // Dangling or vanished: only the spelling names it.
@@ -581,11 +590,11 @@ export function normalizePathForSandbox(
   // tolerates the spelling, and the Linux backend rebuilds its destinations
   // with path.dirname/join, so that argv was already right.
   //
-  // Lexical only, and deliberately not path.normalize/path.resolve: those
-  // also fold '..', which through a symlinked component aims the rule at a
-  // different file than the kernel would reach. An absolute spelling's '..' is
-  // left to realpath below; a relative one was already folded lexically by the
-  // path.resolve above (pre-existing).
+  // Lexical only, and deliberately not path.normalize/path.resolve, which
+  // also fold '..'. An absolute spelling's '..' is left to realPathOf below:
+  // that folds it in text too, and answers only for a path that is there, so
+  // one that is not keeps its '..' as written. A relative one was already
+  // folded lexically by the path.resolve above (pre-existing).
   if (getPlatform() !== 'windows') {
     normalizedPath = collapseInteriorSpellings(normalizedPath)
   }
@@ -605,7 +614,7 @@ export function normalizePathForSandbox(
 
       // Try to resolve symlinks for the base directory
       try {
-        const resolvedBaseDir = fs.realpathSync(baseDir)
+        const resolvedBaseDir = realPathOf(baseDir)
         // Validate that resolution stays within expected boundaries
         if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
           // Reconstruct the pattern with the resolved directory
@@ -632,7 +641,7 @@ export function normalizePathForSandbox(
   // Resolve symlinks to real paths to avoid bwrap issues
   // Validate that the resolution stays within expected boundaries
   try {
-    const resolvedPath = fs.realpathSync(normalizedPath)
+    const resolvedPath = realPathOf(normalizedPath)
 
     // A symlink pointing outside the expected boundaries (e.g. to a parent
     // directory) keeps the original path.
@@ -773,17 +782,43 @@ function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
   }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
-    try {
-      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
-      return p => regex.test(p)
-    } catch {
-      // Brackets that do not form a valid class. The entry may be a literal
-      // file name, so it is compared as one.
-    }
+    const regex = compiledDenyGlob(normalizePathForSandbox(stripped))
+    // Too large to compile. What it covers cannot be told, so it covers.
+    return regex === null ? () => true : p => regex.test(p)
   }
   const rule = normalizePathForSandbox(stripped, { literal: true })
   return p => isAtOrUnder(p, rule)
 }
+
+/**
+ * {@link denyGlobRegex} compiled, or null for a pattern too large to compile.
+ * Kept by the normalized pattern, which is all it depends on: these rules are
+ * read for a getter that callers ask once a path. What is asked of the disk
+ * on the way to the normalized pattern is asked every time.
+ */
+function compiledDenyGlob(normalizedGlob: string): RegExp | null {
+  let regex = compiledDenyGlobs.get(normalizedGlob)
+  if (regex === undefined) {
+    try {
+      regex = new RegExp(denyGlobRegex(normalizedGlob))
+      // V8 finds a pattern too large only when it first runs it.
+      regex.test('')
+    } catch {
+      regex = null
+    }
+    compiledDenyGlobChars += normalizedGlob.length
+    if (compiledDenyGlobChars > MAX_COMPILED_DENY_GLOB_CHARS) {
+      compiledDenyGlobs.clear()
+      compiledDenyGlobChars = normalizedGlob.length
+    }
+    compiledDenyGlobs.set(normalizedGlob, regex)
+  }
+  return regex
+}
+const compiledDenyGlobs = new Map<string, RegExp | null>()
+let compiledDenyGlobChars = 0
+/** Past this much pattern text all that is kept is let go, to begin again. */
+const MAX_COMPILED_DENY_GLOB_CHARS = 1 << 20
 
 /**
  * Generate proxy environment variables for sandboxed processes
@@ -1083,6 +1118,8 @@ const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
  *     without `-c http.sslBackend=openssl`. Revocation is disabled
  *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
  *     be WFP-fenced.
+ *   - `http.sslBackend=openssl` when `opensslBackend` — for a child
+ *     whose token Schannel refuses (the write-restricted token).
  *
  * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
  * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
@@ -1102,6 +1139,8 @@ export function buildGitConfigEnv(opts: {
   safeDirs: readonly string[]
   /** Windows-only schannel knobs; default false. */
   schannelCa?: boolean
+  /** Windows-only: select git's OpenSSL TLS backend; default false. */
+  opensslBackend?: boolean
   baseEnv?: Readonly<Record<string, string | undefined>>
 }): Record<string, string> {
   // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
@@ -1150,6 +1189,9 @@ export function buildGitConfigEnv(opts: {
   if (opts.schannelCa) {
     emit('http.schannelUseSSLCAInfo', 'true')
     emit('http.schannelCheckRevoke', 'false')
+  }
+  if (opts.opensslBackend) {
+    emit('http.sslBackend', 'openssl')
   }
   if (n === start) return {}
   out.GIT_CONFIG_COUNT = String(n)
@@ -1266,60 +1308,6 @@ export function encodedCommandFromProxyUser(
     return undefined
   }
   return suffix
-}
-
-/**
- * Convert a glob pattern to a regular expression
- *
- * This implements gitignore-style pattern matching to match the behavior of the
- * `ignore` library used by the permission system.
- *
- * Supported patterns:
- * - * matches any characters except / (e.g., *.ts matches foo.ts but not foo/bar.ts)
- * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
- * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
- * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
- *
- * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
- */
-export function globToRegex(globPattern: string): string {
-  return (
-    '^' +
-    globPattern
-      // Escape regex special characters (except glob chars * ? [ ])
-      .replace(/[.^$+{}()|\\]/g, '\\$&')
-      // Escape unclosed brackets (no matching ])
-      .replace(/\[([^\]]*?)$/g, '\\[$1')
-      // Convert glob patterns to regex (order matters - ** before *)
-      .replace(/\*\*\//g, '__GLOBSTAR_SLASH__') // Placeholder for **/
-      .replace(/\*\*/g, '__GLOBSTAR__') // Placeholder for **
-      .replace(/\*/g, '[^/]*') // * matches anything except /
-      .replace(/\?/g, '[^/]') // ? matches single character except /
-      // Restore placeholders
-      .replace(/__GLOBSTAR_SLASH__/g, '(.*/)?') // **/ matches zero or more dirs
-      .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
-    '$'
-  )
-}
-
-/**
- * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
- * `/…` tail, so the deny covers everything beneath each match the way
- * `subpath` does for literals. Callers strip a trailing `/**` before the
- * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
- * as `**\/secrets` and, matched exactly, would deny only the directory
- * vnode while `secrets/key` stayed readable. This is what the Linux backend
- * already does (a deny masks the whole subtree). Only ever widens a deny.
- *
- * Takes a whole pattern, so every character in it is glob syntax: right for
- * the pattern reading of a spelling the caller wrote, which is what
- * {@link readRuleCovers} passes. A pattern anchored at a directory that is a
- * name on disk goes through the macOS `denyGlobEntryRegex`, which splices
- * that directory back in escaped and calls this for the tail.
- */
-export function denyGlobRegex(normalizedGlob: string): string {
-  // globToRegex() always returns '^…$'.
-  return globToRegex(normalizedGlob).slice(0, -1) + '(/.*)?$'
 }
 
 export interface ExpandGlobOptions {
@@ -1469,13 +1457,10 @@ export function expandGlobPattern(
  * after it are shared, so the automaton grows with the pattern's length and
  * not with the number of combinations.
  *
- * `splits` is false for a pattern this cannot be done for: one with a
- * wildcard inside a bracket expression (globToRegex rewrites that wildcard
- * like any other, and what is left no longer reads as one character), with a
- * second `[` that nothing closes, or that spells one of globToRegex's
- * placeholders. Its positions say nothing, so every directory is listed, an
- * entry is matched by its whole spelling, and {@link walkGlobPattern} does
- * not list such a pattern through symlinks.
+ * `splits` is false for a pattern this cannot be done for: one of thousands
+ * of components, more than a path has. Its positions say nothing, so every
+ * directory is listed, an entry is matched by its whole spelling, and
+ * {@link walkGlobPattern} does not list such a pattern through symlinks.
  */
 interface GlobPositions {
   splits: boolean
@@ -1501,83 +1486,16 @@ interface GlobPositions {
   ) => boolean
 }
 
-/** What globToRegex makes of a pattern, piece by piece: `any` is its `.*`,
- *  `anyDirs` its `(.*\/)?`, and a `source` matches within one name. Undefined
- *  for the patterns {@link GlobPositions} does not split. */
-type GlobPiece =
-  | 'any'
-  | 'anyDirs'
-  | '/'
-  | { source: string; canBeSeparator?: true }
-
-function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
-  // globToRegex rewrites its own placeholders where a pattern spells one.
-  if (pattern.includes('__GLOBSTAR')) return undefined
-  const sourceOf = (text: string): string => globToRegex(text).slice(1, -1)
-  const pieces: GlobPiece[] = []
-  let unclosed = 0
-  // A bracket expression first, the way a regular expression reads one:
-  // everything up to the first `]`. Then a run of `*` with the separator
-  // after it, since `**/` is one thing to globToRegex.
-  const tokenizer = /(\[[^\]]*\])|(\*+)(\/?)|(\/)|([^[*/]+|\[)/g
-  for (const match of pattern.matchAll(tokenizer)) {
-    const [text, bracket, stars, separatorAfterStars, separator] = match
-    if (bracket !== undefined) {
-      if (/[*?]/.test(bracket)) return undefined
-      const source = sourceOf(bracket)
-      pieces.push(
-        new RegExp(`^${source}$`, flags).test('/')
-          ? { source, canBeSeparator: true }
-          : { source },
-      )
-    } else if (stars !== undefined) {
-      // globToRegex takes `**/` first, so the last two of a run before a
-      // separator go with it. What is left of the run is `**` pairs from the
-      // left and then a `*`; a `.*` takes in a `.*` or `[^/]*` beside it.
-      const withSeparator = separatorAfterStars === '/' && stars.length >= 2
-      const left = stars.length - (withSeparator ? 2 : 0)
-      if (left >= 2) pieces.push('any')
-      else if (left === 1) pieces.push({ source: '[^/]*' })
-      if (withSeparator) pieces.push('anyDirs')
-      else if (separatorAfterStars === '/') pieces.push('/')
-    } else if (separator !== undefined) {
-      pieces.push('/')
-    } else {
-      // globToRegex escapes the first `[` that nothing closes and no other:
-      // a second one reads on into whatever a later wildcard is rewritten to.
-      if (text === '[' && unclosed++ > 0) return undefined
-      pieces.push({ source: sourceOf(text) })
-    }
-  }
-  // `(.*/)?` adds nothing before another one or before a `.*`.
-  return pieces.filter(
-    (piece, i) =>
-      piece !== 'anyDirs' ||
-      (pieces[i + 1] !== 'anyDirs' && pieces[i + 1] !== 'any'),
-  )
-}
-
 function globPositions(
   normalizedPattern: string,
   flags: string,
 ): GlobPositions {
+  const regex = new RegExp(globToRegex(normalizedPattern), flags)
   const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
-  let regex: RegExp
-  let directoryRegex: RegExp | undefined
-  try {
-    regex = new RegExp(globToRegex(normalizedPattern), flags)
-    directoryRegex =
-      directoryForm !== normalizedPattern
-        ? new RegExp(globToRegex(directoryForm), flags)
-        : undefined
-  } catch (err) {
-    // A pattern that is no regular expression would match nothing and deny
-    // nothing, silently: it is raised as the configuration error it is.
-    throw new SyntaxError(
-      `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
-      { cause: err },
-    )
-  }
+  const directoryRegex =
+    directoryForm !== normalizedPattern
+      ? new RegExp(globToRegex(directoryForm), flags)
+      : undefined
   const unsplit: GlobPositions = {
     splits: false,
     start: [0],
@@ -1594,10 +1512,11 @@ function globPositions(
   // after it, undefined where the pattern ends, which is a match.
   type Component = { edges: { regex: RegExp; to: number | undefined }[] }
   const states: (Globstar | Component)[] = []
-  const star = '[^/]*'
+  const star = globTokenToRegex({ kind: GlobTokenKind.Star })
 
   /** The automaton of one pattern, as the position it starts at. */
-  const build = (pieces: readonly GlobPiece[]): number => {
+  const build = (pieces: readonly GlobToken[]): number => {
+    const sources = pieces.map(globTokenToRegex)
     const memo = new Map<string, number>()
     const globstar = (then: number | undefined): number =>
       states.push({ then }) - 1
@@ -1607,13 +1526,17 @@ function globPositions(
       const key = `${i}${lead ? '*' : ''}`
       const known = memo.get(key)
       if (known !== undefined) return known
-      if (!lead && pieces[i] === 'anyDirs') {
+      if (!lead && pieces[i]?.kind === GlobTokenKind.GlobstarSlash) {
         const id = globstar(undefined)
         memo.set(key, id)
         ;(states[id] as Globstar).then = componentAt(i + 1, false)
         return id
       }
-      if (!lead && pieces[i] === 'any' && i === pieces.length - 1) {
+      if (
+        !lead &&
+        pieces[i]?.kind === GlobTokenKind.Globstar &&
+        i === pieces.length - 1
+      ) {
         const id = globstar(undefined)
         memo.set(key, id)
         return id
@@ -1631,22 +1554,22 @@ function globPositions(
           endsWith(source, undefined)
           break
         }
-        if (piece === '/') {
+        if (piece.kind === GlobTokenKind.Separator) {
           endsWith(source, componentAt(j + 1, false))
           break
         }
-        if (piece === 'any') {
+        if (piece.kind === GlobTokenKind.Globstar) {
           // Spanning separators: `X*` / `**` / `*Y`. Or not: `X*Y`.
           endsWith(source + star, globstar(componentAt(j + 1, true)))
           source += star
-        } else if (piece === 'anyDirs') {
+        } else if (piece.kind === GlobTokenKind.GlobstarSlash) {
           // Spanning: `X*` / `**` / what follows. Or X run into it.
           endsWith(source + star, globstar(componentAt(j + 1, false)))
-        } else if (piece.canBeSeparator) {
+        } else if (piece.kind === GlobTokenKind.Set && piece.matchesSeparator) {
           endsWith(source, componentAt(j + 1, false))
-          source += `(?!/)${piece.source}`
+          source += `(?!/)${sources[j]}`
         } else {
-          source += piece.source
+          source += sources[j]
         }
       }
       return id
@@ -1657,16 +1580,11 @@ function globPositions(
   let starts: number[]
   let firstOfDirectoryForm: number
   try {
-    const pieces = globPieces(normalizedPattern, flags)
-    const directoryPieces = directoryRegex
-      ? globPieces(directoryForm, flags)
-      : []
-    if (pieces === undefined || directoryPieces === undefined) return unsplit
-    starts = [build(pieces)]
+    starts = [build(parseGlob(normalizedPattern))]
     firstOfDirectoryForm = states.length
-    if (directoryRegex) starts.push(build(directoryPieces))
+    if (directoryRegex) starts.push(build(parseGlob(directoryForm)))
   } catch {
-    // A piece of the pattern that is no regular expression on its own.
+    // More components than the build can nest.
     return unsplit
   }
 
@@ -1944,7 +1862,7 @@ export function* walkGlobPatternSteps(
         linkPath,
         p => ({
           isDirectory: fs.statSync(p).isDirectory(),
-          real: fs.realpathSync(p),
+          real: realPathOf(p),
         }),
         isAbsenceErrno,
         () => (unread = true),
@@ -1989,7 +1907,7 @@ export function* walkGlobPatternSteps(
       try {
         // Where it leads can still tell: only a link leads away from its place.
         const isDirectory = fs.statSync(spelled).isDirectory()
-        if (fs.realpathSync(spelled) !== path.join(real, name)) type = 'link'
+        if (realPathOf(spelled) !== path.join(real, name)) type = 'link'
         else if (isDirectory) type = 'directory'
       } catch (err) {
         // Only links make a circle. One that is not there is gone since it was
@@ -2021,7 +1939,7 @@ export function* walkGlobPatternSteps(
   const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
   let baseReal = baseSpelling
   try {
-    baseReal = fs.realpathSync(baseSpelling)
+    baseReal = realPathOf(baseSpelling)
   } catch {
     // Not there, or a component of it cannot be resolved: list the spelling.
   }
@@ -2172,12 +2090,13 @@ export function* walkGlobPatternSteps(
       }
       // Nothing is listed through a link that leads nobody knows where.
       if (target === 'uninspectable') continue
-      // Where the short name alone says it leads is denied besides.
+      // Where the short name alone says it leads is denied besides: for the
+      // root, as for any link to it, the directory that holds the link.
       if (
         unread &&
         (isMatch || (isDirectoryFormCandidate && target.isDirectory))
       ) {
-        walk.matches.push(target.real)
+        walk.matches.push(target.real === '/' ? real : target.real)
       }
       if (isMatch && !unread) walk.realOf.set(fullPath, target.real)
       if (!target.isDirectory) continue

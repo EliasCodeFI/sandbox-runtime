@@ -941,14 +941,18 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
   const run = (
     runnable: string,
     words: string[],
+    env: Record<string, string> = {},
   ): { status: number | null; said: string } => {
     const result = spawnSync(runnable, words, {
       encoding: 'utf8',
       timeout: 30000,
       cwd: ROOT,
+      env: { ...process.env, ...env },
     })
     return { status: result.status, said: result.stdout + result.stderr }
   }
+  /** Lifts the helper's namespaces filter, which refuses every mount call. */
+  const NAMESPACES_ALLOWED = { SRT_ALLOW_NESTED_USERNS: '1' }
   const holding = (...names: Array<keyof typeof LINKS>): string[] =>
     names.flatMap(name => ['--hold-link', join(ROOT, name), LINKS[name]])
   /** umount2() with UMOUNT_NOFOLLOW, which reaches a mount on a link. */
@@ -993,17 +997,19 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
     ).toContain('Device or resource busy')
   })
 
+  // The filter answers first, whoever asks. Where it is lifted, this user lacks
+  // the capability, and uid 0 meets the lock.
   it.each([
-    ['this user', [], 'EPERM'],
-    ['uid 0, with every capability in its namespace', ['-Ur'], 'EINVAL'],
-  ])('a command of %s cannot unmount the hold', (_who, as, errno) => {
-    const { said } = run('unshare', [
-      ...as,
-      helper(),
-      ...holding('name'),
-      ...UNMOUNT,
-      join(ROOT, 'name'),
-    ])
+    ['this user', [], {}, 'EPERM'],
+    ['uid 0, with every capability in its namespace', ['-Ur'], {}, 'EPERM'],
+    ['this user, allowed namespaces', [], NAMESPACES_ALLOWED, 'EPERM'],
+    ['uid 0, allowed namespaces', ['-Ur'], NAMESPACES_ALLOWED, 'EINVAL'],
+  ])('a command of %s cannot unmount the hold', (_who, as, env, errno) => {
+    const { said } = run(
+      'unshare',
+      [...as, helper(), ...holding('name'), ...UNMOUNT, join(ROOT, 'name')],
+      env,
+    )
     expect(said.trim()).toBe(errno)
   })
 
@@ -1021,13 +1027,17 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
   })
 
   it.each(['--ro-bind', '--bind', '--dev-bind'])(
-    'a bubblewrap the command starts with %s / / starts, and the hold holds there',
+    'a bubblewrap the command may start, with %s / /, starts, and the hold holds there',
     bind => {
-      const { said } = run(helper(), [
-        ...holding('name', 'way', 'dangling'),
-        ...['bwrap', bind, '/', '/', '--bind', ROOT, ROOT, '--dev', '/dev'],
-        ...['sh', '-c', 'echo started; rm name way dangling'],
-      ])
+      const { said } = run(
+        helper(),
+        [
+          ...holding('name', 'way', 'dangling'),
+          ...['bwrap', bind, '/', '/', '--bind', ROOT, ROOT, '--dev', '/dev'],
+          ...['sh', '-c', 'echo started; rm name way dangling'],
+        ],
+        NAMESPACES_ALLOWED,
+      )
       expect(said).toContain('started')
       expect(said.match(/Device or resource busy/g)).toHaveLength(3)
     },
