@@ -416,7 +416,7 @@ onLinux(
         filesystem: own,
       }),
     ).toStartWith(`${real.bwrap} `)
-    expect(lookups.map(lookup => lookup.mock.calls.length)).toEqual([4, 1, 1])
+    expect(lookups.map(lookup => lookup.mock.calls.length)).toEqual([6, 1, 1])
     for (const call of lookups.flatMap(lookup => lookup.mock.calls))
       expect(call[1]).toContain(project)
   },
