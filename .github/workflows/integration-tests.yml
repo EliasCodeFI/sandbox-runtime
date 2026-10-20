@@ -166,7 +166,7 @@ jobs:
             d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
         run: |
           $ErrorActionPreference = 'Stop'
-          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           function Stop-Step($message) { "::error::$message"; exit 1 }
           $listed = @(-split $env:LISTED)
           if ($listed.Count -ne 10 -or @($listed -notmatch '^[0-9a-f]{64}$').Count -ne 0) { Stop-Step 'The list does not hold 10 SHA-256 hashes.' }
@@ -467,7 +467,8 @@ jobs:
             runner: ubuntu-24.04-arm
 
     env:
-      # Node reads the trust store of the system.
+      # Node on the host reads the trust store of the system. The container
+      # below has a store of its own, and its Node its own list.
       NODE_OPTIONS: --use-openssl-ca
     steps:
       - name: Drop the listed CA certificates from the trust store

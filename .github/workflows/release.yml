@@ -543,7 +543,7 @@ jobs:
             d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
         run: |
           $ErrorActionPreference = 'Stop'
-          trap { "::error::No CA file was written ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::No CA file was written ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           New-Item -ItemType Directory -Force $env:SSL_CERT_DIR | Out-Null
           if (@(Get-ChildItem -Force $env:SSL_CERT_DIR).Count -ne 0) { '::error::The folder that is to hold no certificate holds something.'; exit 1 }
           $script = Join-Path $env:RUNNER_TEMP 'write-ca-file.cjs'
@@ -592,7 +592,7 @@ jobs:
             d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
         run: |
           $ErrorActionPreference = 'Stop'
-          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           function Stop-Step($message) { "::error::$message"; exit 1 }
           $listed = @(-split $env:LISTED)
           if ($listed.Count -ne 10 -or @($listed -notmatch '^[0-9a-f]{64}$').Count -ne 0) { Stop-Step 'The list does not hold 10 SHA-256 hashes.' }
@@ -625,7 +625,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          trap { "::error::The check stopped ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::The check stopped ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           function Stop-Step($message) { "::error::$message"; exit 1 }
           $registry = 'https://registry.npmjs.org'
           $hosts = -split 'github.com api.github.com release-assets.githubusercontent.com results-receiver.actions.githubusercontent.com nodejs.org registry.npmjs.org static.rust-lang.org crates.io index.crates.io static.crates.io'
@@ -635,12 +635,20 @@ jobs:
 
           $listed = @(-split $env:LISTED)
           function Get-Hash($bytes) { (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([byte[]]$bytes))).Hash.ToLower() }
-          $left = @('LocalMachine', 'CurrentUser' | ForEach-Object { Get-ChildItem "Cert:\$_\Root", "Cert:\$_\AuthRoot", "Cert:\$_\CA" } | Where-Object {
-            $listed -contains (Get-Hash $_.RawData) -or $listed -contains (Get-Hash $_.PublicKey.ExportSubjectPublicKeyInfo())
-          })
-          if ($listed.Count -ne 10 -or $left.Count -gt 0) { Stop-Step "$($left.Count) listed certificates are in the Windows stores." }
+          if ($listed.Count -ne 10) { Stop-Step 'The list does not hold 10 hashes.' }
+          $left = 0
+          foreach ($store in 'LocalMachine\Root', 'LocalMachine\AuthRoot', 'LocalMachine\CA', 'CurrentUser\Root', 'CurrentUser\AuthRoot', 'CurrentUser\CA') {
+            $held = @(Get-ChildItem "Cert:\$store")
+            $found = @($held | Where-Object {
+              $listed -contains (Get-Hash $_.RawData) -or $listed -contains (Get-Hash $_.PublicKey.ExportSubjectPublicKeyInfo())
+            })
+            "$($store) holds $($held.Count) certificates, $($found.Count) of them listed."
+            if ($store -eq 'LocalMachine\Root' -and $held.Count -eq 0) { Stop-Step 'The store reads as empty, so it was not checked.' }
+            $left += $found.Count
+          }
+          if ($left -gt 0) { Stop-Step "$left listed certificates are in the Windows stores." }
           $elevated = [bool](whoami /groups | Select-String -SimpleMatch 'S-1-16-12288')
-          "The Windows stores hold no listed certificate. Elevated: $elevated."
+          "Elevated: $elevated."
 
           Set-Content -Path check.cjs -Value @'
           const { createHash, X509Certificate } = require('crypto')
@@ -656,18 +664,25 @@ jobs:
               },
             )
           } else {
+            // The file holds this Node's own certificates but for the listed ones, and no other.
             try {
               const listed = new Set(process.env.LISTED.split(/\s+/).filter(Boolean))
-              const blocks =
-                fs.readFileSync(target, 'latin1').match(/-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----/g) ?? []
-              let found = 0
-              for (const block of blocks) {
-                const certificate = new X509Certificate(block)
+              const isListed = pem => {
+                const certificate = new X509Certificate(pem)
                 const key = certificate.publicKey.export({ type: 'spki', format: 'der' })
-                if (listed.has(sha256(certificate.raw)) || listed.has(sha256(key))) found++
+                return listed.has(sha256(certificate.raw)) || listed.has(sha256(key))
               }
-              console.log(`${blocks.length} certificates in the file, ${found} listed`)
-              process.exit(listed.size === 10 && blocks.length > 0 && found === 0 ? 0 : 1)
+              const own = require('tls').rootCertificates
+              const wanted = own.filter(pem => !isListed(pem))
+              const held =
+                fs.readFileSync(target, 'latin1').match(/-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----/g) ?? []
+              const found = held.filter(isListed).length
+              const same = held.length === wanted.length && wanted.every(pem => held.includes(pem))
+              console.log(
+                `${own.length - wanted.length} of the ${own.length} certificates of Node ${process.version} are listed; ` +
+                  `the file holds ${held.length} certificates, ${found} of them listed`,
+              )
+              process.exit(listed.size === 10 && wanted.length > 0 && found === 0 && same ? 0 : 1)
             } catch {
               console.log('The file could not be read.')
               process.exit(1)
@@ -686,14 +701,14 @@ jobs:
           }
 
           node check.cjs file $env:SSL_CERT_FILE
-          if ($LASTEXITCODE -ne 0) { Stop-Step 'A listed certificate or key is in the CA file.' }
+          if ($LASTEXITCODE -ne 0) { Stop-Step 'The CA file is not the list of Node without the listed certificates.' }
 
           # A certificate made here, as the only one: Node and git refuse.
           $made = New-SelfSignedCertificate -Subject 'CN=made here' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
           $made = Get-Item "Cert:\CurrentUser\My\$($made.Thumbprint)"
           $other = Join-Path $work 'other.pem'
           Set-Content -Path $other -Value $made.ExportCertificatePem()
-          $made | Remove-Item -DeleteKey
+          Remove-Item -Path "Cert:\CurrentUser\My\$($made.Thumbprint)" -DeleteKey
           Get-ChildItem Cert:\CurrentUser\CA, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq $made.Thumbprint | Remove-Item
           $file = $env:SSL_CERT_FILE
 
@@ -1123,7 +1138,7 @@ jobs:
             d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
         run: |
           $ErrorActionPreference = 'Stop'
-          trap { "::error::No CA file was written ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::No CA file was written ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           New-Item -ItemType Directory -Force $env:SSL_CERT_DIR | Out-Null
           if (@(Get-ChildItem -Force $env:SSL_CERT_DIR).Count -ne 0) { '::error::The folder that is to hold no certificate holds something.'; exit 1 }
           $script = Join-Path $env:RUNNER_TEMP 'write-ca-file.cjs'
@@ -1172,7 +1187,7 @@ jobs:
             d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
         run: |
           $ErrorActionPreference = 'Stop'
-          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           function Stop-Step($message) { "::error::$message"; exit 1 }
           $listed = @(-split $env:LISTED)
           if ($listed.Count -ne 10 -or @($listed -notmatch '^[0-9a-f]{64}$').Count -ne 0) { Stop-Step 'The list does not hold 10 SHA-256 hashes.' }
@@ -1205,7 +1220,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          trap { "::error::The check stopped ($($_.Exception.GetType().Name))."; exit 1 }
+          trap { "::error::The check stopped ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
           function Stop-Step($message) { "::error::$message"; exit 1 }
           $registry = 'https://registry.npmjs.org'
           $hosts = -split 'github.com api.github.com release-assets.githubusercontent.com results-receiver.actions.githubusercontent.com nodejs.org registry.npmjs.org static.rust-lang.org crates.io index.crates.io static.crates.io'
@@ -1215,12 +1230,20 @@ jobs:
 
           $listed = @(-split $env:LISTED)
           function Get-Hash($bytes) { (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([byte[]]$bytes))).Hash.ToLower() }
-          $left = @('LocalMachine', 'CurrentUser' | ForEach-Object { Get-ChildItem "Cert:\$_\Root", "Cert:\$_\AuthRoot", "Cert:\$_\CA" } | Where-Object {
-            $listed -contains (Get-Hash $_.RawData) -or $listed -contains (Get-Hash $_.PublicKey.ExportSubjectPublicKeyInfo())
-          })
-          if ($listed.Count -ne 10 -or $left.Count -gt 0) { Stop-Step "$($left.Count) listed certificates are in the Windows stores." }
+          if ($listed.Count -ne 10) { Stop-Step 'The list does not hold 10 hashes.' }
+          $left = 0
+          foreach ($store in 'LocalMachine\Root', 'LocalMachine\AuthRoot', 'LocalMachine\CA', 'CurrentUser\Root', 'CurrentUser\AuthRoot', 'CurrentUser\CA') {
+            $held = @(Get-ChildItem "Cert:\$store")
+            $found = @($held | Where-Object {
+              $listed -contains (Get-Hash $_.RawData) -or $listed -contains (Get-Hash $_.PublicKey.ExportSubjectPublicKeyInfo())
+            })
+            "$($store) holds $($held.Count) certificates, $($found.Count) of them listed."
+            if ($store -eq 'LocalMachine\Root' -and $held.Count -eq 0) { Stop-Step 'The store reads as empty, so it was not checked.' }
+            $left += $found.Count
+          }
+          if ($left -gt 0) { Stop-Step "$left listed certificates are in the Windows stores." }
           $elevated = [bool](whoami /groups | Select-String -SimpleMatch 'S-1-16-12288')
-          "The Windows stores hold no listed certificate. Elevated: $elevated."
+          "Elevated: $elevated."
 
           Set-Content -Path check.cjs -Value @'
           const { createHash, X509Certificate } = require('crypto')
@@ -1236,18 +1259,25 @@ jobs:
               },
             )
           } else {
+            // The file holds this Node's own certificates but for the listed ones, and no other.
             try {
               const listed = new Set(process.env.LISTED.split(/\s+/).filter(Boolean))
-              const blocks =
-                fs.readFileSync(target, 'latin1').match(/-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----/g) ?? []
-              let found = 0
-              for (const block of blocks) {
-                const certificate = new X509Certificate(block)
+              const isListed = pem => {
+                const certificate = new X509Certificate(pem)
                 const key = certificate.publicKey.export({ type: 'spki', format: 'der' })
-                if (listed.has(sha256(certificate.raw)) || listed.has(sha256(key))) found++
+                return listed.has(sha256(certificate.raw)) || listed.has(sha256(key))
               }
-              console.log(`${blocks.length} certificates in the file, ${found} listed`)
-              process.exit(listed.size === 10 && blocks.length > 0 && found === 0 ? 0 : 1)
+              const own = require('tls').rootCertificates
+              const wanted = own.filter(pem => !isListed(pem))
+              const held =
+                fs.readFileSync(target, 'latin1').match(/-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----/g) ?? []
+              const found = held.filter(isListed).length
+              const same = held.length === wanted.length && wanted.every(pem => held.includes(pem))
+              console.log(
+                `${own.length - wanted.length} of the ${own.length} certificates of Node ${process.version} are listed; ` +
+                  `the file holds ${held.length} certificates, ${found} of them listed`,
+              )
+              process.exit(listed.size === 10 && wanted.length > 0 && found === 0 && same ? 0 : 1)
             } catch {
               console.log('The file could not be read.')
               process.exit(1)
@@ -1266,14 +1296,14 @@ jobs:
           }
 
           node check.cjs file $env:SSL_CERT_FILE
-          if ($LASTEXITCODE -ne 0) { Stop-Step 'A listed certificate or key is in the CA file.' }
+          if ($LASTEXITCODE -ne 0) { Stop-Step 'The CA file is not the list of Node without the listed certificates.' }
 
           # A certificate made here, as the only one: Node and git refuse.
           $made = New-SelfSignedCertificate -Subject 'CN=made here' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
           $made = Get-Item "Cert:\CurrentUser\My\$($made.Thumbprint)"
           $other = Join-Path $work 'other.pem'
           Set-Content -Path $other -Value $made.ExportCertificatePem()
-          $made | Remove-Item -DeleteKey
+          Remove-Item -Path "Cert:\CurrentUser\My\$($made.Thumbprint)" -DeleteKey
           Get-ChildItem Cert:\CurrentUser\CA, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq $made.Thumbprint | Remove-Item
           $file = $env:SSL_CERT_FILE
 
