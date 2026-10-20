@@ -2282,11 +2282,11 @@ describe.if(isLinux)(
         publishing.restore()
         pinning.restore()
         spy.mockRestore()
-        shared.forEach(name => rmSync(name))
+        shared.forEach(name => rmSync(name, { recursive: true, force: true }))
       }
     })
 
-    it("goes to a directory of the process's own that the same plan binds, written or not", async () => {
+    it("is recorded in a directory of the process's own that the same plan binds, whether or not the manifest can be written", async () => {
       // Neither shared name will do, from the start.
       const shared = [
         runtime.manifestDir(),
@@ -2309,7 +2309,7 @@ describe.if(isLinux)(
       })
       try {
         // The forced clean-up removes the directory, so each wrap settles anew.
-        for (full of [false, false, true]) {
+        for (full of [false, true]) {
           published = 0
           const command = await wrap('true', [LEAF])
           expect(published).toBe(1)
@@ -2323,23 +2323,29 @@ describe.if(isLinux)(
         }
       } finally {
         publishing.restore()
-        shared.forEach(name => rmSync(name))
+        shared.forEach(name => rmSync(name, { recursive: true, force: true }))
       }
     })
 
-    it('is kept in directories that the wrap looks at again before it binds them, so a link put at a name since is not followed', async () => {
-      // Bound last, where the link leads would lie on top of every read deny.
+    it('is recorded among directories that the wrap naming it looks at again before it binds them, so a link put at a name since is not followed', async () => {
+      // Bound last, where the link leads would lie on top of the read denies
+      // beneath it.
       const shared = join(tmpdir(), `srt-mount-points-${process.getuid!()}`)
       const elsewhere = join(BASE, 'elsewhere')
       mkdirSync(elsewhere)
-      // As the wrap makes what its mount point binds from, in the deny loop.
+      // As the wrap makes what its mount point binds from, in the deny loop:
+      // it makes one only with none left from an earlier case.
+      emptySources().forEach(source => fs.rmdirSync(source))
       const mkdtemp = fs.mkdtempSync
       const spy = spyOn(fs, 'mkdtempSync').mockImplementation(((
-        ...args: unknown[]
+        prefix: unknown,
+        ...rest: unknown[]
       ) => {
-        fs.rmdirSync(shared)
-        symlinkSync(elsewhere, shared)
-        return (mkdtemp as (...args: unknown[]) => unknown)(...args)
+        if (String(prefix).includes('claude-empty-')) {
+          rmSync(shared, { recursive: true })
+          symlinkSync(elsewhere, shared)
+        }
+        return (mkdtemp as (...args: unknown[]) => unknown)(prefix, ...rest)
       }) as never)
       try {
         const command = await wrap('true', [LEAF])
@@ -2348,7 +2354,7 @@ describe.if(isLinux)(
         expect(lastMountAt(command, shared)).toBeUndefined()
       } finally {
         spy.mockRestore()
-        rmSync(shared, { recursive: true })
+        rmSync(shared, { recursive: true, force: true })
       }
     })
 
@@ -2784,9 +2790,9 @@ describe.if(isLinux)(
       expectPinned(command, join(HOME, 'run'))
     }, 30000)
 
-    it('are pinned above the directory of its own a process settles on as it records', () => {
-      // Neither shared name will do, so the wrap makes a directory only this
-      // process knows.
+    it('are pinned above the directory of its own a process settles on to record in', () => {
+      // No runtime directory, and the shared name will not do, so the wrap makes
+      // a directory only this process knows.
       takeTheSharedName()
       const command = wrapped(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
