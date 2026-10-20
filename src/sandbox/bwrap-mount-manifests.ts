@@ -64,6 +64,13 @@
  * is live, for {@link OTHER_NAMESPACE_MAX_AGE_MS}. It records the boot too: no
  * process of an earlier one runs, where only this kernel reaches the directory.
  * NO LASTING STATE KEEPS WHAT IS LEFT FOR EVER.
+ *
+ * So a pass that can judge says what it found, for those that cannot: it renames
+ * the claim of a manifest with no process left to `<id>.finished`, before the
+ * reading it decides on, and they keep nothing on the word of a manifest at that
+ * name. Else two passes that cannot judge each other's manifests would each keep
+ * a path because the other's names it and drop their own, and nothing would name
+ * the path any more (see {@link collect}).
  */
 
 import { randomBytes } from 'node:crypto'
@@ -82,7 +89,10 @@ const MANIFEST_VERSION = 1
 const MANIFEST_SUFFIX = '.json'
 const STARTED_SUFFIX = '.started'
 const CLAIMED_SUFFIX = '.claimed'
+const FINISHED_SUFFIX = '.finished'
 const PASS_SUFFIX = '.pass'
+/** Where a manifest is found, in the order it goes through them. */
+const MANIFEST_SUFFIXES = [MANIFEST_SUFFIX, CLAIMED_SUFFIX, FINISHED_SUFFIX]
 
 /**
  * A manifest this young counts as live with no started record yet, so that a
@@ -161,7 +171,7 @@ const TEMPORARY_SUFFIX = '.tmp'
 const ManifestSchema = z.object({
   /**
    * INVARIANT for every later version: it may add fields, and keeps these, the
-   * four file names and what they mean, so a reader takes a later version by
+   * five file names and what they mean, so a reader takes a later version by
    * the fields it knows. A manifest that is not read puts everything in doubt,
    * which would refuse every wrap of an older process for as long as a newer
    * one is at work beside it. A change that cannot keep to this takes another
@@ -195,9 +205,11 @@ const ManifestSchema = z.object({
 })
 
 type Manifest = z.infer<typeof ManifestSchema> & {
-  /** Where it is: at its own name, `<id>.json`, or at a claim's. */
+  /** Where it is: at its own name, `<id>.json`, or at one of a claim's two. */
   file: string
   claimed: boolean
+  /** Claimed, and by its name no process was left on its record after that. */
+  finished: boolean
   /** Its started record, `<id>.started`. */
   record: string
   /** This process wrote it and the caller says its command is over. */
@@ -760,7 +772,7 @@ function readOwnFile(
 const idOf = (file: string): string => file.slice(0, file.lastIndexOf('.'))
 
 /**
- * The manifest at `file`, which is its own name or its claim's, or `undefined`
+ * The manifest at `file`, which is its own name or a claim's, or `undefined`
  * where nothing is there. Throws like {@link readOwnFile}, and {@link NotOurs}
  * for what does not hold a manifest's fields.
  */
@@ -783,7 +795,8 @@ function readManifest(file: string): Manifest | undefined {
   return {
     ...parsed.data,
     file,
-    claimed: file.endsWith(CLAIMED_SUFFIX),
+    claimed: !file.endsWith(MANIFEST_SUFFIX),
+    finished: file.endsWith(FINISHED_SUFFIX),
     record: `${id}${STARTED_SUFFIX}`,
     released: ownManifests.get(`${id}${MANIFEST_SUFFIX}`)?.over === true,
   }
@@ -832,6 +845,22 @@ function recordVouches(record: string, orphan = false): boolean | undefined {
   })
 }
 
+const isOfAnotherBoot = (manifest: Manifest): boolean =>
+  manifest.boot !== undefined &&
+  manifest.boot !== (ownBootId() ?? manifest.boot)
+
+/**
+ * Whether this process can tell if the processes behind a manifest run: none of
+ * another boot does, and of this one it can ask after those of its own PID
+ * namespace. What {@link isLive} says of any other goes by its age alone.
+ */
+function canBeAskedAfter(manifest: Manifest): boolean {
+  const here = ownPidNamespace()
+  return (
+    isOfAnotherBoot(manifest) || (here !== undefined && manifest.ns === here)
+  )
+}
+
 /**
  * Whether a sandbox that named this manifest may be running, or may yet start.
  * None of another boot is, whatever else the manifest says. Only a process in
@@ -843,20 +872,16 @@ function recordVouches(record: string, orphan = false): boolean | undefined {
  * young and has no record.
  */
 function isLive(manifest: Manifest): boolean {
-  if (
-    manifest.boot !== undefined &&
-    manifest.boot !== (ownBootId() ?? manifest.boot)
-  ) {
+  if (isOfAnotherBoot(manifest)) {
     return false
   }
-  const here = ownPidNamespace()
-  if (here === undefined) {
-    return true
-  }
-  if (manifest.ns !== here) {
-    return !(
-      olderThan(manifest.file, OTHER_NAMESPACE_MAX_AGE_MS) &&
-      olderThan(manifest.record, OTHER_NAMESPACE_MAX_AGE_MS, true)
+  if (!canBeAskedAfter(manifest)) {
+    return (
+      ownPidNamespace() === undefined ||
+      !(
+        olderThan(manifest.file, OTHER_NAMESPACE_MAX_AGE_MS) &&
+        olderThan(manifest.record, OTHER_NAMESPACE_MAX_AGE_MS, true)
+      )
     )
   }
   const vouched = recordVouches(manifest.record)
@@ -1108,14 +1133,15 @@ type Reading = {
  * Reads the manifests in `dirs`, every one that the listings showed. Doubt in
  * one directory is doubt.
  *
- * A pass renames a manifest to claim it and to give it back, which can hide it
+ * A pass renames a manifest to claim it, to give it back and to say that it is
+ * finished, which can hide it
  * from a listing under way and from the open that follows one, and one published
  * while the directory is listed can be missed with its record shown. A record is
  * never renamed. So the reading starts over for a listed manifest that is gone
  * when opened, and for a record with no manifest listed beside it whose manifest
  * is there when asked for by name.
  *
- * A record with no manifest at either name puts the reading in doubt only while
+ * A record with no manifest at any of its names puts the reading in doubt only while
  * a process on it runs (see {@link recordVouches}) and is spent otherwise, one
  * with no whole line past {@link MANIFEST_GRACE_MS} (its shell may be about to
  * write to it).
@@ -1149,7 +1175,7 @@ function readManifests(dirs: readonly string[]): Reading {
     const listed = new Set<string>()
     let moved = false
     for (const file of files) {
-      if (!file.endsWith(MANIFEST_SUFFIX) && !file.endsWith(CLAIMED_SUFFIX)) {
+      if (!MANIFEST_SUFFIXES.some(suffix => file.endsWith(suffix))) {
         continue
       }
       listed.add(idOf(file))
@@ -1202,13 +1228,12 @@ function readManifests(dirs: readonly string[]): Reading {
           reading.spent.push(file)
         }
       } else if (file.endsWith(STARTED_SUFFIX) && !listed.has(idOf(file))) {
-        // Asked for at its own name first, and the record read last. Only a
-        // claim given back can then pass between the two names unseen, and a
-        // pass gives back only once it has found a process on the record,
+        // Asked for in the order it goes through its names, and the record read
+        // last. Only a claim given back can then pass between them unseen, and
+        // a pass gives back only once it has found a process on the record,
         // which the read below finds too.
         if (
-          isThere(`${idOf(file)}${MANIFEST_SUFFIX}`) ||
-          isThere(`${idOf(file)}${CLAIMED_SUFFIX}`)
+          MANIFEST_SUFFIXES.some(suffix => isThere(`${idOf(file)}${suffix}`))
         ) {
           moved = true
           continue
@@ -1338,7 +1363,10 @@ export function liveMountPoints(): ReadonlySet<string> | undefined {
       throw new Error(reading.inDoubt)
     }
     for (const manifest of reading.manifests) {
-      if (isLive(manifest)) {
+      if (
+        isLive(manifest) &&
+        !(manifest.finished && !canBeAskedAfter(manifest))
+      ) {
         for (const mountPoint of manifest.paths) named.add(mountPoint)
       }
     }
@@ -1578,6 +1606,19 @@ const childrenFirst = (paths: Iterable<string>): string[] =>
  * what remains is a manifest published after the reading, whose sandbox would
  * reach its bind on a path a claimed manifest names too.
  *
+ * INVARIANT: a pass drops a manifest whose processes it can ask after only at
+ * the name `<id>.finished`, which such a pass gives a claim it finds no process
+ * behind, before that reading; and a pass that cannot ask keeps nothing on the
+ * word of a manifest at that name. A path that is kept is dropped from the
+ * manifests of this pass and left to the one it is kept for. To a pass that
+ * cannot ask (one in another PID namespace) a claim is live like any other, so
+ * without the name each of two such passes would leave the path to the other's
+ * manifest. With it, whichever reads second finds the other's finished, and of
+ * all the manifests that name a path the pass over the last to be finished
+ * keeps it for none. What such a manifest names alone is still its own
+ * namespace's to remove, or anybody's once it is old. A pass that goes by the
+ * age of a manifest does not give it the name: whoever can ask goes on asking.
+ *
  * INVARIANT: the pass is on record in every directory it can write from before
  * that reading until after its last removal, and removes nothing where it could
  * not be put there. A wrap lists the passes once it has published, and hands no
@@ -1611,16 +1652,31 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
       }
     }
     for (const manifest of before.manifests) {
-      if (!manifest.claimed && !isLive(manifest)) {
-        const claim = `${idOf(manifest.file)}${CLAIMED_SUFFIX}`
+      const claim = manifest.claimed
+        ? manifest.file
+        : `${idOf(manifest.file)}${CLAIMED_SUFFIX}`
+      if (!manifest.claimed) {
+        if (isLive(manifest)) continue
         try {
           fs.renameSync(manifest.file, claim)
           own.add(claim)
         } catch {
           // Another pass has it, or the directory cannot be written.
+          continue
         }
       }
-      claims ||= manifest.claimed || own.size > 0
+      // Asked again, now that no sandbox can start under it.
+      const over = !isLive({ ...manifest, file: claim, claimed: true })
+      claims ||= over || own.has(claim)
+      // Not of one that is only old: those who can ask go on asking.
+      if (over && !manifest.finished && canBeAskedAfter(manifest)) {
+        try {
+          fs.renameSync(claim, `${idOf(claim)}${FINISHED_SUFFIX}`)
+          own.delete(claim)
+        } catch {
+          // Another pass has said so, or has dropped it.
+        }
+      }
     }
   }
   // Nothing to remove, or nothing that may be: not worth a record, which every
@@ -1640,9 +1696,9 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
   }
   const writable = dirs.filter(dir => isOurPrivateDirectory(dir))
   try {
-    // Off the record it claims in no directory: the claims it has made go back,
-    // and what is left to remove is what this process could record nowhere,
-    // which no wrap elsewhere knows for a mount point or waits for.
+    // Off the record it removes nothing on a manifest's word. What is left to
+    // remove is what this process could record nowhere, which no wrap elsewhere
+    // knows for a mount point or waits for.
     return removeWhatIsFinished(
       dirs,
       putPassOnRecord(writable) ? writable : [],
@@ -1682,12 +1738,20 @@ function removeWhatIsFinished(
   }
   const finished: Manifest[] = []
   for (const manifest of reading.manifests) {
+    const asked = canBeAskedAfter(manifest)
     if (
       manifest.claimed &&
       !isLive(manifest) &&
+      // Else its last process has ended, or the renaming has failed, since the
+      // claims: it is the next pass's, which says so before it reads.
+      (manifest.finished || !asked) &&
       writable.includes(path.dirname(manifest.file))
     ) {
       finished.push(manifest)
+      continue
+    }
+    // Not for this pass to remove, and nothing to keep anything for.
+    if (manifest.finished && !asked) {
       continue
     }
     keep(manifest)
