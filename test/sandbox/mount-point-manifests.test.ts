@@ -2202,6 +2202,70 @@ describe.if(isLinux)('The mount point manifests', () => {
       }
     })
 
+    it.each([
+      ['/var/tmp', 0, 2],
+      ['/tmp', 2, 0],
+    ] as const)(
+      'are one directory where %s is a link to the other, read once and collected in like any',
+      (_, link, target) => {
+        // A pass cannot go on record twice under one name, and off the record it
+        // removes nothing.
+        rmSync(dirname(PLACES[link]!), { recursive: true })
+        symlinkSync(dirname(PLACES[target]!), dirname(PLACES[link]!))
+        forgetMountPointManifestDirectory()
+        leftover(X)
+        leftover(Y)
+        at(PLACES[target]!, () => manifestOfADeadProcess([X]))
+        expect(dirname(publish([Y]))).toBe(PLACES[0]!)
+        expect(named()).toEqual([X, Y].sort())
+        expect(live()).toEqual([Y])
+        expect(collectMountPoints().sort()).toEqual([X, Y].sort())
+        expect(readdirSync(PLACES[target]!)).toEqual([])
+        // Both names are kept out of a command's reach all the same.
+        expect(mountPointManifestDirectories()).toEqual(
+          expect.arrayContaining([PLACES[0]!, PLACES[2]!]),
+        )
+      },
+    )
+
+    it('goes by the name it can be written at where the other is read-only, as a read-only bind of it is', () => {
+      rmSync(dirname(PLACES[0]!), { recursive: true })
+      symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+      // This process writes elsewhere, and knows neither name for its own.
+      expect(dirname(publish([Y]))).toBe(PLACES[0]!)
+      collectMountPoints('all')
+      forgetMountPointManifestDirectory()
+      leftover(X)
+      at(PLACES[2]!, () => manifestOfADeadProcess([X]))
+      const access = fs.accessSync
+      const spy = spyOn(fs, 'accessSync').mockImplementation(((
+        file: unknown,
+        mode: unknown,
+      ) => {
+        if (file === PLACES[0]) {
+          throw Object.assign(new Error('EROFS'), { code: 'EROFS' })
+        }
+        ;(access as (f: unknown, m: unknown) => void)(file, mode)
+      }) as never)
+      try {
+        expect(collectMountPoints('all')).toEqual([X])
+      } finally {
+        spy.mockRestore()
+      }
+      expect(readdirSync(PLACES[2]!)).toEqual([])
+    })
+
+    it('goes by the name it writes under where that is the later of the two', () => {
+      // Settled on /tmp while /var/tmp could not be written.
+      taken([PLACES[0]!, dirname(PLACES[1]!)])
+      leftover(Y)
+      expect(dirname(publish([Y]))).toBe(PLACES[2]!)
+      rmSync(dirname(PLACES[0]!), { recursive: true })
+      symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+      expect(collectMountPoints()).toEqual([Y])
+      expect(readdirSync(PLACES[2]!)).toEqual([])
+    })
+
     it('are believed, collected in and bound, but not written, under a /run/user/UID that is open to others', () => {
       // Where that is a write root a sandboxed command can open it up, and
       // must not have other processes read less by that.

@@ -560,6 +560,10 @@ function sharedManifestDirectoryNames(
  * written, because only processes with that environment keep them out of a
  * sandbox's reach; and the one it has settled on. Each only while it is a
  * directory of ours alone. Makes nothing. Throws where it cannot tell.
+ *
+ * Each directory once, whatever it is called: where /var/tmp is a link to /tmp,
+ * or a bind mount of it, two of the names are one directory. Every manifest in
+ * it would be read at two names, and no pass could go on record in it twice.
  */
 function believedManifestDirectories(): string[] {
   const names = fixedManifestDirectoryNames(true, true).some(dir =>
@@ -568,9 +572,32 @@ function believedManifestDirectories(): string[] {
     ? fixedManifestDirectoryNames(true)
     : sharedManifestDirectoryNames(true)
   if (manifestDirectory !== undefined) names.push(manifestDirectory)
-  return [...new Set(names)].filter(dir =>
-    isOurPrivateDirectory(dir, true, false),
-  )
+  const byIdentity = new Map<string, string>()
+  for (const dir of names) {
+    if (!isOurPrivateDirectory(dir, true, false)) continue
+    let identity: string
+    try {
+      // As big integers: a number does not hold every inode number apart.
+      const { dev, ino } = fs.lstatSync(dir, { bigint: true })
+      identity = `${dev}:${ino}`
+    } catch (e) {
+      if (isAbsenceErrno(e)) continue
+      throw e
+    }
+    // By the name this process writes under, which it knows its own manifests
+    // by; else by one it can be written at (the other may be a read-only bind).
+    const sofar = byIdentity.get(identity)
+    if (
+      sofar === undefined ||
+      dir === manifestDirectory ||
+      (sofar !== manifestDirectory &&
+        !isOurPrivateDirectory(sofar) &&
+        isOurPrivateDirectory(dir))
+    ) {
+      byIdentity.set(identity, dir)
+    }
+  }
+  return [...byIdentity.values()]
 }
 
 /**
