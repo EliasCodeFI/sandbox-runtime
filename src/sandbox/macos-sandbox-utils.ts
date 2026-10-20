@@ -363,33 +363,31 @@ interface ResolvedReadConfig {
  * links on the way resolved. A deny is resolved to its end. An allow is a
  * name, so its last component stays as written. Of a pattern, the directory
  * it starts from is what is resolved. The root is never a second spelling.
+ * `end` is the second spelling where the caller has walked there itself.
  */
-function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
+function inBothSpellings(
+  kind: PathListKind,
+  entry: PathEntry,
+  end?: string,
+): PathEntry[] {
   const resolved = (p: string): string => pathSpellings(p)[1] ?? p
   const base = entryBaseDir(entry)
   const canonical =
-    kind === 'deny' || entry.glob
+    end ??
+    (kind === 'deny' || entry.glob
       ? resolved(base)
-      : nameLocation(base, resolved)
-  return [entry, ...startingFrom(canonical, entry)]
-}
-
-/**
- * `entry` with `canonical` for the path it is, or for the directory its
- * pattern starts from; nothing where that is no other spelling, or the root.
- * Nor among the devices, as on Linux: a name blanked with a link to /dev/null
- * would take /dev/null from every command.
- */
-function startingFrom(canonical: string, entry: PathEntry): PathEntry[] {
-  const base = entryBaseDir(entry)
+      : nameLocation(base, resolved))
+  // Nor among the devices: a rule on a name blanked with a link to /dev/null
+  // would be one on /dev/null for every command.
   if (
     canonical === base ||
     canonical === '/' ||
     isAtOrUnder(canonical, '/dev')
   ) {
-    return []
+    return [entry]
   }
   return [
+    entry,
     entry.glob
       ? {
           glob: true,
@@ -1014,12 +1012,10 @@ function generateWriteRules(
     ...alsoReadAs(config.denyWithinAllow, 'deny'),
   ].map(entry => ({ entry, ...followLinks(entryBaseDir(entry)) }))
   // As written, and where the links on the way lead, there or not: that is the
-  // path Seatbelt compares a write through them with. A directory the walk
-  // could not look in is denied whole, its mode with it, and so is a name that
-  // is not there and that the way goes up from: a link made there leads it off.
+  // path Seatbelt compares a write through them with. Denied whole: a directory
+  // the walk could not look in, and a missing name the way goes up from.
   const denyEntries = walked.flatMap(({ entry, end, unsearched, passed }) => [
-    entry,
-    ...(end === undefined ? [] : startingFrom(end, entry)),
+    ...inBothSpellings('deny', entry, end),
     ...(unsearched === undefined ? [] : [unsearched]).map(toLiteralPathEntry),
     ...passed.map(toLiteralPathEntry),
   ])
@@ -1050,9 +1046,7 @@ function generateWriteRules(
   }
   // Each of those links stays where it lies, and each directory the way goes
   // up from: whoever replaces one decides what the denied name leads to.
-  for (const stays of new Set(
-    walked.flatMap(({ links, left }) => [...links.keys(), ...left]),
-  )) {
+  for (const stays of walked.flatMap(w => [...w.links.keys(), ...w.left])) {
     if (isAtOrUnder(stays, '/dev')) continue
     for (const kept of [stays, ...getAncestorDirectories(stays)]) {
       moveFilters.add(`(literal ${escapePath(kept)})`)

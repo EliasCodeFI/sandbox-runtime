@@ -1137,12 +1137,10 @@ export const SeccompConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'Whether the helper takes --hold-link, by which the symbolic links on ' +
-        'the way to denied paths are kept in place. Taken at its word: ' +
-        'nothing is run to find out. Not set, the file of a helper the ' +
-        'library found for itself is read for the name of --holds-links, and ' +
-        'one named by applyPath is handed no link. false also serves to turn ' +
-        'holding off.',
+      'Whether the helper takes --hold-link, which keeps the symbolic links ' +
+        'on the way to denied paths in place. Taken at its word. Not set, a ' +
+        'helper the library found for itself is read for the option, and ' +
+        'one named by applyPath is handed no link. false turns holding off.',
     ),
 })
 

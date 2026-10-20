@@ -117,12 +117,8 @@ export function nameLocation(
 }
 
 /**
- * What has to stay as it is for the absolute path `p`, a denied name, to go on
- * leading where it leads, and where that is.
- *
- * A `.`, `..` or `//` in `p` itself is folded in text before anything is
- * looked at, as everywhere a configured name is read: `link/..` is the
- * directory that holds the link, which is not where the kernel goes.
+ * What has to stay as it is for `p`, a denied name, to go on leading where it
+ * leads, and where that is. `p` is folded in text first, as by `realPathOf`.
  *
  * INVARIANT: "could not look" is never "no link". A walk that stops for any
  * reason but a name that is not there, or that nothing can be at, has no end,
@@ -138,58 +134,43 @@ export function followLinks(p: string): {
   left: Set<string>
   /** The names that are not there which one goes up from in the same way. */
   passed: string[]
-  /** Where the way ends, what is not there taken as written: a dangling link
-   *  ends at the path a write through it would create. A way that goes up
-   *  again further on among such names ends at the first: with nothing made
-   *  there, nothing beyond comes about. None past the number of links the
-   *  kernel follows, nor past a target that is no text. */
+  /** Where the way ends, what is not there taken as written: the path a write
+   *  through a dangling link would create. A way that goes up again further on
+   *  among such names ends at the first. None where the walk stopped. */
   end?: string
   unsearched?: string
 } {
   const links = new Map<string, string>()
   const left = new Set<string>()
-  const walk = (): ReturnType<typeof wayPastMissingNames> =>
-    wayPastMissingNames(path.resolve(p), {
+  const walk = (): ReturnType<typeof followLinks> => {
+    const { real, rest, shut, passed } = wayPastMissingNames(path.resolve(p), {
       link: (at, target) => links.set(at, target),
       left: dir => left.add(dir),
     })
-  let way: ReturnType<typeof walk>
+    if (shut) return { links, left, passed, unsearched: real || undefined }
+    const names = rest.includes('..') ? rest.slice(0, 1) : rest
+    return { links, left, passed, end: [real, ...names].join('/') || '/' }
+  }
   try {
-    way = walk()
+    return walk()
   } catch {
     // Once more: a look can fail in passing (EIO, ESTALE), and what would
     // follow from that is a directory denied whole.
-    try {
-      way = walk()
-    } catch (err) {
-      const { code, path: at } = err as NodeJS.ErrnoException
-      // A link all the same, which says what no string spells.
-      if (code === 'EILSEQ' && at) links.set(at, '')
-      const nothingCanBeThere =
-        isAbsenceErrno(err) ||
-        code === 'EILSEQ' ||
-        code === 'ERR_INVALID_ARG_VALUE'
-      const dir = nothingCanBeThere ? '/' : path.dirname(at ?? path.resolve(p))
-      return {
-        links,
-        left,
-        passed: [],
-        ...(dir !== '/' && { unsearched: dir }),
-      }
-    }
   }
-  const { real, rest, notThere, passed } = way
-  return (notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES'
-    ? { links, left, passed, ...(real !== '' && { unsearched: real }) }
-    : {
-        links,
-        left,
-        passed,
-        end:
-          [real, ...(rest.includes('..') ? rest.slice(0, 1) : rest)].join(
-            '/',
-          ) || '/',
-      }
+  try {
+    return walk()
+  } catch (err) {
+    const { code, path: at } = err as NodeJS.ErrnoException
+    // A link all the same, which says what no string spells.
+    if (code === 'EILSEQ' && at) links.set(at, '')
+    const nothingCanBeThere =
+      isAbsenceErrno(err) ||
+      code === 'EILSEQ' ||
+      code === 'ERR_INVALID_ARG_VALUE'
+    const dir = path.dirname(at ?? path.resolve(p))
+    const unsearched = nothingCanBeThere || dir === '/' ? undefined : dir
+    return { links, left, passed: [], unsearched }
+  }
 }
 
 /** `process.cwd()`, or undefined where that throws: it has been removed. */

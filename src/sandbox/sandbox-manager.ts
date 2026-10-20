@@ -3520,9 +3520,8 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   /**
    * Linux: the symbolic links on the way to a denied path that a command
-   * could replace, each with the reason nothing holds it, for the embedder to
-   * show or to look at again after the command. Each link is listed by the
-   * latest wrap that met it; `reset()` and `updateConfig()` empty the list.
+   * could replace, each with the reason nothing holds it. Each is listed by
+   * the latest wrap that met it; `reset()` and `updateConfig()` empty the list.
    */
   getLinuxUnheldLinks(): LinuxUnheldLink[]
   getConfig(): SandboxRuntimeConfig | undefined

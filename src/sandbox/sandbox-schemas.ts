@@ -46,9 +46,8 @@ export interface FsReadRestrictionConfig {
    */
   unlistableDenyDirs?: string[]
   /**
-   * The names a glob expansion matched that are symbolic links. `denyOnly`
-   * holds what each leads to, which is where its mount goes; the next
-   * expansion finds that by the name again. Linux only, likewise.
+   * The names a glob expansion matched that are symbolic links: `denyOnly`
+   * holds what each leads to. Linux only, likewise.
    */
   matchedLinks?: string[]
 }
