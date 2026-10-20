@@ -13,7 +13,9 @@ import {
   buildGitConfigEnv,
   normalizePathForSandbox,
   containsGlobCharsWin,
+  DANGEROUS_FILES,
   expandGlobPattern,
+  getDangerousDirectories,
   isAtOrUnder,
   isUncPath,
   markedLiteralPath,
@@ -2753,6 +2755,109 @@ function coveringWindowsPath(
     const covering = keys.findIndex(dir => isAtOrUnder(key, dir))
     return covering < 0 ? undefined : dirs[covering]
   }
+}
+
+/**
+ * The mandatory write denies for a command run in `cwd`, from the definitions
+ * the Linux and macOS backends read: the dangerous files and directories,
+ * `.git\hooks` and (unless `allowGitConfig`) `.git\config`, each name down to
+ * `maxDepth` levels below `cwd` (`a\b\.bashrc`, `a\b\.git` at 3),
+ * `node_modules` apart. Of those, the ones a command could write: at or
+ * beneath one of `writeRoots`.
+ *
+ * Only what IS THERE is returned: `srt-win` answers a missing deny target with
+ * a placeholder that stays, which would leave an empty `.mcp.json` or
+ * `.vscode\` in every directory ever sandboxed.
+ *
+ * Where `.git` is a FILE (a linked worktree, a submodule) the file is denied:
+ * rewritten, it would send the user's next git command to a directory with
+ * hooks of the writer's own. So are the same names where it leads
+ * ({@link windowsGitFileDirs}).
+ */
+export function windowsMandatoryDenyPaths(
+  cwd: string,
+  writeRoots: readonly string[],
+  opts: { maxDepth: number; allowGitConfig: boolean },
+): string[] {
+  if (writeRoots.length === 0) return []
+  const writeRootOf = coveringWindowsPath(writeRoots)
+  // Denied wherever they are met, and denied inside a directory of that name.
+  const whole = new Set<string>(DANGEROUS_FILES)
+  const inside = new Map([
+    ['.git', new Set(opts.allowGitConfig ? ['hooks'] : ['hooks', 'config'])],
+  ])
+  for (const dir of getDangerousDirectories()) {
+    const [name, part] = dir.split('/') as [string, string?]
+    if (part === undefined) whole.add(name)
+    else inside.set(name, (inside.get(name) ?? new Set()).add(part))
+  }
+  const found: string[] = []
+  const walk = (dir: string, depth: number, only?: Set<string>): void => {
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const name = normalizeCaseForComparison(entry.name)
+      const full = path.join(dir, entry.name)
+      if ((only ?? whole).has(name)) {
+        found.push(full)
+      } else if (only !== undefined) {
+        continue
+      } else if (name === '.git' && entry.isFile()) {
+        found.push(full)
+        for (const led of windowsGitFileDirs(full, writeRootOf)) {
+          walk(led, depth, inside.get(name))
+        }
+      } else if (entry.isDirectory() && name !== 'node_modules') {
+        const parts = inside.get(name)
+        if (parts !== undefined) walk(full, depth, parts)
+        else if (depth < opts.maxDepth) walk(full, depth + 1)
+      }
+    }
+  }
+  walk(path.resolve(cwd), 1)
+  return [...new Set(found)].filter(p => writeRootOf(p) !== undefined)
+}
+
+/**
+ * The directories a `.git` file leads to: the one its `gitdir:` line names
+ * (relative to the file's directory) and, for a linked worktree, the one that
+ * directory's `commondir` names (relative to it).
+ *
+ * THREAT: a sandboxed command may have written both files. So nothing is read
+ * at a path it could not write anyway, only a small regular file is read at
+ * all, and a UNC or device form is dropped before it is so much as resolved:
+ * that alone would have this process, which no fence holds, call a server of
+ * the writer's choosing.
+ */
+function windowsGitFileDirs(
+  gitFile: string,
+  writeRootOf: (p: string) => string | undefined,
+): string[] {
+  const firstLine = (file: string): string => {
+    try {
+      const st = fs.lstatSync(file)
+      if (!st.isFile() || st.size > 4096) return ''
+      return fs.readFileSync(file, 'utf8').split(/\r?\n/, 1)[0]!.trim()
+    } catch {
+      return ''
+    }
+  }
+  const follow = (from: string, named = ''): string | undefined => {
+    if (named === '' || isUnprobedWindowsPath(named)) return undefined
+    const dir = path.resolve(from, named)
+    return writeRootOf(dir) === undefined ? undefined : dir
+  }
+  const gitDir = follow(
+    path.dirname(gitFile),
+    /^gitdir:\s*(.+)$/.exec(firstLine(gitFile))?.[1],
+  )
+  if (gitDir === undefined) return []
+  const commonDir = follow(gitDir, firstLine(path.join(gitDir, 'commondir')))
+  return commonDir === undefined ? [gitDir] : [gitDir, commonDir]
 }
 
 /**

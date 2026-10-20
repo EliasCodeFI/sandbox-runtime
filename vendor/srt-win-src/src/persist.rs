@@ -948,8 +948,18 @@ pub fn apply(
         touch(root);
     }
     let all_roots = all_root_paths(conn)?;
+    // A deny is on the object, so a directory above it that is renamed
+    // aside takes it along and leaves the denied NAME free to be made anew.
+    // Each one up to the root is kept where it is.
+    let pins: Vec<(String, SbAce)> = denies
+        .iter()
+        .filter(|(_, ace)| matches!(ace, SbAce::Deny(_)))
+        .filter_map(|(canon, _)| Some((covering_root(&all_roots, canon)?, canon)))
+        .flat_map(|(root, canon)| path_id::dirs_between(root, canon))
+        .map(|dir| (dir, SbAce::DenyDelete))
+        .collect();
     let mut per_session = Vec::new();
-    for (canon, ace) in denies {
+    for (canon, ace) in denies.iter().chain(&pins) {
         let Some(root) = covering_root(&all_roots, canon) else {
             per_session.push((canon.clone(), *ace));
             continue;
