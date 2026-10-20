@@ -3,11 +3,15 @@ name: Release
 on:
   release:
     types: [published]
+  # Runs every job except publish. The `package` artifact holds the
+  # tarball a release from that commit would publish.
+  pull_request:
 
 permissions:
   contents: read
-  id-token: write
 
+# Every job builds from a clean runner: no toolchain, dependency or
+# build-output cache is restored.
 jobs:
   build-seccomp:
     name: Build seccomp (${{ matrix.arch }})
@@ -16,7 +20,7 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -24,6 +28,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
+          no-cache: true
       - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
       - run: npm run build:seccomp
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -34,12 +39,13 @@ jobs:
 
   build-java-agent:
     name: Build JVM proxy agent
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
+          no-cache: true
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
@@ -66,21 +72,9 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-      # This job builds the helper that runs elevated on a user's machine,
-      # so both actions are pinned by commit: `@stable` and `@v2` are a
-      # branch and a moving major tag in third-party repositories.
-      # dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-      # Swatinem/rust-cache@v2.9.2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          workspaces: vendor/srt-win-src
-          # Same key as integration-tests.yml so releases (tag refs)
-          # restore the cache main pushes have warmed. Without a
-          # shared key the release ref never sees a saved cache.
-          shared-key: srt-win
+          no-cache: true
+      # Installs the version named in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: npm run build:srt-win
       - name: Verify srt-win.exe runs
         shell: pwsh
@@ -95,76 +89,17 @@ jobs:
           path: vendor/srt-win/${{ matrix.arch }}
           if-no-files-found: error
 
-  verify-package:
-    # Proves getSrtWinPath() resolves and runs the host-arch (x64)
-    # prebuilt binary from inside an installed package. The arm64
-    # binary and seccomp binaries are not exercised here — the
-    # publish job's tarball-contents check covers their presence.
-    #
-    # This is the one place the packed tarball is installed and imported,
-    # and it does so under Node, so it runs once on each Node release line
-    # from the engines floor in package.json (>=22) up. publish waits for
-    # both.
-    name: Verify package (Windows / Node ${{ matrix.node }})
-    needs: build-srt-win
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ['22', '24']
-    env:
-      # Husky's prepare hook chokes on Windows runners; skip it.
-      HUSKY: '0'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: srt-win-x64
-          path: vendor/srt-win/x64
-      - run: npm ci
-      - run: npm run build
-      - name: Pack, install into clean dir, resolve+run srt-win.exe
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          npm pack
-          $pkg = (Get-ChildItem *.tgz).FullName
-          $tmp = Join-Path $env:RUNNER_TEMP "pkg-verify"
-          New-Item -ItemType Directory -Force $tmp | Out-Null
-          Push-Location $tmp
-          npm init -y | Out-Null
-          npm install $pkg
-          # Package is ESM-only ("type":"module"); use dynamic import().
-          # End-to-end: getSrtWinPath() from the installed package resolves
-          # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
-          Set-Content -Path verify.cjs -Value @"
-          const { spawnSync } = require('child_process');
-          import('@anthropic-ai/sandbox-runtime').then(m => {
-            const p = m.getSrtWinPath();
-            console.log('resolved:', p);
-            const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
-            console.log((r.stdout || '') + (r.stderr || ''));
-            if (r.status !== 0) throw new Error('exit ' + r.status + ': ' + r.stderr);
-          }).catch(e => { console.error(e); process.exit(1); });
-          "@
-          node verify.cjs
-          Pop-Location
-
-  publish:
-    name: Publish to npm
-    needs: [build-seccomp, build-java-agent, build-srt-win, verify-package]
-    runs-on: ubuntu-latest
-    environment: npm
+  pack:
+    name: Pack
+    needs: [build-seccomp, build-java-agent, build-srt-win]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Verify release tag is on main
+        if: github.event_name == 'release'
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -173,6 +108,7 @@ jobs:
           fi
 
       - name: Verify tag matches package.json version
+        if: github.event_name == 'release'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
@@ -183,10 +119,8 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # The package is built and packed here, so this stays inside its
-          # own engines range (>=22).
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
+          package-manager-cache: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -212,23 +146,27 @@ jobs:
           name: srt-win-arm64
           path: vendor/srt-win/arm64
 
-      # `npm ci` installs exactly what package-lock.json records and fails
-      # when package.json has moved away from it, so what is built and
-      # published here is what CI tested. setup-node wrote an .npmrc that
-      # reads the registry token from NODE_AUTH_TOKEN, which only the publish
-      # step sets; left unset, npm sends the unexpanded placeholder as the
-      # token, and an empty value makes this install anonymous instead.
-      - run: npm ci
-        env:
-          NODE_AUTH_TOKEN: ''
+      # Only tsc may run from node_modules beside the binaries downloaded
+      # above. A git dependency runs its code on install even with
+      # --ignore-scripts, and the build's `npm run` puts node_modules/.bin
+      # first on PATH, where a dependency could plant its own rm or tsc.
+      - name: Install dependencies, link tsc
+        run: |
+          if [ "$(npm config get allow-git)" = undefined ]; then
+            echo "::error::npm older than 11.9 ignores --allow-git"; exit 1
+          fi
+          npm ci --ignore-scripts --no-bin-links --allow-git=none
+          # No -p: fail if npm linked any bin.
+          mkdir node_modules/.bin
+          ln -s ../typescript/bin/tsc node_modules/.bin/tsc
 
       - name: Build, pack, verify contents
         # `npm pack` does NOT run prepublishOnly (only directory-mode
-        # `npm publish` does), so run it explicitly first — the packed
-        # tarball is then byte-identical to what publishes below.
+        # `npm publish` does), so run it explicitly first.
         run: |
           npm run prepublishOnly
-          npm pack
+          # --ignore-scripts skips `prepare` (husky).
+          npm pack --ignore-scripts
           PKG=$(ls *.tgz)
           LIST=$(tar -tzf "$PKG" | sort)
           echo "::group::tarball contents"
@@ -243,12 +181,80 @@ jobs:
           if grep -q '^package/dist/vendor/' <<<"$LIST"; then
             echo "::error::dist/vendor/ duplicated in tarball"; exit 1
           fi
-          echo "PKG=$PKG" >> "$GITHUB_ENV"
 
-      - name: Publish to npm
-        # Publish the exact tarball verified above. Publishing a
-        # tarball (vs the directory) skips prepublishOnly, so no
-        # rebuild happens between verify and publish.
-        run: npm publish "$PKG" --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package
+          path: '*.tgz'
+          if-no-files-found: error
+
+  verify-package:
+    # Installs the packed tarball and proves getSrtWinPath() resolves and
+    # runs the host-arch (x64) prebuilt binary from inside it. The arm64
+    # binary and seccomp binaries are not exercised here — the pack
+    # job's tarball-contents check covers their presence.
+    name: Verify package (Windows)
+    needs: pack
+    runs-on: windows-latest
+    permissions: {}
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # The oldest Node that `engines` in package.json allows.
+          node-version: '22.12.0'
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package
+      - name: Install into clean dir, resolve+run srt-win.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pkg = (Get-ChildItem *.tgz).FullName
+          $tmp = Join-Path $env:RUNNER_TEMP "pkg-verify"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          Push-Location $tmp
+          npm init -y | Out-Null
+          npm install $pkg
+          # Package is ESM-only ("type":"module"); use dynamic import().
+          # End-to-end: getSrtWinPath() from the installed package resolves
+          # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
+          Set-Content -Path verify.cjs -Value @"
+          const { spawnSync } = require('child_process');
+          import('@anthropic-ai/sandbox-runtime').then(m => {
+            const p = m.getSrtWinPath();
+            console.log('resolved:', p);
+            const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
+            console.log((r.stdout || '') + (r.stderr || ''));
+            if (r.status !== 0) throw new Error('exit ' + r.status + ': ' + r.stderr);
+          }).catch(e => { console.error(e); process.exit(1); });
+          "@
+          node verify.cjs
+          Pop-Location
+
+  publish:
+    # Checks nothing out and builds nothing: publishes the tarball that
+    # pack uploaded and verify-package installed.
+    name: Publish to npm
+    if: github.event_name == 'release'
+    needs: [pack, verify-package]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      # npm trusted publishing exchanges this job's OIDC token for a
+      # short-lived publish credential.
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Trusted publishing needs npm >= 11.5.1. Node 24 is the first
+          # release line that ships npm 11.
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package
+      # Trusted publishing attaches provenance without --provenance.
+      - run: npm publish ./*.tgz --access public
