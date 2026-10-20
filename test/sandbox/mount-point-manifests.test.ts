@@ -47,6 +47,7 @@ import {
   leftover,
   namedBy,
   recordOf,
+  refusal,
   started,
   startOf,
   statLine,
@@ -2403,17 +2404,15 @@ describe.if(isLinux)('The mount point manifests', () => {
       try {
         expect(named()).toEqual([])
         expect(() => mountPointManifestDirectories()).toThrow('EIO')
-        const refused = await wrapCommandWithSandboxLinux({
-          command: 'true',
-          needsNetworkRestriction: false,
-          writeConfig: { allowOnly: [BASE], denyWithinAllow: [] },
-        }).then(
-          () => undefined,
-          (error: unknown) => error,
-        )
-        expect((refused as { code?: string }).code).toBe(
-          'mount_points_unreadable',
-        )
+        expect(
+          await refusal(
+            wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              writeConfig: { allowOnly: [BASE], denyWithinAllow: [] },
+            }),
+          ),
+        ).toBe('mount_points_unreadable')
       } finally {
         look.restore()
       }

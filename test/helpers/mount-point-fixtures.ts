@@ -102,7 +102,6 @@ export function started(manifest: string, ...by: Process[]): string {
   return manifest
 }
 
-/** The mount points the wrap named in its manifest, none without one. */
 /** The code the wrap was refused with. */
 export async function refusal(wrapping: Promise<string>): Promise<unknown> {
   const thrown: unknown = await wrapping.then(
@@ -113,6 +112,7 @@ export async function refusal(wrapping: Promise<string>): Promise<unknown> {
   return (thrown as LinuxSandboxProfileError).code
 }
 
+/** The mount points the wrap named in its manifest, none without one. */
 export function namedBy(command: string): string[] {
   const file = manifestOf(command)
   return file === undefined

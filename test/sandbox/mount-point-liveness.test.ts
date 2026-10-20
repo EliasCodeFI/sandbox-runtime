@@ -21,7 +21,6 @@ import { basename, dirname, join } from 'node:path'
 import { liveMountPoints } from '../../src/index.js'
 import {
   cleanupBwrapMountPoints,
-  LinuxSandboxProfileError,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
@@ -1124,7 +1123,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
       const inOnePlan = opens / 3
       // Which planning again does not mend where something else is amiss too.
       const junk = join(dirname(theirs), '4242-00.json')
-      writeFileSync(junk, 'no manifest')
+      writeFileSync(junk, '{}')
       expect(await refusal(wrap('true'))).toBe('mount_points_unreadable')
       rmSync(junk)
       ;[opens, elusiveFor] = [0, inOnePlan]
@@ -1136,7 +1135,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 
   it('is not asked of a wrap that restricts no write, which has no mount point', async () => {
     mkdirSync(runtime.manifestDir(), { recursive: true, mode: 0o700 })
-    writeFileSync(join(runtime.manifestDir(), '4242-00.json'), 'no manifest')
+    writeFileSync(join(runtime.manifestDir(), '4242-00.json'), '{}')
     expect(await refusal(wrap('true'))).toBe('mount_points_unreadable')
     expect(
       await wrapCommandWithSandboxLinux({
@@ -2327,7 +2326,7 @@ describe.if(isLinux)(
 
       // The manifests are read first: in doubt from the start, it makes nothing.
       const junk = join(runtime.manifestDir(), '4242-00.json')
-      writeFileSync(junk, 'no manifest')
+      writeFileSync(junk, '{}')
       expect(await refusal(wrap('true', [LEAF]))).toBe(
         'mount_points_unreadable',
       )
@@ -2339,7 +2338,7 @@ describe.if(isLinux)(
       const spy = spyOn(fs, 'mkdtempSync').mockImplementation(((
         ...args: unknown[]
       ) => {
-        writeFileSync(junk, 'no manifest')
+        writeFileSync(junk, '{}')
         return (mkdtemp as (...args: unknown[]) => unknown)(...args)
       }) as never)
       try {
@@ -2371,16 +2370,11 @@ describe.if(isLinux)(
         // What the mount point is bound from, as a clean-up elsewhere takes it.
         emptySources().forEach(source => fs.rmdirSync(source))
       })
-      let refused: unknown
       try {
-        refused = await wrap('true', [LEAF]).catch((error: unknown) => error)
+        expect(await refusal(wrap('true', [LEAF]))).toBe('mount_points_changed')
       } finally {
         publishing.restore()
       }
-      expect(refused).toBeInstanceOf(LinuxSandboxProfileError)
-      expect((refused as LinuxSandboxProfileError).code).toBe(
-        'mount_points_changed',
-      )
       expect(published).toBe(3)
       expect(readdirSync(runtime.manifestDir())).toEqual([])
 
