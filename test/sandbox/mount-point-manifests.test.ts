@@ -2551,6 +2551,25 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(existsSync(X)).toBe(true)
   })
 
+  it.each([
+    ['left to bubblewrap to make', () => {}],
+    ['had made itself', () => keepTrackOfMountPoint(X)],
+  ])(
+    'keeps what one wrap %s and could not record, while another wrap that names it too is cleaned up after',
+    (_, planned) => {
+      // The sandbox of the first may be running over it, and only this process
+      // knows: the manifest of the second is not all that names it.
+      planned()
+      leftover(X)
+      unrecorded([X])
+      publishMountPointManifest([X], [], 'the second')
+      expect(collectMountPoints({ commandKey: 'the second' })).toEqual([])
+      expect(existsSync(X)).toBe(true)
+      expect(named()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
+    },
+  )
+
   it('publishes no manifest that it would not read', () => {
     const paths = (count: number): string[] =>
       Array.from({ length: count }, (_, i) =>

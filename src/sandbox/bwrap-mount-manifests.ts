@@ -202,13 +202,18 @@ const ownManifests = new Map<
 /**
  * The mount points, and the directories they bind from, that no manifest names:
  * of wraps that could record them nowhere, and what a plan has made on the host
- * itself until its manifest is published, which takes it out of here. No other
- * process knows of them, so they are this process's to remove once none of its
- * wraps is outstanding: in a pass like any other where there is a directory by
- * then, so that a path another process's manifest names is kept, and on its own
- * word where there is none.
+ * itself (`madeByAPlan`, which are among `paths`) until a manifest is published
+ * that names it, which takes it out of here. No other process knows of them, so
+ * they are this process's to remove once none of its wraps is outstanding, and
+ * kept until then: in a pass like any other where there is a directory by then,
+ * so that a path another process's manifest names is kept, and on its own word
+ * where there is none.
  */
-const unrecorded = { paths: new Set<string>(), sources: new Set<string>() }
+const unrecorded = {
+  paths: new Set<string>(),
+  sources: new Set<string>(),
+  madeByAPlan: new Set<string>(),
+}
 
 /** Has `source` removed at this process's own clean-up if no manifest keeps it. */
 export function keepTrackOfMountSource(source: string): void {
@@ -221,6 +226,7 @@ export function keepTrackOfMountSource(source: string): void {
  */
 export function keepTrackOfMountPoint(mountPoint: string): void {
   unrecorded.paths.add(mountPoint)
+  unrecorded.madeByAPlan.add(mountPoint)
 }
 
 /**
@@ -1055,7 +1061,13 @@ export function publishMountPointManifest(
       fs.writeFileSync(temporary, text, { mode: 0o600 })
       fs.renameSync(temporary, file)
       ownManifests.set(file, { commandKey, over: false })
-      for (const mountPoint of mountPoints) unrecorded.paths.delete(mountPoint)
+      // Not what an earlier wrap could record nowhere and this one names too:
+      // that wrap's sandbox may outlast this manifest.
+      for (const mountPoint of mountPoints) {
+        if (unrecorded.madeByAPlan.delete(mountPoint)) {
+          unrecorded.paths.delete(mountPoint)
+        }
+      }
       return { dir, file, started: `${id}${STARTED_SUFFIX}` }
     } catch (e) {
       try {
@@ -1069,7 +1081,10 @@ export function publishMountPointManifest(
       )
     }
   }
-  for (const mountPoint of mountPoints) unrecorded.paths.add(mountPoint)
+  for (const mountPoint of mountPoints) {
+    unrecorded.paths.add(mountPoint)
+    unrecorded.madeByAPlan.delete(mountPoint)
+  }
   for (const source of sources) unrecorded.sources.add(source)
   return undefined
 }
@@ -1550,8 +1565,7 @@ export function collectMountPoints(release: OwnManifestRelease): string[] {
     for (const source of unrecorded.sources) {
       if (removeMountSource(source) === 'removed') removed.push(source)
     }
-    unrecorded.paths.clear()
-    unrecorded.sources.clear()
+    Object.values(unrecorded).forEach(named => named.clear())
   }
   return removed
 }
@@ -1713,11 +1727,15 @@ function removeWhatIsFinished(
   }
 
   const kept = new Set<string>()
-  const keep = (manifest: Manifest): void => {
+  const keep = (
+    manifest: Record<'paths' | 'sources', Iterable<string>>,
+  ): void => {
     for (const named of [...manifest.paths, ...manifest.sources]) {
       kept.add(named)
     }
   }
+  // A wrap of this process is outstanding, and may be the one that relies on it.
+  if (!unrecordedToo) keep(unrecorded)
   const finished: Manifest[] = []
   for (const manifest of reading.manifests) {
     const asked = canBeAskedAfter(manifest)
@@ -1821,7 +1839,7 @@ function removeWhatIsFinished(
     }
   }
   if (unrecordedToo) {
-    for (const named of [unrecorded.paths, unrecorded.sources]) {
+    for (const named of Object.values(unrecorded)) {
       for (const one of named) if (!notRemoved.has(one)) named.delete(one)
     }
   }
