@@ -3,7 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wayPastMissingNames } from '../utils/real-path.js'
 import {
   denyGlobRegex,
   globToRegex,
@@ -116,81 +116,80 @@ export function nameLocation(
   return `${parent === '/' ? '' : parent}/${path.basename(p)}`
 }
 
-/** As many links as the kernel follows on the way to one path. */
-const MAX_LINKS_FOLLOWED = 40
-
-/** What a look at a name fails with where it is settled that no link is there:
- * nothing is, it is no link by now, or no call takes the name (a NUL byte). */
-const NO_LINK_THERE = ['ENOENT', 'ENOTDIR', 'EINVAL', 'ERR_INVALID_ARG_VALUE']
-
 /**
- * The absolute path `p` walked name by name: the symbolic links met on the
- * way, each where it lies, and where the way ends.
+ * What has to stay as it is for the absolute path `p`, a denied name, to go on
+ * leading where it leads, and where that is.
  *
  * A `.`, `..` or `//` in `p` itself is folded in text before anything is
  * looked at, as everywhere a configured name is read: `link/..` is the
- * directory that holds the link, which is not where the kernel goes. A `..` in
- * a link's target is read as the kernel reads it, the parent of the directory
- * reached.
+ * directory that holds the link, which is not where the kernel goes.
  *
- * A name that is not there is taken as written, so a dangling link ends at the
- * path a write through it would create. There is no end past the number of
- * links the kernel follows, nor past a target that is no text.
- *
- * INVARIANT: "could not look" is never "no link". Only a name that is not
- * there (ENOENT, ENOTDIR), is no link, or is one no call takes (a NUL byte)
- * counts as none. On any other failure the walk stops with no end, and
- * `unsearched` is the directory reached, in which it could not look: a
- * same-uid command can take a directory's search bit away and give it back
- * from inside the next sandbox. Never the root, which stands in for nothing.
- *
- * `looked` holds what stands at each name looked at, a link's target or null.
- * One map for the paths of one wrap has a directory they share looked at once.
+ * INVARIANT: "could not look" is never "no link". A walk that stops for any
+ * reason but a name that is not there, or that nothing can be at, has no end,
+ * and `unsearched` is the directory it could not look in: a same-uid command
+ * can take a directory's search bit away and give it back from inside the next
+ * sandbox. Never the root, which stands in for nothing.
  */
-export function followLinks(
-  p: string,
-  looked: Map<string, string | null> = new Map(),
-): { links: string[]; end: string | undefined; unsearched?: string } {
-  const links: string[] = []
-  const rest = path.resolve(p).split('/')
-  // No link in it.
-  let reached = ''
-  for (let name = rest.shift(); name !== undefined; name = rest.shift()) {
-    if (name === '' || name === '.') continue
-    if (name === '..') {
-      reached = reached.slice(0, reached.lastIndexOf('/'))
-      continue
-    }
-    const next = `${reached}/${name}`
-    let target = looked.get(next)
-    if (target === undefined) {
-      try {
-        // Nearly every name is no link, and asking one for its target throws.
-        target = fs.lstatSync(next, { throwIfNoEntry: false })?.isSymbolicLink()
-          ? fs.readlinkSync(next)
-          : null
-      } catch (err) {
-        if (
-          !NO_LINK_THERE.includes((err as NodeJS.ErrnoException).code ?? '')
-        ) {
-          return { links, end: undefined, unsearched: reached || undefined }
-        }
-        target = null
+export function followLinks(p: string): {
+  /** The symbolic links on the way: where each lies, and what it says, ''
+   *  where that is no text. */
+  links: Map<string, string>
+  /** The directories a link's target goes into and, by `..`, out of again. */
+  left: Set<string>
+  /** The names that are not there which one goes up from in the same way. */
+  passed: string[]
+  /** Where the way ends, what is not there taken as written: a dangling link
+   *  ends at the path a write through it would create. A way that goes up
+   *  again further on among such names ends at the first: with nothing made
+   *  there, nothing beyond comes about. None past the number of links the
+   *  kernel follows, nor past a target that is no text. */
+  end?: string
+  unsearched?: string
+} {
+  const links = new Map<string, string>()
+  const left = new Set<string>()
+  const walk = (): ReturnType<typeof wayPastMissingNames> =>
+    wayPastMissingNames(path.resolve(p), {
+      link: (at, target) => links.set(at, target),
+      left: dir => left.add(dir),
+    })
+  let way: ReturnType<typeof walk>
+  try {
+    way = walk()
+  } catch {
+    // Once more: a look can fail in passing (EIO, ESTALE), and what would
+    // follow from that is a directory denied whole.
+    try {
+      way = walk()
+    } catch (err) {
+      const { code, path: at } = err as NodeJS.ErrnoException
+      // A link all the same, which says what no string spells.
+      if (code === 'EILSEQ' && at) links.set(at, '')
+      const nothingCanBeThere =
+        isAbsenceErrno(err) ||
+        code === 'EILSEQ' ||
+        code === 'ERR_INVALID_ARG_VALUE'
+      const dir = nothingCanBeThere ? '/' : path.dirname(at ?? path.resolve(p))
+      return {
+        links,
+        left,
+        passed: [],
+        ...(dir !== '/' && { unsearched: dir }),
       }
-      looked.set(next, target)
     }
-    if (target === null) {
-      reached = next
-      continue
-    }
-    links.push(next)
-    if (links.length > MAX_LINKS_FOLLOWED || target.includes('\uFFFD')) {
-      return { links, end: undefined }
-    }
-    if (target.startsWith('/')) reached = ''
-    rest.unshift(...target.split('/'))
   }
-  return { links, end: reached || '/' }
+  const { real, rest, notThere, passed } = way
+  return (notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES'
+    ? { links, left, passed, ...(real !== '' && { unsearched: real }) }
+    : {
+        links,
+        left,
+        passed,
+        end:
+          [real, ...(rest.includes('..') ? rest.slice(0, 1) : rest)].join(
+            '/',
+          ) || '/',
+      }
 }
 
 /** `process.cwd()`, or undefined where that throws: it has been removed. */

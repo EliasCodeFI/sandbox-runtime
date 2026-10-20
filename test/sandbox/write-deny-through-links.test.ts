@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+} from 'bun:test'
 import * as fs from 'fs'
 import { spawnSync } from 'node:child_process'
 import {
@@ -78,6 +86,8 @@ const DENIED = [
   'blank',
   'out',
 ]
+/** EBUSY, as glibc words it ("Device or resource busy") or musl. */
+const BUSY = /resource busy/i
 /** No mode keeps uid 0 from looking. */
 const modesCount = process.getuid?.() !== 0
 
@@ -126,7 +136,24 @@ function program(name: string, script: string): string {
 }
 
 describe.if(!isWindows)('the links on the way to a path', () => {
-  it.each<[string, string[], string]>([
+  /** What is said of `p`, a name in ROOT, with the names in ROOT again. */
+  const followed = (p: string): object => {
+    const { links, left, ...rest } = followLinks(join(ROOT, p))
+    const named = (at: string): string => relative(ROOT, at)
+    return JSON.parse(
+      JSON.stringify(
+        { links: [...links], left: [...left], ...rest },
+        (_key, value: unknown) =>
+          typeof value === 'string' && value.startsWith(ROOT)
+            ? named(value)
+            : value,
+      ),
+    ) as object
+  }
+  const said = (...names: Array<keyof typeof LINKS>): string[][] =>
+    names.map(name => [name, LINKS[name]])
+
+  it.each<[string, Array<keyof typeof LINKS>, string]>([
     ['beside', [], 'beside'],
     ['name', ['name'], 'conf/x'],
     ['holder/commands/file', ['holder/commands'], 'shared/commands/file'],
@@ -136,33 +163,47 @@ describe.if(!isWindows)('the links on the way to a path', () => {
     ['absent/name', [], 'absent/name'],
     ['beside/name', [], 'beside/name'],
     ['./way/./secret/', ['way'], 'real/secret'],
+    // Folded in text, as the path it is given always is.
+    ['holder/commands/../name', [], 'holder/name'],
   ])('%s: %p, ending at %s', (p, links, end) => {
-    expect(followLinks(join(ROOT, p))).toEqual({
-      links: inRoot(links),
-      end: join(ROOT, end),
+    expect(followed(p)).toMatchObject({
+      links: said(...links),
+      passed: [],
+      end,
     })
   })
 
-  it('takes a name with a NUL byte, which no call takes, as written', () => {
-    expect(followLinks(join(ROOT, 'way', 'nul\0byte'))).toEqual({
-      links: inRoot(['way']),
-      end: join(ROOT, 'real', 'nul\0byte'),
-    })
-  })
-
-  it('reads `..` in a target as the parent of the directory reached', () => {
-    symlinkSync(join(ROOT, 'shared', 'commands'), join(ROOT, 'absolute'))
-    symlinkSync('./absolute/../made', join(ROOT, 'up'))
-    expect(followLinks(join(ROOT, 'up'))).toEqual({
-      links: inRoot(['up', 'absolute']),
-      end: join(ROOT, 'shared', 'made'),
-    })
-  })
-
-  it('folds `..` in the path it is given in text', () => {
-    expect(followLinks(`${ROOT}/holder/commands/../name`)).toEqual({
-      links: [],
-      end: join(ROOT, 'holder', 'name'),
+  it.each([
+    [
+      'a directory',
+      'shared/commands/../../real/secret',
+      { left: ['shared/commands', 'shared'], passed: [], end: 'real/secret' },
+    ],
+    [
+      'a link to one, whose parent it is the parent of',
+      'holder/commands/../made',
+      {
+        links: [...said('holder/commands')],
+        left: ['holder', 'shared/commands'],
+        passed: [],
+        end: 'shared/made',
+      },
+    ],
+    [
+      'a name that is not there',
+      'missing/../gone/../real/secret',
+      { left: [], passed: ['missing', 'gone'], end: 'real/secret' },
+    ],
+    [
+      'one further on among names that are not there, where it ends at the first',
+      'missing/deeper/../../real/secret',
+      { left: [], passed: [], end: 'missing' },
+    ],
+  ])('a target that goes up again from %s: %s', (_what, target, told) => {
+    symlinkSync(target, join(ROOT, 'up'))
+    expect(followed('up')).toEqual({
+      ...told,
+      links: [['up', target], ...('links' in told ? told.links : [])],
     })
   })
 
@@ -174,18 +215,27 @@ describe.if(!isWindows)('the links on the way to a path', () => {
 
   it('names a link where it lies, whatever it was reached through', () => {
     symlinkSync(ROOT, join(OUTSIDE, 'to-root'))
-    expect(followLinks(join(OUTSIDE, 'to-root', 'name'))).toEqual({
-      links: [join(OUTSIDE, 'to-root'), join(ROOT, 'name')],
-      end: join(ROOT, 'conf', 'x'),
+    expect([...followLinks(join(OUTSIDE, 'to-root', 'name')).links]).toEqual([
+      [join(OUTSIDE, 'to-root'), ROOT],
+      [join(ROOT, 'name'), LINKS.name],
+    ])
+  })
+
+  it('reads a target that holds U+FFFD itself like any other', () => {
+    symlinkSync('x�y', join(ROOT, 'odd'))
+    expect(followed('odd/file')).toMatchObject({
+      links: [['odd', 'x�y']],
+      end: 'x�y/file',
     })
   })
 
   // Not every file system takes such a target.
   it.if(isLinux)('has no end past a target that is no text', () => {
     symlinkSync(Buffer.from([0x78, 0xff]), join(ROOT, 'bytes'))
-    expect(followLinks(join(ROOT, 'bytes', 'file'))).toEqual({
-      links: inRoot(['bytes']),
-      end: undefined,
+    expect(followed('bytes/file')).toEqual({
+      links: [['bytes', '']],
+      left: [],
+      passed: [],
     })
   })
 
@@ -194,8 +244,9 @@ describe.if(!isWindows)('the links on the way to a path', () => {
     for (let i = 2; i <= 41; i++) {
       symlinkSync(`hop-${i - 1}`, join(ROOT, `hop-${i}`))
     }
-    expect(followLinks(join(ROOT, 'hop-40')).end).toBe(join(ROOT, 'beside'))
-    expect(followLinks(join(ROOT, 'hop-41')).end).toBeUndefined()
+    expect(followed('hop-40')).toMatchObject({ end: 'beside' })
+    expect(followed('hop-41')).not.toHaveProperty('end')
+    expect(followed('hop-41')).not.toHaveProperty('unsearched')
     // macOS gives up sooner, at 32: what is denied past that is denied in vain.
     if (isLinux) {
       expect(() => readFileSync(join(ROOT, 'hop-40'))).not.toThrow()
@@ -203,61 +254,72 @@ describe.if(!isWindows)('the links on the way to a path', () => {
     expect(() => readFileSync(join(ROOT, 'hop-41'))).toThrow('ELOOP')
   })
 
+  it.each([
+    ['longer than a name can be', 'a'.repeat(300)],
+    ['with a NUL byte', 'nul\0byte'],
+  ])('a name %s: nothing can be there, so it has looked', (_what, name) => {
+    expect(followed(`way/${name}`)).toEqual({
+      links: said('way'),
+      left: [],
+      passed: [],
+    })
+  })
+
   it.if(modesCount)(
     'stops at a directory it cannot look in, and says which',
     () => {
       chmodSync(join(ROOT, 'holder'), 0)
       symlinkSync('holder/commands', join(ROOT, 'to-holder'))
-      expect(followLinks(join(ROOT, 'to-holder', 'file'))).toEqual({
-        links: inRoot(['to-holder']),
-        end: undefined,
-        unsearched: join(ROOT, 'holder'),
+      expect(followed('to-holder/file')).toEqual({
+        links: [['to-holder', 'holder/commands']],
+        left: [],
+        passed: [],
+        unsearched: 'holder',
       })
     },
   )
 
-  it.each([
-    ['ENOENT', undefined],
-    ['EINVAL', undefined],
-    ['EIO', ''],
-    ['ESTALE', ''],
-    ['ENAMETOOLONG', ''],
-  ])('a look that fails with %s: could not look in %p', (code, unsearched) => {
-    const spy = spyOn(fs, 'readlinkSync').mockImplementation(() => {
-      throw Object.assign(new Error(code), { code })
-    })
-    try {
-      expect(followLinks(join(ROOT, 'name')).unsearched).toBe(
-        unsearched === undefined ? undefined : ROOT,
-      )
-    } finally {
-      spy.mockRestore()
-    }
-  })
+  describe('a look that fails', () => {
+    afterEach(() => mock.restore())
+    const failing = (code: string, path?: string): Error =>
+      Object.assign(new Error(code), { code, path })
 
-  it('never gives the root for the directory it could not look in', () => {
-    const spy = spyOn(fs, 'lstatSync').mockImplementation(() => {
-      throw Object.assign(new Error('EIO'), { code: 'EIO' })
-    })
-    try {
-      expect(followLinks(ROOT)).toEqual({ links: [], end: undefined })
-    } finally {
-      spy.mockRestore()
-    }
-  })
-
-  it('looks at a name once for all the paths that share a map', () => {
-    const looked = new Map<string, string | null>()
-    followLinks(join(ROOT, 'name'), looked)
-    expect(looked.get(ROOT)).toBeNull()
-    expect(looked.get(join(ROOT, 'name'))).toBe('conf/x')
-    expect(looked.get(join(ROOT, 'conf', 'x'))).toBeNull()
-
-    rmSync(join(ROOT, 'name'))
-    expect(followLinks(join(ROOT, 'name'), looked).links).toEqual(
-      inRoot(['name']),
+    it.each(['EIO', 'ESTALE', 'EINVAL'])(
+      'with %s both times: the directory of what it looked at',
+      code => {
+        spyOn(fs, 'readlinkSync').mockImplementation(at => {
+          throw failing(code, String(at))
+        })
+        expect(followed('holder/commands/file')).toMatchObject({
+          unsearched: 'holder',
+        })
+      },
     )
-    expect(followLinks(join(ROOT, 'name')).links).toEqual([])
+
+    it('once: it looks again', () => {
+      spyOn(fs, 'readlinkSync').mockImplementationOnce(at => {
+        throw failing('EIO', String(at))
+      })
+      expect(followed('name')).toMatchObject({ end: 'conf/x' })
+    })
+
+    it('and does not say where: the directory of the path as written', () => {
+      spyOn(fs, 'readlinkSync').mockImplementation(() => {
+        throw failing('EIO')
+      })
+      expect(followed('way/secret')).toMatchObject({ unsearched: 'way' })
+    })
+
+    it('in the root: no directory, which would stand in for everything', () => {
+      spyOn(fs, 'lstatSync').mockImplementation(at => {
+        throw failing('EIO', String(at))
+      })
+      expect(followLinks(ROOT)).toEqual({
+        links: new Map(),
+        left: new Set(),
+        passed: [],
+      })
+    })
   })
 })
 
@@ -292,7 +354,6 @@ describe.if((isLinux && bwrapCanNamespace()) || isMacOS)(
         cwd: OUTSIDE,
       })
       const said = `${result.stdout}${result.stderr}`
-      console.log(`${attempt}\n  ${said.trim().split('\n').join('\n  ')}`)
       expect(said).toContain('started')
       if (isLinux) cleanupBwrapMountPoints({ force: true })
       return said.includes('DONE') ? 'DONE' : 'refused'
@@ -375,6 +436,28 @@ describe.if((isLinux && bwrapCanNamespace()) || isMacOS)(
         symlinkSync('/dev/null', join(ROOT, '.zshrc'))
         symlinkSync('../shared/commands', join(ROOT, '.claude', 'commands'))
         expect(await fromRoot(() => outcomeOf(attempt, []))).toBe(outcome)
+      },
+    )
+
+    it.each([
+      [
+        'a directory',
+        'shared/commands/../../real/secret',
+        'mv shared/commands aside',
+      ],
+      ['a directory', 'shared/commands/../../real/secret', 'mv shared aside'],
+      ['a name that is not there', 'missing/../real/secret', 'mkdir missing'],
+      [
+        'a name that is not there',
+        'missing/../real/secret',
+        'ln -s conf missing',
+      ],
+    ])(
+      'where a link goes up again from %s (%s), refuses: %s',
+      async (_what, target, attempt) => {
+        symlinkSync(target, join(ROOT, 'up'))
+        expect(await outcomeOf(attempt, ['up'])).toBe('refused')
+        expect(await outcomeOf('echo changed >> up', ['up'])).toBe('refused')
       },
     )
 
@@ -813,70 +896,43 @@ describe.if(isLinux)('where no link is held', () => {
     expect(getLinuxUnheldLinks()).toEqual([])
   })
 
-  it('a helper the library found for itself is asked once', async () => {
-    const spy = found(noting(RUNS_ITS_WORDS))
-    try {
-      for (const _ of [1, 2]) {
-        expect(await wrapLinux(inRoot(['first']))).not.toContain('--hold-link')
-        expect(getLinuxUnheldLinks()).toEqual(unheld('older_helper'))
-      }
-    } finally {
-      spy.mockRestore()
-    }
-    expect(runs()).toBe(1)
-  })
-
-  it('it is not asked where there is nothing to hold', async () => {
-    const spy = found(noting(RUNS_ITS_WORDS))
-    try {
-      await wrapLinux(inRoot(['beside']))
-    } finally {
-      spy.mockRestore()
-    }
-    expect(runs()).toBe(0)
-  })
-
-  it.each([
-    ['ends by a signal', 'kill -9 $$', 0o755, 2],
-    ['cannot be started', '', 0o644, 0],
+  it.each<[string, string, number, LinuxUnheldLinkReason | undefined]>([
+    ['names the option that says so', '# --holds-links', 0o755, undefined],
+    ['does not', RUNS_ITS_WORDS, 0o755, 'older_helper'],
+    ...(modesCount
+      ? [
+          ['cannot be read', '', 0, 'no_answer'] as [
+            string,
+            string,
+            0,
+            'no_answer',
+          ],
+        ]
+      : []),
   ])(
-    'one that %s is asked twice, and again at the next wrap',
-    async (_what, script, mode, perWrap) => {
+    'a helper the library found for itself is read, never run: one that %s',
+    async (_what, script, mode, reason) => {
       const helper = noting(script)
       chmodSync(helper, mode)
       const spy = found(helper)
       try {
-        for (const wraps of [1, 2]) {
-          const { warnings } = await withCapturedWarnings(() =>
-            wrapLinux(inRoot(['first'])),
-          )
-          expect(getLinuxUnheldLinks()).toEqual(unheld('no_answer'))
-          expect(
-            warnings.filter(l => l.includes('gave no answer')),
-          ).toHaveLength(2)
-          expect(runs()).toBe(perWrap * wraps)
-        }
+        const wrapped = await wrapLinux(inRoot(['first']))
+        expect(wrapped.includes('--hold-link')).toBe(reason === undefined)
       } finally {
         spy.mockRestore()
       }
+      expect(getLinuxUnheldLinks()).toEqual(reason ? unheld(reason) : [])
+      expect(runs()).toBe(0)
     },
   )
 
-  it('asking an older helper runs no program of that name', async () => {
-    const named = join(ROOT, '--holds-links')
-    writeFileSync(named, `#!/bin/sh\necho ran > ${ROOT}/ran\n`)
-    chmodSync(named, 0o755)
-    const PATH = process.env.PATH
-    process.env.PATH = `${ROOT}:.:${PATH}`
-    const spy = found(noting(RUNS_ITS_WORDS))
-    try {
-      await fromRoot(() => wrapLinux(inRoot(['name'])))
-    } finally {
-      spy.mockRestore()
-      process.env.PATH = PATH
-    }
-    expect(runs()).toBe(1)
-    expect(existsSync(join(ROOT, 'ran'))).toBe(false)
+  it('what holds a link is not pinned for it either', async () => {
+    const pin = `--ro-bind ${ROOT}/holder ${ROOT}/holder `
+    const denied = inRoot(['holder/commands'])
+    expect(await wrapLinux(denied)).toContain(pin)
+    expect(
+      await wrapLinux(denied, { seccompConfig: { holdsLinks: false } }),
+    ).not.toContain(pin)
   })
 
   it('a link is listed by the latest wrap that met it', async () => {
@@ -886,12 +942,11 @@ describe.if(isLinux)('where no link is held', () => {
   })
 
   it('a wrap that throws names none', async () => {
-    const wrap = wrapLinux(inRoot(['first']), {
+    const refusal: unknown = await wrapLinux(inRoot(['first']), {
       allowAllUnixSockets: true,
       binShell: 'no-such-shell',
-    })
-    expect(wrap).rejects.toThrow('no-such-shell')
-    await wrap.catch(() => {})
+    }).catch((error: unknown) => error)
+    expect(String(refusal)).toContain('no-such-shell')
     expect(getLinuxUnheldLinks()).toEqual([])
   })
 
@@ -915,6 +970,17 @@ describe.if(isLinux)('where no link is held', () => {
       await SandboxManager.initialize({ ...config(false), seccomp: parsed })
       await SandboxManager.wrapWithSandbox('true')
       expect(SandboxManager.getLinuxUnheldLinks()).toEqual(unheld('told_no'))
+    })
+
+    it('getFsReadConfig() names the links its patterns match, as a wrap does', async () => {
+      const { filesystem, ...rest } = config(false)
+      await SandboxManager.initialize({
+        ...rest,
+        filesystem: { ...filesystem, denyRead: [join(ROOT, 'nam*')] },
+      })
+      expect(SandboxManager.getFsReadConfig().matchedLinks).toEqual(
+        inRoot(['name']),
+      )
     })
 
     it('lists them', async () => {
@@ -987,14 +1053,14 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
       run(helper(), ['--hold-link', join(ROOT, name), target, 'echo', 'ran']),
     ).toEqual({
       status: 1,
-      said: `apply-seccomp: --hold-link ${join(ROOT, name)}: ${why}\n`,
+      said: `apply-seccomp: --hold-link ${join(ROOT, name)}: ${why} (seccomp.holdsLinks: false in the sandbox configuration holds no link)\n`,
     })
   })
 
   it('holds a link it is given no word on', () => {
     expect(
       run(helper(), ['--hold-link', join(ROOT, 'name'), '', 'rm', 'name']).said,
-    ).toContain('Device or resource busy')
+    ).toMatch(BUSY)
   })
 
   // The filter answers first, whoever asks. Where it is lifted, this user lacks
@@ -1021,7 +1087,7 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
         `echo read > ${OUTSIDE}/x && ln -s x ${link} && ` +
         `exec ${helper()} --hold-link ${link} x sh -c 'rm ${link}; cat ${link}'`,
     ])
-    expect(said).toContain('Device or resource busy')
+    expect(said).toMatch(BUSY)
     expect(said).toContain('Too many levels of symbolic links')
     expect(said).not.toContain('read')
   })
@@ -1039,7 +1105,7 @@ describe.if(isLinux && bwrapCanNamespace())('the seccomp helper', () => {
         NAMESPACES_ALLOWED,
       )
       expect(said).toContain('started')
-      expect(said.match(/Device or resource busy/g)).toHaveLength(3)
+      expect(said.match(new RegExp(BUSY, 'gi'))).toHaveLength(3)
     },
   )
 

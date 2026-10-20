@@ -728,7 +728,10 @@ static void enter_user_namespace(void) {
 }
 
 static void die_holding(const char *path, const char *why) {
-    fprintf(stderr, "apply-seccomp: --hold-link %s: %s\n", path, why);
+    fprintf(stderr,
+            "apply-seccomp: --hold-link %s: %s (seccomp.holdsLinks: false in the "
+            "sandbox configuration holds no link)\n",
+            path, why);
     _exit(1);
 }
 

@@ -2002,6 +2002,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
+  const matchedLinks = new Set<string>()
   const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
     resolveReadDenies(
@@ -2012,7 +2013,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
           pattern,
           reExposedPaths,
           unlistableDenyDirs,
-          { anchor, listings },
+          { anchor, listings, matchedLinks },
         ),
     ),
   )
@@ -2021,6 +2022,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...(matchedLinks.size > 0 && { matchedLinks: [...matchedLinks] }),
     ...literalReadLists(
       config.filesystem.denyRead,
       config.filesystem.allowRead,
