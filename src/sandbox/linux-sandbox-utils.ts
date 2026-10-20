@@ -3063,6 +3063,10 @@ async function generateFilesystemArgs(
       // tools that expect a directory there. Whatever the order of denyPaths.
       const dest = findFirstNonExistentComponent(absentPath)
       decidedMountPoints.add(dest)
+      // The manifests are read before anything is made on the host (see
+      // makeableMountPoint). A plan refused for what they cannot tell would
+      // leave it there, and a clean-up in the same doubt removes nothing.
+      if (named === undefined) whatIsNamedNow()
       const kind = makeableMountPoint(
         dest,
         denyPathAncestors.has(dest)

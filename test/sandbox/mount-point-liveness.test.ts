@@ -2217,7 +2217,8 @@ describe.if(isLinux)(
 
     it('plans again when its manifest went to a directory settled on since the pins', async () => {
       // Nothing is pinned above that one. Both shared names are taken as the
-      // wrap reads the manifests, so it publishes in a directory of its own.
+      // wrap reads the manifests again, with the pins made, so it publishes in
+      // a directory of its own.
       const shared = [
         runtime.manifestDir(),
         join(tmpdir(), `srt-mount-points-${process.getuid!()}`),
@@ -2228,7 +2229,7 @@ describe.if(isLinux)(
         ...rest: unknown[]
       ) => {
         const names = (readdir as (...args: unknown[]) => unknown)(dir, ...rest)
-        if (dir === shared[1]) {
+        if (pinned && dir === shared[1]) {
           for (const name of shared) {
             fs.rmdirSync(name)
             writeFileSync(name, '')
@@ -2236,6 +2237,8 @@ describe.if(isLinux)(
         }
         return names
       }) as never)
+      let pinned = false
+      const pinning = beforeThePins(() => (pinned = true))
       let published = 0
       const publishing = atEachPublish(() => published++)
       try {
@@ -2247,6 +2250,7 @@ describe.if(isLinux)(
         expect(readdirSync(own)).toEqual([basename(recordedBy(command)!)])
       } finally {
         publishing.restore()
+        pinning.restore()
         spy.mockRestore()
         shared.forEach(name => rmSync(name))
       }
@@ -2290,12 +2294,23 @@ describe.if(isLinux)(
       expect(readdirSync(runtime.manifestDir())).toEqual([])
       expect(emptySources()).toEqual([])
 
-      // Before it publishes: what it made goes once a clean-up can tell.
+      // Before it publishes: what it made goes once a clean-up can tell. The
+      // manifests are read first, so the doubt comes as that is made.
       const junk = join(runtime.manifestDir(), '4242-00.json')
-      writeFileSync(junk, 'no manifest')
-      expect(await wrap('true', [LEAF]).catch((e: Error) => e.name)).toBe(
-        'LinuxSandboxProfileError',
-      )
+      const mkdtemp = fs.mkdtempSync
+      const spy = spyOn(fs, 'mkdtempSync').mockImplementation(((
+        ...args: unknown[]
+      ) => {
+        writeFileSync(junk, 'no manifest')
+        return (mkdtemp as (...args: unknown[]) => unknown)(...args)
+      }) as never)
+      try {
+        expect(await wrap('true', [LEAF]).catch((e: Error) => e.name)).toBe(
+          'LinuxSandboxProfileError',
+        )
+      } finally {
+        spy.mockRestore()
+      }
       expect(emptySources()).toHaveLength(1)
       rmSync(junk)
       cleanupBwrapMountPoints()

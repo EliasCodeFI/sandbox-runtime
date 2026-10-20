@@ -454,7 +454,6 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
       fs.chmodSync(join(BASE, 'run'), 0o700)
       const junk = join(manifests, '1-junk.json')
-      fs.writeFileSync(junk, '{}')
       const child = spawnSync(
         process.execPath,
         [
@@ -462,6 +461,11 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
           `const fs = require('node:fs')
            const statfs = fs.statfsSync
            fs.statfsSync = (...args) => ({ ...statfs(...args), type: ${V9FS_MAGIC} })
+           const open = fs.openSync
+           fs.openSync = (p, ...rest) => {
+             if (String(p).endsWith('/policy.json')) fs.writeFileSync(${JSON.stringify(junk)}, '{}')
+             return open(p, ...rest)
+           }
            const { wrapCommandWithSandboxLinux } = await import('./test/helpers/isolated/library.ts')
            const refused = await wrapCommandWithSandboxLinux({
              command: 'true',
@@ -481,43 +485,80 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       expect(listing()).toEqual(['own.empty'])
     })
 
-    it.each(['a forced clean-up', 'the next wrap and its clean-up'])(
-      'has what it made removed by %s when the plan comes to nothing',
-      async by => {
-        const absent = join(DIR, 'policy.json')
-        const own = join(DIR, 'own.empty')
-        fs.writeFileSync(own, '')
-        // What is no manifest puts the reading in doubt that the caller's empty
-        // file asks for, once the mount point has been made.
-        const manifests = join(
-          process.env['XDG_RUNTIME_DIR']!,
-          'srt-mount-points',
+    describe.each([
+      ['file', 'policy.json', 'policy.json', 'openSync'],
+      ['directory', 'absent/policy.json', 'absent', 'mkdirSync'],
+    ] as const)(
+      'when the plan comes to nothing, the %s it made',
+      (_kind, denied, made, makes) => {
+        it.each(['a forced clean-up', 'the next wrap and its clean-up'])(
+          'is removed by %s',
+          async by => {
+            const absent = join(DIR, denied)
+            const own = join(DIR, 'own.empty')
+            fs.writeFileSync(own, '')
+            // What is no manifest puts the readings in doubt, from the moment
+            // the mount point is made: the plan has read the manifests by then.
+            const manifests = join(
+              process.env['XDG_RUNTIME_DIR']!,
+              'srt-mount-points',
+            )
+            fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
+            stub(makes, p => {
+              if (names(p, join(DIR, made))) {
+                fs.writeFileSync(join(manifests, '1-junk.json'), '{}')
+              }
+              return undefined
+            })
+            try {
+              const refused = await wrap([absent, own]).then(
+                () => undefined,
+                (error: unknown) => error,
+              )
+              expect((refused as { code?: string }).code).toBe(
+                'mount_points_unreadable',
+              )
+            } finally {
+              fs.rmSync(join(manifests, '1-junk.json'))
+            }
+            expect(listing()).toEqual([made, 'own.empty'].sort())
+            if (by === 'a forced clean-up') {
+              cleanupBwrapMountPoints({ force: true })
+            } else {
+              expect(mountsAt(await wrap([absent, own]), absent)).toEqual([
+                `--ro-bind /dev/null ${absent}`,
+              ])
+              cleanupBwrapMountPoints()
+            }
+            expect(listing()).toEqual(['own.empty'])
+          },
         )
-        fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
-        fs.writeFileSync(join(manifests, '1-junk.json'), '{}')
-        try {
-          const refused = await wrap([absent, own]).then(
-            () => undefined,
-            (error: unknown) => error,
-          )
-          expect((refused as { code?: string }).code).toBe(
-            'mount_points_unreadable',
-          )
-        } finally {
-          fs.rmSync(join(manifests, '1-junk.json'))
-        }
-        expect(listing()).toEqual(['own.empty', 'policy.json'])
-        if (by === 'a forced clean-up') {
-          cleanupBwrapMountPoints({ force: true })
-        } else {
-          expect(mountsAt(await wrap([absent, own]), absent)).toEqual([
-            `--ro-bind /dev/null ${absent}`,
-          ])
-          cleanupBwrapMountPoints()
-        }
-        expect(listing()).toEqual(['own.empty'])
       },
     )
+
+    it('makes nothing while the manifests cannot be read, when no clean-up would remove it either', async () => {
+      const manifests = join(
+        process.env['XDG_RUNTIME_DIR']!,
+        'srt-mount-points',
+      )
+      fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(join(manifests, '1-junk.json'), '{}')
+      try {
+        const refused = await wrap([
+          join(DIR, 'policy.json'),
+          join(DIR, 'absent', 'policy.json'),
+        ]).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect((refused as { code?: string }).code).toBe(
+          'mount_points_unreadable',
+        )
+        expect(listing()).toEqual([])
+      } finally {
+        fs.rmSync(join(manifests, '1-junk.json'))
+      }
+    })
 
     it('covers a file with a directory in a folder that takes subfolders and no files', async () => {
       const denied = join(DIR, 'policy.json')
