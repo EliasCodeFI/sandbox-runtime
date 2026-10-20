@@ -2123,8 +2123,9 @@ describe.if(isLinux)(
 
     /**
      * Runs `then` when the wrap has decided where its mount points go and has
-     * yet to pin what lies above them: as it asks where the manifest directory
-     * really is, which is pinned too. It asks once in a plan.
+     * yet to pin what lies above them: as it asks where the directory they
+     * bind from really is, which is pinned too. It asks once in a plan that has
+     * a directory among them.
      */
     function beforeThePins(then: () => void): { restore(): void } {
       const native = fs.realpathSync.native
@@ -2132,7 +2133,7 @@ describe.if(isLinux)(
         dir: unknown,
         ...rest: unknown[]
       ) => {
-        if (dir === runtime.manifestDir()) then()
+        if (basename(String(dir)).startsWith('claude-empty-')) then()
         return (native as (...args: unknown[]) => unknown)(dir, ...rest)
       }) as never)
       return { restore: () => spy.mockRestore() }
@@ -2162,9 +2163,11 @@ describe.if(isLinux)(
           goes(published++ === 0 && !early),
         )
         const pinning = beforeThePins(() => goes(early))
+        // Absent from the first plan on, so that has a directory to bind from.
+        const other = join(AREA, 'proj', 'other')
         let command: string
         try {
-          command = await wrap('true', [spared, LEAF])
+          command = await wrap('true', [spared, LEAF, join(other, 'leaf')])
         } finally {
           pinning.restore()
           publishing.restore()
@@ -2178,7 +2181,9 @@ describe.if(isLinux)(
         // Nothing is left of the plan it gave up, nor of what only that named:
         // found there, the file would be the caller's own from now on.
         expect(command).toContain(`--ro-bind /dev/null ${spared}`)
-        expect(namedBy(command).sort()).toEqual([spared, DIRECTORY].sort())
+        expect(namedBy(command).sort()).toEqual(
+          [spared, DIRECTORY, other].sort(),
+        )
         expect(readdirSync(join(AREA, 'proj'))).toEqual([])
         expect(readdirSync(runtime.manifestDir())).toEqual([
           basename(recordedBy(command)!),
@@ -2325,6 +2330,32 @@ describe.if(isLinux)(
       } finally {
         publishing.restore()
         shared.forEach(name => rmSync(name))
+      }
+    })
+
+    it('is kept in directories that are bound where the plan found them, not where a link put at the name since leads', async () => {
+      // Bound last, that would lie on top of every read deny under it.
+      const shared = join(tmpdir(), `srt-mount-points-${process.getuid!()}`)
+      const elsewhere = join(BASE, 'elsewhere')
+      mkdirSync(elsewhere)
+      // As the wrap makes what its mount point binds from, in the deny loop.
+      const mkdtemp = fs.mkdtempSync
+      const spy = spyOn(fs, 'mkdtempSync').mockImplementation(((
+        ...args: unknown[]
+      ) => {
+        fs.rmdirSync(shared)
+        symlinkSync(elsewhere, shared)
+        return (mkdtemp as (...args: unknown[]) => unknown)(...args)
+      }) as never)
+      try {
+        const command = await wrap('true', [LEAF])
+        expect(lastMountAt(command, elsewhere)).toBeUndefined()
+        expect(lastMountAt(command, shared)).toBe(
+          `--ro-bind-try ${shared} ${shared}`,
+        )
+      } finally {
+        spy.mockRestore()
+        rmSync(shared)
       }
     })
 

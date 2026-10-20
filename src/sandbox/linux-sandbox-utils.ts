@@ -2259,7 +2259,7 @@ async function generateFilesystemArgs(
   // The mount points on the host this wrap relies on: placeholders bwrap makes
   // for absent deny paths, and another sandbox's that this wrap covers again.
   const mountPoints: string[] = []
-  // Where the manifests are kept.
+  // Where the manifests are kept, each where it really is.
   let manifestDirs: string[] = []
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
@@ -2801,9 +2801,9 @@ async function generateFilesystemArgs(
     // Made before any reading of them. What the environment names is believed
     // only while none of the others can be written, and what this wrap found
     // named there its own manifest would carry to where every process believes
-    // it.
+    // it. Resolved at once, while each is known for a directory and no link.
     try {
-      manifestDirs = mountPointManifestDirectories()
+      manifestDirs = mountPointManifestDirectories().map(canonicalForm)
     } catch (err) {
       throw new LinuxSandboxProfileError(
         'mount_points_unreadable',
@@ -3548,17 +3548,18 @@ async function generateFilesystemArgs(
   // with the temp dir strictly inside a write root a command could otherwise
   // rename the temp dir aside and make the name again.
   // With a manifest to come, where it goes is settled now, to be bound and
-  // pinned too, written or not: it may be a directory of the process's own.
+  // pinned too: it may be a directory of the process's own.
   if (mountPoints.length > 0 || emptySource !== undefined) {
     const own = ensureManifestDirectory()
-    if (own !== undefined) manifestDirs.push(own)
+    if (own !== undefined) manifestDirs.push(canonicalForm(own))
   }
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
-      ...[...manifestDirs, maskedFileStoreDir, emptySource].flatMap(dir =>
+      ...manifestDirs,
+      ...[maskedFileStoreDir, emptySource].flatMap(dir =>
         dir === undefined ? [] : [canonicalForm(dir)],
       ),
     ],
@@ -3819,7 +3820,8 @@ async function generateFilesystemArgs(
       [...madeIn].every(relied => isThere(relied, true)) &&
       mountPointsReliedOn(manifest?.file).every(dir => names.includes(dir)) &&
       // Else settled on since the pins were made: nothing is pinned above it.
-      (manifest === undefined || manifestDirs.includes(manifest.dir))
+      (manifest === undefined ||
+        manifestDirs.includes(canonicalForm(manifest.dir)))
   } finally {
     if (!holds && manifest !== undefined) {
       discardMountPointManifest(manifest.file)
@@ -3866,7 +3868,7 @@ async function generateFilesystemArgs(
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
     // Each where it really is, once: two of the names may lead to one place.
-    const others = new Set(manifestDirs.map(canonicalForm))
+    const others = new Set(manifestDirs)
     if (manifest !== undefined) others.delete(canonicalForm(manifest.dir))
     for (const dir of others) {
       if (isInReach(dir)) args.push('--ro-bind-try', dir, dir)
