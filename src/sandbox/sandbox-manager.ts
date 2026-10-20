@@ -41,13 +41,13 @@ import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
-import {
-  FilesystemConfigSchema,
-  type CredentialsConfig,
-  type FilesystemPathEntry,
-  type SandboxRuntimeConfig,
-  type SeccompConfig,
+import type {
+  CredentialsConfig,
+  FilesystemPathEntry,
+  SandboxRuntimeConfig,
+  SeccompConfig,
 } from './sandbox-config.js'
+import { FilesystemConfigSchema } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   CredentialRestrictionConfig,
@@ -1918,11 +1918,8 @@ function* resolveReadPathEntries(
       !literal.has(p) &&
       containsGlobChars(stripped)
     ) {
-      for (const found of yield* withOtherReadings(
-        p,
-        stripped,
-        kind,
-        expandGlob,
+      for (const found of yield* withinBudget(
+        withOtherReadings(p, stripped, kind, expandGlob),
       )) {
         resolved.add(found)
       }
@@ -1976,60 +1973,33 @@ function readGlobBudget(
   )
 }
 
-/** `walk`, which is of `pattern`, with a budget that runs out in it told as
+/** `walk`, with a budget that runs out in it told as
  *  {@link LinuxSandboxProfileError} `deny_glob_too_large`. */
-function* withinBudget<T>(pattern: string, walk: Steps<T>): Steps<T> {
+function* withinBudget<T>(walk: Steps<T>): Steps<T> {
   try {
     return yield* walk
   } catch (error) {
     if (!(error instanceof GlobWalkBudgetError)) throw error
     throw new LinuxSandboxProfileError(
       'deny_glob_too_large',
-      `Pattern "${pattern}" could not be expanded: the allowRead, denyRead and credentials.files patterns of one ` +
-        `configuration share ${error.maxEntries} directory entries and ${error.timeoutMs} ms, and the ${error.exhausted} ran out ` +
-        `with ${error.entries} entries read after ${error.elapsedMs} ms, while listing ${error.directory}; ` +
+      `${error.message}; the allowRead, denyRead and credentials.files patterns of one configuration share the budget: ` +
         `narrow the pattern, remove or move what it walks into, or raise filesystem.denyReadGlobBudget`,
       error,
     )
   }
 }
 
-function allowReadGlobExpander(
+function* expandAllowReadGlob(
   budget: GlobWalkBudget,
-): (pattern: string, anchor?: string) => Steps<string[]> {
-  return function* (pattern, anchor) {
-    const expanded = (yield* withinBudget(
-      pattern,
-      walkGlobPatternSteps(pattern, { anchor, budget }),
-    )).matches
-    logForDebugging(
-      `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
-    )
-    return expanded
-  }
-}
-
-/**
- * The expansion of every denyRead glob of one read configuration, on Linux,
- * listing each directory once between them, in `listings`, which a caller that
- * goes on to other work hands in to empty it afterwards.
- */
-function readDenyGlobExpander(
-  reExposedPaths: readonly string[],
-  unlistableDenyDirs: Set<string>,
-  budget: GlobWalkBudget,
-  listings: GlobWalkListings = new Map(),
-): (pattern: string, anchor?: string) => Steps<string[]> {
-  return (pattern, anchor) =>
-    withinBudget(
-      pattern,
-      expandReadDenyGlobLinuxSteps(
-        pattern,
-        reExposedPaths,
-        unlistableDenyDirs,
-        { anchor, budget, listings },
-      ),
-    )
+  pattern: string,
+  anchor?: string,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor, budget }))
+    .matches
+  logForDebugging(
+    `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
+  )
+  return expanded
 }
 
 /**
@@ -2038,8 +2008,7 @@ function readDenyGlobExpander(
  * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
  * to wrapCommandWithSandboxLinux with a different one. Marked entries are
- * in the `literal…` lists, as spelled: pass the object on whole. Throws
- * {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does.
+ * in the `literal…` lists, as spelled: pass the object on whole.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -2059,7 +2028,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     resolveReadPathEntries(
       'allow',
       config.filesystem.allowRead ?? [],
-      allowReadGlobExpander(budget),
+      (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
     ),
   )
   const reExposedPaths = reExposedBy(
@@ -2068,11 +2037,18 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
+  const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
     resolveReadDenies(
       config.filesystem.denyRead,
       credentialRestrictions,
-      readDenyGlobExpander(reExposedPaths, unlistableDenyDirs, budget),
+      (pattern, anchor) =>
+        expandReadDenyGlobLinuxSteps(
+          pattern,
+          reExposedPaths,
+          unlistableDenyDirs,
+          { anchor, budget, listings },
+        ),
     ),
   )
 
@@ -2635,7 +2611,7 @@ async function wrapWithSandboxOnce(
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
-        allowReadGlobExpander(budget),
+        (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
       ),
     )
     if (expandedAllowRead === REPLACED) return startOver()
@@ -2662,12 +2638,13 @@ async function wrapWithSandboxOnce(
       resolveReadDenies(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
         credentialRestrictions,
-        readDenyGlobExpander(
-          reExposedPaths,
-          unlistableDenyDirs,
-          budget,
-          listings,
-        ),
+        (pattern, anchor) =>
+          expandReadDenyGlobLinuxSteps(
+            pattern,
+            reExposedPaths,
+            unlistableDenyDirs,
+            { anchor, budget, listings },
+          ),
       ),
     )
     // Emptied by hand: a runtime may keep what this function has named for as

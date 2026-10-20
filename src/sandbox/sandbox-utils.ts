@@ -1252,14 +1252,6 @@ export interface ExpandGlobOptions {
   anchor?: string
 }
 
-/** The most directory entries the glob walks of one read configuration read
- *  from disk, all its patterns together, unless
- *  `filesystem.denyReadGlobBudget` sets another. */
-export const GLOB_WALK_MAX_ENTRIES = 20_000_000
-
-/** The longest they take, all together, in milliseconds; likewise. */
-export const GLOB_WALK_TIMEOUT_MS = 60_000
-
 /**
  * What the walks handed it may spend between them: one count and one clock,
  * so the patterns of one configuration cannot each spend a full one.
@@ -1280,8 +1272,8 @@ export function newGlobWalkBudget(
   limits: { maxEntries?: number; timeoutMs?: number } = {},
 ): GlobWalkBudget {
   return {
-    maxEntries: limits.maxEntries ?? GLOB_WALK_MAX_ENTRIES,
-    timeoutMs: limits.timeoutMs ?? GLOB_WALK_TIMEOUT_MS,
+    maxEntries: limits.maxEntries ?? 20_000_000,
+    timeoutMs: limits.timeoutMs ?? 60_000,
     startedAt: performance.now(),
     entries: 0,
   }
@@ -1292,33 +1284,27 @@ export function newGlobWalkBudget(
  * found is not handed back: a deny list cut short is a path left readable.
  */
 export class GlobWalkBudgetError extends Error {
-  /** The pattern being walked, as the caller wrote it. */
-  readonly pattern: string
-  /** The directory the walk was listing. */
-  readonly directory: string
   /** Which limit was reached. */
   readonly exhausted: 'entries' | 'time'
   /** The entries read under the budget, by this walk and those before. */
   readonly entries: number
   /** Milliseconds since the budget was made. */
   readonly elapsedMs: number
-  /** The entries the budget allowed. */
   readonly maxEntries: number
-  /** The milliseconds it allowed. */
   readonly timeoutMs: number
   constructor(
-    pattern: string,
-    directory: string,
-    exhausted: 'entries' | 'time',
+    /** The pattern being walked, as the caller wrote it. */
+    readonly pattern: string,
+    /** The directory the walk was listing. */
+    readonly directory: string,
     budget: GlobWalkBudget,
   ) {
+    const exhausted = budget.entries > budget.maxEntries ? 'entries' : 'time'
     const elapsedMs = Math.round(performance.now() - budget.startedAt)
     super(
-      `Glob pattern ${pattern} was not walked to the end: ${budget.entries} directory entries read in ${elapsedMs} ms (the budget is ${budget.maxEntries} entries and ${budget.timeoutMs} ms), stopped while listing ${directory}`,
+      `Pattern "${pattern}" could not be expanded: the ${exhausted} ran out with ${budget.entries} of ${budget.maxEntries} directory entries read after ${elapsedMs} of ${budget.timeoutMs} ms, while listing ${directory}`,
     )
     this.name = 'GlobWalkBudgetError'
-    this.pattern = pattern
-    this.directory = directory
     this.exhausted = exhausted
     this.entries = budget.entries
     this.elapsedMs = elapsedMs
@@ -1410,11 +1396,6 @@ export interface GlobWalk {
    *  what was found through a symlinked directory, which is reported where
    *  it really lives to begin with. */
   realOf: Map<string, string>
-  /** How many directories were gone through, whoever read them from disk. */
-  directoriesListed: number
-  /** How many of their entries were looked at: each once for every time the
-   *  pattern called for its directory. */
-  entriesExamined: number
 }
 
 /**
@@ -1715,8 +1696,6 @@ export function* walkGlobPatternSteps(
     uninspectableLinks: new Set(),
     unlisted: [],
     realOf: new Map(),
-    directoriesListed: 0,
-    entriesExamined: 0,
   }
 
   // Beneath an anchor the pattern is the tail alone, so no character of the
@@ -1814,11 +1793,11 @@ export function* walkGlobPatternSteps(
     const budget = opts.budget
     if (budget === undefined) return
     budget.entries += read
-    if (budget.entries > budget.maxEntries) {
-      throw new GlobWalkBudgetError(globPath, dir, 'entries', budget)
-    }
-    if (performance.now() - budget.startedAt >= budget.timeoutMs) {
-      throw new GlobWalkBudgetError(globPath, dir, 'time', budget)
+    if (
+      budget.entries > budget.maxEntries ||
+      performance.now() - budget.startedAt >= budget.timeoutMs
+    ) {
+      throw new GlobWalkBudgetError(globPath, dir, budget)
     }
   }
   const codeOf = (err: unknown): string | undefined =>
@@ -2040,11 +2019,8 @@ export function* walkGlobPatternSteps(
       }
       continue
     }
-    if (record.listedFor.size === 0) walk.directoriesListed++
     for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
-      // Before the skip below: an entry it passes over was looked at too.
-      walk.entriesExamined++
       spend(dir, known === undefined ? 1 : 0)
       // Nearly every entry of a large tree: a plain file the pattern does not
       // match, which nothing below records. A pattern that splits is matched

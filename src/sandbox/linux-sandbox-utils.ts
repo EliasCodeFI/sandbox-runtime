@@ -983,8 +983,7 @@ export type LinuxSandboxProfileErrorCode =
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
  * configuration expands to, with the mandatory denies of the working
  * directory, is past a limit, or, for `command_too_long` and `nul_in_path`,
- * what the caller passed in is; for `deny_glob_too_large` the profile could
- * not be worked out at all. The command was not run and no
+ * what the caller passed in is. The command was not run and no
  * profile file stays open, so do not run the per-command cleanup
  * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
  * threw: it would release a second time, and a sandbox still running would
