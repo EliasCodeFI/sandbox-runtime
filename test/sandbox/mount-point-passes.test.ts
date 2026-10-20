@@ -248,7 +248,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       }) as never),
     ]
     try {
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spies.forEach(spy => spy.mockRestore())
     }
@@ -272,7 +272,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       unlink(file)
     }) as never)
     try {
-      collectMountPoints()
+      collectMountPoints('all')
     } finally {
       spy.mockRestore()
     }
@@ -286,7 +286,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     manifestOfADeadProcess([LOCK], anotherProcess())
     const open = spyOn(fs, 'openSync')
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(
         open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
       ).toEqual([])
@@ -309,7 +309,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       return (open as (...args: unknown[]) => number)(file, ...rest)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
@@ -318,7 +318,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     expect(readdirSync(DIR)).toEqual([
       basename(manifest).replace(/json$/, 'finished'),
     ])
-    expect(collectMountPoints()).toEqual([LOCK])
+    expect(collectMountPoints('all')).toEqual([LOCK])
   })
 
   it('still removes what this process could record nowhere, on a disk that takes neither a manifest nor a record', () => {
@@ -349,7 +349,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     try {
       expect(publishMountPointManifest([LOCK], [])).toBeUndefined()
       leftover(LOCK)
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spies.forEach(spy => spy.mockRestore())
     }
@@ -361,7 +361,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     writeFileSync(join(DIR, '1-0123456789abcdef.json'), '{"version":"?"}')
     const open = spyOn(fs, 'openSync')
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(
         open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
       ).toEqual([])
@@ -379,7 +379,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       return now()
     })
     try {
-      expect(() => collectMountPoints()).toThrow('a bug')
+      expect(() => collectMountPoints('all')).toThrow('a bug')
     } finally {
       spy.mockRestore()
     }
@@ -425,14 +425,14 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       }) as never)
       try {
         // Children first, which among siblings is the later name first.
-        expect(collectMountPoints()).toEqual([second])
+        expect(collectMountPoints('all')).toEqual([second])
       } finally {
         spy.mockRestore()
         clock.mockRestore()
       }
       expect(existsSync(LOCK)).toBe(true)
       expect(passes()).toEqual([])
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     },
   )
 
@@ -463,13 +463,13 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
           return result
         }) as never)
         try {
-          expect(collectMountPoints()).toEqual([])
+          expect(collectMountPoints('all')).toEqual([])
         } finally {
           spy.mockRestore()
           clock.mockRestore()
         }
         if (heldUpIn === 'readdirSync') expect(listings).toBe(2)
-        expect(collectMountPoints()).toEqual([LOCK])
+        expect(collectMountPoints('all')).toEqual([LOCK])
       }
     },
   )
@@ -513,7 +513,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   ])('is over when %s, and the next pass drops its record', (_what, plant) => {
     const pass = plant()
     expect(passesUnderWay()).toEqual([])
-    collectMountPoints()
+    collectMountPoints('all')
     expect(existsSync(pass)).toBe(false)
   })
 
@@ -541,16 +541,16 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       expect(passesUnderWay()).toEqual([pass])
       aged(pass, 59_000)
       expect(passesUnderWay()).toEqual([pass])
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(true)
       aged(pass, 61_000)
       expect(passesUnderWay()).toEqual([])
       // Its record is not this process's to drop: its own may be stopped half
       // way, and those who can ask after it still wait for it.
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(true)
       aged(pass, 8 * 24 * 60 * 60 * 1000)
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(false)
     },
   )
@@ -568,13 +568,13 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       unlink(file)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spy.mockRestore()
     }
     expect(passes()).toHaveLength(1)
     expect(passesUnderWay()).toEqual([])
-    collectMountPoints()
+    collectMountPoints('all')
     expect(passes()).toEqual([])
   })
 
@@ -791,7 +791,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
             `  }`,
             `  unlink(file)`,
             `})`,
-            `m.collectMountPoints()`,
+            `m.collectMountPoints('all')`,
           ]),
         ],
         { stdio: 'ignore' },
@@ -849,7 +849,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       [
         script('cleaner.ts', [
           `const m = await import(${MODULE})`,
-          `m.collectMountPoints()`,
+          `m.collectMountPoints('all')`,
         ]),
       ],
       { encoding: 'utf8', timeout: 30000 },
@@ -898,9 +898,9 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
           ? [anotherProcess(), ...gone]
           : [...gone, anotherProcess()]),
       )
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       started(manifest, ...gone)
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     },
   )
 
@@ -914,7 +914,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       record,
       line.repeat(Math.ceil((4 * 1024 * 1024 + 1) / line.length)),
     )
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(LOCK)).toBe(true)
   })
 
@@ -980,7 +980,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     const pass = passOf(exited)
     expect(passesUnderWay()).toEqual([])
     expect([...(liveMountPoints() ?? [])]).toEqual([])
-    expect(collectMountPoints()).toEqual([LOCK])
+    expect(collectMountPoints('all')).toEqual([LOCK])
     expect(existsSync(pass)).toBe(false)
     // Still there to be asked after: it is what it says that counts.
     expect(existsSync(`/proc/${pid}`)).toBe(true)

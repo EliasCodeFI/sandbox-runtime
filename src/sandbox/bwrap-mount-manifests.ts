@@ -285,7 +285,6 @@ export type OwnManifestRelease =
 let manifestDirectory: string | undefined
 // Whether that is the last resort below, which no other process knows of.
 let manifestDirectoryIsPrivate = false
-let directoryFailureLogged = false
 // Set once the last resort has been tried and found wanting, so a process on a
 // temp dir that keeps no modes does not make a fresh directory on every call.
 let manifestDirectoryUnavailable = false
@@ -437,9 +436,7 @@ function olderThan(file: string, ms: number, absent = false): boolean {
  */
 function isOurPrivateDirectory(
   dir: string,
-  orThrow = false,
-  toWrite = true,
-  alone = true,
+  { orThrow = false, toWrite = true, alone = true } = {},
 ): boolean {
   try {
     const stat = fs.lstatSync(dir)
@@ -543,7 +540,11 @@ function fixedManifestDirectoryNames(
   const runtimeDir = path.join(root, 'run/user', String(uid))
   return [
     path.join(root, 'var/tmp', `srt-mount-points-${uid}`),
-    ...(isOurPrivateDirectory(runtimeDir, orThrow, false, toWrite)
+    ...(isOurPrivateDirectory(runtimeDir, {
+      orThrow,
+      toWrite: false,
+      alone: toWrite,
+    })
       ? [path.join(runtimeDir, 'srt-mount-points')]
       : []),
     path.join(root, 'tmp', `srt-mount-points-${uid}`),
@@ -587,14 +588,14 @@ function sharedManifestDirectoryNames(
  */
 function believedManifestDirectories(): string[] {
   const names = fixedManifestDirectoryNames(true, true).some(dir =>
-    isOurPrivateDirectory(dir, true),
+    isOurPrivateDirectory(dir, { orThrow: true }),
   )
     ? fixedManifestDirectoryNames(true)
     : sharedManifestDirectoryNames(true)
   if (manifestDirectory !== undefined) names.push(manifestDirectory)
   const byIdentity = new Map<string, string>()
   for (const dir of names) {
-    if (!isOurPrivateDirectory(dir, true, false)) continue
+    if (!isOurPrivateDirectory(dir, { orThrow: true, toWrite: false })) continue
     let identity: string
     try {
       // As big integers: a number does not hold every inode number apart.
@@ -665,13 +666,10 @@ function ensureManifestDirectory(): string | undefined {
     return private_
   } catch (e) {
     manifestDirectoryUnavailable = true
-    if (!directoryFailureLogged) {
-      directoryFailureLogged = true
-      logForDebugging(
-        `[Sandbox Linux] No directory for mount point manifests (${String(e)}) - the mount points this process makes are kept in memory and removed at its own clean-up`,
-        { level: 'warn' },
-      )
-    }
+    logForDebugging(
+      `[Sandbox Linux] No directory for mount point manifests (${String(e)}) - the mount points this process makes are kept in memory and removed at its own clean-up`,
+      { level: 'warn' },
+    )
     return undefined
   }
 }
@@ -704,7 +702,7 @@ export function mountPointManifestDirectories(recording = false): string[] {
   // is not "not there": left unbound on that, it is believed again a moment
   // later, by this process and by every other.
   const isToBeBound = (dir: string): boolean =>
-    isOurPrivateDirectory(dir, true, false, false)
+    isOurPrivateDirectory(dir, { orThrow: true, toWrite: false, alone: false })
   for (const candidate of sharedManifestDirectoryNames(true)) {
     makeOurPrivateDirectory(candidate)
     if (isToBeBound(candidate)) {
@@ -1567,9 +1565,7 @@ export function holdsMountPointManifest(file: string): boolean {
  * at any time, any number of times. Returns the mount points removed. Does
  * nothing anywhere but on Linux.
  */
-export function collectMountPoints(
-  release: OwnManifestRelease = 'all',
-): string[] {
+export function collectMountPoints(release: OwnManifestRelease): string[] {
   if (!onLinux()) {
     return []
   }
@@ -1916,5 +1912,4 @@ export function forgetMountPointManifestDirectory(): void {
   manifestDirectory = undefined
   manifestDirectoryIsPrivate = false
   manifestDirectoryUnavailable = false
-  directoryFailureLogged = false
 }
