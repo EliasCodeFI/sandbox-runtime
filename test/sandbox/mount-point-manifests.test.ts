@@ -25,6 +25,7 @@ import {
   collectMountPoints,
   discardMountPointManifest,
   forgetMountPointManifestDirectory,
+  keepTrackOfMountPoint,
   liveMountPoints,
   mountPointManifestDirectories,
   namedMountPoints,
@@ -3018,6 +3019,22 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect([...reads(namedMountPoints(first, own)).paths].sort()).toEqual(
       [X, Y, Z].sort(),
     )
+  })
+
+  it('names what a plan has made on the host itself from that moment, until a manifest names it', () => {
+    const first = reads(namedMountPoints())
+    keepTrackOfMountPoint(X)
+    leftover(X)
+    expect([...reads(namedMountPoints(first)).paths]).toEqual([X])
+
+    // From then on it is the manifest's, and goes with that.
+    publishMountPointManifest([X], [], 'the command')
+    expect(collectMountPoints({ commandKey: 'the command' })).toEqual([X])
+    // What the user puts there afterwards is the user's.
+    writeFileSync(X, '')
+    expect(named()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
+    expect(existsSync(X)).toBe(true)
   })
 
   it('is one listing of the directory, and changes nothing in it', () => {

@@ -228,17 +228,27 @@ const ownManifests = new Map<
 >()
 
 /**
- * The mount points, and the directories they bind from, of wraps that could
- * record them nowhere. No other process knows of them, so they are this
- * process's to remove once none of its wraps is outstanding: in a pass like
- * any other where there is a directory by then, so that a path another
- * process's manifest names is kept, and on its own word where there is none.
+ * The mount points, and the directories they bind from, that no manifest names:
+ * of wraps that could record them nowhere, and what a plan has made on the host
+ * itself until its manifest is published, which takes it out of here. No other
+ * process knows of them, so they are this process's to remove once none of its
+ * wraps is outstanding: in a pass like any other where there is a directory by
+ * then, so that a path another process's manifest names is kept, and on its own
+ * word where there is none.
  */
 const unrecorded = { paths: new Set<string>(), sources: new Set<string>() }
 
 /** Has `source` removed at this process's own clean-up if no manifest keeps it. */
 export function keepTrackOfMountSource(source: string): void {
   unrecorded.sources.add(source)
+}
+
+/**
+ * The same for a mount point that a plan has made on the host itself, from then
+ * until a manifest names it: the plan may come to nothing before that.
+ */
+export function keepTrackOfMountPoint(mountPoint: string): void {
+  unrecorded.paths.add(mountPoint)
 }
 
 /**
@@ -1041,7 +1051,7 @@ export type MountPointManifest = {
  * `undefined` when there is nothing to record or no manifest could be written.
  * What could not be recorded is kept in memory and removed at this process's
  * own clean-up, since no other process will know of it. `too-large`, with
- * nothing written or kept, for one its own reader would refuse: every pass of
+ * nothing written or added to that, for one its own reader would refuse: every pass of
  * every process would turn back at it.
  */
 export function publishMountPointManifest(
@@ -1079,6 +1089,7 @@ export function publishMountPointManifest(
       fs.writeFileSync(temporary, text, { mode: 0o600 })
       fs.renameSync(temporary, file)
       ownManifests.set(file, { commandKey, over: false })
+      for (const mountPoint of mountPoints) unrecorded.paths.delete(mountPoint)
       return { dir, file, started: `${id}${STARTED_SUFFIX}` }
     } catch (e) {
       try {
@@ -1297,6 +1308,8 @@ export function namedMountPoints(
     const dirs = onLinux() ? believedManifestDirectories() : []
     if (
       earlier !== undefined &&
+      // What a plan has made itself since then is named from that moment.
+      [...unrecorded.paths].every(kept => earlier.paths.has(kept)) &&
       filesIn(dirs).every(file => earlier.listed.has(file) || file === own)
     ) {
       return earlier

@@ -13,6 +13,7 @@ import {
   collectMountPoints,
   discardMountPointManifest,
   holdsMountPointManifest,
+  keepTrackOfMountPoint,
   keepTrackOfMountSource,
   kindOfMountPoint,
   mountPointManifestDirectories,
@@ -363,6 +364,11 @@ function makeableMountPoint(
       throw err
     }
   }
+  /** Until a manifest names it, and should the process end before one does. */
+  const keepTrackOf = (made: string): void => {
+    keepTrackOfMountPoint(made)
+    registerExitCleanupHandler()
+  }
   let fd: number | undefined
   try {
     // One descriptor answers every question, through /proc: a command still
@@ -394,7 +400,8 @@ function makeableMountPoint(
     // On a Windows drive the Windows ACL decides, and nothing on this side
     // tells it: every directory there is this user's, with a mode that lets it
     // write, also one that takes subfolders and no files. So the mount point
-    // is made here instead of by bubblewrap, which finds it there.
+    // is made here instead of by bubblewrap, which finds it there. No manifest
+    // names it yet, and the plan may be given up before one does.
     if (refusal === undefined) {
       const entry = `${parent}/${path.basename(dest)}`
       if (
@@ -402,9 +409,11 @@ function makeableMountPoint(
         refusalOf(() => fs.closeSync(fs.openSync(entry, 'wx', 0o444))) ===
           undefined
       ) {
+        keepTrackOf(dest)
         return MountPointKind.File
       }
       if (refusalOf(() => fs.mkdirSync(entry)) === undefined) {
+        keepTrackOf(dest)
         return MountPointKind.Directory
       }
     }
@@ -709,8 +718,9 @@ function ensureEmptyMountSourceDir(): string {
   // directory lands on 0500. Set the mode here rather than let the check
   // above reject the directory this call has just made.
   fs.chmodSync(emptyMountSourceDir, 0o700)
-  // The wrap may throw before a manifest names it.
+  // The wrap may throw before a manifest names it, and the process end then.
   keepTrackOfMountSource(emptyMountSourceDir)
+  registerExitCleanupHandler()
   return emptyMountSourceDir
 }
 
