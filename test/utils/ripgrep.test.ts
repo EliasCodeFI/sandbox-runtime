@@ -100,6 +100,30 @@ describe('ripGrep', () => {
     }
   })
 
+  it('says what had been listed when it rejects', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rg-listed-'))
+    try {
+      const script = join(dir, 'lists-then-fails.cjs')
+      writeFileSync(
+        script,
+        "process.stdout.write('one\\0two\\0half a pa'); process.stderr.write('went wrong'); process.exitCode = 2",
+      )
+
+      const error: unknown = await ripGrep(
+        [],
+        dir,
+        new AbortController().signal,
+        { command: process.execPath, args: [script] },
+      ).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(RipgrepError)
+      expect((error as RipgrepError).listed).toEqual(['one', 'two'])
+      expect((error as RipgrepError).stderr).toBe('went wrong')
+    } finally {
+      rmSync(dir, { recursive: true })
+    }
+  })
+
   it('rejects on exit code > 1', () => {
     expect(
       ripGrep(['--invalid-flag-xyz'], '.', new AbortController().signal),
@@ -124,7 +148,7 @@ describe('ripGrep', () => {
       }).catch((e: unknown) => e)
 
       expect(error).toBeInstanceOf(RipgrepError)
-      expect((error as RipgrepError).partialMatches).toEqual(['/found/a'])
+      expect((error as RipgrepError).listed).toEqual(['/found/a'])
       expect((error as RipgrepError).stderr).toContain('/found/locked')
       expect((error as RipgrepError).timedOut).toBe(false)
     },
@@ -148,7 +172,7 @@ describe('ripGrep', () => {
 
         expect(error).toBeInstanceOf(RipgrepError)
         expect((error as RipgrepError).timedOut).toBe(true)
-        expect((error as RipgrepError).partialMatches).toEqual(['/found/a'])
+        expect((error as RipgrepError).listed).toEqual(['/found/a'])
       } finally {
         rmSync(dir, { recursive: true })
       }
@@ -225,9 +249,7 @@ describe('ripGrep', () => {
         ).catch((e: unknown) => e)
 
         expect(error).toBeInstanceOf(RipgrepError)
-        expect((error as RipgrepError).partialMatches).toEqual([
-          join(dir, 'a.txt'),
-        ])
+        expect((error as RipgrepError).listed).toEqual([join(dir, 'a.txt')])
         // The caller denies what rg could not read, so the paths must survive.
         expect((error as RipgrepError).stderr).toContain(join(dir, 'locked'))
         expect((error as RipgrepError).timedOut).toBe(false)

@@ -26,7 +26,9 @@ import {
   lastMountAt,
 } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { leaveManifestNaming } from '../helpers/leftover-manifest.js'
 import { isLinux } from '../helpers/platform.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 /**
  * The mount point for a file git reads back (`commondir`, `config.worktree`)
@@ -42,6 +44,7 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
   const BOOTED = 'BOOTED'
   const WROTE_GIT_DIR = 'WROTE_GIT_DIR'
   const LIVE = bwrapCanNamespace()
+  const runtime = usePrivateManifestDirectory()
   let dir: string
   const savedCwd = process.cwd()
 
@@ -81,9 +84,10 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
     chmodSync(file, mode)
   }
 
-  /** The shape bubblewrap's own ensure_file() leaves behind. */
+  /** What bubblewrap's own ensure_file() makes, left by a killed process. */
   function leaveStaleMountPoint(file: string): void {
     writeWithMode(file, '', 0o444)
+    leaveManifestNaming(runtime.manifestDir(), [file])
   }
 
   /**
@@ -286,7 +290,8 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
 
     // The swap landed at least once, and at least once between the wrapper
     // finding the stale file and rewriting it, which is where it gives up on
-    // the file and denies the directory instead.
+    // the file and plans again: an entry that is a link has the directory
+    // denied whole.
     expect(outcomes.length).toBeGreaterThan(1)
     expect(outcomes).toContain('git directory denied whole')
   })
@@ -320,8 +325,9 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
       })
     })
 
+    // It plans again there too, and finds somebody's file, bound from itself.
     expect(outcomes.length).toBeGreaterThan(1)
-    expect(outcomes).toContain('git directory denied whole')
+    expect(new Set(outcomes)).toEqual(new Set(['file denied']))
   })
 
   /**
@@ -431,7 +437,9 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
    */
   describe('what is bound, by what was there', () => {
     const ownerCannotWrite = process.getuid?.() !== 0
-    type Before = { contents: string; mode: number } | undefined
+    /** `named` by the manifest a killed wrap left, which makes it a mount
+     *  point. Anything else that is there is somebody's file. */
+    type Before = { contents: string; mode: number; named?: true } | undefined
     type Expected = {
       /** 'itself', or the bytes of the placeholder file bound instead. */
       boundFrom: 'itself' | { placeholder: string }
@@ -467,7 +475,7 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
       {
         name: 'a commondir placeholder a killed wrap left',
         file: 'commondir',
-        before: { contents: '.\n', mode: 0o444 },
+        before: { contents: '.\n', mode: 0o444, named: true },
         expected: {
           boundFrom: { placeholder: '.\n' },
           during: { contents: '.\n', mode: 0o444 },
@@ -477,7 +485,7 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
       {
         name: 'a config.worktree placeholder a killed wrap left',
         file: 'config.worktree',
-        before: { contents: '', mode: 0o444 },
+        before: { contents: '', mode: 0o444, named: true },
         expected: {
           boundFrom: { placeholder: '' },
           during: { contents: '', mode: 0o444 },
@@ -515,15 +523,45 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
         },
       },
       {
-        name: 'an empty read-only commondir, the shape bubblewrap leaves',
+        name: 'an empty commondir bubblewrap made, which a killed wrap left',
         file: 'commondir',
-        before: { contents: '', mode: 0o444 },
+        before: { contents: '', mode: 0o444, named: true },
         expected: {
           boundFrom: { placeholder: '.\n' },
           // Rewritten in place; made writable for that only where the owner
           // of a read-only file cannot write it as it is.
           during: { contents: '.\n', mode: ownerCannotWrite ? 0o644 : 0o444 },
           removedByCleanup: true,
+        },
+      },
+      {
+        name: "a commondir that holds what the placeholder does, and is nobody's leftover",
+        file: 'commondir',
+        before: { contents: '.\n', mode: 0o444 },
+        expected: {
+          boundFrom: 'itself',
+          during: { contents: '.\n', mode: 0o444 },
+          removedByCleanup: false,
+        },
+      },
+      {
+        name: "an empty read-only commondir that is nobody's leftover",
+        file: 'commondir',
+        before: { contents: '', mode: 0o444 },
+        expected: {
+          boundFrom: { placeholder: '.\n' },
+          during: { contents: '', mode: 0o444 },
+          removedByCleanup: false,
+        },
+      },
+      {
+        name: "an empty read-only config.worktree that is nobody's leftover",
+        file: 'config.worktree',
+        before: { contents: '', mode: 0o444 },
+        expected: {
+          boundFrom: 'itself',
+          during: { contents: '', mode: 0o444 },
+          removedByCleanup: false,
         },
       },
       {
@@ -555,6 +593,7 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
         if (before !== undefined) {
           writeWithMode(dest, before.contents, before.mode)
         }
+        if (before?.named) leaveManifestNaming(runtime.manifestDir(), [dest])
 
         const command = await wrapIn(checkout)
 

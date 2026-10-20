@@ -1,3 +1,5 @@
+import { existsSync, realpathSync } from 'node:fs'
+import { basename } from 'node:path'
 import { quote } from '../../src/utils/shell-quote.js'
 
 /** The $0 renderBwrapInvocation gives the shell that opens an over-long
@@ -5,8 +7,33 @@ import { quote } from '../../src/utils/shell-quote.js'
  * file and not in the command. */
 const ARGS_FILE_ARGV0 = 'srt-args'
 
+/**
+ * How a wrapped command that takes steps of its own before bubblewrap begins, on
+ * this host: bash where it is at one of its two usual places, else /bin/sh.
+ */
+export const STEP_SHELL = ((): string => {
+  const bash =
+    ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell)) ??
+    ['/bin/sh'].find(shell => basename(realpathSync(shell)) === 'bash')
+  return bash === undefined ? '/bin/sh -c' : `${bash} -p -c`
+})()
+
+/** The step that puts the command on its manifest's started record. */
+export const RECORD_STEP =
+  'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1" && shift'
+
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']
+
+/** How many words follow each mount flag this generator emits. */
+const MOUNT_ARITY: Record<string, number> = {
+  '--bind': 2,
+  '--ro-bind': 2,
+  '--dev-bind': 2,
+  '--tmpfs': 1,
+  '--dev': 1,
+  '--proc': 1,
+}
 
 /**
  * A whole mount, in the two shapes bwrap is given here: a destination-only
@@ -63,6 +90,28 @@ function runIndices(command: string, words: readonly string[]): number[] {
   return found
 }
 
+/**
+ * The manifest the wrap recorded its mount points in, by the started record
+ * the command's own shell is given, or `undefined` for a wrap that recorded
+ * none.
+ */
+export function manifestOf(command: string): string | undefined {
+  const id = / srt(?:-args)? (\S+)\.started /.exec(command)?.[1]
+  return id === undefined ? undefined : `${id}.json`
+}
+
+/**
+ * `command` with the name of its manifest taken out. A wrap that names mount
+ * points names a manifest of its own for them, so two wraps by one policy
+ * differ in that name and in nothing else.
+ */
+export function withoutManifestName(command: string): string {
+  return command.replace(
+    /(srt-mount-points(?:-\d+)?\/)\d+-[0-9a-f]{16}/g,
+    '$1MANIFEST',
+  )
+}
+
 /** How many times that whole mount appears. */
 export function countMounts(command: string, ...words: MountWords): number {
   return runIndices(command, words).length
@@ -75,6 +124,25 @@ export function countMounts(command: string, ...words: MountWords): number {
  */
 export function indexOfMount(command: string, ...words: MountWords): number {
   return runIndices(command, words)[0] ?? -1
+}
+
+/**
+ * Every mount the command carries, in emission order, each as the words
+ * bwrap is given for it. Compare as a MULTISET: the mandatory-deny scan
+ * takes ripgrep's hits in thread order, so that order varies run to run.
+ */
+export function mountsOf(command: string): string[] {
+  const argv = argvOf(command)
+  const mounts: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i]
+    if (flag === undefined) continue
+    const arity = MOUNT_ARITY[flag]
+    if (arity === undefined) continue
+    const words = argv.slice(i, i + 1 + arity)
+    if (words.length === 1 + arity) mounts.push(words.join(' '))
+  }
+  return mounts
 }
 
 /** Argv index of the last occurrence of that whole mount, or -1. */

@@ -1,6 +1,10 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
-export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
+export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
+export type {
+  WrapWithSandboxOptions,
+  SandboxInitializeOptions,
+} from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -8,6 +12,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
@@ -38,6 +43,7 @@ export type {
 export type {
   FilterRequestCallback,
   RequestDecision,
+  RequestInfo,
   MutateForwardedHeaders,
 } from './sandbox/request-filter.js'
 
@@ -59,6 +65,9 @@ export {
   GitMetadataError,
   SubmoduleWalkBudgetError,
 } from './sandbox/mandatory-deny-paths.js'
+// The mount points a running sandbox relies on (Linux), as a snapshot, for an
+// embedder that removes paths itself after a command to leave out.
+export { liveMountPoints } from './sandbox/bwrap-mount-manifests.js'
 
 // Windows install/status API
 export {
@@ -87,12 +96,25 @@ export {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
+  revokeWindowsAclChecked,
+  grantWindowsProfileRead,
+  forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
+  getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
+  windowsProfileReadEnv,
+  windowsProfileExclusionConflicts,
+  windowsProfileGrantSkipReason,
+  windowsProfileGrantNotice,
+  WINDOWS_PROFILE_READ_ENV_VARS,
   expandWindowsFsPaths,
   buildGitConfigEnv,
   parseWindowsBinShell,
   parseWindowsSandboxError,
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
+  WINDOWS_LOOPBACK_PROBE_PORT,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
@@ -100,12 +122,25 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  SeclogonDisabledError,
+  WindowsSeclogonState,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
   WindowsAclStampOptions,
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
+  WindowsAclRevokeResult,
+  WindowsProfileGrantState,
+  WindowsProfileGrantStatus,
+  WindowsProfileGrantPath,
+  WindowsProfileGrantOptions,
+  WindowsProfileGrantResult,
+  WindowsProfileGrantItem,
+  WindowsInstallProfileGrant,
+  WindowsProfileExclusionConflict,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
@@ -135,6 +170,9 @@ export {
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+export { writeRootsOf } from './sandbox/path-entries.js'
+// Where the library takes a path to be: for a caller that judges paths itself.
+export { realPathOf } from './utils/real-path.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

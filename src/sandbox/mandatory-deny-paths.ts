@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOrSelf } from '../utils/real-path.js'
 import { DEFAULT_RIPGREP_TIMEOUT_MS } from '../utils/ripgrep.js'
 import {
   isAbsenceErrno,
@@ -340,8 +341,8 @@ export interface GitDirTreeDenies {
  *
  * An empty placeholder also says that an empty file at that path is a
  * legitimate one to leave alone; a non-empty placeholder says the opposite,
- * which is what lets the Linux backend repair an empty `commondir` (see
- * `gitRedirectMountPoint` in src/sandbox/linux-sandbox-utils.ts).
+ * which is what lets the Linux backend cover or repair an empty `commondir`
+ * (see `writeGitRedirectMountPoint` in src/sandbox/linux-sandbox-utils.ts).
  */
 const GIT_REDIRECT_FILES: ReadonlyArray<{
   name: string
@@ -1841,14 +1842,5 @@ function deepestReachableAncestor(target: string): string | undefined {
       // Unreachable at this level; try the parent.
     }
     if (path.dirname(dir) === dir) return undefined
-  }
-}
-
-/** `target` with symlinks resolved, or itself when that fails. */
-function realPathOrSelf(target: string): string {
-  try {
-    return fs.realpathSync(target)
-  } catch {
-    return target
   }
 }

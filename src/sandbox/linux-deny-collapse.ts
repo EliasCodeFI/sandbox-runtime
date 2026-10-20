@@ -1,4 +1,4 @@
-import * as fs from 'fs'
+import { realPathOrSelf } from '../utils/real-path.js'
 import type {
   GitDirDenies,
   GitDirTreeDenies,
@@ -382,14 +382,4 @@ function collapsibleGitDirs(
 function underDirectory(dir: string): (candidate: string) => boolean {
   const real = realPathOrSelf(dir)
   return candidate => isAtOrUnder(realPathOrSelf(candidate), real)
-}
-
-/** `target` with symlinks resolved, or itself when that fails - which leaves
- *  a path that cannot be resolved outside the bind, and so denied as it was. */
-function realPathOrSelf(target: string): string {
-  try {
-    return fs.realpathSync(target)
-  } catch {
-    return target
-  }
 }

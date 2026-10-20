@@ -16,9 +16,10 @@ export interface RipgrepConfig {
 export const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
 
 /**
- * ripgrep exited with an error status. `partialMatches` is what it listed
- * before that: rg reports an unreadable directory with exit code 2 after
- * printing every match it could reach, and names each one in `stderr`.
+ * ripgrep ended otherwise than by finding something or nothing. `listed` is
+ * what it had listed by then: rg reports an unreadable directory with exit code
+ * 2 after printing every match it could reach, and names each one in `stderr`.
+ * The paths in that are the tree's own text.
  *
  * `killed` says the run did not exit on its own — the timeout, an OOM kill, a
  * signal to the process group — so what it listed is a prefix of an unknown
@@ -30,7 +31,7 @@ export const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
  * at the end of it.
  */
 export class RipgrepError extends Error {
-  readonly partialMatches: string[]
+  readonly listed: string[]
   readonly stderr: string
   readonly timedOut: boolean
   readonly killed: boolean
@@ -39,7 +40,7 @@ export class RipgrepError extends Error {
   constructor(
     message: string,
     details: {
-      partialMatches: string[]
+      listed: string[]
       stderr: string
       timedOut: boolean
       killed: boolean
@@ -47,7 +48,8 @@ export class RipgrepError extends Error {
     },
   ) {
     super(message)
-    this.partialMatches = details.partialMatches
+    this.name = 'RipgrepError'
+    this.listed = details.listed
     this.stderr = details.stderr
     this.timedOut = details.timedOut
     this.killed = details.killed
@@ -133,7 +135,7 @@ export async function ripGrep(
       ? `ripgrep was killed by ${exit.signal ?? 'a signal'} after ${elapsedMs} ms, inside the ${timeoutMs} ms it was given`
       : `ripgrep failed with exit code ${exit.code}`
   throw new RipgrepError(`${failure}: ${stderr}`, {
-    partialMatches: matches,
+    listed: matches,
     stderr,
     timedOut,
     killed,

@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 import { captured } from '../helpers/captured.js'
 import { spawn, spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
 import {
   existsSync,
   lstatSync,
@@ -78,8 +79,8 @@ describe('MaskedFileStore', () => {
   test('write does not follow a symlink planted at the fake path', () => {
     // Cross-invocation attack: if a prior sandbox run could write the
     // store dir, it could leave `ln -s <victim> 0.fake` behind and the
-    // next host-side write() would clobber <victim>. write() must unlink
-    // first so the sentinel lands in a fresh regular file.
+    // next host-side write() would clobber <victim>. write() must replace
+    // the name, so the sentinel lands in a fresh regular file.
     const store = new MaskedFileStore()
     const fake = store.write('k', 'first')
     const victim = join(FIXTURE_DIR, 'symlink-victim')
@@ -102,6 +103,35 @@ describe('MaskedFileStore', () => {
     expect(b).toBe(a)
     expect(readFileSync(a, 'utf8')).toBe('second')
     expect(readdirSync(store.dirPath!)).toHaveLength(1)
+    store.dispose()
+  })
+
+  test('write never leaves the fake path without a file', () => {
+    // A command line handed out earlier binds from the name, and bubblewrap
+    // does not start on a source that is not there.
+    const store = new MaskedFileStore()
+    const fake = store.write('k', 'first')
+    const seen: boolean[] = []
+    const calls = ['rmSync', 'unlinkSync', 'writeFileSync', 'renameSync']
+    const spies = calls.map(name => {
+      const real = fs[name as 'rmSync'] as (...args: unknown[]) => unknown
+      return spyOn(fs, name as 'rmSync').mockImplementation(((
+        ...args: unknown[]
+      ) => {
+        const result = real(...args)
+        seen.push(existsSync(fake))
+        return result
+      }) as never)
+    })
+    try {
+      store.write('k', 'second')
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+    }
+
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen).not.toContain(false)
+    expect(readFileSync(fake, 'utf8')).toBe('second')
     store.dispose()
   })
 
@@ -1586,6 +1616,10 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
@@ -1741,6 +1775,10 @@ describe.if(isLinux)(
         '10',
         '--proxy',
         `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+        // An empty list overrides NO_PROXY, which would send curl around
+        // the proxy under test for 127.0.0.1.
+        '--noproxy',
+        '',
         '-H',
         `Authorization: Bearer ${bearer}`,
       ]
@@ -1892,6 +1930,10 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
@@ -2019,6 +2061,10 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
