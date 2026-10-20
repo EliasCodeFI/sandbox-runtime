@@ -1965,12 +1965,15 @@ function stripWriteGlobs(
 function readGlobBudget(
   ...limits: Array<SandboxRuntimeConfig['filesystem']['denyReadGlobBudget']>
 ): GlobWalkBudget {
-  return newGlobWalkBudget(
-    FilesystemConfigSchema.shape.denyReadGlobBudget.parse(
-      Object.assign({}, ...limits),
-      { path: ['filesystem', 'denyReadGlobBudget'] },
-    ),
+  const [session, own] = limits.map(given =>
+    FilesystemConfigSchema.shape.denyReadGlobBudget.parse(given, {
+      path: ['filesystem', 'denyReadGlobBudget'],
+    }),
   )
+  return newGlobWalkBudget({
+    maxEntries: own?.maxEntries ?? session?.maxEntries,
+    timeoutMs: own?.timeoutMs ?? session?.timeoutMs,
+  })
 }
 
 /** `walk`, with a budget that runs out in it told as

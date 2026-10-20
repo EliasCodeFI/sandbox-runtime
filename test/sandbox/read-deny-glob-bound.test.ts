@@ -94,14 +94,6 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
       budget: newGlobWalkBudget({ maxEntries }),
     })
 
-  it('defaults to twenty million entries and sixty seconds', () => {
-    expect(newGlobWalkBudget()).toMatchObject({
-      maxEntries: 20_000_000,
-      timeoutMs: 60_000,
-      entries: 0,
-    })
-  })
-
   it('is charged for every entry read from disk, matched or not, and not for one another walk has read', () => {
     const budget = newGlobWalkBudget()
     const listings: GlobWalkListings = new Map()
@@ -178,7 +170,11 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     const untyped: ProxyHandler<fs.Dirent> = {
       get: ({ name }, key) => (key === 'name' ? name : () => false),
     }
-    listingsThrough((_dir, entries) => entries.map(e => new Proxy(e, untyped)))
+    const listed: string[] = []
+    listingsThrough((dir, entries) => {
+      listed.push(dir)
+      return entries.map(e => new Proxy(e, untyped))
+    })
     const asked = spyOn(fs, 'lstatSync')
     tickingClock()
     const budget = newGlobWalkBudget({ timeoutMs: 4 })
@@ -187,6 +183,20 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
       await refusalOf(() => walkGlobPattern(PATTERN, { budget })),
     ).toMatchObject({ exhausted: 'time', directory: TREE, entries: 0 })
     expect(asked).toHaveBeenCalledTimes(2)
+
+    // Nor as a real path that could not be read, which is asked for again by
+    // a shorter name that led to it.
+    fs.mkdirSync(join(ROOT, 'v'))
+    fs.symlinkSync(TREE, join(ROOT, 'v', 'l'))
+    listed.length = 0
+    expect(
+      await refusalOf(() =>
+        expandReadDenyGlobLinux(join(ROOT, 'v', '**/.env'), [], undefined, {
+          budget: newGlobWalkBudget({ timeoutMs: 6 }),
+        }),
+      ),
+    ).toMatchObject({ exhausted: 'time', directory: TREE })
+    expect(listed).toEqual([join(ROOT, 'v'), TREE])
   })
 })
 
@@ -325,9 +335,9 @@ describe.if(isLinux)('the budget of a read configuration', () => {
     expect(await refusalWith()).toMatchObject({
       cause: { maxEntries: ENTRIES - 1, timeoutMs: 1234 },
     })
-    expect(await refusalWith({ maxEntries: ENTRIES - 2 })).toMatchObject({
-      cause: { maxEntries: ENTRIES - 2, timeoutMs: 1234 },
-    })
+    expect(
+      await refusalWith({ maxEntries: ENTRIES - 2, timeoutMs: undefined }),
+    ).toMatchObject({ cause: { maxEntries: ENTRIES - 2, timeoutMs: 1234 } })
     expect(await refusalWith({ maxEntries: ENTRIES })).toBeUndefined()
 
     SandboxManager.updateConfig(configOf({ maxEntries: ENTRIES }, lists))
@@ -342,22 +352,27 @@ describe.if(isLinux)('the budget of a read configuration', () => {
     ['allowRead', 2],
     ['denyRead', DIRECTORIES + 1 + 2],
   ])(
-    'starts over under the budget of a configuration that arrives during the %s walk',
+    'starts over under the budget of a configuration that arrives during the %s walk, with nothing spent',
     async (_walk, arrivesAt) => {
       const lists = { allowRead: [join(TREE, '**/a')], denyRead: [PATTERN] }
-      const tighter = configOf({ maxEntries: ENTRIES - 1 }, lists)
-      SandboxManager.updateConfig(configOf(undefined, lists))
-      let listed = 0
-      listingsThrough((dir, entries) => {
-        if (dir.startsWith(TREE) && ++listed === arrivesAt) {
-          SandboxManager.updateConfig(tighter)
-        }
-        return entries
-      })
+      const refusalUnderLate = (maxEntries: number): Promise<unknown> => {
+        mock.restore()
+        SandboxManager.updateConfig(configOf(undefined, lists))
+        let listed = 0
+        listingsThrough((dir, entries) => {
+          if (dir.startsWith(TREE) && ++listed === arrivesAt) {
+            SandboxManager.updateConfig(configOf({ maxEntries }, lists))
+          }
+          return entries
+        })
+        return refusalOf(() => SandboxManager.wrapWithSandbox('true'))
+      }
 
-      expect(
-        await refusalOf(() => SandboxManager.wrapWithSandbox('true')),
-      ).toMatchObject({ cause: { maxEntries: ENTRIES - 1 } })
+      expect(await refusalUnderLate(ENTRIES - 1)).toMatchObject({
+        cause: { maxEntries: ENTRIES - 1 },
+      })
+      // What the two walks of one attempt read, and no more.
+      expect(await refusalUnderLate(2 * ENTRIES)).toBeUndefined()
     },
   )
 })

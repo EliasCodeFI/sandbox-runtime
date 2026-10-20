@@ -1827,7 +1827,7 @@ export function* walkGlobPatternSteps(
     try {
       return call(real)
     } catch (first) {
-      if (short === real) throw first
+      if (short === real || first instanceof GlobWalkBudgetError) throw first
       let answer: T
       try {
         answer = call(short)
