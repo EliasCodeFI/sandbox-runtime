@@ -157,10 +157,10 @@ const WAITS_FOR_PASSES_MS = 5 * 1000
 const MANIFEST_MAX_BYTES = 1024 * 1024
 
 /**
- * How much of a started record is read, from its end: a line of some 300 bytes
- * for each run, so the last two hundred runs of one command line.
+ * The largest file read as a started record: a line of some 300 bytes for each
+ * run, so fourteen thousand runs of one command line.
  */
-const RECORD_MAX_BYTES = 64 * 1024
+const RECORD_MAX_BYTES = 4 * 1024 * 1024
 
 /**
  * Suffix of a manifest before it is moved into place. One left by a killed
@@ -753,13 +753,8 @@ function isOwnReadableFile(file: string): boolean {
  * of the user's, no larger than `max`, is read, through a descriptor opened
  * without following a link and without blocking. Throws {@link NotOurs} for
  * anything else that is there, and the error itself where that cannot be told.
- * With `itsLastLines`, of a larger one the whole lines in its last `max` bytes.
  */
-function readOwnFile(
-  file: string,
-  max: number,
-  itsLastLines = false,
-): string | undefined {
+function readOwnFile(file: string, max: number): string | undefined {
   let fd: number
   try {
     fd = fs.openSync(
@@ -775,21 +770,10 @@ function readOwnFile(
   }
   try {
     const stat = fs.fstatSync(fd)
-    if (
-      !stat.isFile() ||
-      stat.uid !== process.getuid?.() ||
-      (stat.size > max && !itsLastLines)
-    ) {
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.size > max) {
       throw new NotOurs(`${file} is not a small regular file of this user's`)
     }
-    if (stat.size <= max) {
-      return fs.readFileSync(fd, 'utf8')
-    }
-    const end = Buffer.alloc(max)
-    const text = end
-      .subarray(0, fs.readSync(fd, end, 0, max, stat.size - max))
-      .toString('utf8')
-    return text.slice(text.indexOf('\n') + 1)
+    return fs.readFileSync(fd, 'utf8')
   } finally {
     fs.closeSync(fd)
   }
@@ -835,9 +819,9 @@ function readManifest(file: string): Manifest | undefined {
  * file, or holds a line that is no /proc/PID/stat line vouches: only a process
  * that is gone says its sandbox has ended.
  *
- * A command line may be run again and again, and each run adds its line. Of a
- * record past {@link RECORD_MAX_BYTES} the last runs are asked after: refusing
- * to read it would keep what it vouches for named for ever.
+ * A command line may be run again and again, and each run adds its line. Every
+ * one of them is asked after, the last first: the first run may outlast all that
+ * follow it.
  *
  * Not so an `orphan`, which has no manifest that can be read: it names no path,
  * so it protects none. Only a process that can be asked after vouches there, and
@@ -852,11 +836,11 @@ function readManifest(file: string): Manifest | undefined {
 function recordVouches(record: string, orphan = false): boolean | undefined {
   let lines: string[]
   try {
-    const text = readOwnFile(record, RECORD_MAX_BYTES, true)
+    const text = readOwnFile(record, RECORD_MAX_BYTES)
     if (text === undefined) {
       return undefined
     }
-    lines = text.split('\n').slice(0, -1)
+    lines = text.split('\n').slice(0, -1).reverse()
   } catch (e) {
     return !(orphan && e instanceof NotOurs)
   }

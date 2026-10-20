@@ -835,17 +835,36 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     expect(existsSync(manifest)).toBe(true)
   })
 
-  it('goes by the last runs of a command line that has been run more often than a record is read for', () => {
+  it.each(['first', 'last'] as const)(
+    'asks after every run of a command line that has been run thousands of times: the %s may be the one that lasts',
+    which => {
+      leftover(LOCK)
+      const gone = Array<Process>(3000).fill({ pid: deadPid(), start: '1' })
+      const manifest = manifestOfADeadProcess([LOCK])
+      started(
+        manifest,
+        ...(which === 'first'
+          ? [anotherProcess(), ...gone]
+          : [...gone, anotherProcess()]),
+      )
+      expect(collectMountPoints()).toEqual([])
+      started(manifest, ...gone)
+      expect(collectMountPoints()).toEqual([LOCK])
+    },
+  )
+
+  it('takes a record too long to be read to vouch, like any that cannot be read', () => {
     leftover(LOCK)
-    const gone = Array<Process>(1500).fill({ pid: deadPid(), start: '1' })
     const manifest = manifestOfADeadProcess([LOCK])
-    started(manifest, ...gone, anotherProcess())
-    expect(
-      fs.statSync(manifest.replace(/\.json$/, '.started')).size,
-    ).toBeGreaterThan(64 * 1024)
+    started(manifest, { pid: deadPid(), start: '1' })
+    const record = manifest.replace(/\.json$/, '.started')
+    const line = fs.readFileSync(record, 'utf8')
+    fs.writeFileSync(
+      record,
+      line.repeat(Math.ceil((4 * 1024 * 1024 + 1) / line.length)),
+    )
     expect(collectMountPoints()).toEqual([])
-    started(manifest, ...gone)
-    expect(collectMountPoints()).toEqual([LOCK])
+    expect(existsSync(LOCK)).toBe(true)
   })
 
   it('takes it once that process is gone', () => {
