@@ -133,6 +133,15 @@ export class SentinelRegistry {
     // nest; a caller-minted one (a shaped fake) can, and is refused here
     // rather than at the first body that carries it. Registration is once per
     // credential at wrap time, so the scan costs nothing that matters.
+    //
+    // The empty one nests with every other, and is found at every position of
+    // every body. Registered first it would meet nothing to nest with.
+    if (sentinel === '') {
+      throw new Error(
+        `Credential "${name}" was given an empty sentinel. Mint sentinels ` +
+          `that embed a uuid4.`,
+      )
+    }
     for (const registered of this.bySentinel.values()) {
       if (
         registered.sentinel.includes(sentinel) ||

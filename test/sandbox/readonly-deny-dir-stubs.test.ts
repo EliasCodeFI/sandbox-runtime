@@ -18,7 +18,11 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { countMounts, lastIndexOfMount } from '../helpers/bwrap-argv.js'
+import {
+  countMounts,
+  lastIndexOfMount,
+  withoutManifestName,
+} from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
@@ -358,21 +362,28 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // does not re-bind read-only would suppress a stub the sandbox needs,
     // and only under some orderings. Which mounts come out is what the
     // pre-pass makes order-independent, so the two orderings must agree.
-    const outside = join(BASE, 'outside')
-    mkdirSync(join(outside, 'kept'), { recursive: true })
-    symlinkSync(outside, join(AREA, 'link'))
+    //
+    // `kept` is named by two spellings, one through a link, beneath a
+    // directory that is denied too: which of the two the loop meets first is
+    // the caller's ordering.
+    const kept = join(AREA, 'real', 'kept')
+    mkdirSync(kept, { recursive: true })
+    symlinkSync(join(AREA, 'real'), join(AREA, 'link'))
     mkdirSync(join(PROJ, 'sub'), { recursive: true })
     const denies = [
       PROJ,
       join(PROJ, '.gitconfig'),
       join(PROJ, 'sub'),
       join(PROJ, 'sub', 'absent'),
+      join(AREA, 'real'),
+      kept,
       join(AREA, 'link', 'kept'),
       join(AREA, 'other', 'absent'),
       '/dev/null',
     ]
+    // Each wrap names a manifest of its own.
     const mountsOf = (command: string) =>
-      [...command.matchAll(/--(?:ro-)?bind (\S+) (\S+)/g)]
+      [...withoutManifestName(command).matchAll(/--(?:ro-)?bind (\S+) (\S+)/g)]
         .map(mount => `${mount[1]} ${mount[2]}`)
         .sort()
 
@@ -385,6 +396,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // are left unstubbed, and the absent entry outside it still gets its
     // empty-directory placeholder.
     expect(forward).toContain(`${PROJ} ${PROJ}`)
+    expect(forward).toContain(`${kept} ${kept}`)
     expect(
       forward.filter(mount => mount.startsWith(`/dev/null ${PROJ}/`)),
     ).toEqual([])
@@ -936,7 +948,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   ): Promise<{ command: string; warnings: string[]; probeLookups: number }> {
     const probe = '/srt-unresolvable-probe'
     const realReaddirSync = fs.readdirSync
-    const realRealpathSync = fs.realpathSync
+    const realRealpathSync = fs.realpathSync.native
     let probeLookups = 0
     const spies = [
       spyOn(fs, 'readdirSync').mockImplementation(((
@@ -951,7 +963,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
           ? [...real, probe.slice(1)]
           : real
       }) as typeof fs.readdirSync),
-      spyOn(fs, 'realpathSync').mockImplementation(((
+      spyOn(fs.realpathSync, 'native').mockImplementation(((
         p: fs.PathLike,
         ...rest: unknown[]
       ) => {
@@ -963,7 +975,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
           return probe
         }
         return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
-      }) as typeof fs.realpathSync),
+      }) as typeof fs.realpathSync.native),
     ]
     try {
       return { ...(await wrapDenyingRoot()), probeLookups }
@@ -1008,8 +1020,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(countMounts(usable, '--tmpfs', build)).toBeGreaterThan(0)
     expect(usable).not.toContain(stub)
 
-    const realRealpathSync = fs.realpathSync
-    const spy = spyOn(fs, 'realpathSync')
+    const realRealpathSync = fs.realpathSync.native
+    const spy = spyOn(fs.realpathSync, 'native')
     spy.mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
       if (String(p) === build) {
         throw Object.assign(new Error('EACCES: cannot resolve'), {
@@ -1017,7 +1029,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         })
       }
       return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
-    }) as typeof fs.realpathSync)
+    }) as typeof fs.realpathSync.native)
     try {
       const { result: unusable, warnings } = await withCapturedWarnings(() =>
         wrap([PROJ], [build]),

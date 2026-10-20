@@ -18,7 +18,8 @@
  * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
  *
  * On macOS, SBPL cannot redirect reads, so masked files degrade to
- * `mode: "deny"` (see macos-sandbox-utils.ts).
+ * `mode: "deny"` (see macos-sandbox-utils.ts). On Windows an ACL cannot
+ * either (see `windowsMaskedFileDenies` in sandbox-manager.ts).
  */
 
 import { randomUUID } from 'node:crypto'
@@ -93,12 +94,21 @@ export class MaskedFileStore {
     }
     // Never follow a symlink at fakePath: a prior sandbox invocation may
     // have planted one (the store dir is ro-bound now, but defence in
-    // depth). Unlink first so writeFileSync creates a fresh regular file.
-    fs.rmSync(fakePath, { force: true })
-    // 0600: owner rw so the idempotent rewrite above succeeds; the bind
-    // into the sandbox is --ro-bind so the sandboxed process sees it
-    // read-only regardless of the host mode. No group/other.
-    fs.writeFileSync(fakePath, sentinel, { mode: 0o600 })
+    // depth). So a fresh regular file is made beside it and moved onto the
+    // name, which replaces a link rather than following it. Moved, not
+    // unlinked and written again: a command line handed out earlier binds from
+    // this name, and bubblewrap does not start on a source that is not there.
+    //
+    // 0600: owner rw; the bind into the sandbox is --ro-bind so the sandboxed
+    // process sees it read-only regardless of the host mode. No group/other.
+    const fresh = `${fakePath}.${randomUUID()}`
+    try {
+      fs.writeFileSync(fresh, sentinel, { mode: 0o600, flag: 'wx' })
+      fs.renameSync(fresh, fakePath)
+    } catch (err) {
+      fs.rmSync(fresh, { force: true })
+      throw err
+    }
     return fakePath
   }
 

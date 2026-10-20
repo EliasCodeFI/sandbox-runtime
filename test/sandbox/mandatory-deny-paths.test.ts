@@ -6,6 +6,7 @@ import {
   afterAll,
   beforeEach,
   afterEach,
+  spyOn,
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
@@ -14,12 +15,14 @@ import {
   readdirSync,
   mkdtempSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
   readFileSync,
   symlinkSync,
   readlinkSync,
   existsSync,
+  lstatSync,
   statSync,
   realpathSync,
 } from 'node:fs'
@@ -30,6 +33,7 @@ import {
   indexOfMount,
   lastIndexOfMount,
   lastMountAt,
+  manifestOf,
 } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
@@ -43,6 +47,8 @@ import {
   linuxGetCwdMandatoryDenyPaths,
   linuxGetMonitorCwdDenyPaths,
   LinuxSandboxProfileError,
+  unreadableDirectories,
+  type LinuxSandboxParams,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   GitMetadataError,
@@ -269,6 +275,7 @@ describe.if(isSupportedPlatform)(
        * denies have to survive.
        */
       readConfig?: { denyOnly: string[]; allowWithinDeny?: string[] }
+      ripgrepArgs?: string[]
     }
 
     async function runSandboxed(
@@ -300,6 +307,7 @@ describe.if(isSupportedPlatform)(
           writeConfig,
           mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
           allowGitConfig: opts.allowGitConfig,
+          ripgrepConfig: { command: 'rg', args: opts.ripgrepArgs ?? [] },
         })
       }
 
@@ -1029,6 +1037,71 @@ describe.if(isSupportedPlatform)(
                 locked.release()
               }
             })
+
+            it('accounts for an unreadable directory at the depth the scan stops at', async () => {
+              // ripgrep opens a directory that sits AT its --max-depth to
+              // list it, and reports one it cannot read. This walk stops a
+              // level above, so it found nothing for that EACCES and the
+              // wrap was refused - over a layout as ordinary as a
+              // `docker/data/postgres/base` another user owns. Nothing below
+              // such a directory is in the scan's reach on either side, so it
+              // is accounted for with nothing to deny.
+              const locked = lockDirectory(
+                join('docker', 'data', 'postgres', 'base'),
+              )
+              try {
+                const command = await wrapWith(
+                  failingRipgrep([nestedConfig()], locked.stderr),
+                )
+
+                const denies = denySectionOf(command)
+                expect(denies).not.toContain(denyBindOf(locked.path))
+                // And nothing widened to stand in for it.
+                expect(denies).not.toContain(
+                  denyBindOf(join(process.cwd(), 'docker', 'data', 'postgres')),
+                )
+                expect(denies).toContain(denyBindOf(nestedConfig()))
+              } finally {
+                locked.release()
+              }
+            })
+
+            it('refuses a run killed inside its budget, whatever it reported', async () => {
+              // Every code this run printed is one a deny stands in for, and
+              // the directory it named is really there - so the listing
+              // would be used, if the run had finished. It did not: a kill
+              // that is not the timeout (an OOM kill, a signal to the
+              // process group) stops the listing wherever it arrived, and
+              // what lies past that is unknown however complete the stderr
+              // looks. An unreadable directory is one `chmod 000` a command
+              // can leave behind, so taking the two together would be a
+              // fail-open with a plantable half.
+              const locked = lockDirectory('killed-mid-listing')
+              try {
+                const error = await wrapWith({
+                  command: '/bin/sh',
+                  args: [
+                    '-c',
+                    `printf '%s\\0' ${quote([nestedConfig()])}; ` +
+                      `printf '%s' ${quote([locked.stderr])} >&2; ` +
+                      'kill -KILL $$',
+                  ],
+                  timeoutMs: 30000,
+                }).catch((e: unknown) => e)
+
+                expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+                expect((error as LinuxSandboxProfileError).code).toBe(
+                  'deny_scan_failed',
+                )
+                expect((error as Error).message).toMatch(
+                  /was killed by SIGKILL before it finished/,
+                )
+                // Named as what it was: nothing here ran out of time.
+                expect((error as Error).message).not.toMatch(/did not finish/)
+              } finally {
+                locked.release()
+              }
+            })
           },
         )
 
@@ -1320,6 +1393,342 @@ describe.if(isSupportedPlatform)(
           expect(result.success).toBe(false)
           expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
         })
+      }
+    })
+
+    describe('The same names below the working directory', () => {
+      /** What holds files the host runs or trusts, and a file in each. */
+      const heldIn = new Map([
+        ['.git/hooks', 'pre-commit'],
+        ...getDangerousDirectories().map(
+          dir => [dir, DIRECTORY_PROBE_FILE] as const,
+        ),
+      ])
+      const existing = [
+        ...DANGEROUS_FILES,
+        '.git/config',
+        ...[...heldIn].map(([dir, file]) => `${dir}/${file}`),
+      ]
+      const populate = (container: string): void => {
+        for (const dir of heldIn.keys()) {
+          mkdirSync(join(TEST_DIR, container, dir), { recursive: true })
+        }
+        for (const name of [...existing, 'safe-file.txt']) {
+          writeFileSync(join(TEST_DIR, container, name), ORIGINAL_CONTENT)
+        }
+      }
+      // How far the default depth reaches on Linux: every name in `sub`, and
+      // the files alone in `a/b`.
+      const covered = [
+        ['sub', existing],
+        ['a/b', DANGEROUS_FILES],
+      ] as const
+      const beyond = 'a/b/c'
+      beforeAll(() => ['sub', 'a/b', beyond].forEach(populate))
+
+      for (const [container, names] of covered) {
+        for (const name of names) {
+          it(`blocks writes to ${container}/${name}`, async () => {
+            const target = `${container}/${name}`
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+          })
+        }
+        it(`allows writes to ${container}/safe-file.txt`, async () => {
+          const target = `${container}/safe-file.txt`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(target, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+        })
+      }
+
+      for (const dir of heldIn.keys()) {
+        it(`blocks a new file in sub/${dir}/`, async () => {
+          const target = `sub/${dir}/new-file`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(false)
+          expect(existsSync(target)).toBe(false)
+        })
+      }
+
+      for (const state of ['empty', 'missing']) {
+        it(`blocks a new hook in a repository whose hooks directory is ${state}`, async () => {
+          const repository = `hooks-${state}`
+          const hooks = `${repository}/.git/hooks`
+          mkdirSync(join(TEST_DIR, repository, '.git'), { recursive: true })
+          writeFileSync(
+            join(TEST_DIR, repository, '.git', 'HEAD'),
+            'ref: refs/heads/main',
+          )
+          if (state === 'empty') mkdirSync(join(TEST_DIR, hooks))
+
+          const result = await runSandboxed(
+            `mkdir -p '${hooks}' && echo x > '${hooks}/pre-commit'`,
+          )
+
+          expect(result.success).toBe(false)
+          expect(existsSync(`${hooks}/pre-commit`)).toBe(false)
+          // The rest of the repository is still the command's to write.
+          expect(
+            (await runSandboxedWrite(`${repository}/.git/HEAD`, 'x')).success,
+          ).toBe(true)
+        })
+      }
+
+      for (const [file, line] of [
+        ['.gitignore', 'sub/'],
+        ['.ignore', '*'],
+      ] as const) {
+        it(`blocks them all the same when ${file} holds ${line}`, async () => {
+          writeFileSync(join(TEST_DIR, file), `${line}\n`)
+          try {
+            for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+              const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+              expect([name, result.success]).toEqual([name, false])
+              expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+            }
+          } finally {
+            rmSync(join(TEST_DIR, file))
+          }
+        })
+      }
+
+      it.if(isLinux)(
+        "blocks them all the same whatever ripgrep's configuration file says",
+        async () => {
+          const configuration = join(TEST_DIR, 'ripgrep-configuration')
+          writeFileSync(configuration, '--glob=!sub\n')
+          process.env.RIPGREP_CONFIG_PATH = configuration
+          try {
+            const result = await runSandboxedWrite(
+              'sub/.bashrc',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('sub/.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
+          } finally {
+            delete process.env.RIPGREP_CONFIG_PATH
+            rmSync(configuration)
+          }
+        },
+      )
+
+      it('blocks them all the same beside a directory that cannot be read', async () => {
+        const unreadable = join(TEST_DIR, 'unreadable')
+        mkdirSync(unreadable, { mode: 0o000 })
+        try {
+          for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+            const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+            expect([name, result.success]).toEqual([name, false])
+            expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+          }
+        } finally {
+          rmdirSync(unreadable)
+        }
+      })
+
+      for (const [directory, mode] of [
+        ['locked', 0o000],
+        ['locked/.git', 0o000],
+        // As deep as one of the names can itself lie.
+        ['locked/.claude/commands', 0o000],
+        // Can be listed, and nothing in it looked at.
+        ['locked', 0o444],
+        // The other way about.
+        ['locked', 0o111],
+      ] as const) {
+        // With one thread, as on one CPU, ripgrep words what it says otherwise.
+        for (const threads of [[], ['-j1']]) {
+          it(`blocks them all the same in locked/ when ${directory} has mode ${mode.toString(8)} (rg ${threads.join()})`, async () => {
+            const names = [
+              '.bashrc',
+              '.git/config',
+              '.git/hooks/pre-commit',
+              `.claude/commands/${DIRECTORY_PROBE_FILE}`,
+            ]
+            populate('locked')
+            try {
+              for (const name of names) {
+                // Each time: a command that is not held gives the mode back.
+                chmodSync(join(TEST_DIR, directory), mode)
+                const result = await runSandboxed(
+                  `chmod 755 locked '${directory}'; echo x > 'locked/${name}'`,
+                  { ripgrepArgs: threads },
+                )
+
+                expect([name, result.success]).toEqual([name, false])
+              }
+            } finally {
+              chmodSync(join(TEST_DIR, directory), 0o755)
+            }
+            for (const name of names) {
+              expect(readFileSync(`locked/${name}`, 'utf8')).toBe(
+                ORIGINAL_CONTENT,
+              )
+            }
+          })
+        }
+      }
+
+      // root reads a directory of any mode.
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'finds what cannot be read on the file system, whatever ripgrep says',
+        async () => {
+          const project = join(TEST_DIR, 'hints')
+          const outside = join(TEST_DIR, 'hints-outside')
+          for (const directory of [
+            join(project, 'is-readable'),
+            join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'locked\\so'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
+            join(project, 'listed-only/child'),
+            join(project, 'entered-only'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]) {
+            mkdirSync(directory, { recursive: true })
+          }
+          symlinkSync(outside, join(project, 'link'))
+          const locked = [
+            join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'locked\\so'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]
+          // What a name in the tree could make ripgrep say.
+          const said = [
+            'is-readable',
+            'really-locked',
+            'a/b/c/too-deep',
+            'link/behind-a-link',
+            '../hints-outside/behind-a-link',
+            'not-there/at-all',
+            'entered-only/not-there',
+            'locked: too',
+            'locked\\so',
+            'listed-only/child',
+          ].map(
+            name => `rg: ${project}/${name}: Permission denied (os error 13)`,
+          )
+          said.push(
+            `rg: ${project}/one-thread: IO error for operation on ${project}/one-thread: Permission denied (os error 13)`,
+            `${project}/no-prefix: Permission denied (os error 13)`,
+          )
+          const standIn = join(TEST_DIR, 'says-it-could-not-read')
+          const asked = join(TEST_DIR, 'was-asked')
+          writeFileSync(
+            standIn,
+            [
+              '#!/bin/sh',
+              `printf '%s\\n' "$@" > '${asked}'`,
+              ...said.map(line => `echo '${line}' >&2`),
+              'exit 2',
+            ].join('\n'),
+            { mode: 0o755 },
+          )
+          process.chdir(project)
+          locked.forEach(directory => chmodSync(directory, 0o000))
+          chmodSync(join(project, 'listed-only'), 0o444)
+          chmodSync(join(project, 'entered-only'), 0o111)
+          try {
+            const wrapped = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+              ripgrepConfig: { command: standIn },
+            })
+
+            const found = unreadableDirectories(project, 3, Date.now() + 10_000)
+            expect(found.own.sort()).toEqual(
+              [
+                'really-locked',
+                'locked: too',
+                'locked\\so',
+                'listed-only',
+                'entered-only',
+                'one-thread',
+                'no-prefix',
+              ]
+                .map(name => join(project, name))
+                .sort(),
+            )
+            // As deep as ripgrep opens a directory, and looks at nothing in.
+            expect(found.leftAlone).toBe(1)
+            // Nobody else's mode can be given back from inside.
+            const uid = process.getuid!()
+            const getuid = spyOn(process, 'getuid').mockReturnValue(uid + 1)
+            try {
+              expect(
+                unreadableDirectories(project, 3, Date.now() + 10_000),
+              ).toEqual({ own: [], leftAlone: 8 })
+            } finally {
+              getuid.mockRestore()
+            }
+            expect(wrapped).toContain('really-locked')
+            for (const name of ['is-readable', 'behind-a-link', 'too-deep']) {
+              expect(wrapped).not.toContain(name)
+            }
+            expect(readFileSync(asked, 'utf8').split('\n')).toEqual(
+              expect.arrayContaining(['--no-ignore', '--no-config']),
+            )
+          } finally {
+            for (const directory of [
+              ...locked,
+              join(project, 'listed-only'),
+              join(project, 'entered-only'),
+            ]) {
+              chmodSync(directory, 0o755)
+            }
+          }
+        },
+      )
+
+      it.if(isLinux)(
+        'takes no directory above the working directory for one of the names',
+        async () => {
+          const project = join(TEST_DIR, 'above', '.idea', 'project')
+          mkdirSync(join(project, 'sub'), { recursive: true })
+          writeFileSync(join(project, 'sub', '.bashrc'), ORIGINAL_CONTENT)
+          process.chdir(project)
+
+          expect((await runSandboxedWrite('sub/.bashrc', 'x')).success).toBe(
+            false,
+          )
+          expect((await runSandboxedWrite('safe-file.txt', 'x')).success).toBe(
+            true,
+          )
+        },
+      )
+
+      for (const [container, names] of [
+        ['a/b', existing.filter(name => name.includes('/'))],
+        [beyond, existing],
+      ] as const) {
+        it.if(isLinux)(
+          `looks no deeper than the depth says: ${names.length} names in ${container}/`,
+          async () => {
+            for (const name of names) {
+              const target = `${container}/${name}`
+              const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+              expect([target, result.success]).toEqual([target, true])
+            }
+          },
+          60_000,
+        )
       }
     })
 
@@ -1858,6 +2267,272 @@ describe.if(isSupportedPlatform)(
           }
         }, 15000)
 
+        // The caller runs no cleanup for a wrap that threw, so what was
+        // deferred to that wrap has nobody else to let go of it. A command that
+        // ran and has ended is let go of by any clean-up call; what waits for
+        // the count is the manifest of one that was wrapped and never started.
+
+        const wrapInCwd = (
+          command: string,
+          failing?: Partial<LinuxSandboxParams>,
+        ): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+            enableWeakerNestedSandbox: true,
+            allowAllUnixSockets: true,
+            ...failing,
+          })
+
+        it.each(['aborted', 'refused'])(
+          'runs the cleanup deferred to a wrap that is then %s',
+          async how => {
+            const raceDir = join(TEST_DIR, 'race-test-4')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+
+            try {
+              const manifestA = manifestOf(await wrapInCwd('true')) ?? ''
+              expect(existsSync(manifestA)).toBe(true)
+
+              // B is still looking for the mandatory denies when A's caller
+              // cleans up, and nothing tells that call from one for B.
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                binShell: how === 'refused' ? 'no-such-shell' : undefined,
+              })
+              cleanupBwrapMountPoints()
+              expect(existsSync(manifestA)).toBe(true)
+
+              if (how === 'aborted') controller.abort(new Error('stopped'))
+              expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                Error,
+              )
+              expect(existsSync(manifestA)).toBe(false)
+              expect(readdirSync(raceDir)).toEqual([])
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+        )
+
+        it('forgets the mount points planned by a wrap that is then refused', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-6')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            expect(
+              await wrapInCwd('true', { binShell: 'no-such-shell' }).catch(
+                (e: unknown) => e,
+              ),
+            ).toBeInstanceOf(Error)
+
+            // bwrap never ran, so this is no mount point: the host made it.
+            writeFileSync('.mcp.json', '')
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['.mcp.json'])
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        })
+
+        it.each([
+          ['aborted', 'counted along with it'],
+          ['aborted', 'started since a forced cleanup'],
+          ['handed out', 'started since a forced cleanup'],
+        ])(
+          'a wrap that is %s leaves the mount points of a running sandbox %s',
+          async (how, which) => {
+            const raceDir = join(TEST_DIR, 'race-test-5')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+            // Stands in for ripgrep, and goes on until told to end.
+            const heldScan = join(raceDir, 'held-scan')
+            writeFileSync(
+              heldScan,
+              `#!/bin/sh\nuntil [ -e '${raceDir}/scanned' ]; do sleep 0.1; done\n`,
+              { mode: 0o755 },
+            )
+
+            try {
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                ripgrepConfig: { command: heldScan },
+              })
+              if (which !== 'counted along with it') {
+                cleanupBwrapMountPoints({ force: true })
+              }
+
+              // C runs throughout, and tries a denied name once told to.
+              const childC = spawn(
+                await wrapInCwd(
+                  'until [ -e go ]; do sleep 0.1; done; echo WRITTEN > .bashrc',
+                ),
+                { shell: true },
+              )
+              const exitC = new Promise<void>(resolve => {
+                childC.on('exit', () => resolve())
+              })
+              while (!existsSync('.bashrc')) {
+                await new Promise(r => setTimeout(r, 50))
+              }
+
+              if (how === 'aborted') {
+                controller.abort(new Error('stopped'))
+                expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                  Error,
+                )
+              } else {
+                writeFileSync('scanned', '')
+                spawnSync(await wrappedB, { shell: true, timeout: 10000 })
+                cleanupBwrapMountPoints()
+              }
+              expect(existsSync('.bashrc')).toBe(true)
+
+              // C is still counted, so the next command to end defers to it.
+              spawnSync(await wrapInCwd('true'), {
+                shell: true,
+                timeout: 10000,
+              })
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(true)
+
+              writeFileSync('go', '')
+              await exitC
+              expect(readFileSync('.bashrc', 'utf8')).toBe('')
+
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(false)
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+          15000,
+        )
+
+        // A running sandbox answers for its own mount points, so what a count
+        // that is one short costs is the start of a command that is wrapped and
+        // has not started: bubblewrap refuses to start without its manifest.
+        it.each(['aborted', 'handed out'])(
+          'a wrap from before a forced cleanup that is %s leaves the manifest of a command wrapped since',
+          async how => {
+            const raceDir = join(TEST_DIR, 'race-test-9')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+            const heldScan = join(raceDir, 'held-scan')
+            writeFileSync(
+              heldScan,
+              `#!/bin/sh\nuntil [ -e '${raceDir}/scanned' ]; do sleep 0.1; done\n`,
+              { mode: 0o755 },
+            )
+
+            try {
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                ripgrepConfig: { command: heldScan },
+              })
+              cleanupBwrapMountPoints({ force: true })
+              const commandC = await wrapInCwd('echo STARTED')
+
+              if (how === 'aborted') {
+                controller.abort(new Error('stopped'))
+                expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                  Error,
+                )
+              } else {
+                writeFileSync('scanned', '')
+                spawnSync(await wrappedB, { shell: true, timeout: 10000 })
+                cleanupBwrapMountPoints()
+              }
+
+              const ranC = spawnSync(commandC, {
+                shell: true,
+                encoding: 'utf8',
+                timeout: 10000,
+              })
+              expect(ranC.stdout).toContain('STARTED')
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(false)
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+          15000,
+        )
+
+        it('leaves nothing of a directory mount point that another sandbox was wrapped under', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-7')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            const childT = spawn(
+              await wrapInCwd('until [ -e go ]; do sleep 0.1; done'),
+              { shell: true },
+            )
+            const exitT = new Promise<void>(resolve => {
+              childT.on('exit', () => resolve())
+            })
+            while (!existsSync('.claude')) {
+              await new Promise(r => setTimeout(r, 50))
+            }
+
+            // T's .claude is there by now, so X's mount points go inside it.
+            // They are collected once X has ended; the directory is T's still.
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync('.claude')).toEqual([])
+
+            writeFileSync('go', '')
+            await exitT
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['go'])
+
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['go'])
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        }, 15000)
+
+        it('takes only its own where the host has written at a mount point or inside one', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-8')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            // The second is wrapped with the first's .claude there.
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            expect(readdirSync('.claude')).not.toEqual([])
+            writeFileSync('.claude/kept', '')
+            rmSync('.bashrc')
+            writeFileSync('.bashrc', 'kept')
+
+            cleanupBwrapMountPoints()
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir).sort()).toEqual(['.bashrc', '.claude'])
+            expect(readdirSync('.claude')).toEqual(['kept'])
+            expect(readFileSync('.bashrc', 'utf8')).toBe('kept')
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        })
+
         it('non-existent .git/hooks deny does not turn .git into a file, breaking git', async () => {
           // When .git doesn't exist yet, denying .git/hooks causes
           // findFirstNonExistentComponent to return .git itself. bwrap then does
@@ -2361,6 +3036,40 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     }
   })
 
+  it.if(!isWindows)('names every link a looping entry went through', () => {
+    // A filter matches the name an unlink or a rename uses, so each link of
+    // the loop is held by its own name here and nothing else is needed: the
+    // command that would make `.git/hooks` reach a directory has to remove
+    // one of them first.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-loop-')))
+    const saved = process.cwd()
+    try {
+      const gitDir = join(dir, '.git')
+      mkdirSync(gitDir, { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      const links = join(dir, 'links')
+      mkdirSync(links, { recursive: true })
+      symlinkSync('b', join(links, 'a'))
+      symlinkSync('a', join(links, 'b'))
+      symlinkSync('../links/a', join(gitDir, 'hooks'))
+      process.chdir(dir)
+
+      const paths = macGetMandatoryDenyEntries(false)
+        .filter(pathEntry => !pathEntry.glob)
+        .map(pathEntry => pathEntry.path)
+
+      expect(paths).toContain(join(links, 'a'))
+      expect(paths).toContain(join(links, 'b'))
+      // What a hop leads to is never denied, and a loop leads nowhere to
+      // deny in the first place: the directory holding the links stays out.
+      expect(paths).not.toContain(links)
+      expect(paths.length).toBe(new Set(paths).size)
+    } finally {
+      process.chdir(saved)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it.if(!isWindows)(
     'names a submodule reached through a symlinked modules entry both ways',
     () => {
@@ -2618,6 +3327,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'entry',
+          chain: 'resolved',
           source: join(gitDir, 'hooks'),
           link: middle,
           holder: join(dir, 'repo'),
@@ -2652,6 +3362,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(denies.chainHops).toEqual([
       {
         kind: 'entry',
+        chain: 'resolved',
         source: join(gitDir, 'hooks'),
         link: hop,
         holder: join(dir, 'repo'),
@@ -2680,6 +3391,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'entry',
+          chain: 'resolved',
           source: join(gitDir, 'hooks'),
           link: hop,
           holder: join(dir, 'repo'),
@@ -2710,6 +3422,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'entry',
+          chain: 'resolved',
           source: join(gitDir, 'hooks'),
           link: hop,
           holder: undefined,
@@ -2743,6 +3456,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect(denies.chainHops).toEqual([
           {
             kind: 'entry',
+            chain: 'resolved',
             source: join(gitDir, 'hooks'),
             link: hop,
             holder: join(dir, 'repo'),
@@ -2773,9 +3487,220 @@ describe('Git metadata deny paths - Unit Tests', () => {
       ])
       expect(denies.linkedEntryDirs).toEqual([gitDir])
       expect(denies.escapingDenyPaths).toEqual([])
-      // A chain past the kernel's hop limit reaches nothing, so there is no
-      // hop to hold either: the whole deny is the whole answer.
+      // A link onto itself is the one link of its own chain, and the whole
+      // deny of the directory holding it covers that: no hop is left over.
       expect(denies.chainHops).toEqual([])
+    },
+  )
+
+  it.if(!isWindows)(
+    'holds the links a looping entry goes through, which are what makes it loop',
+    () => {
+      // hooks -> ../links/a, a -> b, b -> a. The entry reaches nothing while
+      // that stands, and the whole-directory deny holds the entry, but the
+      // two links are ordinary work-tree names: a command that puts a
+      // directory at either one makes the chain reach it, and the host's git
+      // runs what is inside. Every link the walk visited before it gave up is
+      // therefore a hop, named once however many times the loop met it.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const links = join(dir, 'repo', 'links')
+      mkdirSync(links, { recursive: true })
+      symlinkSync('b', join(links, 'a'))
+      symlinkSync('a', join(links, 'b'))
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync('../links/a', join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.denyPaths).toContain(join(links, 'a'))
+      expect(denies.denyPaths).toContain(join(links, 'b'))
+      // Neither is under the git directory, so a degrade to one bind of it
+      // must not drop them.
+      expect(denies.escapingDenyPaths).toEqual([
+        join(links, 'a'),
+        join(links, 'b'),
+      ])
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'entry',
+          chain: 'unresolvable',
+          source: join(gitDir, 'hooks'),
+          link: join(links, 'a'),
+          holder: links,
+        },
+        {
+          kind: 'entry',
+          chain: 'unresolvable',
+          source: join(gitDir, 'hooks'),
+          link: join(links, 'b'),
+          holder: links,
+        },
+      ])
+    },
+  )
+
+  it.if(!isWindows)('holds the hops before a loop it runs into', () => {
+    // Two ordinary hops and then the loop: the chain gives up in the middle,
+    // and the links it walked to get there are held like any others.
+    const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+    const links = join(dir, 'repo', 'links')
+    mkdirSync(links, { recursive: true })
+    symlinkSync('second', join(links, 'first'))
+    symlinkSync('loopA', join(links, 'second'))
+    symlinkSync('loopB', join(links, 'loopA'))
+    symlinkSync('loopA', join(links, 'loopB'))
+    rmSync(join(gitDir, 'hooks'), { recursive: true })
+    symlinkSync('../links/first', join(gitDir, 'hooks'))
+
+    const denies = gitDirDenies(gitDir, false)
+
+    expect(denies.chainHops.map(hop => hop.link)).toEqual([
+      join(links, 'first'),
+      join(links, 'second'),
+      join(links, 'loopA'),
+      join(links, 'loopB'),
+    ])
+    expect(denies.chainHops.every(hop => hop.chain === 'unresolvable')).toBe(
+      true,
+    )
+  })
+
+  it.if(!isWindows)(
+    'leaves a loop confined to the git directory to the whole-directory deny',
+    () => {
+      // Both links live under the git directory, which is denied whole for
+      // the entry anyway: each hop names no holder of its own, and nothing a
+      // command can write is left over.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      symlinkSync('inner-b', join(gitDir, 'inner-a'))
+      symlinkSync('inner-a', join(gitDir, 'inner-b'))
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync('inner-a', join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.escapingDenyPaths).toEqual([])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'entry',
+          chain: 'unresolvable',
+          source: join(gitDir, 'hooks'),
+          link: join(gitDir, 'inner-a'),
+          holder: undefined,
+        },
+        {
+          kind: 'entry',
+          chain: 'unresolvable',
+          source: join(gitDir, 'hooks'),
+          link: join(gitDir, 'inner-b'),
+          holder: undefined,
+        },
+      ])
+    },
+  )
+
+  it.if(!isWindows)('holds a modules directory that is a symlink', () => {
+    // `modules` is no deny path of its own - denying it whole would take
+    // every submodule git directory under it read-only - but removing the
+    // link and putting a directory in its place aims every submodule this
+    // repository has at hooks nothing denied. So it is held the way a hop is:
+    // its own name for the backend that matches a rename, and this git
+    // directory denied whole for the one whose denies resolve.
+    const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+    const elsewhere = join(dir, 'nm')
+    mkdirSync(elsewhere, { recursive: true })
+    symlinkSync('../nm', join(gitDir, 'modules'))
+
+    const denies = gitDirDenies(gitDir, false)
+
+    expect(denies.denyPaths).toContain(join(gitDir, 'modules'))
+    // Never what it leads to: that is a tree of submodule git directories,
+    // each with precise denies of its own.
+    expect(denies.denyPaths).not.toContain(elsewhere)
+    expect(denies.linkedEntryDirs).toEqual([gitDir])
+    expect(denies.chainHops).toEqual([
+      {
+        kind: 'entry',
+        chain: 'resolved',
+        source: join(gitDir, 'modules'),
+        link: join(gitDir, 'modules'),
+        holder: undefined,
+      },
+    ])
+  })
+
+  it.if(!isWindows)(
+    'leaves an ordinary modules directory out of the denies entirely',
+    () => {
+      // The other half: a real `modules` is where every submodule git
+      // directory lives, and each of those is denied precisely. Naming it
+      // would take them all read-only.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      mkdirSync(join(gitDir, 'modules', 'lib'), { recursive: true })
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.denyPaths).toEqual(gitDirDenyPaths(gitDir, false))
+      expect(denies.linkedEntryDirs).toEqual([])
+      expect(denies.chainHops).toEqual([])
+    },
+  )
+
+  it.if(!isWindows)(
+    "holds a submodule's own modules directory, and the chain past it",
+    () => {
+      // The shape the whole of this exists for: a submodule git directory
+      // whose own `modules` leads out of the repository through a link.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const submodule = makeGitDir(join(gitDir, 'modules', 'foo'))
+      const links = join(dir, 'repo', 'links')
+      mkdirSync(join(dir, 'repo', 'nm', 'bar'), { recursive: true })
+      mkdirSync(links, { recursive: true })
+      symlinkSync('../nm', join(links, 'hop'))
+      symlinkSync('../../../links/hop', join(submodule, 'modules'))
+
+      const denies = gitDirDenies(submodule, false)
+
+      expect(denies.denyPaths).toContain(join(submodule, 'modules'))
+      expect(denies.linkedEntryDirs).toEqual([submodule])
+      // The link in the middle is a hop like any other, held by the
+      // directory it sits in.
+      expect(denies.chainHops.map(hop => hop.link)).toEqual([
+        join(submodule, 'modules'),
+        join(links, 'hop'),
+      ])
+      expect(denies.chainHops.map(hop => hop.holder)).toEqual([
+        undefined,
+        links,
+      ])
+    },
+  )
+
+  it.if(!isWindows)(
+    'holds the hops of an entry whose chain names something too long to exist',
+    () => {
+      // ENAMETOOLONG, not a loop: the chain reaches nothing all the same, and
+      // the link it went through is a name a command can point elsewhere.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const hop = join(dir, 'repo', 'hop')
+      symlinkSync(`../${'n'.repeat(300)}`, hop)
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync('../hop', join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'entry',
+          chain: 'unresolvable',
+          source: join(gitDir, 'hooks'),
+          link: hop,
+          holder: join(dir, 'repo'),
+        },
+      ])
     },
   )
 
@@ -2784,13 +3709,18 @@ describe('Git metadata deny paths - Unit Tests', () => {
     () => {
       // lstat refused: whether it is a link is unknown, so the entry keeps
       // the deny it has (and keeps it through a degrade, in case it is one)
-      // and the git directory is denied whole as a link would need.
+      // and the git directory is denied whole as a link would need. `modules`
+      // is in the same position, and named for the backend that holds a link
+      // by its own name.
       const gitDir = makeGitDir(join(dir, 'repo', '.git'))
       chmodSync(gitDir, 0o000)
       try {
         const denies = gitDirDenies(gitDir, false)
 
-        expect(denies.denyPaths).toEqual(gitDirDenyPaths(gitDir, false))
+        expect(denies.denyPaths).toEqual([
+          ...gitDirDenyPaths(gitDir, false),
+          join(gitDir, 'modules'),
+        ])
         expect(denies.linkedEntryDirs).toEqual([gitDir])
         expect(denies.escapingDenyPaths).toEqual(gitDirDenyPaths(gitDir, false))
       } finally {
@@ -2865,6 +3795,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(scan.chainHops).toEqual([
         {
           kind: 'entry',
+          chain: 'resolved',
           source: join(modules, 'lib'),
           link: hop,
           holder: join(dir, 'repo'),
@@ -3105,6 +4036,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'pointer',
+          chain: 'resolved',
           source: pointer,
           link: hop,
           holder: join(dir, 'checkout'),
@@ -3178,6 +4110,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'pointer',
+          chain: 'resolved',
           source: pointer,
           link: hop,
           holder: join(dir, 'checkout'),
@@ -3191,20 +4124,61 @@ describe('Git metadata deny paths - Unit Tests', () => {
     symlinkSync(join(dir, 'checkout', 'loopB'), join(dir, 'checkout', 'loopA'))
     symlinkSync(join(dir, 'checkout', 'loopA'), join(dir, 'checkout', 'loopB'))
 
-    // Past the hop limit the walk stops on the loop itself, which is where
-    // the deny goes: the whole directory that still reads.
+    // A value the kernel cannot walk to an end names no git directory: git
+    // opens nothing through it, and the lexical fold is not a fallback git
+    // takes. The links it walked are the whole of what a command can move,
+    // and the checkout - which a fail-closed deny of the deepest directory
+    // still reachable would take whole, over a file a sandboxed command may
+    // create - stays writable.
     const denies = gitFileDenies(pointer, false)
 
     expect(denies.denyPaths).toEqual([
       pointer,
-      ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
-      join(dir, 'checkout'),
+      join(dir, 'checkout', 'loopA'),
+      join(dir, 'checkout', 'loopB'),
     ])
-    // A chain the kernel cannot walk either reaches nothing, so there is no
-    // hop to hold: the whole-directory deny is the whole answer, as it is
-    // for a symlinked entry that loops.
-    expect(denies.chainHops).toEqual([])
+    expect(denies.chainHops).toEqual([
+      {
+        kind: 'pointer',
+        chain: 'unresolvable',
+        source: pointer,
+        link: join(dir, 'checkout', 'loopA'),
+        holder: join(dir, 'checkout'),
+      },
+      {
+        kind: 'pointer',
+        chain: 'unresolvable',
+        source: pointer,
+        link: join(dir, 'checkout', 'loopB'),
+        holder: join(dir, 'checkout'),
+      },
+    ])
   })
+
+  it.if(!isWindows)(
+    'never widens a looping pointer value to a write root',
+    () => {
+      // The shape a sandboxed command can plant in one write: a .git file
+      // whose value runs into a loop in the checkout itself. Nothing here
+      // names the checkout or any directory above it, so the commands after
+      // it still write the project; the pointer file and the loop's links
+      // are what they cannot touch.
+      const pointer = writePointer('checkout', 'gitdir: loop/gd\n')
+      symlinkSync('loop2', join(dir, 'checkout', 'loop'))
+      symlinkSync('loop', join(dir, 'checkout', 'loop2'))
+
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toEqual([
+        pointer,
+        join(dir, 'checkout', 'loop'),
+        join(dir, 'checkout', 'loop2'),
+      ])
+      expect(denies.denyPaths).not.toContain(join(dir, 'checkout'))
+      expect(denies.denyPaths).not.toContain(dir)
+      expect(denies.linkedEntryDirs).toEqual([])
+    },
+  )
 
   it.if(!isWindows)('resolves a commondir the same way', () => {
     const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
@@ -3229,6 +4203,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(denies.chainHops).toEqual([
       {
         kind: 'pointer',
+        chain: 'resolved',
         source: join(worktreeGitDir, 'commondir'),
         link: hop,
         holder: worktreeGitDir,
@@ -3284,6 +4259,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.chainHops).toEqual([
         {
           kind: 'pointer',
+          chain: 'resolved',
           source: pointer,
           link: hop,
           holder: join(dir, 'checkout'),
@@ -3310,6 +4286,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(denies.chainHops).toEqual([
       {
         kind: 'pointer',
+        chain: 'resolved',
         source: pointer,
         link: hop,
         holder: join(dir, 'checkout'),
@@ -3336,6 +4313,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect(denies.chainHops).toEqual([
           {
             kind: 'pointer',
+            chain: 'resolved',
             source: pointer,
             link: hop,
             holder: join(dir, 'checkout'),
@@ -3358,6 +4336,127 @@ describe('Git metadata deny paths - Unit Tests', () => {
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
     expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+  })
+
+  /**
+   * A whole-directory deny is what a backend falls back on for a tree it
+   * cannot enumerate or a link it has no other handle on, and every producer
+   * of one reads paths a sandboxed command can write. One that lands on the
+   * working directory or a write root takes the project read-only for every
+   * command after the one that arranged it, and nothing inside the sandbox
+   * can undo it: a denial of service planted by the code the sandbox
+   * contains. None is emitted, whichever producer asked.
+   */
+  describe.if(isLinux)('a deny that would take the work tree whole', () => {
+    /** A directory git accepts and whose `hooks` is a link, which is what
+     *  makes whatever holds it a git directory denied WHOLE. */
+    function makeLinkedGitDir(gitDir: string): string {
+      mkdirSync(gitDir, { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      symlinkSync('nowhere', join(gitDir, 'hooks'))
+      return gitDir
+    }
+
+    /** `linuxGetCwdMandatoryDenyPaths` from `checkout`. */
+    function denyPathsIn(checkout: string, allowWritePaths: string[]) {
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        return linuxGetCwdMandatoryDenyPaths(false, allowWritePaths)
+      } finally {
+        process.chdir(originalCwd)
+      }
+    }
+
+    it('never denies the working directory a pointer of its own names', () => {
+      // One write plants it: `.git` naming the checkout, whose `hooks` is a
+      // link. The checkout is then a git directory with a symlinked entry,
+      // which is denied whole - and that is the project.
+      const checkout = makeLinkedGitDir(join(dir, 'repo'))
+      writeFileSync(join(checkout, '.git'), 'gitdir: .\n')
+
+      const denyPaths = denyPathsIn(checkout, [checkout])
+
+      expect(denyPaths).not.toContain(checkout)
+      // What the deny was holding keeps its own two ends.
+      expect(denyPaths).toContain(join(checkout, 'hooks'))
+    })
+
+    it('never denies an ancestor of the working directory', () => {
+      const parent = makeLinkedGitDir(join(dir, 'outer'))
+      const checkout = join(parent, 'repo')
+      mkdirSync(checkout, { recursive: true })
+      writeFileSync(join(checkout, '.git'), 'gitdir: ..\n')
+
+      const denyPaths = denyPathsIn(checkout, [checkout])
+
+      expect(denyPaths).not.toContain(parent)
+    })
+
+    it('never denies a second write root', () => {
+      const checkout = join(dir, 'repo')
+      mkdirSync(checkout, { recursive: true })
+      const other = makeLinkedGitDir(join(dir, 'other'))
+      writeFileSync(join(checkout, '.git'), `gitdir: ${other}\n`)
+
+      const denyPaths = denyPathsIn(checkout, [checkout, other])
+
+      expect(denyPaths).not.toContain(other)
+    })
+
+    it('never denies a directory that holds a write root', () => {
+      const checkout = join(dir, 'repo')
+      mkdirSync(checkout, { recursive: true })
+      const container = makeLinkedGitDir(join(dir, 'container'))
+      const secondRoot = join(container, 'inner')
+      mkdirSync(secondRoot, { recursive: true })
+      writeFileSync(join(checkout, '.git'), `gitdir: ${container}\n`)
+
+      const denyPaths = denyPathsIn(checkout, [checkout, secondRoot])
+
+      expect(denyPaths).not.toContain(container)
+    })
+
+    it('still denies an ordinary directory whole', () => {
+      // The guard is about the work tree and nothing else: a git directory
+      // beside it keeps the deny that holds its symlinked entry.
+      const checkout = join(dir, 'repo')
+      mkdirSync(checkout, { recursive: true })
+      const gitDir = makeLinkedGitDir(join(checkout, 'gitdir-real'))
+      writeFileSync(join(checkout, '.git'), 'gitdir: gitdir-real\n')
+
+      const denyPaths = denyPathsIn(checkout, [checkout])
+
+      expect(denyPaths).toContain(gitDir)
+    })
+
+    it('never denies the working directory a modules entry is linked to', () => {
+      // The same end state through the `.git/modules` walk, and with no
+      // pointer file: the entry is followed, the checkout has an entry named
+      // `hooks` so the walk takes it for a git directory, and its `hooks` is
+      // a link - so the entry's own git directory, which resolves to the
+      // checkout, is denied whole.
+      const checkout = join(dir, 'repo')
+      const gitDir = join(checkout, '.git')
+      mkdirSync(join(gitDir, 'modules'), { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      symlinkSync('nowhere', join(checkout, 'hooks'))
+      symlinkSync('../..', join(gitDir, 'modules', 'x'))
+
+      const denyPaths = denyPathsIn(checkout, [checkout])
+
+      // By where each lands, not by how it is spelled: a bind resolves its
+      // destination, so `.git/modules/x` IS the checkout here.
+      expect(
+        denyPaths.map(denyPath => {
+          try {
+            return realpathSync(denyPath)
+          } catch {
+            return denyPath
+          }
+        }),
+      ).not.toContain(checkout)
+    })
   })
 
   it.if(isLinux)(
@@ -4544,9 +5643,11 @@ describe.if(isSupportedPlatform)(
           readConfig: undefined,
           writeConfig: { allowOnly: [checkout, outside], denyWithinAllow: [] },
         })
-        // The whole tree behind one bind, and the linked entry - which that
-        // bind does not cover, since the deny lands where the link really
-        // points - behind one of its own.
+        // The whole tree behind one bind. The linked entry is not covered by
+        // it, since a deny lands where the link really points, and what it
+        // points at is a write root: binding that whole would take a
+        // directory the command was given away from it, so it keeps the
+        // denies of its own entries instead.
         const words = mountWords(command)
         const mounted = (source: string, dest: string): boolean =>
           words.some(
@@ -4558,7 +5659,13 @@ describe.if(isSupportedPlatform)(
         expect(mounted(join(gitDir, 'modules'), join(gitDir, 'modules'))).toBe(
           true,
         )
-        expect(mounted(outside, outside)).toBe(true)
+        expect(mounted(outside, outside)).toBe(false)
+        expect(mounted(join(outside, 'hooks'), join(outside, 'hooks'))).toBe(
+          true,
+        )
+        expect(mounted(join(outside, 'config'), join(outside, 'config'))).toBe(
+          true,
+        )
 
         const result = spawnSync(command, {
           shell: true,
@@ -5248,6 +6355,643 @@ describe.if(isSupportedPlatform)(
         300000,
       )
     })
+
+    /**
+     * A chain that reaches NOTHING - a loop, or a name no file can occupy -
+     * has no landing to deny, so the links it goes through are the whole of
+     * what holds it. Each is a name a command replaces with a directory to
+     * make the chain reach one, which is why a hop this backend cannot bind
+     * is a refusal here rather than the warning a resolved chain gets.
+     */
+    describe('a chain that reaches nothing', () => {
+      /** A repository whose `hooks` runs into a two-link loop in `holder`. */
+      function makeLoop(holder: string): {
+        checkout: string
+        gitDir: string
+        first: string
+        second: string
+      } {
+        const checkout = join(dir, 'repo')
+        const gitDir = makeGitDir(join(checkout, '.git'))
+        mkdirSync(holder, { recursive: true })
+        const first = join(holder, 'a')
+        const second = join(holder, 'b')
+        symlinkSync('b', first)
+        symlinkSync('a', second)
+        rmSync(join(gitDir, 'hooks'), { recursive: true })
+        symlinkSync(first, join(gitDir, 'hooks'))
+        return { checkout, gitDir, first, second }
+      }
+
+      it.if(isLinux)(
+        'binds the directory holding a loop read-only where it is a subdirectory',
+        async () => {
+          const checkout = join(dir, 'repo')
+          const holder = join(checkout, 'links')
+          const { gitDir } = makeLoop(holder)
+          process.chdir(checkout)
+
+          const command = await wrapCommandWithSandboxLinux({
+            command: 'true',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+
+          const writeRootBind = indexOfMount(
+            command,
+            '--bind',
+            checkout,
+            checkout,
+          )
+          expect(writeRootBind).toBeGreaterThan(-1)
+          expect(
+            lastIndexOfMount(command, '--ro-bind', holder, holder),
+          ).toBeGreaterThan(writeRootBind)
+          // The entry keeps what it had: the git directory denied whole.
+          expect(
+            lastIndexOfMount(command, '--ro-bind', gitDir, gitDir),
+          ).toBeGreaterThan(writeRootBind)
+        },
+        60000,
+      )
+
+      it.if(isLinux)(
+        'refuses the command where the working directory holds the loop',
+        async () => {
+          // There is no bind for the link and no far end to fall back on, so
+          // the answer a resolved chain gets - warn, and rely on both ends -
+          // holds nothing here. This is what such a repository got before any
+          // of these denies existed: the deny path could not be resolved and
+          // the wrap failed closed.
+          const checkout = join(dir, 'repo')
+          const { gitDir, first } = makeLoop(checkout)
+          process.chdir(checkout)
+
+          const error = await wrapCommandWithSandboxLinux({
+            command: 'true',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          }).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_unresolvable_git_entry',
+          )
+          // The entry, the link and the directory holding it: each of the
+          // three ways out the message names works on one of them.
+          expect((error as Error).message).toContain(join(gitDir, 'hooks'))
+          expect((error as Error).message).toContain(first)
+          expect((error as Error).message).toContain(checkout)
+        },
+        60000,
+      )
+
+      it.if(isLinux)(
+        'never denies the working directory for a pointer value that loops',
+        async () => {
+          // A `.git` FILE is something a sandboxed command may write, so
+          // failing closed on the deepest directory still reachable towards
+          // its value would let one command lock every later one out of the
+          // project. The pointer file and the loop's links are denied; the
+          // checkout is not, and nothing is refused.
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          const first = join(checkout, 'a')
+          symlinkSync('b', first)
+          symlinkSync('a', join(checkout, 'b'))
+          const pointer = join(checkout, '.git')
+          writeFileSync(pointer, 'gitdir: a/gd\n')
+          process.chdir(checkout)
+
+          const { result: command, warnings } = await withCapturedWarnings(() =>
+            wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            }),
+          )
+
+          const writeRootBind = indexOfMount(
+            command,
+            '--bind',
+            checkout,
+            checkout,
+          )
+          expect(writeRootBind).toBeGreaterThan(-1)
+          expect(
+            lastIndexOfMount(command, '--ro-bind', checkout, checkout),
+          ).toBeLessThan(writeRootBind)
+          expect(
+            lastIndexOfMount(command, '--ro-bind', pointer, pointer),
+          ).toBeGreaterThan(writeRootBind)
+          expect(warnings.join('\n')).toContain(pointer)
+        },
+        60000,
+      )
+
+      it.if(LIVE)(
+        'refuses every way to make a loop a subdirectory holds reach a directory',
+        async () => {
+          const checkout = join(dir, 'repo')
+          const holder = join(checkout, 'links')
+          const { gitDir, first, second } = makeLoop(holder)
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          const evil = join(checkout, 'evil-hooks')
+          mkdirSync(evil, { recursive: true })
+          process.chdir(checkout)
+
+          const command = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `! rm -f ${first} || echo LINK_UNLINKABLE; ` +
+              `! mv ${second} ${second}.aside || echo LINK_RENAMABLE; ` +
+              `! ln -sfn ${evil} ${first} || echo LINK_RETARGETABLE; ` +
+              `! mkdir -p ${join(holder, 'a', 'x')} || echo LINK_REPLACEABLE_BY_DIR; ` +
+              `! echo x > ${join(holder, 'a')} || echo LINK_REPLACEABLE_BY_FILE; ` +
+              `! rm -f ${join(gitDir, 'hooks')} || echo ENTRY_UNLINKABLE; ` +
+              `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('LINK_UNLINKABLE')
+          expect(result.stdout).not.toContain('LINK_RENAMABLE')
+          expect(result.stdout).not.toContain('LINK_RETARGETABLE')
+          expect(result.stdout).not.toContain('LINK_REPLACEABLE_BY_DIR')
+          expect(result.stdout).not.toContain('LINK_REPLACEABLE_BY_FILE')
+          expect(result.stdout).not.toContain('ENTRY_UNLINKABLE')
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
+          // The loop is where it was: `.git/hooks` still reaches nothing.
+          expect(readlinkSync(first)).toBe('b')
+          expect(readlinkSync(second)).toBe('a')
+        },
+        300000,
+      )
+
+      it.if(LIVE)(
+        'leaves the project writable for the command after one that plants a looping pointer',
+        async () => {
+          // Two wraps, as a session runs them. The first writes a `.git` file
+          // whose value runs into a loop in the working directory - an
+          // ordinary write inside the write root, and one creating a `.git`
+          // is deliberately allowed to make. The second still writes the
+          // project: what it cannot touch is the pointer file itself, which
+          // is removed from outside the sandbox.
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+          const pointer = join(checkout, '.git')
+
+          const plant = await wrapCommandWithSandboxLinux({
+            command:
+              `ln -sfn b ${join(checkout, 'a')} && ` +
+              `ln -sfn a ${join(checkout, 'b')} && ` +
+              `printf 'gitdir: a/gd\\n' > ${pointer} && echo PLANTED`,
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const planted = spawnSync(plant, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+          expect(planted.stdout).toContain('PLANTED')
+          cleanupBwrapMountPoints({ force: true })
+
+          const { result: after, warnings } = await withCapturedWarnings(() =>
+            wrapCommandWithSandboxLinux({
+              command:
+                'echo BOOTED; ' +
+                `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+                `mkdir -p ${join(checkout, 'sub')} || echo SUBDIR_UNCREATABLE; ` +
+                `! echo x > ${pointer} || echo POINTER_WRITABLE; ` +
+                `! rm -f ${pointer} || echo POINTER_REMOVABLE; ` +
+                'echo DONE',
+              needsNetworkRestriction: false,
+              allowAllUnixSockets: true,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            }),
+          )
+          const result = spawnSync(after, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          // The project is the command's, as it was before the plant.
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(result.stdout).not.toContain('SUBDIR_UNCREATABLE')
+          expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
+          // The pointer file is not: it stays until it is removed from
+          // outside the sandbox, and the wrap says which file that is.
+          expect(result.stdout).not.toContain('POINTER_WRITABLE')
+          expect(result.stdout).not.toContain('POINTER_REMOVABLE')
+          expect(warnings.join('\n')).toContain(pointer)
+        },
+        300000,
+      )
+    })
+
+    /**
+     * Every whole-directory deny is a stand-in read off paths a sandboxed
+     * command can write, so each is a way to aim one at the project itself.
+     * None of them may: the deny is dropped where what is beneath it is
+     * known, and the command refused where it is not.
+     */
+    describe('a deny aimed at the project', () => {
+      const NOT_ROOT = isLinux && process.getuid?.() !== 0
+
+      it.if(LIVE)(
+        'leaves the project writable after a pointer that names the checkout',
+        async () => {
+          // One command: a `.git` file naming the checkout, and an entry
+          // named `hooks` that is a link, which makes the checkout a git
+          // directory with a symlinked entry - denied WHOLE before this.
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+
+          const plant = await wrapCommandWithSandboxLinux({
+            command:
+              `printf 'ref: refs/heads/main\\n' > ${join(checkout, 'HEAD')} && ` +
+              `ln -sfn nowhere ${join(checkout, 'hooks')} && ` +
+              `printf 'gitdir: .\\n' > ${join(checkout, '.git')} && echo PLANTED`,
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          expect(
+            spawnSync(plant, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 120000,
+              cwd: checkout,
+            }).stdout,
+          ).toContain('PLANTED')
+          cleanupBwrapMountPoints({ force: true })
+
+          const after = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              `mkdir -p ${join(checkout, 'sub')} || echo SUBDIR_UNCREATABLE; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(after, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(result.stdout).not.toContain('SUBDIR_UNCREATABLE')
+          expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
+        },
+        300000,
+      )
+
+      it.if(LIVE)(
+        'leaves the project writable after a modules entry linked at the checkout',
+        async () => {
+          // The same end state with no pointer file at all: the walk follows
+          // `.git/modules/x` to the checkout, which has an entry named
+          // `hooks`, so it reads as a git directory whose entry is a link.
+          const checkout = join(dir, 'repo')
+          const gitDir = join(checkout, '.git')
+          mkdirSync(join(gitDir, 'modules'), { recursive: true })
+          writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+
+          const plant = await wrapCommandWithSandboxLinux({
+            command:
+              `ln -sfn nowhere ${join(checkout, 'hooks')} && ` +
+              `ln -sfn ../.. ${join(gitDir, 'modules', 'x')} && echo PLANTED`,
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          expect(
+            spawnSync(plant, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 120000,
+              cwd: checkout,
+            }).stdout,
+          ).toContain('PLANTED')
+          cleanupBwrapMountPoints({ force: true })
+
+          const after = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(after, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
+        },
+        300000,
+      )
+
+      it.if(NOT_ROOT)(
+        'refuses rather than deny a working directory it cannot list',
+        async () => {
+          // The one whole-directory deny nothing stands in for: what is
+          // beneath an unlistable directory is unknown, so dropping it would
+          // run the command against an unscanned tree and keeping it locks
+          // the project. Refusing names the directory, and one chmod outside
+          // the sandbox lifts it.
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          process.chdir(checkout)
+          // Searchable, so chdir and the walk's own lstat still work, and
+          // unreadable, so neither rg nor the walk can list it.
+          chmodSync(checkout, 0o100)
+          try {
+            const error = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            }).catch((e: unknown) => e)
+
+            expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+            expect((error as LinuxSandboxProfileError).code).toBe(
+              'deny_scan_failed',
+            )
+            expect((error as Error).message).toContain(checkout)
+          } finally {
+            chmodSync(checkout, 0o755)
+          }
+        },
+        60000,
+      )
+
+      it.if(LIVE && NOT_ROOT)(
+        'keeps wrapping a tree holding a directory that is readable but not searchable',
+        async () => {
+          // mode 0400: its entries list, and nothing in it can be reached.
+          // The walk comes here for the CHILD whose own listing failed, and
+          // recording that child - a path the host cannot stat either - asks
+          // bubblewrap for a file mount at what is really a directory, which
+          // fails every later wrap with an untyped error.
+          const checkout = join(dir, 'repo')
+          const readable = join(checkout, 'a')
+          mkdirSync(join(readable, 'nested', '.git'), { recursive: true })
+          writeFileSync(
+            join(readable, 'nested', '.git', 'HEAD'),
+            'ref: refs/heads/main\n',
+          )
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+          chmodSync(readable, 0o400)
+          try {
+            const command = await wrapCommandWithSandboxLinux({
+              command:
+                'echo BOOTED; ' +
+                `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+                `! mkdir ${join(readable, 'x')} || echo UNSEARCHABLE_WRITABLE; ` +
+                'echo DONE',
+              needsNetworkRestriction: false,
+              allowAllUnixSockets: true,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            })
+            const result = spawnSync(command, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 120000,
+              cwd: checkout,
+            })
+
+            expect(result.stdout).toContain('BOOTED')
+            expect(result.stdout).toContain('DONE')
+            expect(result.stderr).not.toContain('Is a directory')
+            expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+            // The directory that cannot be seen through is denied whole.
+            expect(result.stdout).not.toContain('UNSEARCHABLE_WRITABLE')
+          } finally {
+            chmodSync(readable, 0o755)
+          }
+        },
+        300000,
+      )
+
+      it.if(NOT_ROOT)(
+        'wraps a project holding an unreadable directory at the scan depth limit',
+        async () => {
+          // ripgrep opens a directory that sits AT its --max-depth to list
+          // it, and reports one it cannot read; this walk stops a level
+          // above, so a directory another user owns exactly that far down -
+          // a `docker/data/postgres`, mode 0700 - was an EACCES the walk
+          // found nothing for, and every command in the project refused.
+          const checkout = join(dir, 'repo')
+          const deep = join(checkout, 'docker', 'data', 'postgres')
+          mkdirSync(deep, { recursive: true })
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+          chmodSync(deep, 0o000)
+          try {
+            const command = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            })
+
+            expect(command).toContain('bwrap')
+          } finally {
+            chmodSync(deep, 0o755)
+          }
+        },
+        60000,
+      )
+    })
+
+    /**
+     * `modules` is where a git directory keeps the git directories of its
+     * submodules. It is no deny path of its own - that would take every one
+     * of them read-only - but it is an entry a command can replace, and
+     * replacing it aims every submodule this repository has at hooks nothing
+     * denied. It is held the way a chain hop is.
+     */
+    describe('a modules directory that is a symlink', () => {
+      it.if(LIVE)(
+        "refuses a directory put in place of a submodule's modules link",
+        async () => {
+          const checkout = join(dir, 'repo')
+          const gitDir = makeGitDir(join(checkout, '.git'))
+          const submodule = makeGitDir(join(gitDir, 'modules', 'foo'))
+          const outside = join(checkout, 'nm')
+          makeGitDir(join(outside, 'bar'))
+          symlinkSync('../../../nm', join(submodule, 'modules'))
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+
+          const command = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `! echo x > ${join(outside, 'bar', 'hooks', 'post-checkout')} || echo THROUGH_LINK_WRITABLE; ` +
+              `! echo x > ${join(submodule, 'hooks', 'post-checkout')} || echo SUBMODULE_HOOKS_WRITABLE; ` +
+              `! rm ${join(submodule, 'modules')} || echo MODULES_LINK_REMOVABLE; ` +
+              // The reviewer's own sequence: replace the link with a real
+              // directory of the same name and write the hook into it.
+              `! { rm ${join(submodule, 'modules')} && ` +
+              `mkdir -p ${join(submodule, 'modules', 'bar', 'hooks')} && ` +
+              `echo x > ${join(submodule, 'modules', 'bar', 'hooks', 'post-checkout')}; } || echo MODULES_REPLACED; ` +
+              `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('THROUGH_LINK_WRITABLE')
+          expect(result.stdout).not.toContain('SUBMODULE_HOOKS_WRITABLE')
+          expect(result.stdout).not.toContain('MODULES_LINK_REMOVABLE')
+          expect(result.stdout).not.toContain('MODULES_REPLACED')
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          // Nothing of it reached the host: the link is where it was, and
+          // there is no hook at either end of it.
+          expect(lstatSync(join(submodule, 'modules')).isSymbolicLink()).toBe(
+            true,
+          )
+          expect(
+            existsSync(join(outside, 'bar', 'hooks', 'post-checkout')),
+          ).toBe(false)
+        },
+        300000,
+      )
+
+      it.if(LIVE)(
+        'costs the repository its sandboxed git writes when a command plants the link',
+        async () => {
+          // The price of holding the link, recorded rather than left to be
+          // found: an ordinary repository has no `.git/modules`, and an
+          // absent one is deliberately not denied (a mount there would stop
+          // `git submodule add`). So one `ln -s` makes `.git` a git
+          // directory with a symlinked entry, which is denied whole from the
+          // next wrap on - and nothing inside the sandbox can remove the
+          // link, because `.git` is read-only by then.
+          const git = Bun.which('git') as string
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          expect(
+            spawnSync(
+              git,
+              ['-c', 'init.defaultBranch=main', 'init', '-q', checkout],
+              { encoding: 'utf8', timeout: 60000 },
+            ).status,
+          ).toBe(0)
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          process.chdir(checkout)
+
+          const plant = await wrapCommandWithSandboxLinux({
+            command: `ln -sfn nowhere ${join(checkout, '.git', 'modules')} && echo PLANTED`,
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          expect(
+            spawnSync(plant, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 120000,
+              cwd: checkout,
+            }).stdout,
+          ).toContain('PLANTED')
+          cleanupBwrapMountPoints({ force: true })
+
+          const after = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `${git} -C ${checkout} status --porcelain > /dev/null || echo GIT_STATUS_FAILED; ` +
+              `echo two > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              `${git} -C ${checkout} add f.txt && ${git} -C ${checkout} -c user.email=a@b -c user.name=n commit -q -m x && echo GIT_COMMIT_WORKED; ` +
+              `! rm ${join(checkout, '.git', 'modules')} || echo LINK_REMOVABLE; ` +
+              `! echo x > ${join(checkout, '.git', 'hooks', 'post-commit')} || echo HOOK_PLANTABLE; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(after, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          // The work tree is the command's, and reading the repository works.
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(result.stdout).not.toContain('GIT_STATUS_FAILED')
+          // What it costs: everything that writes the git directory.
+          expect(result.stdout).not.toContain('GIT_COMMIT_WORKED')
+          expect(result.stdout).not.toContain('LINK_REMOVABLE')
+          expect(result.stdout).not.toContain('HOOK_PLANTABLE')
+        },
+        300000,
+      )
+    })
   },
 )
 
@@ -5265,10 +7009,10 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
    *  anything from a sandbox that never started. */
   const BOOTED = 'BOOTED'
   /** Imported by the child process below, which wraps and is then killed. */
-  const LINUX_BACKEND_SOURCE = new URL(
-    '../../src/sandbox/linux-sandbox-utils.ts',
-    import.meta.url,
-  ).pathname
+  const LINUX_BACKEND_SOURCE = join(
+    import.meta.dir,
+    '../helpers/isolated/library.ts',
+  )
   const LIVE = bwrapCanNamespace() && Bun.which('git') !== null
   /** Enough to commit without a hook, an identity or a signature. */
   const IDENT = [
@@ -5379,6 +7123,37 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     throw new Error(`timed out waiting for ${what}`)
   }
 
+  /**
+   * Wraps a command with `checkout` as the cwd in a process of its own, which
+   * is then killed: no exit event, so nothing of that wrap's clean-up runs. What
+   * it leaves is its mount points and the manifest that names them.
+   */
+  async function wrapAndBeKilled(checkout: string): Promise<void> {
+    const script = join(dir, 'killed-wrap.ts')
+    writeFileSync(
+      script,
+      [
+        `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(LINUX_BACKEND_SOURCE)}`,
+        `process.chdir(${JSON.stringify(checkout)})`,
+        'await wrapCommandWithSandboxLinux({',
+        "  command: 'true',",
+        '  needsNetworkRestriction: false,',
+        '  allowAllUnixSockets: true,',
+        '  readConfig: undefined,',
+        `  writeConfig: { allowOnly: [${JSON.stringify(checkout)}], denyWithinAllow: [] },`,
+        '})',
+        "process.kill(process.pid, 'SIGKILL')",
+      ].join('\n'),
+    )
+    const killed = spawnSync(process.execPath, [script], {
+      encoding: 'utf8',
+      timeout: 60000,
+    })
+    expect(`${killed.signal} ${killed.stderr}`).toBe('SIGKILL ')
+    // A manifest this young counts as live with no command on its record yet.
+    await new Promise(resolve => setTimeout(resolve, 600))
+  }
+
   it('binds a commondir that is not there from a placeholder holding "."', async () => {
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
@@ -5438,13 +7213,16 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
   })
 
-  it('repairs a commondir left empty rather than covering it', async () => {
-    // The shape bubblewrap's own ensure_file() leaves, which the wrap takes
-    // for a mount point an earlier sandbox left behind and covers with
-    // /dev/null — the one thing a commondir must never be covered with.
+  it('repairs a commondir that a manifest names and that is empty', async () => {
+    // What bubblewrap's own ensure_file() makes where the placeholder has gone
+    // from under a command that then starts. An empty mount point is covered
+    // with /dev/null, the one thing a commondir must never be covered with.
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
-    writeFileSync(commondir, '', { mode: 0o444 })
+    await wrapAndBeKilled(checkout)
+    chmodSync(commondir, 0o644)
+    writeFileSync(commondir, '')
+    chmodSync(commondir, 0o444)
 
     const source = mountSource(await wrapIn(checkout), commondir)
 
@@ -5455,15 +7233,15 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     expect(existsSync(commondir)).toBe(false)
   })
 
-  it('claims a commondir already holding the placeholder, and binds the store', async () => {
-    // What a killed process leaves: nothing in memory knows the file is a
-    // mount point, but nothing else writes exactly those bytes there, so the
-    // next wrap claims it and removes it. The bind comes off the store, not
-    // off the file: another process wrapping a command in this repository
-    // claims the same file, and its cleanup would leave this bind sourceless.
+  it('claims the commondir a killed wrap left behind, and binds the store', async () => {
+    // Nothing in memory knows the file is a mount point, and the manifest the
+    // killed process left says so: the next wrap names it too and the clean-up
+    // removes it. The bind comes off the store, not off the file, which a host
+    // process could rewrite between the wrap and the mount.
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
-    writeFileSync(commondir, '.\n')
+    await wrapAndBeKilled(checkout)
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
 
     const source = mountSource(await wrapIn(checkout), commondir)
     expect(source).not.toBe(commondir)
@@ -5473,36 +7251,25 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     expect(existsSync(commondir)).toBe(false)
   })
 
-  it('claims the config.worktree a killed wrap of its own left behind', async () => {
+  it('takes a commondir holding "." that no manifest names for the caller\'s own', async () => {
+    // Only a manifest makes a path a mount point, whatever it holds.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '.\n', { mode: 0o444 })
+
+    expect(mountSource(await wrapIn(checkout), commondir)).toBe(commondir)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+  })
+
+  it('claims the config.worktree a killed wrap left behind', async () => {
     // The wrapper's own leftover, not a hand-made one: an empty
-    // config.worktree is a legitimate file nothing here may remove, so the
-    // mount point is written with the mode bubblewrap gives its own and is
-    // recognised by that shape alone once the process holding it is gone.
+    // config.worktree is a legitimate file nothing here may remove, and the
+    // manifest is what tells the two apart.
     const checkout = makeCheckout('repo')
     const configWorktree = join(checkout, '.git', 'config.worktree')
-    const script = join(dir, 'killed-wrap.ts')
-    writeFileSync(
-      script,
-      [
-        `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(LINUX_BACKEND_SOURCE)}`,
-        `process.chdir(${JSON.stringify(checkout)})`,
-        'await wrapCommandWithSandboxLinux({',
-        "  command: 'true',",
-        '  needsNetworkRestriction: false,',
-        '  allowAllUnixSockets: true,',
-        '  readConfig: undefined,',
-        `  writeConfig: { allowOnly: [${JSON.stringify(checkout)}], denyWithinAllow: [] },`,
-        '})',
-        // No exit event, so nothing of that wrap's cleanup runs.
-        "process.kill(process.pid, 'SIGKILL')",
-      ].join('\n'),
-    )
-
-    const killed = spawnSync(process.execPath, [script], {
-      encoding: 'utf8',
-      timeout: 60000,
-    })
-    expect(`${killed.signal} ${killed.stderr}`).toBe('SIGKILL ')
+    await wrapAndBeKilled(checkout)
     expect(readFileSync(configWorktree, 'utf8')).toBe('')
 
     await wrapIn(checkout)
@@ -5510,46 +7277,45 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     expect(existsSync(configWorktree)).toBe(false)
   })
 
-  it('leaves alone an empty config.worktree it did not leave there', async () => {
-    // An empty config.worktree reads as no worktree config at all, so one is
-    // legitimate and this wrapper never claims it — unless it has the shape
-    // bubblewrap leaves, which nothing writing a config on purpose does.
-    const checkout = makeCheckout('repo')
-    const legitimate = join(checkout, '.git', 'config.worktree')
-    writeFileSync(legitimate, '', { mode: 0o644 })
+  // 0444 is the mode bubblewrap gives its own mount points.
+  it.each([0o644, 0o444])(
+    'leaves alone an empty config.worktree it did not leave there (mode %o)',
+    async mode => {
+      // An empty config.worktree reads as no worktree config at all, so one is
+      // legitimate, and this wrapper never claims what no manifest names.
+      const checkout = makeCheckout('repo')
+      const legitimate = join(checkout, '.git', 'config.worktree')
+      writeFileSync(legitimate, '', { mode })
 
-    expect(mountSource(await wrapIn(checkout), legitimate)).toBe(legitimate)
+      expect(mountSource(await wrapIn(checkout), legitimate)).toBe(legitimate)
 
-    cleanupBwrapMountPoints({ force: true })
-    expect(existsSync(legitimate)).toBe(true)
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(legitimate)).toBe(true)
+    },
+  )
 
-    // The shape bubblewrap leaves, which nothing writing a config on
-    // purpose has: read-only, empty, one link.
-    chmodSync(legitimate, 0o444)
-    await wrapIn(checkout)
-    cleanupBwrapMountPoints({ force: true })
-    expect(existsSync(legitimate)).toBe(false)
-  })
+  it.each([0o644, 0o444])(
+    'covers a zero-byte commondir that no manifest names, and leaves it (mode %o)',
+    async mode => {
+      // git creates commondir and writes it as two steps, so an empty one is a
+      // file another process may own right now. The sandbox still gets a
+      // commondir it can read, off the store, and the host's file is neither
+      // rewritten nor removed.
+      const checkout = makeCheckout('repo')
+      const commondir = join(checkout, '.git', 'commondir')
+      writeFileSync(commondir, '', { mode })
 
-  it('leaves a zero-byte commondir a host git is mid-write on', async () => {
-    // git creates commondir and writes it as two steps, so an empty one with
-    // write bits is a file another process owns right now — not the shape
-    // bubblewrap leaves. The sandbox still gets a commondir it can read, off
-    // the store, and the host's file is neither rewritten nor removed.
-    const checkout = makeCheckout('repo')
-    const commondir = join(checkout, '.git', 'commondir')
-    writeFileSync(commondir, '', { mode: 0o644 })
+      const source = mountSource(await wrapIn(checkout), commondir)
+      expect(source).not.toBe(commondir)
+      expect(source).not.toBe('/dev/null')
+      expect(readFileSync(source, 'utf8')).toBe('.\n')
+      expect(readFileSync(commondir, 'utf8')).toBe('')
 
-    const source = mountSource(await wrapIn(checkout), commondir)
-    expect(source).not.toBe(commondir)
-    expect(source).not.toBe('/dev/null')
-    expect(readFileSync(source, 'utf8')).toBe('.\n')
-    expect(readFileSync(commondir, 'utf8')).toBe('')
-
-    cleanupBwrapMountPoints({ force: true })
-    expect(existsSync(commondir)).toBe(true)
-    expect(readFileSync(commondir, 'utf8')).toBe('')
-  })
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(commondir)).toBe(true)
+      expect(readFileSync(commondir, 'utf8')).toBe('')
+    },
+  )
 
   it.if(process.getuid?.() !== 0)(
     'denies a git directory whole when it takes no mount point',
@@ -5567,6 +7333,18 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
         expect(lastMountAt(command, gitDir)).toBe(
           `--ro-bind ${gitDir} ${gitDir}`,
         )
+        // A deny bind is emitted after the write root's own bind; an
+        // ancestor pin spells the same words before it.
+        const writeRootBind = indexOfMount(
+          command,
+          '--bind',
+          checkout,
+          checkout,
+        )
+        expect(writeRootBind).toBeGreaterThan(-1)
+        expect(
+          lastIndexOfMount(command, '--ro-bind', gitDir, gitDir),
+        ).toBeGreaterThan(writeRootBind)
         expect(existsSync(join(gitDir, 'commondir'))).toBe(false)
         expect(existsSync(join(gitDir, 'config.worktree'))).toBe(false)
       } finally {
@@ -5790,18 +7568,23 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
       const repo = gitRepo('repo')
       const commondir = join(repo, '.git', 'commondir')
 
-      // What a killed process leaves now: the host's git works on it, and
-      // the next wrap takes it away.
-      writeFileSync(commondir, '.\n')
+      // What a killed process leaves: the host's git works on it, and the next
+      // wrap takes it away.
+      await wrapAndBeKilled(repo)
+      expect(readFileSync(commondir, 'utf8')).toBe('.\n')
       expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
       expect(git(repo, ['log', '--oneline'])).toMatchObject({ status: 0 })
       await wrapIn(repo)
       cleanupBwrapMountPoints()
       expect(existsSync(commondir)).toBe(false)
 
-      // What an older release leaves: git refuses every command in the
-      // repository until the next wrap rewrites it.
-      writeFileSync(commondir, '', { mode: 0o444 })
+      // What bubblewrap makes where the placeholder has gone from under it: git
+      // refuses every command in the repository until the next wrap rewrites
+      // it.
+      await wrapAndBeKilled(repo)
+      chmodSync(commondir, 0o644)
+      writeFileSync(commondir, '')
+      chmodSync(commondir, 0o444)
       const broken = git(repo, ['status', '--porcelain'])
       expect(broken.status).not.toBe(0)
       expect(broken.stdout).toContain('commondir')

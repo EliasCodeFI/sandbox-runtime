@@ -1,4 +1,8 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import {
+  SERVES_EMITTED_CONNECTIONS,
+  testWithTls,
+} from '../helpers/emitted-connections.js'
 import { captured } from '../helpers/captured.js'
 import {
   createServer as createHttpServer,
@@ -145,6 +149,17 @@ describe('SentinelRegistry', () => {
     expect(reg.lookupReal(outer)).toBe('real-a')
   })
 
+  test('an empty caller-minted sentinel is refused, first or not', () => {
+    // It nests with every sentinel registered after it, which would then be
+    // the one refused, and the substitution scan finds it everywhere.
+    const reg = new SentinelRegistry()
+    expect(() =>
+      reg.registerWithSentinel('A', '', 'real-a', ['h.example.com']),
+    ).toThrow(/empty sentinel/)
+    expect(reg.size).toBe(0)
+    expect(reg.lookupReal(reg.register('B', 'real-b', []))).toBe('real-b')
+  })
+
   test('a caller-minted sentinel that nests with nothing registers', () => {
     const reg = new SentinelRegistry()
     reg.registerWithSentinel('A', 'fake.jwt.aaa', 'real-a', ['h.example.com'])
@@ -263,6 +278,8 @@ describe('macOS env preamble for masked credentials', () => {
  * Reuses the tls-terminate-proxy.test.ts fixture pattern.
  */
 describe('header injection through the TLS-terminating proxy', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const reg = new SentinelRegistry()
   const sentinel = reg.register('GH_TOKEN', REAL_TOKEN, ['127.0.0.1'])
@@ -291,7 +308,7 @@ describe('header injection through the TLS-terminating proxy', () => {
 
     proxy = createHttpProxyServer({
       filter: () => true,
-      mitmCA: ca,
+      mitmCA: SERVES_EMITTED_CONNECTIONS ? ca : undefined,
       tlsTerminateUpstreamCA: CA_PEM,
       // Per-sentinel host gating lives in the registry now; the closure
       // just forwards destHost.
@@ -1443,6 +1460,10 @@ async function curlViaProxy(
     '-sS',
     '--proxy',
     `http://${auth}127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--max-time',
     '10',
     '-D',

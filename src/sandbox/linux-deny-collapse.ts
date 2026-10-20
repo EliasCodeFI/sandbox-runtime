@@ -1,4 +1,4 @@
-import * as fs from 'fs'
+import { realPathOrSelf } from '../utils/real-path.js'
 import type {
   GitDirDenies,
   GitDirTreeDenies,
@@ -26,6 +26,13 @@ export interface RepositorySubmodules {
    * rather than sitting under it, and it is no reason to degrade anything.
    */
   wholeDirDenies: string[]
+  /**
+   * Set where these are not submodules at all but the git directories of the
+   * repository's linked worktrees, and `modulesDir` its `.git/worktrees`: the
+   * same shape degraded the same way (see {@link repositoryWorktrees}), and
+   * named for what it is in the wrap's warning.
+   */
+  linkedWorktrees?: true
 }
 
 /** What one wrap denies, and what of that can be degraded. */
@@ -37,7 +44,9 @@ export interface SubmoduleDenyPlan {
    * something under, in the order they were served: the working directory's
    * own repository first, then the nested ones the scan found, sorted. A
    * repository with nothing under its `modules` is not here at all, so an
-   * absent one is never denied and never costs anything.
+   * absent one is never denied and never costs anything. Each repository's
+   * `.git/worktrees` follows its `modules` as an entry of its own, under the
+   * same conditions.
    */
   repositories: RepositorySubmodules[]
   /**
@@ -52,6 +61,16 @@ export interface SubmoduleDenyPlan {
    * and `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
    */
   chainHops: GitChainHop[]
+  /**
+   * The entries of the git directory the working directory's own `.git` is or
+   * names: `hooks`, `config`, `commondir`, `config.worktree`. Each is denied
+   * at its own path from the first wrap that saw the repository, so a link
+   * found at one was there before any command ran: the layout is the user's,
+   * where any other git directory a wrap finds - a nested repository, a
+   * submodule's - may be one an earlier command made. Absent for a plan that
+   * was not built from a working directory.
+   */
+  ownEntries?: string[]
 }
 
 /**
@@ -92,6 +111,41 @@ export function repositorySubmodules(
     modulesDir: denies.modulesDir,
     gitDirs: denies.submodules,
     wholeDirDenies,
+  }
+}
+
+/**
+ * The git directories of one repository's linked worktrees as a plan
+ * degrades them, or undefined where it has none.
+ *
+ * A `.git/worktrees` is as writable inside the sandbox as a `.git/modules`
+ * is, so a command can fill one, and each directory in it costs a mount per
+ * file denied there and a pin. They are degraded in the steps a submodule is
+ * — the worktree's git directory bound read-only whole, then `worktrees`
+ * itself — and what a step costs is smaller: the command runs in another
+ * checkout, so what stops working is git housekeeping that reaches across
+ * worktrees (`git gc` expiring that worktree's reflog) and, at the last step,
+ * `git worktree add`. What a worktree's `commondir` names outside it is
+ * marked as leading out of the directory by the producer, and is kept.
+ */
+export function repositoryWorktrees(
+  denies: GitDirTreeDenies,
+): RepositorySubmodules | undefined {
+  // Under `worktrees` only, and nothing at all for a repository that has
+  // none: an absent `.git/worktrees` is never denied, for the reason an
+  // absent `.git/modules` is not.
+  const wholeDirDenies = [
+    ...denies.unreadableDirs,
+    ...denies.linkedEntryDirs,
+  ].filter(denyPath => isAtOrUnder(denyPath, denies.worktreesDir))
+  if (denies.worktrees.length === 0 && wholeDirDenies.length === 0) {
+    return undefined
+  }
+  return {
+    modulesDir: denies.worktreesDir,
+    gitDirs: denies.worktrees,
+    wholeDirDenies,
+    linkedWorktrees: true,
   }
 }
 
@@ -207,6 +261,20 @@ export function collapseFurther(
   return undefined
 }
 
+/**
+ * The last level: every submodule git directory and every `.git/modules`
+ * denied whole, past which {@link collapseFurther} has nothing left to take.
+ * It is where the caller goes once a step has given nothing back, rather than
+ * on through entries that may all be like the ones it just took: see
+ * `generateFilesystemArgs` in src/sandbox/linux-sandbox-utils.ts.
+ */
+export function collapseEverything(plan: SubmoduleDenyPlan): CollapseLevel {
+  return {
+    wholeGitDirs: collapsibleGitDirs(plan).length,
+    wholeModulesDirs: plan.repositories.length,
+  }
+}
+
 /** How many entries before `from` it takes for `gives` to reach `mounts`, at
  *  least one: a step that degraded nothing would loop for ever. */
 function stepBack(
@@ -239,28 +307,41 @@ export function describeCollapse(
   const order = collapsibleGitDirs(plan)
   const alreadyWhole = coveredByWholeDirDeny(plan)
   const parts: string[] = []
-  if (level.wholeGitDirs > 0) {
-    const collapsed = order
-      .slice(order.length - level.wholeGitDirs)
-      .filter(entry => !alreadyWhole(entry.gitDir))
-    if (collapsed.length > 0) {
-      const repositories = [
-        ...new Set(collapsed.map(entry => entry.modulesDir)),
-      ].join(', ')
-      parts.push(
-        `${collapsed.length} of the ${order.length} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
-      )
+  // Submodules and linked worktrees are degraded by the same steps and lose
+  // different things to them, so each is told in its own words.
+  for (const linkedWorktrees of [false, true]) {
+    const ofKind = (entry: { linkedWorktrees?: true }): boolean =>
+      (entry.linkedWorktrees === true) === linkedWorktrees
+    if (level.wholeGitDirs > 0) {
+      const collapsed = order
+        .slice(order.length - level.wholeGitDirs)
+        .filter(entry => ofKind(entry) && !alreadyWhole(entry.gitDir))
+      if (collapsed.length > 0) {
+        const repositories = [
+          ...new Set(collapsed.map(entry => entry.modulesDir)),
+        ].join(', ')
+        const total = order.filter(ofKind).length
+        parts.push(
+          linkedWorktrees
+            ? `${collapsed.length} of the ${total} linked worktree git directories under ${repositories} are denied whole rather than by path, so git writes into those worktrees' own HEAD, index and logs fail read-only`
+            : `${collapsed.length} of the ${total} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
+        )
+      }
     }
-  }
-  if (level.wholeModulesDirs > 0) {
-    const collapsed = plan.repositories
-      .slice(plan.repositories.length - level.wholeModulesDirs)
-      .map(repository => repository.modulesDir)
-      .filter(modulesDir => !alreadyWhole(modulesDir))
-    if (collapsed.length > 0) {
-      parts.push(
-        `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`,
-      )
+    if (level.wholeModulesDirs > 0) {
+      const collapsed = plan.repositories
+        .slice(plan.repositories.length - level.wholeModulesDirs)
+        .filter(ofKind)
+        .map(repository => repository.modulesDir)
+        .filter(modulesDir => !alreadyWhole(modulesDir))
+      if (collapsed.length > 0) {
+        const taken = linkedWorktrees
+          ? `every linked worktree's git directory under ${collapsed.length === 1 ? 'it' : 'them'}, and \`git worktree add\` with ${collapsed.length === 1 ? 'it' : 'them'}`
+          : `every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`
+        parts.push(
+          `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking ${taken}`,
+        )
+      }
     }
   }
   return parts.join('; ')
@@ -284,10 +365,13 @@ function coveredByWholeDirDeny(
  *  own sorted. */
 function collapsibleGitDirs(
   plan: SubmoduleDenyPlan,
-): Array<{ modulesDir: string; gitDir: string } & GitDirDenies> {
+): Array<
+  { modulesDir: string; linkedWorktrees?: true; gitDir: string } & GitDirDenies
+> {
   return plan.repositories.flatMap(repository =>
     repository.gitDirs.map(submodule => ({
       modulesDir: repository.modulesDir,
+      linkedWorktrees: repository.linkedWorktrees,
       ...submodule,
     })),
   )
@@ -298,14 +382,4 @@ function collapsibleGitDirs(
 function underDirectory(dir: string): (candidate: string) => boolean {
   const real = realPathOrSelf(dir)
   return candidate => isAtOrUnder(realPathOrSelf(candidate), real)
-}
-
-/** `target` with symlinks resolved, or itself when that fails - which leaves
- *  a path that cannot be resolved outside the bind, and so denied as it was. */
-function realPathOrSelf(target: string): string {
-  try {
-    return fs.realpathSync(target)
-  } catch {
-    return target
-  }
 }
