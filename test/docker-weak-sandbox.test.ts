@@ -195,7 +195,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
 
       expect(r.stdout).toContain('SANDBOX-RAN')
       expect(r.stdout).toContain(`umount2 ${LINK} rc=-1 errno=${errno}`)
-      expect(r.stdout).toContain('Device or resource busy')
+      // EBUSY, as glibc words it ("Device or resource busy") or musl.
+      expect(r.stdout).toMatch(/resource busy/i)
       expect(readlinkSync(LINK)).toBe('leads-to')
     },
   )
