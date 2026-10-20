@@ -162,7 +162,7 @@ try {
     [join(projectBin, 'srt-test-helper'), join(linked, 'srt-test-helper')],
   )
   assert.strictEqual(
-    findHostHelper('srt-test-helper', undefined).path,
+    findHostHelper('srt-test-helper', []).path,
     join(projectBin, 'srt-test-helper'),
     'no write restriction: the plain search',
   )

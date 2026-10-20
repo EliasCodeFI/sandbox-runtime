@@ -62,12 +62,12 @@ export function writablePlaces(
     ...getDefaultWritePaths(),
   ]) {
     const normalized = normalizePathForSandbox(allowed)
+    // The empty spelling (an empty $HOME) would cover every path as a prefix.
+    if (!path.isAbsolute(normalized)) continue
     const spelled =
       (containsGlobChars(normalized)
         ? globPatternBaseDir(normalized)
         : normalized.replace(/\/+$/, '')) || '/'
-    // The empty spelling (an empty $HOME) would cover every path as a prefix.
-    if (!path.isAbsolute(spelled)) continue
     if (spelled === '/') return []
     places.add(spelled)
     try {

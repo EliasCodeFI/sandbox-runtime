@@ -139,7 +139,7 @@ describe('whichSync searches PATH in this process', () => {
     expect(whichSync('tool')).toBeNull()
   })
 
-  it('reads an empty entry as the current directory and answers with an absolute path', () => {
+  it('reads an empty entry as the current directory, and joins as a shell does', () => {
     const dir = join(base, 'cwd')
     mkdirSync(dir)
     plant(join(dir, 'tool'), join(base, 'unused'))
@@ -147,9 +147,9 @@ describe('whichSync searches PATH in this process', () => {
     process.chdir(dir)
     try {
       process.env.PATH = ':/nonexistent-for-test'
-      expect(whichSync('tool')).toBe(join(dir, 'tool'))
+      expect(whichSync('tool')).toBe('./tool')
       process.env.PATH = '.'
-      expect(whichSync('tool')).toBe(join(dir, 'tool'))
+      expect(whichSync('tool')).toBe('./tool')
     } finally {
       process.chdir(savedCwd)
     }
