@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { forgetMountPointManifestDirectory } from '../../src/sandbox/bwrap-mount-manifests.js'
+import './isolated/places.js'
 import { cleanupBwrapMountPoints } from '../../src/sandbox/linux-sandbox-utils.js'
 
 /** Field 22 of a /proc/PID/stat line: when that process started. */

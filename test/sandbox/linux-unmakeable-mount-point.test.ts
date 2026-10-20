@@ -780,7 +780,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     () => {
       const denied = join(DIR, 'policy.json')
       const script = `
-        const { wrapCommandWithSandboxLinux } = await import('./src/sandbox/linux-sandbox-utils.ts')
+        const { wrapCommandWithSandboxLinux } = await import('./test/helpers/isolated/library.ts')
         const { spawnSync } = await import('node:child_process')
         const command = await wrapCommandWithSandboxLinux({
           command: 'echo BOOTED; echo x > ${denied}; echo x > ${join(ROOT, 'new')}',
