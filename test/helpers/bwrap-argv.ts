@@ -22,7 +22,7 @@ export const STEP_SHELL = ((): string => {
 
 /** The step that puts the command on its manifest's started record. */
 export const RECORD_STEP =
-  'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1" && shift'
+  'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1" && shift'
 
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']

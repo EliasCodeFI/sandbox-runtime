@@ -1057,8 +1057,8 @@ let stepShell: string[] | undefined
  *
  * THREAT: this shell runs on the host, unsandboxed, in an environment a
  * sandboxed command may have had a hand in. So `-p`: plain `bash -c` imports
- * exported functions, and one named `shift`, `read`, `printf` or `exec` would
- * run in place of the step's own word; it also reads the file `$BASH_ENV`
+ * exported functions, and one named `shift`, `local`, `read`, `printf` or `exec`
+ * would run in place of the step's own word; it also reads the file `$BASH_ENV`
  * names. And never a PATH look-up or the caller's `binShell`: a copy planted in
  * a writable PATH directory would be run out here.
  */
@@ -1107,8 +1107,11 @@ export class WorkingDirectoryChanged extends Error {
  * execs bwrap in its place: the pid on record is bwrap's, written before bwrap
  * has made a mount. Read by the shell itself, a redirection on a builtin: a
  * child's line would be that of a process gone at once. Not /proc/$$: under an
- * outer /proc `$$` is nobody there, or an unrelated process. Appended, not
- * written over, so that every run of the string is on record while it lasts.
+ * outer /proc `$$` is nobody there, or an unrelated process. Into a variable
+ * local to a function: assigned to, one of that name that the caller exports
+ * would reach the command with the line in it. (`local` is in bash, dash, ash
+ * and mksh, not in POSIX; the function's name is none a shell has an alias for.) Appended, not written over, so
+ * that every run of the string is on record while it lasts.
  * One shell does both where both are needed.
  * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
@@ -1125,7 +1128,7 @@ function renderBwrapInvocation(
       ? []
       : [
           {
-            run: 'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"',
+            run: 'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1"',
             file: started,
           },
         ]

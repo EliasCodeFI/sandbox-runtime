@@ -798,6 +798,31 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     90000,
   )
 
+  it.if(BWRAP_CAN_NAMESPACE).each([STEP_SHELL, '/bin/sh -c'])(
+    'leaves an entry named like a variable of its own steps as it was (steps run by %s)',
+    async stepShell => {
+      // Else the command gets the host shell's /proc/self/stat line for it. The
+      // steps are run by /bin/sh where there is no bash.
+      const wrapped = await wrap('echo "s=[${s-unset}]"')
+      expect(wrapped).toStartWith(`${STEP_SHELL} `)
+      const command = `${stepShell}${wrapped.slice(STEP_SHELL.length)}`
+      for (const [s, said] of [
+        ['precious', 's=[precious]\n'],
+        [undefined, 's=[unset]\n'],
+      ] as const) {
+        const run = spawnSync(command, {
+          shell: true,
+          env: { ...process.env, s },
+          encoding: 'utf8',
+          timeout: 60000,
+        })
+        expect(`${run.stdout}${run.stderr}`).toBe(said)
+      }
+      expect(onRecord(wrapped)).toHaveLength(2)
+    },
+    90000,
+  )
+
   it.if(BWRAP_CAN_NAMESPACE && BASH !== undefined)(
     'runs nothing on the host that the environment plants for a shell',
     async () => {
