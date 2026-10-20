@@ -599,14 +599,8 @@ function believedManifestDirectories(): string[] {
  * alone, else a private directory only this process knows, which keeps the
  * guarantee within this process. Revalidated on every use, because a directory
  * swapped for a symlink between two wraps would send manifests elsewhere.
- *
- * What it makes is believed from then on. So a wrap with a manifest to come
- * asks before it pins, and binds this one with the others.
  */
-export function ensureManifestDirectory(): string | undefined {
-  if (!onLinux()) {
-    return undefined
-  }
+function ensureManifestDirectory(): string | undefined {
   if (
     manifestDirectory !== undefined &&
     isOurPrivateDirectory(manifestDirectory)
@@ -656,8 +650,7 @@ export function ensureManifestDirectory(): string | undefined {
 /**
  * Every directory a wrap must bind read-only because some process of this user
  * keeps manifests in it and a collect believes what it finds there: every
- * shared name, whichever this process writes to, plus the one it settled on
- * (for a manifest yet to come, see {@link ensureManifestDirectory}).
+ * shared name, whichever this process writes to, plus the one it settled on.
  *
  * Each is made if it can be, so a sandboxed command cannot make and fill it
  * first. One that can be neither made nor bound is not believed, and the
@@ -669,9 +662,11 @@ export function ensureManifestDirectory(): string | undefined {
  * - another user has the name, in a sticky directory: only that user or root
  *   can remove or rename it.
  *
- * Throws where it cannot tell whether one of them is there.
+ * With `recording`, the directory this wrap's manifest will go to is settled
+ * first, so the wrap can pin what lies above it before it publishes. Throws
+ * where it cannot tell whether one of them is there.
  */
-export function mountPointManifestDirectories(): string[] {
+export function mountPointManifestDirectories(recording = false): string[] {
   if (!onLinux()) {
     return []
   }
@@ -686,6 +681,9 @@ export function mountPointManifestDirectories(): string[] {
     if (isToBeBound(candidate)) {
       dirs.add(candidate)
     }
+  }
+  if (recording) {
+    ensureManifestDirectory()
   }
   if (manifestDirectory !== undefined && isToBeBound(manifestDirectory)) {
     dirs.add(manifestDirectory)
@@ -1083,9 +1081,6 @@ export function publishMountPointManifest(
       } catch {
         // Never made.
       }
-      // Made just now, it may be, and bound by no command: not left to be
-      // believed with nothing of this process's in it.
-      removePrivateManifestDirectory()
       logForDebugging(
         `[Sandbox Linux] Could not record the mount points this command relies on (${String(e)}) - they are kept in memory and removed at this process's own clean-up`,
         { level: 'warn' },

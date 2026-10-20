@@ -12,7 +12,6 @@ import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
   discardMountPointManifest,
-  ensureManifestDirectory,
   holdsMountPointManifest,
   keepTrackOfMountPoint,
   keepTrackOfMountSource,
@@ -2259,8 +2258,19 @@ async function generateFilesystemArgs(
   // The mount points on the host this wrap relies on: placeholders bwrap makes
   // for absent deny paths, and another sandbox's that this wrap covers again.
   const mountPoints: string[] = []
-  // Where the manifests are kept, each where it really is.
+  // Where the manifests are kept, each made if it can be.
   let manifestDirs: string[] = []
+  const makeManifestDirs = (recording: boolean): void => {
+    try {
+      manifestDirs = mountPointManifestDirectories(recording)
+    } catch (err) {
+      throw new LinuxSandboxProfileError(
+        'mount_points_unreadable',
+        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
+        errorText(err),
+      )
+    }
+  }
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
   const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
@@ -2798,19 +2808,10 @@ async function generateFilesystemArgs(
     // against it on both sides of the await above, the only one here.
     if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
 
-    // Made before any reading of them. What the environment names is believed
-    // only while none of the others can be written, and what this wrap found
-    // named there its own manifest would carry to where every process believes
-    // it. Resolved at once, while each is known for a directory and no link.
-    try {
-      manifestDirs = mountPointManifestDirectories().map(canonicalForm)
-    } catch (err) {
-      throw new LinuxSandboxProfileError(
-        'mount_points_unreadable',
-        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
-        errorText(err),
-      )
-    }
+    // Before any reading of them. What the environment names is believed only
+    // while none of the others can be written, and what this wrap found named
+    // there its own manifest would carry to where every process believes it.
+    makeManifestDirs(false)
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -3547,19 +3548,16 @@ async function generateFilesystemArgs(
   // read-only bind protects one only while its name still leads to it, and
   // with the temp dir strictly inside a write root a command could otherwise
   // rename the temp dir aside and make the name again.
-  // With a manifest to come, where it goes is settled now, to be bound and
-  // pinned too: it may be a directory of the process's own.
+  // With a manifest to come, where it goes is settled now, to be pinned too.
   if (mountPoints.length > 0 || emptySource !== undefined) {
-    const own = ensureManifestDirectory()
-    if (own !== undefined) manifestDirs.push(canonicalForm(own))
+    makeManifestDirs(true)
   }
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
-      ...manifestDirs,
-      ...[maskedFileStoreDir, emptySource].flatMap(dir =>
+      ...[...manifestDirs, maskedFileStoreDir, emptySource].flatMap(dir =>
         dir === undefined ? [] : [canonicalForm(dir)],
       ),
     ],
@@ -3820,8 +3818,7 @@ async function generateFilesystemArgs(
       [...madeIn].every(relied => isThere(relied, true)) &&
       mountPointsReliedOn(manifest?.file).every(dir => names.includes(dir)) &&
       // Else settled on since the pins were made: nothing is pinned above it.
-      (manifest === undefined ||
-        manifestDirs.includes(canonicalForm(manifest.dir)))
+      (manifest === undefined || manifestDirs.includes(manifest.dir))
   } finally {
     if (!holds && manifest !== undefined) {
       discardMountPointManifest(manifest.file)
@@ -3868,7 +3865,7 @@ async function generateFilesystemArgs(
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
     // Each where it really is, once: two of the names may lead to one place.
-    const others = new Set(manifestDirs)
+    const others = new Set(manifestDirs.map(canonicalForm))
     if (manifest !== undefined) others.delete(canonicalForm(manifest.dir))
     for (const dir of others) {
       if (isInReach(dir)) args.push('--ro-bind-try', dir, dir)
