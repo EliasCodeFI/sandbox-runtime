@@ -63,6 +63,9 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  forgetLinuxUnheldLinks,
+  getLinuxUnheldLinks,
+  type LinuxUnheldLink,
   linuxGetCwdMandatoryDenyPaths,
   LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
@@ -2052,6 +2055,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
+  const matchedLinks = new Set<string>()
   const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
     resolveReadDenies(
@@ -2062,7 +2066,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
           pattern,
           reExposedPaths,
           unlistableDenyDirs,
-          { anchor, budget, listings },
+          { anchor, budget, listings, matchedLinks },
         ),
     ),
   )
@@ -2071,6 +2075,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...(matchedLinks.size > 0 && { matchedLinks: [...matchedLinks] }),
     ...literalReadLists(
       config.filesystem.denyRead,
       config.filesystem.allowRead,
@@ -2691,6 +2696,7 @@ async function wrapWithSandboxOnce(
       writeConfig,
     )
     const unlistableDenyDirs = new Set<string>()
+    const matchedLinks = new Set<string>()
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await walked(
       resolveReadDenies(
@@ -2701,7 +2707,7 @@ async function wrapWithSandboxOnce(
             pattern,
             reExposedPaths,
             unlistableDenyDirs,
-            { anchor, budget, listings },
+            { anchor, budget, listings, matchedLinks },
           ),
       ),
     )
@@ -2714,6 +2720,7 @@ async function wrapWithSandboxOnce(
       allowWithinDeny: expandedAllowRead,
       ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
       unlistableDenyDirs: [...unlistableDenyDirs],
+      matchedLinks: [...matchedLinks],
       ...literalReadLists(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
         customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
@@ -3173,6 +3180,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
   configInstalls++
+  forgetLinuxUnheldLinks()
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
@@ -3333,6 +3341,7 @@ async function reset(): Promise<void> {
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
   cleanupBwrapMountPoints({ force: true })
+  forgetLinuxUnheldLinks()
 
   // Stop log monitor
   if (logMonitorShutdown) {
@@ -3634,6 +3643,12 @@ export interface ISandboxManager {
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
+  /**
+   * Linux: the symbolic links on the way to a denied path that a command
+   * could replace, each with the reason nothing holds it. Each is listed by
+   * the latest wrap that met it; `reset()` and `updateConfig()` empty the list.
+   */
+  getLinuxUnheldLinks(): LinuxUnheldLink[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   /**
@@ -3699,6 +3714,7 @@ export const SandboxManager: ISandboxManager = {
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
+  getLinuxUnheldLinks,
   getConfig,
   updateConfig,
 } as const

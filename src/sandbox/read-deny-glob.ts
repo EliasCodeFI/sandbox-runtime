@@ -62,7 +62,7 @@ function collapseReadDenyLocations({
 type ReadDenyGlobOptions = Pick<
   GlobWalkOptions,
   'anchor' | 'budget' | 'listings'
->
+> & { matchedLinks?: Set<string> }
 
 /**
  * Expand a read-deny glob into the paths bwrap should mount over, collapsed
@@ -81,6 +81,8 @@ type ReadDenyGlobOptions = Pick<
  * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
  * @param opts.budget - as in `GlobWalkOptions.budget`.
  * @param opts.listings - one map for all the patterns of a configuration.
+ * @param opts.matchedLinks - receives the matches that are symbolic links, by
+ * name: what is returned for one is where it leads.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
@@ -146,6 +148,7 @@ export function* expandReadDenyGlobLinuxSteps(
     if (!namedBy.has(location)) namedBy.set(location, candidate)
   }
   for (const candidate of candidates) {
+    if (walk.symlinks.has(candidate)) opts.matchedLinks?.add(candidate)
     if (walk.symlinks.has(candidate) && !walk.realOf.has(candidate)) {
       if (!walk.uninspectableLinks.has(candidate)) {
         // A link that resolves to nothing denies nothing, and bwrap cannot
