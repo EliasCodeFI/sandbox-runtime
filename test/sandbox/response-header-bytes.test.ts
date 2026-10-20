@@ -7,8 +7,11 @@ import {
   type Server,
   type Socket,
 } from 'node:net'
-import { createServer as createTlsServer, type TLSSocket } from 'node:tls'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import {
+  connect as tlsConnect,
+  createServer as createTlsServer,
+  type TLSSocket,
+} from 'node:tls'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'

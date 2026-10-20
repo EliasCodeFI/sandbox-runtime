@@ -10,8 +10,10 @@ import {
 } from 'node:http'
 import { createServer, connect, type AddressInfo, type Server } from 'node:net'
 import type { LookupFunction, Socket } from 'node:net'
-import { createServer as createTlsServer } from 'node:tls'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import {
+  createServer as createTlsServer,
+  connect as tlsConnect,
+} from 'node:tls'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
