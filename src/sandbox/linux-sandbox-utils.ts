@@ -1340,6 +1340,10 @@ function cleanUpAfter(
     }
   }
 
+  // This process's own, whatever has become of the manifests that named it.
+  if (release === 'all' && emptyMountSourceDir !== undefined) {
+    keepTrackOfMountSource(emptyMountSourceDir)
+  }
   const removed = collectMountPoints(release)
   if (
     emptyMountSourceDir !== undefined &&

@@ -2355,6 +2355,15 @@ describe.if(isLinux)(
       expect(emptySources()).toEqual([])
     })
 
+    it('has what it binds from removed with its last command, whatever has become of the manifest that named it', async () => {
+      const command = await wrap('true', [LEAF])
+      expect(emptySources()).toHaveLength(1)
+      // As a cleaner of temp dirs takes it.
+      rmSync(recordedBy(command)!)
+      cleanupBwrapMountPoints()
+      expect(emptySources()).toEqual([])
+    })
+
     it('gives up, with a code of its own and nothing left behind, when that happens to every plan', async () => {
       let published = 0
       const publishing = atEachPublish(() => {
