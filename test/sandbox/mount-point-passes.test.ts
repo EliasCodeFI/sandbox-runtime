@@ -386,31 +386,93 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     expect(passes()).toEqual([])
   })
 
-  it('leaves the rest to the next pass once it has been on record for two seconds', () => {
-    const second = join(AREA, 'second.lock')
-    leftover(LOCK)
-    leftover(second)
-    manifestOfADeadProcess([LOCK, second])
-    const unlink = fs.unlinkSync
-    const now = performance.now.bind(performance)
-    let late = 0
-    const spies = [
-      spyOn(performance, 'now').mockImplementation(() => now() + late),
-      spyOn(fs, 'unlinkSync').mockImplementation(((file: string) => {
-        unlink(file)
-        if (file === second) late = 2_001
-      }) as never),
-    ]
-    try {
-      // Children first, which among siblings is the later name first.
-      expect(collectMountPoints()).toEqual([second])
-    } finally {
-      spies.forEach(spy => spy.mockRestore())
+  /** Has that clock go on by `ms` whenever `heldUpFor` is called. */
+  function aClockThatIsHeldUp(clock: typeof performance | typeof Date): {
+    heldUpFor(ms: number): void
+    mockRestore(): void
+  } {
+    const now = clock.now.bind(clock)
+    let lost = 0
+    const spy = spyOn(clock, 'now').mockImplementation(() => now() + lost)
+    return {
+      heldUpFor: ms => {
+        lost += ms
+      },
+      mockRestore: () => spy.mockRestore(),
     }
-    expect(existsSync(LOCK)).toBe(true)
-    expect(passes()).toEqual([])
-    expect(collectMountPoints()).toEqual([LOCK])
-  })
+  }
+  // The wall clock alone goes on while the host is suspended, and others go by
+  // it; it alone can be set back.
+  const CLOCKS = [
+    ['the monotonic clock', (): typeof performance => performance],
+    ['the wall clock', (): typeof Date => Date],
+  ] as const
+
+  it.each(CLOCKS)(
+    'leaves the rest to the next pass once it has been on record for two seconds, by %s',
+    (_, which) => {
+      const second = join(AREA, 'second.lock')
+      leftover(LOCK)
+      leftover(second)
+      manifestOfADeadProcess([LOCK, second])
+      const unlink = fs.unlinkSync
+      const clock = aClockThatIsHeldUp(which())
+      const spy = spyOn(fs, 'unlinkSync').mockImplementation(((
+        file: string,
+      ) => {
+        unlink(file)
+        if (file === second) clock.heldUpFor(2_001)
+      }) as never)
+      try {
+        // Children first, which among siblings is the later name first.
+        expect(collectMountPoints()).toEqual([second])
+      } finally {
+        spy.mockRestore()
+        clock.mockRestore()
+      }
+      expect(existsSync(LOCK)).toBe(true)
+      expect(passes()).toEqual([])
+      expect(collectMountPoints()).toEqual([LOCK])
+    },
+  )
+
+  it.each(CLOCKS)(
+    'counts the time it takes to go on record, and to list the directories before a removal, by %s',
+    (_, which) => {
+      for (const heldUpIn of ['openSync', 'readdirSync'] as const) {
+        leftover(LOCK)
+        manifestOfADeadProcess([LOCK])
+        const clock = aClockThatIsHeldUp(which())
+        const real = fs[heldUpIn] as (...args: unknown[]) => unknown
+        let listings = 0
+        const spy = spyOn(fs, heldUpIn).mockImplementation(((
+          file: unknown,
+          ...rest: unknown[]
+        ) => {
+          const result = real(file, ...rest)
+          if (
+            heldUpIn === 'openSync'
+              ? String(file).endsWith('.pass')
+              : // The reading it decides on, then the one before the removal.
+                file === DIR &&
+                (result as string[]).some(name => name.endsWith('.pass')) &&
+                ++listings === 2
+          ) {
+            clock.heldUpFor(2_001)
+          }
+          return result
+        }) as never)
+        try {
+          expect(collectMountPoints()).toEqual([])
+        } finally {
+          spy.mockRestore()
+          clock.mockRestore()
+        }
+        if (heldUpIn === 'readdirSync') expect(listings).toBe(2)
+        expect(collectMountPoints()).toEqual([LOCK])
+      }
+    },
+  )
 
   // ---- which passes are under way --------------------------------------------
 

@@ -136,10 +136,20 @@ const UNREADABLE_MANIFEST_MAX_AGE_MS = 60 * 60 * 1000
 const OTHER_NAMESPACE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 /**
- * A pass removes nothing more once it has been on record for this long, and
+ * A pass removes nothing more this long after it set out to go on record, and
  * leaves the rest to the next: an ordinary one takes milliseconds.
  */
 const PASS_GOOD_FOR_MS = 2 * 1000
+
+/**
+ * Both clocks. Whoever cannot ask after a pass goes by the age of its record,
+ * which is wall-clock time; the other stands still while the host is suspended
+ * (a laptop asleep, a virtual machine paused), and this one can be set back.
+ */
+const bothClocks = (): readonly [number, number] => [
+  performance.now(),
+  Date.now(),
+]
 
 /**
  * A pass that cannot be asked after (another PID namespace's) counts as under
@@ -1715,6 +1725,8 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
     return []
   }
   const writable = dirs.filter(dir => isOurPrivateDirectory(dir))
+  // From before its record is made, whose age others go by.
+  const since = bothClocks()
   try {
     // Off the record it removes nothing on a manifest's word. What is left to
     // remove is what this process could record nowhere, which no wrap elsewhere
@@ -1724,6 +1736,7 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
       putPassOnRecord(writable) ? writable : [],
       own,
       unrecordedToo,
+      since,
     )
   } finally {
     takePassOffRecord()
@@ -1731,16 +1744,17 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
 }
 
 /**
- * The rest of {@link collect}, for as long as the pass is on record: `own` are
- * the claims it has made, `writable` the directories it can claim in.
+ * The rest of {@link collect}, for as long as the pass is on record, which it
+ * has been `since`: `own` are the claims it has made, `writable` the directories
+ * it can claim in.
  */
 function removeWhatIsFinished(
   dirs: readonly string[],
   writable: readonly string[],
   own: ReadonlySet<string>,
   unrecordedToo: boolean,
+  since: readonly [number, number],
 ): string[] {
-  const since = performance.now()
   const reading = readManifests(dirs)
   if (reading.inDoubt !== undefined) {
     logForDebugging(
@@ -1827,14 +1841,6 @@ function removeWhatIsFinished(
   const removed: string[] = []
   const notRemoved = new Set<string>()
   for (const candidate of childrenFirst(candidates.keys())) {
-    // To a process that cannot ask after this one the pass is over by its age.
-    if (performance.now() - since > PASS_GOOD_FOR_MS) {
-      logForDebugging(
-        '[Sandbox Linux] The clean-up of mount points has taken too long - leaving the rest to the next',
-        { level: 'warn' },
-      )
-      return removed
-    }
     if (
       performance.now() - listedAt >= goodFor &&
       !newcomersKeepWhatTheyName()
@@ -1843,6 +1849,15 @@ function removeWhatIsFinished(
     }
     if (kept.has(candidate)) {
       continue
+    }
+    // To a process that cannot ask after this one the pass is over by its age.
+    // The last thing before a removal, after all that may have taken time.
+    if (bothClocks().some((now, i) => now - since[i]! > PASS_GOOD_FOR_MS)) {
+      logForDebugging(
+        '[Sandbox Linux] The clean-up of mount points has taken too long - leaving the rest to the next',
+        { level: 'warn' },
+      )
+      return removed
     }
     const outcome = candidates.get(candidate)
       ? removeMountSource(candidate)
