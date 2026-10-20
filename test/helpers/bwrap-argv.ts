@@ -100,6 +100,18 @@ export function manifestOf(command: string): string | undefined {
   return id === undefined ? undefined : `${id}.json`
 }
 
+/**
+ * `command` with the name of its manifest taken out. A wrap that names mount
+ * points names a manifest of its own for them, so two wraps by one policy
+ * differ in that name and in nothing else.
+ */
+export function withoutManifestName(command: string): string {
+  return command.replace(
+    /(srt-mount-points(?:-\d+)?\/)\d+-[0-9a-f]{16}/g,
+    '$1MANIFEST',
+  )
+}
+
 /** How many times that whole mount appears. */
 export function countMounts(command: string, ...words: MountWords): number {
   return runIndices(command, words).length

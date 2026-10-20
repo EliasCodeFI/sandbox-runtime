@@ -182,8 +182,13 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
         expect(mountsAt(command, join(DIR, 'absent'))).toEqual(
           planned ? [emptyDirectoryAt(join(DIR, 'absent'))] : [],
         )
-        // The parent is pinned either way, beneath the allow bind.
-        expect(mountsOf(command).indexOf(`--ro-bind ${DIR} ${DIR}`)).toBe(1)
+        // The parent is pinned either way, beneath the allow bind. The
+        // manifest of a wrap that names mount points is bound before both.
+        expect(
+          mountsOf(command)
+            .filter(mount => !mount.includes('srt-mount-points'))
+            .indexOf(`--ro-bind ${DIR} ${DIR}`),
+        ).toBe(1)
         // And the question is asked without a trace.
         expect(fs.readdirSync(DIR)).toEqual([])
       },
@@ -596,7 +601,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   it('asks nothing of the host for a path that needs no placeholder', async () => {
     const opened: unknown[] = []
     stub('openSync', p => {
-      opened.push(p)
+      // Every wrap looks after the manifest directories, whatever it denies.
+      if (!String(p).includes('srt-mount-points')) opened.push(p)
       return undefined
     })
     fs.writeFileSync(join(ROOT, 'file'), '')
@@ -617,7 +623,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   it('asks once for deny paths that share a missing directory', async () => {
     const opened: unknown[] = []
     stub('openSync', p => {
-      opened.push(p)
+      // Every wrap looks after the manifest directories, whatever it denies.
+      if (!String(p).includes('srt-mount-points')) opened.push(p)
       return undefined
     })
 
