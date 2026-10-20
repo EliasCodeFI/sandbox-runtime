@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createServer, type AddressInfo } from 'node:net'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import { connect as tlsConnect } from 'node:tls'
 import { serverNameFromClientHello } from '../../src/sandbox/tls-terminate-proxy.js'
 
 const u16 = (n: number): Buffer => Buffer.from([n >> 8, n & 0xff])

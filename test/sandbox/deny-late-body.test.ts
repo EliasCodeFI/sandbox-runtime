@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 // skipped where this runtime cannot terminate it in-process.
 import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { connect, type AddressInfo } from 'node:net'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import { connect as tlsConnect } from 'node:tls'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 

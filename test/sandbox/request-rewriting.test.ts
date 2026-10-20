@@ -11,7 +11,7 @@ import {
 } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Server } from 'node:net'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import { connect as tlsConnect } from 'node:tls'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {

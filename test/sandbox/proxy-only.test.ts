@@ -14,7 +14,7 @@ import {
   type Socket,
 } from 'node:net'
 import { PassThrough } from 'node:stream'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import { connect as tlsConnect } from 'node:tls'
 import {
   createServer as createHttpServer,
   Server as HttpServer,

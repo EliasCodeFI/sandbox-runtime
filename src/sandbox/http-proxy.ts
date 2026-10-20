@@ -499,10 +499,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     }
   }
 
-  // Handle CONNECT requests for HTTPS traffic. `head` is typed as a plain
-  // Buffer because it is reassigned below with bytes read off the socket;
-  // the listener signature alone would narrow it to a Buffer over a
-  // non-shared ArrayBuffer, which those reads are not declared to return.
+  // Handle CONNECT requests for HTTPS traffic. `head` is widened from the
+  // listener's NonSharedBuffer: it is reassigned below from socket reads.
   server.on('connect', async (req, socket, head: Buffer) => {
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {

@@ -23,7 +23,7 @@ import type {
   ServerResponse,
 } from 'node:http'
 import { BlockList, connect as netConnect, isIP } from 'node:net'
-import { connect as tlsConnect, type ConnectionOptions } from 'node:tls'
+import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import type { ParentProxyConfig } from './sandbox-config.js'
@@ -339,10 +339,6 @@ export function connectViaParentProxy(
     destPort,
     authHeader: proxyAuthHeader(proxyUrl),
     readyEvent: useTls ? 'secureConnect' : 'connect',
-    // The TLS options are checked with `satisfies` because the call does not
-    // check them itself: the Bun type package redeclares `connect` for
-    // 'node:tls', and resolved against @types/node 22 that declaration takes
-    // and returns an untyped value.
     dial: () =>
       useTls
         ? tlsConnect({
@@ -350,7 +346,7 @@ export function connectViaParentProxy(
             port: proxyPort,
             // SNI must be a hostname, never an IP literal (RFC 6066 §3).
             ...(isIP(proxyHost) ? {} : { servername: proxyHost }),
-          } satisfies ConnectionOptions)
+          })
         : netConnect(proxyPort, proxyHost),
   })
 }

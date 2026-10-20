@@ -16,8 +16,7 @@ import {
   type AddressInfo,
   type Socket,
 } from 'node:net'
-import type { TLSSocket } from 'node:tls'
-import { tlsConnect } from '../helpers/tls-connect.js'
+import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'

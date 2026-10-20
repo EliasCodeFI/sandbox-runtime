@@ -47,9 +47,7 @@ jobs:
           # 22.12.0 itself: these tests also run `node` inside the sandbox,
           # and on Windows that release tries only `::1` for `localhost`,
           # where the proxy listens on 127.0.0.1. The floor itself is run by
-          # the package check in release.yml. The steps at the end of the job
-          # that run the built package under Node repeat on 24, the line
-          # above it.
+          # the package check in release.yml.
           node-version: '22'
 
       - name: Setup Bun
@@ -182,17 +180,32 @@ jobs:
           sudo apt-get install -y bubblewrap libseccomp-dev gcc socat apparmor-profiles zsh
 
       # The library reads both the output and the exit status of ripgrep, and
-      # those differ between ripgrep releases: for an unreadable directory
-      # that sits exactly at --max-depth, 14.1.1 prints "Permission denied"
-      # and exits 2, where 15.2.0 passes over it and exits 0. 14.1.1 is the
-      # release most installations have, so it is the one the main run uses.
-      - name: Install ripgrep 14.1.1 (Linux)
+      # those differ between releases: for an unreadable directory exactly at
+      # --max-depth, 14.1.1 prints "Permission denied" and exits 2, where
+      # 15.2.0 passes over it and exits 0. 14.1.1 is what most installations
+      # have, so every later step finds it first on PATH; the second full run
+      # below puts 15.2.0 ahead of it. Both are upstream's archives, by the
+      # checksums upstream publishes. macOS runs whatever Homebrew serves.
+      - name: Install ripgrep 14.1.1 and 15.2.0 (Linux)
         if: matrix.os == 'linux'
         run: |
-          .github/scripts/install-ripgrep.sh 14.1.1 \
+          install_ripgrep() {
+            case "${{ matrix.arch }}" in
+              x86-64) asset=ripgrep-$1-x86_64-unknown-linux-musl.tar.gz sha256=$2 ;;
+              arm64) asset=ripgrep-$1-aarch64-unknown-linux-gnu.tar.gz sha256=$3 ;;
+            esac
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/$1/$asset"
+            echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+            mkdir "$RUNNER_TEMP/ripgrep-$1"
+            tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/ripgrep-$1" --strip-components=1
+            "$RUNNER_TEMP/ripgrep-$1/rg" --version
+          }
+          install_ripgrep 14.1.1 \
             4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e \
             c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f
-          # Ahead of everything already on PATH, for every later step.
+          install_ripgrep 15.2.0 \
+            33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c \
+            a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
           echo "$RUNNER_TEMP/ripgrep-14.1.1" >> "$GITHUB_PATH"
 
       - name: Enable unprivileged user namespaces (Linux)
@@ -217,9 +230,6 @@ jobs:
         run: |
           brew install ripgrep zsh
 
-      # `npm ci`, like the Windows legs above: it installs exactly what
-      # package-lock.json records and fails when package.json has moved away
-      # from it, where `npm install` would resolve again and carry on.
       - name: Install Node dependencies
         if: matrix.os != 'windows'
         run: npm ci
@@ -268,9 +278,9 @@ jobs:
           ninja -C _build install
           "$RUNNER_TEMP/bwrap-0.12/bin/bwrap" --version
 
-      - name: Run tests against bubblewrap 0.12.0 (Linux)
+      - name: Run tests against bubblewrap 0.12.0 and ripgrep 15.2.0 (Linux)
         if: matrix.os == 'linux'
-        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
+        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$RUNNER_TEMP/ripgrep-15.2.0:$PATH" npm test
 
       # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
       # current distribution use, and both refuse to start on a plan that
@@ -309,60 +319,12 @@ jobs:
             test/sandbox/symlink-boundary.test.ts \
             test/sandbox/stale-mount-point.test.ts
 
-      # A release from the 15.x line, pinned like the one above. Over the same
-      # tree its scan can exit with a different status from 14.1.1 (see the
-      # install step above), so the suites that depend on the scan run against
-      # it as well. The macOS legs are not pinned to either: they run on
-      # whichever release Homebrew serves.
-      - name: Install ripgrep 15.2.0 (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          .github/scripts/install-ripgrep.sh 15.2.0 \
-            33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c \
-            a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
-
-      # Every suite under test/ that names ripgrep or the mandatory-deny scan
-      # it implements, less those whose result does not depend on rg here:
-      # config-validation (schema only), public-exports (the export list),
-      # check-dependencies (replaces the lookup with a spy), glob-expand (puts
-      # a stand-in in its place), deny-order-independence and
-      # linux-one-mount-per-destination (keep the working directory where the
-      # scan adds nothing), macos-literal-deny-brackets (macOS only) and
-      # winsrt (Windows only).
-      - name: Run the ripgrep-dependent tests against ripgrep 15.2.0 (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          export PATH="$RUNNER_TEMP/ripgrep-15.2.0:$PATH"
-          rg --version
-          suites=(
-            test/utils/ripgrep.test.ts
-            test/sandbox/mandatory-deny-paths.test.ts
-            test/sandbox/filesystem-disabled.test.ts
-            test/sandbox/linux-ancestor-pin.test.ts
-            test/sandbox/linux-bwrap-args-file.test.ts
-            test/sandbox/linux-file-above-deny.test.ts
-            test/sandbox/linux-mount-plan-record.test.ts
-            test/sandbox/literal-path-entries.test.ts
-            test/sandbox/read-deny-glob.test.ts
-            test/sandbox/readonly-deny-dir-binds.test.ts
-            test/sandbox/readonly-deny-dir-stubs.test.ts
-            test/sandbox/stale-mount-point.test.ts
-            test/sandbox/symlinked-deny-paths.test.ts
-          )
-          # `bun test` takes these as filters and passes over one that matches
-          # nothing, so a suite that was renamed has to fail the step here.
-          ls "${suites[@]}" > /dev/null
-          bun test "${suites[@]}"
-
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
-      # Everything above ran with Node 22 on PATH. `npm run test:node` is the
-      # part of the tree that runs the library under Node: the whichSync
-      # fallback, and the suites that start `node` themselves. Only it repeats
-      # on 24, the line above, so the job matrix stays as it is. Later lines,
-      # which `engines` also admits, are not run.
+      # Everything above ran with Node 22 on PATH. What runs the library under
+      # Node repeats on 24, in a step so that the matrix stays as it is.
       - name: Setup Node.js 24
         if: matrix.os != 'windows'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -371,9 +333,7 @@ jobs:
 
       - name: Run the tests that use Node (Node 24)
         if: matrix.os != 'windows'
-        run: |
-          node --version
-          npm run test:node
+        run: npm run test:node
 
       - name: Upload test results
         if: always()
