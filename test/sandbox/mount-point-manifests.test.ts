@@ -2953,7 +2953,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     ],
     ['a manifest cannot be opened', manifest => failing(manifest, 'EMFILE')],
     ['a manifest cannot be read', manifest => failing(manifest, 'EIO', 'read')],
-    ['something is no manifest', () => planted('1-garbage.json', '{ not json')],
+    ['something is no manifest', () => planted('1-garbage.json', '{}')],
     [
       'a process runs on a record without a manifest',
       () => planted('1-0123456789abcdef.started', statLine(thisProcess())),
