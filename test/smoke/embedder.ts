@@ -39,6 +39,8 @@ import {
   realpathSync,
   rmSync,
 } from 'node:fs'
+import { once } from 'node:events'
+import { createServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -49,7 +51,10 @@ import { basename, join } from 'node:path'
  * can set argv[0], and ripgrep through argv[0] itself.
  */
 function runAsAnotherProgram(): void {
-  const name = process.env.ARGV0 ?? basename(process.argv0)
+  const name =
+    process.env.ARGV0 === 'apply-seccomp'
+      ? process.env.ARGV0
+      : basename(process.argv0)
   const real =
     name === 'apply-seccomp'
       ? process.env.SRT_SMOKE_APPLY_SECCOMP
@@ -82,11 +87,14 @@ function runAsAnotherProgram(): void {
 runAsAnotherProgram()
 
 function check(what: string, ok: boolean, detail = ''): void {
-  if (!ok) {
-    console.error(`FAILED: ${what}${detail === '' ? '' : `\n${detail}`}`)
-    process.exit(1)
-  }
+  if (!ok)
+    throw new Error(`FAILED: ${what}${detail === '' ? '' : `\n${detail}`}`)
   console.log(`ok: ${what}`)
+}
+
+/** One word of a shell command. */
+function quoted(word: string): string {
+  return `'${word.replace(/'/g, `'\\''`)}'`
 }
 
 // Bytecode is CommonJS, which has no top-level await.
@@ -114,7 +122,9 @@ async function main(): Promise<void> {
   // shim above writes a line where a wrapped command can write, each time it
   // is started as one of them.
   const multicallLog = join(work, 'multicall.log')
+  const closing: Array<() => void> = []
   const self = multicall ? openSync(process.execPath, 'r') : undefined
+  if (self !== undefined) closing.push(() => closeSync(self))
   if (multicall) process.env.SRT_SMOKE_MULTICALL_LOG = multicallLog
   const tools = multicall
     ? {
@@ -139,21 +149,35 @@ async function main(): Promise<void> {
     })
 
     // After initialize, so that the helper the configuration names is the
-    // one that is looked for.
-    const dependencies = SandboxManager.checkDependencies()
+    // one that is looked for. A helper that is not found is a warning:
+    // initialize() has thrown already for what would be an error.
+    const { warnings } = SandboxManager.checkDependencies()
     check(
-      'the dependency check finds nothing missing',
-      dependencies.errors.length === 0,
-      dependencies.errors.join('\n'),
+      'the dependency check finds the seccomp helper',
+      !helperExpected || !warnings.some(w => w.includes('seccomp')),
+      warnings.join('\n'),
+    )
+
+    // A listener on the host, which the same words reach from outside the
+    // sandbox: without that, "blocked" could mean a shell that cannot connect.
+    const listener = createServer().listen(0, '127.0.0.1')
+    closing.push(() => listener.close())
+    await once(listener, 'listening')
+    const { port } = listener.address() as AddressInfo
+    const connect = `(exec 9<>/dev/tcp/127.0.0.1/${port}) 2>/dev/null && echo NET-OPEN || echo NET-BLOCKED`
+    check(
+      'the listener is reachable from outside the sandbox',
+      spawnSync('bash', ['-c', connect], { encoding: 'utf8' }).stdout ===
+        'NET-OPEN\n',
     )
 
     const wrapped = await SandboxManager.wrapWithSandbox(
       [
         'echo BOOTED',
-        `echo allowed > ${join(work, 'allowed.txt')}`,
-        `echo denied > ${join(work, 'denied.txt')} 2>/dev/null || echo WRITE-DENIED`,
-        `echo outside > ${join(outside, 'x.txt')} 2>/dev/null || echo OUTSIDE-DENIED`,
-        '(exec 9<>/dev/tcp/1.1.1.1/80) 2>/dev/null && echo NET-OPEN || echo NET-BLOCKED',
+        `echo allowed > ${quoted(join(work, 'allowed.txt'))}`,
+        `echo denied > ${quoted(join(work, 'denied.txt'))} 2>/dev/null || echo WRITE-DENIED`,
+        `echo outside > ${quoted(join(outside, 'x.txt'))} 2>/dev/null || echo OUTSIDE-DENIED`,
+        connect,
         'grep -q "^Seccomp:[[:space:]]*2" /proc/self/status 2>/dev/null && echo SECCOMP-ON || echo SECCOMP-OFF',
         'exit 7',
       ].join('; '),
@@ -268,13 +292,14 @@ async function main(): Promise<void> {
     }
     console.log('SMOKE OK')
   } finally {
-    if (self !== undefined) closeSync(self)
+    for (const close of closing) close()
     await SandboxManager.reset()
     rmSync(root, { recursive: true, force: true })
   }
 }
 
 main().catch((error: unknown) => {
-  console.error(error)
+  // Not the error itself: the runtime would print the minified source with it.
+  console.error(error instanceof Error ? error.stack : error)
   process.exit(1)
 })

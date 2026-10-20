@@ -8,7 +8,7 @@ on:
 
 jobs:
   integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    name: Tests (${{ matrix.os }} / ${{ matrix.label || matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -30,7 +30,8 @@ jobs:
           # The newest macOS as well: the sandbox profile's own regex engine
           # and what Seatbelt refuses have both moved between releases, and
           # the two legs above stay on the images they name.
-          - arch: arm64-macos26
+          - arch: arm64
+            label: arm64-macos26
             runner: macos-26
             os: macos
           # Windows legs build srt-win, run the Rust smoke scripts,
@@ -230,12 +231,9 @@ jobs:
         if: matrix.os != 'windows'
         run: npm ci
 
-      - name: Lint (ESLint)
-        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
-        run: npx eslint .
-
       # `npm run build` compiles src only. This is the one step that checks
-      # the types of test/, which bun strips at runtime.
+      # the types of test/, which bun strips at runtime, save test/smoke,
+      # which imports the built package: `npm run test:bundled` checks that.
       - name: Typecheck
         if: matrix.os != 'windows'
         run: npm run typecheck
@@ -251,6 +249,12 @@ jobs:
       - name: Build project
         if: matrix.os != 'windows'
         run: npm run build
+
+      # After the build: without dist/ the rules that read types see `any`
+      # throughout test/smoke, and report nothing there.
+      - name: Lint (ESLint)
+        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
+        run: npx eslint .
 
       - name: Run tests
         if: matrix.os != 'windows'
@@ -394,7 +398,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+          name: test-results-${{ matrix.os }}-${{ matrix.label || matrix.arch }}
           path: |
             test-results/
             *.log
@@ -448,25 +452,13 @@ jobs:
               apt-get update -qq
               # node and npm are those of the runner, bound in, and not those
               # of the image, which has Node 18, below what engines in
-              # package.json allows. bun is pinned to the version the rest of
-              # the matrix runs (oven-sh/setup-bun above). The tree carries a
-              # dozen bun-version-specific workarounds, so "whatever bun
-              # shipped this morning" is not the runtime under test.
+              # package.json allows.
               apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
               export PATH="/opt/node/bin:$PATH"
               node --version
-              # The release archive, by checksum, rather than an installer
-              # piped into a shell.
-              case "$(uname -m)" in
-                x86_64) bun_zip=bun-linux-x64; bun_sha=36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913 ;;
-                aarch64) bun_zip=bun-linux-aarch64; bun_sha=54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7 ;;
-                *) echo "no bun archive is pinned for $(uname -m)"; exit 1 ;;
-              esac
-              curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/${bun_zip}.zip"
-              echo "${bun_sha}  /tmp/bun.zip" | sha256sum -c -
-              unzip -q /tmp/bun.zip -d /tmp
-              install -m 0755 "/tmp/${bun_zip}/bun" /usr/local/bin/bun
-              bun --version
+              .github/scripts/install-bun.sh \
+                36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913 \
+                54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7
               npm ci
               npm run build:seccomp
               npm run build
@@ -476,11 +468,11 @@ jobs:
               capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
             '
 
-      # The same two runs on musl. The seccomp helper is static and built
-      # here against musl's libseccomp, and bubblewrap, socat and ripgrep are
-      # Alpine's own builds, and bun is its musl build. The checkout
-      # is copied first: node_modules and the helper the step above left in
-      # the workspace were built for glibc.
+      # The same two runs on musl: bubblewrap, socat and ripgrep are Alpine's
+      # own builds, and bun is its musl build. The seccomp helper is the one
+      # the step above built, static against glibc, because that is the file
+      # the npm package brings to a musl host. The rest of the checkout is
+      # copied without what that step installed for glibc.
       - name: Run srt end-to-end as uid 0 in an Alpine container
         run: |
           docker run --rm \
@@ -490,23 +482,16 @@ jobs:
             -v "${{ github.workspace }}:/src:ro" \
             -e SRT_E2E_DOCKER=1 \
             alpine:3.22 \
-            sh -euc '
-              apk add --no-cache bash bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc musl-dev linux-headers libseccomp-dev libseccomp-static libcap-utils libstdc++ libgcc nodejs npm tar
+            sh -euo pipefail -c '
+              apk add --no-cache bash bubblewrap socat ripgrep python3 curl ca-certificates unzip libcap-utils libstdc++ libgcc nodejs npm tar
               mkdir /work
-              tar -C /src --exclude=./node_modules --exclude=./dist --exclude=./vendor/seccomp/x64 --exclude=./vendor/seccomp/arm64 --exclude=./.git -cf - . | tar -C /work -xf -
+              tar -C /src --exclude=./node_modules --exclude=./dist --exclude=./.git -cf - . | tar -C /work -xf -
               cd /work
-              case "$(uname -m)" in
-                x86_64) bun_zip=bun-linux-x64-musl; bun_sha=4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742 ;;
-                aarch64) bun_zip=bun-linux-aarch64-musl; bun_sha=71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df ;;
-                *) echo "no bun archive is pinned for $(uname -m)"; exit 1 ;;
-              esac
-              curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/${bun_zip}.zip"
-              echo "${bun_sha}  /tmp/bun.zip" | sha256sum -c -
-              unzip -q /tmp/bun.zip -d /tmp
-              install -m 0755 "/tmp/${bun_zip}/bun" /usr/local/bin/bun
-              bun --version
+              .github/scripts/install-bun.sh \
+                4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742 \
+                71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df \
+                -musl
               npm ci
-              npm run build:seccomp
               npm run build
               echo "== as uid 0 with CAP_SYS_ADMIN"
               bun test test/docker-weak-sandbox.test.ts

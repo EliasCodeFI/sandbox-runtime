@@ -10,7 +10,9 @@
  * an empty directory and run from there. Nothing of the package is on disk
  * around it then, which is how an embedded copy runs: a lookup that starts
  * from the library's own location finds nothing, and has to be one the
- * configuration already answered.
+ * configuration already answered. (Not quite nothing here: a bundle records
+ * where its modules were when it was built, so on the machine that built it
+ * such a lookup still reaches this checkout.)
  *
  * On Linux each is run twice: told where the helper file is, and as a
  * multicall executable that carries the helper and ripgrep itself and is
@@ -21,7 +23,6 @@ import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   copyFileSync,
-  existsSync,
   mkdtempSync,
   realpathSync,
   rmSync,
@@ -31,10 +32,6 @@ import { join } from 'node:path'
 
 const repo = process.cwd()
 const entry = join(repo, 'test', 'smoke', 'embedder.ts')
-if (!existsSync(join(repo, 'dist', 'index.js'))) {
-  console.error('dist/ is not built: run `npm run build` first')
-  process.exit(1)
-}
 
 const FORMS: Array<{ name: string; flags: string[] }> = [
   { name: 'one file', flags: [] },
@@ -76,23 +73,30 @@ for (const form of FORMS) {
       continue
     }
 
-    const env: Record<string, string | undefined> = { ...process.env }
-    delete env.SRT_SMOKE_APPLY_SECCOMP
-    if (process.platform === 'linux' && existsSync(builtHelper)) {
+    // Less what the program itself reads, should the caller's shell hold it.
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([name]) => name !== 'ARGV0' && !name.startsWith('SRT_SMOKE_'),
+      ),
+    )
+    const modes: Array<{ name: string; env: typeof env }> = [
+      { name: form.name, env },
+    ]
+    if (process.platform === 'linux') {
+      // Both are there on every Linux leg. Were one not, copyFileSync or the
+      // program would fail: a run that skipped these modes would prove less
+      // than it says.
       const helper = join(home, 'apply-seccomp')
       copyFileSync(builtHelper, helper)
       chmodSync(helper, 0o755)
       env.SRT_SMOKE_APPLY_SECCOMP = helper
-    }
-
-    const modes: Array<{ name: string; env: typeof env }> = [
-      { name: form.name, env },
-    ]
-    const ripgrep = Bun.which('rg')
-    if (env.SRT_SMOKE_APPLY_SECCOMP !== undefined && ripgrep !== null) {
       modes.push({
         name: `${form.name}, helper and ripgrep reached through argv0`,
-        env: { ...env, SRT_SMOKE_MULTICALL: '1', SRT_SMOKE_RG: ripgrep },
+        env: {
+          ...env,
+          SRT_SMOKE_MULTICALL: '1',
+          SRT_SMOKE_RG: Bun.which('rg') ?? undefined,
+        },
       })
     }
     for (const mode of modes) {
@@ -103,10 +107,13 @@ for (const form of FORMS) {
         encoding: 'utf8',
         timeout: 300000,
       })
-      process.stdout.write(run.stdout)
-      process.stderr.write(run.stderr)
+      // Both are null for a program that could not be started.
+      process.stdout.write(run.stdout ?? '')
+      process.stderr.write(run.stderr ?? '')
       if (run.status !== 0 || !run.stdout.includes('SMOKE OK')) {
-        console.error(`== ${mode.name}: FAILED (status ${String(run.status)})`)
+        console.error(
+          `== ${mode.name}: FAILED (status ${String(run.status)}${run.error === undefined ? '' : `, ${String(run.error)}`})`,
+        )
         failed = true
       }
     }
