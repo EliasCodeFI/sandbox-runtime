@@ -3113,10 +3113,11 @@ describe.if(isLinux)('The mount point manifests', () => {
         `const published = m.publishMountPointManifest([${JSON.stringify(X)}], []) ?? null`,
         `const live = [...m.liveMountPoints()]`,
         `const directories = m.mountPointManifestDirectories()`,
+        `const settled = m.ensureManifestDirectory() ?? null`,
         `const collected = m.collectMountPoints('all')`,
         `u.cleanupBwrapMountPoints()`,
         `u.cleanupBwrapMountPoints({ force: true })`,
-        `console.log(JSON.stringify({ published, live, directories, collected }))`,
+        `console.log(JSON.stringify({ published, live, directories, settled, collected }))`,
       ].join('\n'),
       {
         first: `Object.defineProperty(process, 'platform', { value: 'darwin' })`,
@@ -3127,6 +3128,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       published: null,
       live: [],
       directories: [],
+      settled: null,
       collected: [],
     })
     expect(existsSync(X)).toBe(true)

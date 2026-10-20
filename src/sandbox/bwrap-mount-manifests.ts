@@ -599,8 +599,14 @@ function believedManifestDirectories(): string[] {
  * alone, else a private directory only this process knows, which keeps the
  * guarantee within this process. Revalidated on every use, because a directory
  * swapped for a symlink between two wraps would send manifests elsewhere.
+ *
+ * What it makes is believed from then on. So a wrap with a manifest to come
+ * asks before it pins, and binds this one with the others.
  */
 export function ensureManifestDirectory(): string | undefined {
+  if (!onLinux()) {
+    return undefined
+  }
   if (
     manifestDirectory !== undefined &&
     isOurPrivateDirectory(manifestDirectory)
@@ -650,7 +656,8 @@ export function ensureManifestDirectory(): string | undefined {
 /**
  * Every directory a wrap must bind read-only because some process of this user
  * keeps manifests in it and a collect believes what it finds there: every
- * shared name, whichever this process writes to, plus the one it settled on.
+ * shared name, whichever this process writes to, plus the one it settled on
+ * (for a manifest yet to come, see {@link ensureManifestDirectory}).
  *
  * Each is made if it can be, so a sandboxed command cannot make and fill it
  * first. One that can be neither made nor bound is not believed, and the
