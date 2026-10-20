@@ -1076,6 +1076,9 @@ export function publishMountPointManifest(
       } catch {
         // Never made.
       }
+      // Made just now, it may be, and bound by no command: not left to be
+      // believed with nothing of this process's in it.
+      removePrivateManifestDirectory()
       logForDebugging(
         `[Sandbox Linux] Could not record the mount points this command relies on (${String(e)}) - they are kept in memory and removed at this process's own clean-up`,
         { level: 'warn' },

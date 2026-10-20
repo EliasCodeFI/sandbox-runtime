@@ -2286,7 +2286,7 @@ describe.if(isLinux)(
       }
     })
 
-    it("goes to a directory of the process's own that the same plan binds, written or not", async () => {
+    it("goes to a directory of the process's own that the same plan binds, and that does not stay when it cannot be written", async () => {
       // Neither shared name will do, from the start.
       const shared = [
         runtime.manifestDir(),
@@ -2298,8 +2298,9 @@ describe.if(isLinux)(
       }
       const own = (): string[] =>
         readdirSync(tmpdir())
-          .filter(name => /^srt-mount-points-[A-Za-z0-9]{6}$/.test(name))
+          .filter(name => name.startsWith('srt-mount-points-'))
           .map(name => join(tmpdir(), name))
+          .filter(name => !shared.includes(name))
       let published = 0
       let full = false
       const publishing = atEachPublish(() => {
@@ -2312,11 +2313,12 @@ describe.if(isLinux)(
           published = 0
           const command = await wrap('true', [LEAF])
           expect(published).toBe(1)
-          expect(own()).toHaveLength(1)
-          expect(recordedBy(command) === undefined).toBe(full)
-          expect(lastMountAt(command, own()[0]!)).toBe(
-            `${full ? '--ro-bind-try' : '--ro-bind'} ${own()[0]} ${own()[0]}`,
-          )
+          // Believed while it is there, and a wrap that settles on it only as
+          // it publishes has not bound it.
+          expect(own()).toEqual(full ? [] : [dirname(recordedBy(command)!)])
+          for (const dir of own()) {
+            expect(lastMountAt(command, dir)).toBe(`--ro-bind ${dir} ${dir}`)
+          }
           cleanupBwrapMountPoints({ force: true })
           expect(own()).toEqual([])
         }
