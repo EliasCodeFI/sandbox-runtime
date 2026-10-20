@@ -600,7 +600,7 @@ function believedManifestDirectories(): string[] {
  * guarantee within this process. Revalidated on every use, because a directory
  * swapped for a symlink between two wraps would send manifests elsewhere.
  */
-function ensureManifestDirectory(): string | undefined {
+export function ensureManifestDirectory(): string | undefined {
   if (
     manifestDirectory !== undefined &&
     isOurPrivateDirectory(manifestDirectory)

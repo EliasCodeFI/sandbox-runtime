@@ -2286,6 +2286,46 @@ describe.if(isLinux)(
       }
     })
 
+    it("goes to a directory of the process's own that the same plan binds, written or not", async () => {
+      // Neither shared name will do, from the start.
+      const shared = [
+        runtime.manifestDir(),
+        join(tmpdir(), `srt-mount-points-${process.getuid!()}`),
+      ]
+      for (const name of shared) {
+        rmSync(name, { recursive: true, force: true })
+        writeFileSync(name, '')
+      }
+      const own = (): string[] =>
+        readdirSync(tmpdir())
+          .filter(name => /^srt-mount-points-[A-Za-z0-9]{6}$/.test(name))
+          .map(name => join(tmpdir(), name))
+      let published = 0
+      let full = false
+      const publishing = atEachPublish(() => {
+        published++
+        if (full) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+      })
+      try {
+        // The forced clean-up removes the directory, so each wrap settles anew.
+        for (full of [false, false, true]) {
+          published = 0
+          const command = await wrap('true', [LEAF])
+          expect(published).toBe(1)
+          expect(own()).toHaveLength(1)
+          expect(recordedBy(command) === undefined).toBe(full)
+          expect(lastMountAt(command, own()[0]!)).toBe(
+            `${full ? '--ro-bind-try' : '--ro-bind'} ${own()[0]} ${own()[0]}`,
+          )
+          cleanupBwrapMountPoints({ force: true })
+          expect(own()).toEqual([])
+        }
+      } finally {
+        publishing.restore()
+        shared.forEach(name => rmSync(name))
+      }
+    })
+
     it('is let go of when a process exits whose wrap made no mount point of its own', () => {
       mkdirSync(DIRECTORY)
       manifestOfAKilledProcess([DIRECTORY])
@@ -2729,7 +2769,7 @@ describe.if(isLinux)(
 
     it('are pinned above the directory of its own a process settles on as it records', () => {
       // Neither shared name will do, so the wrap makes a directory only this
-      // process knows, and makes it as it publishes: after the pins.
+      // process knows.
       takeTheSharedName()
       const command = wrapped(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },

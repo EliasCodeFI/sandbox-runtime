@@ -12,6 +12,7 @@ import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
   discardMountPointManifest,
+  ensureManifestDirectory,
   holdsMountPointManifest,
   keepTrackOfMountPoint,
   keepTrackOfMountSource,
@@ -3550,6 +3551,12 @@ async function generateFilesystemArgs(
   // read-only bind protects one only while its name still leads to it, and
   // with the temp dir strictly inside a write root a command could otherwise
   // rename the temp dir aside and make the name again.
+  // With a manifest to come, where it goes is settled now, to be bound and
+  // pinned too, written or not: it may be a directory of the process's own.
+  if (mountPoints.length > 0 || emptySource !== undefined) {
+    const own = ensureManifestDirectory()
+    if (own !== undefined) manifestDirs.push(own)
+  }
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
