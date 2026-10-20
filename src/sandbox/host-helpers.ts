@@ -1,6 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { realPathOf, wayTo } from '../utils/real-path.js'
+import { wayTo } from '../utils/real-path.js'
 import {
   isExecutableFile,
   isPathQualified,
@@ -10,9 +10,9 @@ import {
 import {
   containsGlobChars,
   getDefaultWritePaths,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   isAtOrUnder,
-  isSymlinkOutsideBoundary,
   normalizePathForSandbox,
   workingDirectory,
 } from './sandbox-utils.js'
@@ -36,20 +36,20 @@ export type HostHelperSearch = {
 export type WritablePlaces = readonly string[]
 
 /**
- * Where a sandboxed command may write, in the forms a location is compared
+ * Where a sandboxed command may write, in the form a location is compared
  * against: each allowed write path (`writeRootsOf` a write config) as
- * `normalizePathForSandbox` spells it and with every symlink resolved, a
- * pattern by the directory it starts from. `denyWithinAllow` is not
- * subtracted: passing over more is the safe side.
+ * `normalizePathForSandbox` spells it, symlinks resolved, a pattern by the
+ * directory it starts from. `denyWithinAllow` is not subtracted: passing over
+ * more is the safe side.
  *
  * - `'anywhere'`, said outright, or a list that names `/`: nowhere, since no
  *   place is then better than another. A file's permissions are not judged.
  * - `undefined`, the policy not being known yet: the working directory and the
  *   default write paths, which nearly every policy allows.
- * - Where a link leads out of its own place (`isSymlinkOutsideBoundary`) does
- *   not count, as the wrap binds nothing for it. The command can make such a
- *   link wherever one entry lies inside another (`<project>/dist -> /`), so
- *   it must neither switch the comparison off nor widen it.
+ * - A link that leads out of its own place is left as spelled, and the wrap
+ *   binds nothing for it. The command can make such a link wherever one entry
+ *   lies inside another (`<project>/dist -> /`), so it must neither switch
+ *   the comparison off nor widen it.
  */
 export function writablePlaces(
   allowedWritePaths: readonly string[] | 'anywhere' | undefined,
@@ -62,20 +62,13 @@ export function writablePlaces(
     ...getDefaultWritePaths(),
   ]) {
     const normalized = normalizePathForSandbox(allowed)
-    // The empty spelling (an empty $HOME) would cover every path as a prefix.
+    // `~` under an empty $HOME is the empty spelling, which names no place.
     if (!path.isAbsolute(normalized)) continue
-    const spelled =
-      (containsGlobChars(normalized)
-        ? globPatternBaseDir(normalized)
-        : normalized.replace(/\/+$/, '')) || '/'
-    if (spelled === '/') return []
-    places.add(spelled)
-    try {
-      const resolved = realPathOf(spelled)
-      if (!isSymlinkOutsideBoundary(spelled, resolved)) places.add(resolved)
-    } catch {
-      // Not there yet: the spelling names it.
-    }
+    const place = containsGlobChars(normalized)
+      ? globPatternBaseDir(normalized)
+      : normalized
+    if (globBaseDirIsRoot(place)) return []
+    places.add(place)
   }
   return [...places]
 }

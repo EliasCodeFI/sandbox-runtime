@@ -3,7 +3,7 @@ import type { Mock } from 'bun:test'
 import * as childProcess from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import * as fs from 'node:fs'
-import { tmpdir } from 'node:os'
+import * as os from 'node:os'
 import { dirname, join } from 'node:path'
 import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
 import * as hostHelpers from '../../src/sandbox/host-helpers.js'
@@ -31,7 +31,7 @@ const BWRAP_CAN_NAMESPACE = isLinux && bwrapCanNamespace()
 const savedPath = process.env.PATH ?? ''
 const savedCwd = process.cwd()
 const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-const base = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'host-helpers-')))
+const base = fs.realpathSync(fs.mkdtempSync(join(os.tmpdir(), 'host-helpers-')))
 const marker = `${base}/a-planted-file-was-run`
 const project = `${base}/project`
 const projectBin = `${project}/node_modules/.bin`
@@ -103,11 +103,13 @@ posix.each<[string, Parameters<typeof writablePlaces>[0], string[]]>([
   ['a name that reads as a pattern', [`${safe}/w[1]`], [safe]],
   ['a trailing slash', [`${project}/`], [project]],
   ['an entry that is not there', [`${base}/absent`], [`${base}/absent`]],
+  ['a home directory with no name', ['~', project], [project]],
   // The command can make such a link wherever one entry lies inside another,
   // and the wrap binds nothing for it: it switches nothing off, widens nothing.
   ['a link to the root', [`${project}/dist`], [`${project}/dist`]],
   ['a link out of its place', [`${project}/tools`], [`${project}/tools`]],
 ])('writablePlaces: %s', (_, allowed, places) => {
+  spyOn(os, 'homedir').mockReturnValue('')
   expect(writablePlaces(allowed)).toEqual(places)
 })
 

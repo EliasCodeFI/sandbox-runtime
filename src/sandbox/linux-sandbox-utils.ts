@@ -1338,10 +1338,10 @@ export function getLinuxDependencyStatus(
 ): LinuxDependencyStatus {
   const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
   const writable = opts?.writable ?? writablePlaces(undefined)
-  // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
-  // the on-disk lookup and trust that applyPath resolves inside bwrap.
   const onPath = (helper: string): boolean =>
     findHostHelper(helper, writable).path !== null
+  // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
+  // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
     hasBwrap: bwrapPath ? isExecutable(bwrapPath) : onPath('bwrap'),
     hasSocat: socatPath ? isExecutable(socatPath) : onPath('socat'),
@@ -3701,17 +3701,11 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
-    // Found before anything else is done: a wrap that must refuse for want of
-    // one has then scanned nothing and recorded no mount point.
     const writable = writablePlaces(
       writeConfig ? writeRootsOf(writeConfig) : 'anywhere',
     )
     const bwrapBinary =
       bwrapPath ?? requireHostHelper('bwrap', 'bwrapPath', writable)
-    const relayed = needsNetworkRestriction && httpSocketPath && socksSocketPath
-    const socat = relayed
-      ? (socatPath ?? requireHostHelper('socat', 'socatPath', writable))
-      : undefined
 
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
@@ -3986,14 +3980,14 @@ export async function wrapCommandWithSandboxLinux(
     // With network restrictions, route the command through buildSandboxCommand
     // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
     // directly if we have a binary.
-    if (socat !== undefined && httpSocketPath && socksSocketPath) {
+    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
       const sandboxCommand = buildSandboxCommand(
         httpSocketPath,
         socksSocketPath,
         command,
         applySeccompPrefix,
         shell,
-        socat,
+        socatPath ?? requireHostHelper('socat', 'socatPath', writable),
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
