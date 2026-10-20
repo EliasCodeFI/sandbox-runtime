@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as childProcess from 'node:child_process'
 import * as which from '../../src/utils/which.js'
 import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
+import * as hostHelpers from '../../src/sandbox/host-helpers.js'
 import {
   CAP_SETFCAP,
   CAP_SETFCAP_MISSING_MESSAGE,
@@ -22,6 +23,7 @@ const lacksSetfcap = !processHasBoundingCapability(CAP_SETFCAP)
 // just the piece it's exercising. spyOn patches the export binding, so
 // linux-sandbox-utils' own imports see the replacement.
 let whichSpy: ReturnType<typeof spyOn>
+let hostHelperSpy: ReturnType<typeof spyOn>
 let applySpy: ReturnType<typeof spyOn>
 let euidSpy: ReturnType<typeof spyOn> | undefined
 let spawnSyncSpy: ReturnType<typeof spyOn>
@@ -42,6 +44,10 @@ beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
     (bin: string) => `/usr/bin/${bin}`,
   )
+  // What is passed over is host-helpers.test.ts's.
+  hostHelperSpy = spyOn(hostHelpers, 'findHostHelper').mockImplementation(
+    (name: string) => ({ path: which.whichSync(name), skipped: [] }),
+  )
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
     '/path/to/apply-seccomp',
   )
@@ -57,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   whichSpy.mockRestore()
+  hostHelperSpy.mockRestore()
   applySpy.mockRestore()
   euidSpy?.mockRestore()
   spawnSyncSpy.mockRestore()
@@ -166,7 +173,7 @@ describe('checkLinuxDependencies', () => {
   test('passes custom applyPath through to the resolver', () => {
     checkLinuxDependencies({ seccompConfig: { applyPath: '/custom/apply' } })
 
-    expect(applySpy).toHaveBeenCalledWith('/custom/apply')
+    expect(applySpy).toHaveBeenCalledWith('/custom/apply', expect.anything())
   })
 
   test('argv0 mode: no seccomp warning even when binary lookup would fail', () => {

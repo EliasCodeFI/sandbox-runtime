@@ -135,6 +135,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   // a copy on PATH that lies inside a write path is passed over.
   const HELPERS = {
     bwrapPath: whichSync('bwrap') ?? undefined,
+    binShell: whichSync('bash') ?? undefined,
     ripgrepConfig: { command: whichSync('rg') ?? 'rg' },
   }
   const wrap = (

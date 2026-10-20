@@ -131,10 +131,7 @@ describe.skipIf(isWindows)('The library installed under a write path', () => {
     /**
      * Runs `body` in the project and returns the JSON it prints. It has `s`,
      * the manager of the copy at `link`; `filesystem`, a policy with
-     * `allowWrite`; `warnings()`, the dependency check's under a policy; and
-     * `said()`, what a check returns or the message it throws. On Linux the
-     * check looks for the host's helpers outside the write paths before it comes
-     * to this warning, so what is wrong with a policy stops it there.
+     * `allowWrite`; and `warnings()`, the dependency check's under a policy.
      */
     function run(
       link: string,
@@ -151,7 +148,6 @@ describe.skipIf(isWindows)('The library installed under a write path', () => {
              s.updateConfig({ network: { allowedDomains: [], deniedDomains: [] }, filesystem })
              return s.checkDependencies().warnings
            }
-           const said = check => { try { return check() } catch (e) { return [e.message] } }
            ${body}`,
         ],
         {
@@ -204,7 +200,7 @@ describe.skipIf(isWindows)('The library installed under a write path', () => {
         link,
         project,
         `console.log(JSON.stringify([
-           said(() => warnings({ ...filesystem, denyRead: [{ path: '/x' }] })),
+           warnings({ ...filesystem, denyRead: [{ path: '/x' }] }),
            [await s.wrapWithSandbox('true').catch(e => e.message)],
          ]))`,
       )
@@ -222,7 +218,7 @@ describe.skipIf(isWindows)('The library installed under a write path', () => {
         project,
         `process.chdir(${JSON.stringify(gone)})
          require('node:fs').rmdirSync(${JSON.stringify(gone)})
-         console.log(JSON.stringify(said(() => warnings({ ...filesystem, allowWrite: ['.'] }))))`,
+         console.log(JSON.stringify(warnings({ ...filesystem, allowWrite: ['.'] })))`,
       )
       expect((printed as string[]).filter(w => w.includes(root))).toEqual([])
     }, 120000)

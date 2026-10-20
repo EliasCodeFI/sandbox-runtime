@@ -4,8 +4,15 @@ import * as fs from 'node:fs'
 import { exec, execSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { logForDebugging } from '../utils/debug.js'
+import {
+  hostSearchPath,
+  isOutside,
+  writablePlaces,
+  type WritablePlaces,
+} from './host-helpers.js'
 
-// Cache for path lookups (key: explicit path or empty string, value: resolved path or null)
+// Cache for path lookups (key: explicit path or empty string, and the places
+// it was judged by; value: resolved path or null)
 const applySeccompPathCache = new Map<string, string | null>()
 
 // Cache for global npm paths (computed once per process)
@@ -15,11 +22,12 @@ let pendingGlobalNpmPaths: Promise<string[]> | null = null
 const NPM_ROOT_COMMAND = 'npm root -g'
 const NPM_ROOT_TIMEOUT_MS = 5000
 
-/** `process.env` for `npm root -g`, with `searchPath` as its PATH if given. */
-function npmEnvironment(searchPath: string | undefined): NodeJS.ProcessEnv {
-  return searchPath === undefined
+/** `process.env` for `npm root -g`, which runs on the host: npm, and the node
+ *  that runs it, are looked up outside `writable`. */
+function npmEnvironment(writable: WritablePlaces): NodeJS.ProcessEnv {
+  return process.platform === 'win32'
     ? process.env
-    : { ...process.env, PATH: searchPath }
+    : { ...process.env, PATH: hostSearchPath(writable, ['npm', 'node']) }
 }
 
 /** For tests only: forget what `npm root -g` answered. */
@@ -32,14 +40,13 @@ export function resetGlobalNpmPathsForTesting(): void {
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  *
- * `searchPath` is the PATH `npm`, and what it starts, are looked up on (see
- * `hostSearchPath`). Without it, this process's.
- *
  * Blocks the event loop on `npm root -g` (~100 ms) the first time it is
  * called in a process unless {@link getGlobalNpmPathsAsync} has already
  * filled the cache; initialize() goes through the async variant.
  */
-export function getGlobalNpmPaths(searchPath?: string): string[] {
+export function getGlobalNpmPaths(
+  writable: WritablePlaces = writablePlaces(undefined),
+): string[] {
   if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
 
   let npmRoot: string | undefined
@@ -48,7 +55,7 @@ export function getGlobalNpmPaths(searchPath?: string): string[] {
       encoding: 'utf8',
       timeout: NPM_ROOT_TIMEOUT_MS,
       stdio: ['pipe', 'pipe', 'ignore'],
-      env: npmEnvironment(searchPath),
+      env: npmEnvironment(writable),
     })
   } catch {
     // npm not available or failed
@@ -64,7 +71,9 @@ export function getGlobalNpmPaths(searchPath?: string): string[] {
  * timed-out npm yields just the static fallback locations, as the sync
  * variant does.
  */
-export function getGlobalNpmPathsAsync(searchPath?: string): Promise<string[]> {
+export function getGlobalNpmPathsAsync(
+  writable: WritablePlaces = writablePlaces(undefined),
+): Promise<string[]> {
   if (cachedGlobalNpmPaths) return Promise.resolve(cachedGlobalNpmPaths)
   if (pendingGlobalNpmPaths) return pendingGlobalNpmPaths
 
@@ -75,7 +84,7 @@ export function getGlobalNpmPathsAsync(searchPath?: string): Promise<string[]> {
         {
           encoding: 'utf8',
           timeout: NPM_ROOT_TIMEOUT_MS,
-          env: npmEnvironment(searchPath),
+          env: npmEnvironment(writable),
         },
         (err, stdout) => resolve(err ? undefined : stdout),
       )
@@ -211,11 +220,14 @@ function getLocalSeccompPaths(filename: string): string[] {
  * @param seccompBinaryPath - Optional explicit path to the apply-seccomp binary. If provided
  *   and exists, it will be used. If not provided, falls back to searching local paths and
  *   then global npm install (for native builds where vendor directory isn't bundled).
+ * @param writable - Where the sandboxed command may write: no global install is taken from
+ *   there, nor the npm that is asked for one. Omitted: as for a policy that is not known yet.
  */
 export function getApplySeccompBinaryPath(
   seccompBinaryPath?: string,
+  writable: WritablePlaces = writablePlaces(undefined),
 ): string | null {
-  const cacheKey = seccompBinaryPath ?? ''
+  const cacheKey = [seccompBinaryPath, ...writable].join('\0')
   if (applySeccompPathCache.has(cacheKey)) {
     return applySeccompPathCache.get(cacheKey)!
   }
@@ -224,7 +236,7 @@ export function getApplySeccompBinaryPath(
   const result =
     local !== undefined
       ? local
-      : findGlobalApplySeccompPath(getGlobalNpmPaths())
+      : findGlobalApplySeccompPath(getGlobalNpmPaths(writable), writable)
   applySeccompPathCache.set(cacheKey, result)
   return result
 }
@@ -237,9 +249,9 @@ export function getApplySeccompBinaryPath(
  */
 export async function getApplySeccompBinaryPathAsync(
   seccompBinaryPath?: string,
-  searchPath?: string,
+  writable: WritablePlaces = writablePlaces(undefined),
 ): Promise<string | null> {
-  const cacheKey = seccompBinaryPath ?? ''
+  const cacheKey = [seccompBinaryPath, ...writable].join('\0')
   if (applySeccompPathCache.has(cacheKey)) {
     return applySeccompPathCache.get(cacheKey)!
   }
@@ -248,7 +260,10 @@ export async function getApplySeccompBinaryPathAsync(
   const result =
     local !== undefined
       ? local
-      : findGlobalApplySeccompPath(await getGlobalNpmPathsAsync(searchPath))
+      : findGlobalApplySeccompPath(
+          await getGlobalNpmPathsAsync(writable),
+          writable,
+        )
   applySeccompPathCache.set(cacheKey, result)
   return result
 }
@@ -302,7 +317,10 @@ function findLocalApplySeccompPath(
 /**
  * Fallback: check global npm install (for native builds without bundled vendor)
  */
-function findGlobalApplySeccompPath(globalBases: string[]): string | null {
+function findGlobalApplySeccompPath(
+  globalBases: string[],
+  writable: WritablePlaces,
+): string | null {
   const arch = getVendorArchitecture()
   if (!arch) return null
 
@@ -314,7 +332,7 @@ function findGlobalApplySeccompPath(globalBases: string[]): string | null {
       arch,
       'apply-seccomp',
     )
-    if (fs.existsSync(binaryPath)) {
+    if (fs.existsSync(binaryPath) && isOutside(binaryPath, writable)) {
       logForDebugging(
         `[SeccompFilter] Found apply-seccomp binary in global install: ${binaryPath} (${arch})`,
       )

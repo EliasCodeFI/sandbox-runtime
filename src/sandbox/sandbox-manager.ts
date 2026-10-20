@@ -36,7 +36,6 @@ import {
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { isPathQualified, whichSync } from '../utils/which.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
@@ -68,8 +67,9 @@ import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   describeUnavailableHostHelper,
   findHostHelper,
-  hostSearchPath,
   writableNamedHelperWarning,
+  writablePlaces,
+  type WritablePlaces,
 } from './host-helpers.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -1553,7 +1553,7 @@ async function initializeSteps(
       javaAgentJarPath =
         (await getJavaProxyAgentJarPathAsync(
           config.javaAgentJarPath,
-          hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+          hostWritablePlaces(),
         )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
@@ -1581,7 +1581,7 @@ async function initializeSteps(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
-          hostHelperWritePaths(),
+          hostWritablePlaces(),
         )
       }
 
@@ -1623,19 +1623,21 @@ function isSandboxingEnabled(): boolean {
   return config !== undefined
 }
 
-/** What `npm root -g` looks up on PATH: npm, and the node that runs it. */
-const NPM_LOOKS_UP = ['npm', 'node'] as const
-
 /**
- * What a wrap under the initialized configuration lets the sandboxed command
- * write (see `findHostHelper`). `undefined` when no writes are restricted:
- * the filesystem policy is off, or there is no configuration yet, and then
- * `initialize()` runs the dependency check again once there is one.
+ * Where a wrap under the installed configuration lets the sandboxed command
+ * write (see `writablePlaces`), for what is looked up outside a wrap. A
+ * configuration that cannot be read counts as none: whoever enforces it says
+ * what is wrong with it. POSIX only, like the search.
  */
-function hostHelperWritePaths(): string[] | undefined {
-  return !config || config.filesystem.disabled
-    ? undefined
-    : writeRootsOf(getFsWriteConfig())
+function hostWritablePlaces(): WritablePlaces {
+  if (config?.filesystem.disabled || getPlatform() === 'windows') {
+    return writablePlaces('anywhere')
+  }
+  try {
+    return writablePlaces(config && writeRootsOf(getFsWriteConfig()))
+  } catch {
+    return writablePlaces(undefined)
+  }
 }
 
 /**
@@ -1668,34 +1670,31 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-    const allowedWritePaths = hostHelperWritePaths()
-    const rgNotFound = `ripgrep (${rgToCheck.command}) not found`
-    if (isPathQualified(rgToCheck.command)) {
-      // Named outright: run as given, and warned about when writable.
-      if (whichSync(rgToCheck.command) === null) errors.push(rgNotFound)
-      const warning = writableNamedHelperWarning(
-        'ripgrep.command',
-        rgToCheck.command,
-        allowedWritePaths,
+    const writable = hostWritablePlaces()
+    // Looked for the way the wrap will look for it.
+    const search = findHostHelper(rgToCheck.command, writable)
+    if (search.path === null) {
+      errors.push(
+        describeUnavailableHostHelper(
+          rgToCheck.command,
+          'ripgrep.command',
+          search,
+          `ripgrep (${rgToCheck.command}) not found`,
+        ),
       )
-      if (warning !== undefined) warnings.push(warning)
-    } else {
-      // A bare name is looked for the way the wrap will look for it.
-      const search = findHostHelper(rgToCheck.command, allowedWritePaths)
-      if (search.path === null) {
-        errors.push(
-          search.skipped.length > 0
-            ? describeUnavailableHostHelper(rgToCheck.command, search)
-            : rgNotFound,
-        )
-      }
     }
+    const warning = writableNamedHelperWarning(
+      'ripgrep.command',
+      rgToCheck.command,
+      writable,
+    )
+    if (warning !== undefined) warnings.push(warning)
 
     const linuxDeps = checkLinuxDependencies({
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
-      allowedWritePaths,
+      writable,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
@@ -1765,7 +1764,7 @@ async function checkDependenciesAsync(
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
     await getApplySeccompBinaryPathAsync(
       config?.seccomp?.applyPath,
-      hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+      hostWritablePlaces(),
     )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
