@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - arch: x86-64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             os: linux
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -49,8 +49,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # The release line the legs build and test on, and the engines
-          # floor in package.json (>=22). The steps at the end of the job
+          # The newest release of the oldest line that `engines` allows. Not
+          # 22.12.0 itself: these tests also run `node` inside the sandbox,
+          # and on Windows that release tries only `::1` for `localhost`,
+          # where the proxy listens on 127.0.0.1. The floor itself is run by
+          # the package check in release.yml. The steps at the end of the job
           # that run the built package under Node repeat on 24, the line
           # above it.
           node-version: '22'
@@ -69,6 +72,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          # Its javac pattern stays on for the whole job and takes every
+          # `file:line: warning:` for its own, autotools' included, which the
+          # build of bubblewrap 0.4.1 below prints.
+          problem-matcher: false
 
       # ─── Windows: srt-win helper binary ─────────────────────────────
       # GitHub-hosted Windows runners run as a member of Administrators
@@ -76,24 +83,14 @@ jobs:
       # without an explicit elevation step.
       - name: Setup Rust (Windows)
         if: matrix.os == 'windows'
-        # dtolnay/rust-toolchain@stable, pinned by commit: the ref is a
-        # branch, so a tag-shaped `@stable` still runs whatever that
-        # branch points at today. The cache below is shared with
-        # release.yml, so this job's supply chain is the release's too.
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-          components: clippy
+        # Installs the version and components named in rust-toolchain.toml.
+        run: rustup toolchain install
 
       - name: Rust build cache (Windows)
         if: matrix.os == 'windows'
-        # Swatinem/rust-cache@v2.9.2
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vendor/srt-win-src
-          # Shared with release.yml so tag-ref release builds restore
-          # the cache main pushes warm here.
-          shared-key: srt-win
 
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'
@@ -104,9 +101,13 @@ jobs:
           # be masked by `cargo clippy` exiting 0 on the next line.
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build  --release --manifest-path vendor/srt-win-src/Cargo.toml
-          cargo test   --release --manifest-path vendor/srt-win-src/Cargo.toml
-          cargo clippy --release --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          # Test-only binary with the smoke hooks; its own target dir so
+          # it never replaces the default-feature srt-win.exe.
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
       - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
@@ -138,6 +139,20 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      # Before the TS suite, with the other smokes: this is the child
+      # token and the kept write grants the library uses by default.
+      - name: Smoke-test srt-win write-restricted token (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
+      # On a made-up profile tree, never the runner's own: only the
+      # test-hooks build can be pointed at one.
+      - name: Smoke-test srt-win profile read grant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-profile-read.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -147,6 +162,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # A made-up profile for the suite (test-hooks build only),
+          # outside the temp directory and the checkout.
+          $env:SRT_WIN_TEST_PROFILE = Join-Path $env:RUNNER_TEMP 'srt-ts-profile'
+          New-Item -ItemType Directory -Force -Path $env:SRT_WIN_TEST_PROFILE | Out-Null
+          $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
           # These are listed explicitly because the non-Windows legs run the
@@ -286,6 +306,43 @@ jobs:
         if: matrix.os == 'linux'
         run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
 
+      # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
+      # current distribution use, and both refuse to start on a plan that
+      # masks again a file a read deny has masked: before 0.5.0 a file bind's
+      # mount point has to be a regular file, and that mask leaves /dev/null
+      # there. Run the suites that build and run mount plans against 0.4.1,
+      # the first of which starts bubblewrap on configurations that name one
+      # file twice, so such a plan is caught here rather than on a user's
+      # machine. Autotools, not meson, which that release predates. Pinned by
+      # commit, not by the v0.4.1 tag, which the upstream repository can move.
+      - name: Build bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq autoconf automake libtool libcap-dev pkg-config
+          git clone --filter=blob:none https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap-0.4"
+          cd "$RUNNER_TEMP/bubblewrap-0.4"
+          git checkout 5feb64dc60c936a7f9e424df9478aae9b88ee48a
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure --prefix="$RUNNER_TEMP/bwrap-0.4" --disable-man --disable-selinux
+          make
+          make install
+          "$RUNNER_TEMP/bwrap-0.4/bin/bwrap" --version
+
+      - name: Run the mount-plan suites against bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          PATH="$RUNNER_TEMP/bwrap-0.4/bin:$PATH" bun test \
+            test/sandbox/linux-one-mount-per-destination.test.ts \
+            test/sandbox/readonly-deny-dir-binds.test.ts \
+            test/sandbox/readonly-deny-dir-stubs.test.ts \
+            test/sandbox/linux-ancestor-pin.test.ts \
+            test/sandbox/linux-mount-plan-record.test.ts \
+            test/sandbox/path-canonicalization.test.ts \
+            test/sandbox/credential-deny.test.ts \
+            test/sandbox/symlink-boundary.test.ts \
+            test/sandbox/stale-mount-point.test.ts
+
       # A release from the 15.x line, pinned like the one above. Over the same
       # tree its scan can exit with a different status from 14.1.1 (see the
       # install step above), so the suites that depend on the scan run against
@@ -315,10 +372,13 @@ jobs:
           "$RUNNER_TEMP/ripgrep-15.2.0/rg" --version
 
       # Every suite under test/ that names ripgrep or the mandatory-deny scan
-      # it implements, less the four that never start rg: config-validation
-      # (schema only), public-exports (the export list), check-dependencies
-      # (replaces the lookup with a spy) and macos-literal-deny-brackets
-      # (macOS only).
+      # it implements, less those whose result does not depend on rg here:
+      # config-validation (schema only), public-exports (the export list),
+      # check-dependencies (replaces the lookup with a spy), glob-expand (puts
+      # a stand-in in its place), deny-order-independence and
+      # linux-one-mount-per-destination (keep the working directory where the
+      # scan adds nothing), macos-literal-deny-brackets (macOS only) and
+      # winsrt (Windows only).
       - name: Run the ripgrep-dependent tests against ripgrep 15.2.0 (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -330,7 +390,9 @@ jobs:
             test/sandbox/filesystem-disabled.test.ts \
             test/sandbox/linux-ancestor-pin.test.ts \
             test/sandbox/linux-bwrap-args-file.test.ts \
+            test/sandbox/linux-file-above-deny.test.ts \
             test/sandbox/linux-mount-plan-record.test.ts \
+            test/sandbox/literal-path-entries.test.ts \
             test/sandbox/read-deny-glob.test.ts \
             test/sandbox/readonly-deny-dir-binds.test.ts \
             test/sandbox/readonly-deny-dir-stubs.test.ts \
@@ -379,13 +441,19 @@ jobs:
       matrix:
         include:
           - arch: x86-64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # For the container below, which runs the built CLI with it.
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Enable unprivileged user namespaces on host
         run: |
@@ -404,17 +472,21 @@ jobs:
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
+            -v "$(dirname "$(dirname "$(command -v node)")")":/opt/node:ro \
             -w /work \
             -e SRT_E2E_DOCKER=1 \
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              # node and npm come from the image, and bun is pinned to the
-              # version the rest of the matrix runs (oven-sh/setup-bun above).
-              # The tree carries a dozen bun-version-specific workarounds, so
-              # "whatever bun shipped this morning" is not the runtime under
-              # test.
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin nodejs npm
+              # node and npm are those of the runner, bound in, and not those
+              # of the image, which has Node 18, below what engines in
+              # package.json allows. bun is pinned to the version the rest of
+              # the matrix runs (oven-sh/setup-bun above). The tree carries a
+              # dozen bun-version-specific workarounds, so "whatever bun
+              # shipped this morning" is not the runtime under test.
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
+              export PATH="/opt/node/bin:$PATH"
+              node --version
               # The release archive, by checksum, rather than an installer
               # piped into a shell.
               case "$(uname -m)" in
