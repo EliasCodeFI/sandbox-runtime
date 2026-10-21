@@ -671,6 +671,27 @@ static int reap_until(pid_t main_child) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Host bridges need graceful parent-death cleanup, not a sandbox. Check
+     * the expected parent on both sides of prctl so a CLI killed during
+     * startup cannot leave an unmonitored listener behind. */
+    if (argc >= 2 && strcmp(argv[1], "--parent-death-signal") == 0) {
+        char *end = NULL;
+        errno = 0;
+        long parent = argc >= 3 ? strtol(argv[2], &end, 10) : 0;
+        if (argc < 3 || errno || !end || *end || parent <= 0 || parent > INT_MAX) {
+            fprintf(stderr, "apply-seccomp: expected --parent-death-signal <parent-pid> [<command> [args...]]\n");
+            return 1;
+        }
+        if (getppid() != (pid_t)parent) return 1;
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0) {
+            die("apply-seccomp: prctl(PR_SET_PDEATHSIG)");
+        }
+        if (getppid() != (pid_t)parent) return 1;
+        if (argc == 3) return 0;
+        execvp(argv[3], &argv[3]);
+        die("apply-seccomp: execvp bridge");
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         return 1;

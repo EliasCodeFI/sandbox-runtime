@@ -1484,6 +1484,24 @@ function probeUid0UserNamespace(bwrap: string): string | null {
   return refusal
 }
 
+const parentDeathLauncherSupport = new Map<string, boolean>()
+
+function getBridgeLauncher(): string | undefined {
+  const binary = getApplySeccompBinaryPath()
+  if (!binary) return undefined
+  let supported = parentDeathLauncherSupport.get(binary)
+  if (supported === undefined) {
+    const probe = spawnSync(
+      binary,
+      ['--parent-death-signal', String(process.pid)],
+      { stdio: 'ignore', timeout: 5000 },
+    )
+    supported = !probe.error && probe.status === 0
+    parentDeathLauncherSupport.set(binary, supported)
+  }
+  return supported ? binary : undefined
+}
+
 /**
  * Initialize the Linux network bridge for sandbox networking
  *
@@ -1516,6 +1534,11 @@ export async function initializeLinuxNetworkBridge(
   socatPath?: string,
 ): Promise<LinuxNetworkBridgeContext> {
   const socat = socatPath ?? 'socat'
+  const launcher = getBridgeLauncher()
+  const bridgeCommand = launcher ?? socat
+  const launchArgs = launcher
+    ? ['--parent-death-signal', String(process.pid), socat]
+    : []
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   // Only allocated when ports differ; in the mux case the SOCKS side
@@ -1530,16 +1553,16 @@ export async function initializeLinuxNetworkBridge(
 
   logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`)
 
-  const httpBridgeProcess = spawn(socat, httpSocatArgs, {
-    stdio: 'ignore',
-  })
+  const httpBridgeProcess = spawn(
+    bridgeCommand,
+    [...launchArgs, ...httpSocatArgs],
+    {
+      stdio: 'ignore',
+    },
+  )
 
-  // Add error and exit handlers to monitor bridge health. These must be
-  // registered before the !pid check: when spawn fails (e.g. socat is
-  // missing or not executable), the ChildProcess emits an asynchronous
-  // 'error' event, and throwing first would leave that event without a
-  // listener — surfacing as an uncaughtException instead of the rejection
-  // below.
+  // Attach handlers before checking pid so a failed launcher spawn cannot
+  // emit an unhandled error. A failed socat exec is observed through exit.
   httpBridgeProcess.on('error', err => {
     logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
   })
@@ -1576,9 +1599,13 @@ export async function initializeLinuxNetworkBridge(
       `Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`,
     )
 
-    socksBridgeProcess = spawn(socat, socksSocatArgs, {
-      stdio: 'ignore',
-    })
+    socksBridgeProcess = spawn(
+      bridgeCommand,
+      [...launchArgs, ...socksSocatArgs],
+      {
+        stdio: 'ignore',
+      },
+    )
 
     // Add error and exit handlers to monitor bridge health — registered
     // before the !pid check for the same reason as the HTTP bridge above.
@@ -1609,6 +1636,20 @@ export async function initializeLinuxNetworkBridge(
   const startupTimeoutMs = 5000
   const deadline = performance.now() + startupTimeoutMs
   for (let i = 0; ; i++) {
+    if (
+      httpBridgeProcess.exitCode !== null ||
+      httpBridgeProcess.signalCode !== null
+    ) {
+      socksBridgeProcess.kill('SIGTERM')
+      throw new Error('Failed to start HTTP bridge process')
+    }
+    if (
+      socksBridgeProcess.exitCode !== null ||
+      socksBridgeProcess.signalCode !== null
+    ) {
+      httpBridgeProcess.kill('SIGTERM')
+      throw new Error('Failed to start SOCKS bridge process')
+    }
     if (
       !httpBridgeProcess.pid ||
       httpBridgeProcess.killed ||
