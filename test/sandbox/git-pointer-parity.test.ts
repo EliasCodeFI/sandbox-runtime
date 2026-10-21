@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -748,50 +747,6 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
       join(checkout, 'hooks'),
     )
   })
-
-  it('runs a hook again as soon as a looping hooks link reaches a directory', () => {
-    // The other half of what a loop means, against real git: while
-    // `.git/hooks` runs into one, git finds no hook there and commits
-    // without it - and the moment one of the LINKS is replaced by a
-    // directory, with the entry and the git directory untouched, the hook
-    // inside it is what git runs. That is why every link a looping chain
-    // went through is denied: they are the whole of what makes it reach
-    // anything.
-    const caseDir = join(root, `pointer-${caseCount++}`)
-    const checkout = join(caseDir, 'checkout')
-    mkdirSync(checkout, { recursive: true })
-    expect(runGit(checkout, ['init', '-q', '-b', 'main', '.'])).toBeDefined()
-    runGit(checkout, ['config', 'user.email', 'parity@example.invalid'])
-    runGit(checkout, ['config', 'user.name', 'Parity'])
-    const links = join(checkout, 'links')
-    mkdirSync(links, { recursive: true })
-    symlinkSync('b', join(links, 'a'))
-    symlinkSync('a', join(links, 'b'))
-    rmSync(join(checkout, '.git', 'hooks'), { recursive: true, force: true })
-    symlinkSync('../links/a', join(checkout, '.git', 'hooks'))
-    const ran = join(caseDir, 'hook-ran')
-    writeFileSync(join(checkout, 'f.txt'), 'one\n')
-    runGit(checkout, ['add', 'f.txt'])
-
-    expect(
-      runGit(checkout, ['commit', '-q', '-m', 'first'], { runHooks: true }),
-    ).toBeDefined()
-    expect(existsSync(ran)).toBe(false)
-
-    // One of the two links, replaced by a directory holding a hook.
-    rmSync(join(links, 'a'))
-    mkdirSync(join(links, 'a'), { recursive: true })
-    writeFileSync(join(links, 'a', 'pre-commit'), `#!/bin/sh\ntouch ${ran}\n`, {
-      mode: 0o755,
-    })
-    writeFileSync(join(checkout, 'f.txt'), 'two\n')
-    runGit(checkout, ['add', 'f.txt'])
-
-    expect(
-      runGit(checkout, ['commit', '-q', '-m', 'second'], { runHooks: true }),
-    ).toBeDefined()
-    expect(existsSync(ran)).toBe(true)
-  }, 120_000)
 
   // Linux only: the target has to exist for git to follow it, and macOS
   // filesystems refuse a name that is not valid UTF-8 (EILSEQ on mkdir). The

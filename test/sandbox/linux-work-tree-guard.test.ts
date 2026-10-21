@@ -24,6 +24,20 @@ import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux } from '../helpers/platform.js'
 
 /**
+ * Every `--ro-bind X X` that denies, by what it binds: those above the bind that
+ * makes the working directory writable. An ancestor pin spells the same words
+ * beneath it.
+ */
+function readOnlyBinds(command: string): string[] {
+  const cwd = process.cwd()
+  const madeWritable = command.indexOf(` --bind ${cwd} ${cwd} `)
+  expect(madeWritable).toBeGreaterThan(-1)
+  return [...command.slice(madeWritable).matchAll(/--ro-bind (\S+) (\S+)/g)]
+    .filter(([, source, dest]) => source === dest)
+    .map(([, source]) => source!)
+}
+
+/**
  * A deny path is bound where it LANDS: bubblewrap resolves a destination, so
  * a git directory entry that is itself a link to the checkout
  * (`hooks -> ../..`) binds the checkout, however the entry is spelled. The
@@ -81,13 +95,6 @@ describe.if(isLinux)('a git entry that is a link to the work tree', () => {
       readConfig: undefined,
       writeConfig: { allowOnly, denyWithinAllow: [] },
     })
-  }
-
-  /** Every `--ro-bind X X` of the wrapped command, by what it binds. */
-  function readOnlyBinds(command: string): string[] {
-    return [...command.matchAll(/--ro-bind (\S+) (\S+)/g)]
-      .filter(([, source, dest]) => source === dest)
-      .map(([, source]) => source!)
   }
 
   function landing(denyPath: string): string {
@@ -337,12 +344,6 @@ describe.if(isLinux)('a git entry whose link chain is a loop', () => {
       readConfig: undefined,
       writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
     })
-  }
-
-  function readOnlyBinds(command: string): string[] {
-    return [...command.matchAll(/--ro-bind (\S+) (\S+)/g)]
-      .filter(([, source, dest]) => source === dest)
-      .map(([, source]) => source!)
   }
 
   it('refuses for an entry of the working directory own repository', async () => {
