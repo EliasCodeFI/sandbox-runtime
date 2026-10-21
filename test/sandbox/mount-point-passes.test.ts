@@ -30,6 +30,20 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { manifestOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import {
+  aDeadProcess,
+  leftover,
+  type Process,
+  processAt,
+  recordOf,
+  run,
+  sleep,
+  started,
+  until,
+  wrapIn,
+  writeManifest,
+  writeScript,
+} from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -86,34 +100,6 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /** What bubblewrap leaves on the host for `--ro-bind /dev/null <absent>`. */
-  function leftover(p: string): void {
-    writeFileSync(p, '')
-    chmodSync(p, 0o444)
-  }
-
-  /** A pid nothing in this PID namespace has. */
-  function deadPid(): number {
-    for (let pid = 4194000; pid > 1; pid--) {
-      if (!existsSync(`/proc/${pid}`)) return pid
-    }
-    throw new Error('no free pid')
-  }
-
-  type Process = { pid: number; start: string }
-
-  /** That process as a manifest, a record or a pass names one. */
-  function processAt(pid: number): Process {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    return {
-      pid,
-      start: stat
-        .slice(stat.lastIndexOf(')') + 1)
-        .trim()
-        .split(' ')[19]!,
-    }
-  }
-
   /** Another process of this user, which runs until the test is over. */
   function anotherProcess(): Process {
     const other = spawn('sleep', ['600'], { stdio: 'ignore' })
@@ -121,38 +107,9 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     return processAt(other.pid!)
   }
 
-  /** What a killed process leaves: its manifest, long past its grace. */
-  function manifestOfADeadProcess(paths: string[], writer?: Process): string {
-    const { pid, start } = writer ?? { pid: deadPid(), start: '1' }
-    const file = join(DIR, `${pid}-${Math.random().toString(16).slice(2)}.json`)
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 1,
-        pid,
-        start,
-        ns: OWN_NAMESPACE,
-        boot: OWN_BOOT,
-        created: Date.now() - 60_000,
-        paths,
-        sources: [],
-      }),
-      { mode: 0o600 },
-    )
-    return file
-  }
-
-  /** Puts `manifest` on record as started by those processes. */
-  function started(manifest: string, ...by: Process[]): string {
-    const line = (who: Process): string =>
-      `${who.pid} (bwrap) ${['S', ...Array<string>(18).fill('0'), who.start, '0'].join(' ')}\n`
-    writeFileSync(
-      manifest.replace(/\.json$/, '.started'),
-      by.map(line).join(''),
-      { mode: 0o600 },
-    )
-    return manifest
-  }
+  /** What a killed process leaves in DIR, or one that `writer` wrote. */
+  const manifestOfADeadProcess = (paths: string[], writer?: Process): string =>
+    writeManifest(DIR, paths, { boot: OWN_BOOT, ...writer })
 
   /** Puts a pass of `who` on record, as the library names one. */
   function passOf(
@@ -178,42 +135,11 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   const passes = (): string[] =>
     readdirSync(DIR).filter(name => name.endsWith('.pass'))
 
-  function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
-  }
+  const wrap = (command = 'true', deny = [LOCK]): Promise<string> =>
+    wrapIn(AREA, command, deny)
 
-  async function until(what: string, holds: () => boolean): Promise<void> {
-    const deadline = Date.now() + 30000
-    while (!holds()) {
-      if (Date.now() > deadline)
-        throw new Error(`timed out waiting for ${what}`)
-      await sleep(10)
-    }
-  }
-
-  function wrap(command = 'true', deny = [LOCK]): Promise<string> {
-    return wrapCommandWithSandboxLinux({
-      command,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [] },
-      writeConfig: { allowOnly: [AREA], denyWithinAllow: deny },
-    })
-  }
-
-  function run(command: string): { status: number | null; said: string } {
-    const r = spawnSync(command, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 30000,
-    })
-    return { status: r.status, said: `${r.stdout}${r.stderr}` }
-  }
-
-  function script(name: string, lines: string[]): string {
-    const file = join(BASE, name)
-    writeFileSync(file, lines.join('\n'))
-    return file
-  }
+  const script = (name: string, lines: string[]): string =>
+    writeScript(BASE, name, lines)
 
   // ---- the pass ------------------------------------------------------------
 
@@ -248,7 +174,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       }) as never),
     ]
     try {
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spies.forEach(spy => spy.mockRestore())
     }
@@ -272,7 +198,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       unlink(file)
     }) as never)
     try {
-      collectMountPoints()
+      collectMountPoints('all')
     } finally {
       spy.mockRestore()
     }
@@ -286,7 +212,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     manifestOfADeadProcess([LOCK], anotherProcess())
     const open = spyOn(fs, 'openSync')
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(
         open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
       ).toEqual([])
@@ -309,7 +235,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       return (open as (...args: unknown[]) => number)(file, ...rest)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
@@ -318,7 +244,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     expect(readdirSync(DIR)).toEqual([
       basename(manifest).replace(/json$/, 'finished'),
     ])
-    expect(collectMountPoints()).toEqual([LOCK])
+    expect(collectMountPoints('all')).toEqual([LOCK])
   })
 
   it('still removes what this process could record nowhere, on a disk that takes neither a manifest nor a record', () => {
@@ -349,7 +275,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     try {
       expect(publishMountPointManifest([LOCK], [])).toBeUndefined()
       leftover(LOCK)
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spies.forEach(spy => spy.mockRestore())
     }
@@ -361,7 +287,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     writeFileSync(join(DIR, '1-0123456789abcdef.json'), '{"version":"?"}')
     const open = spyOn(fs, 'openSync')
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(
         open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
       ).toEqual([])
@@ -379,38 +305,100 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       return now()
     })
     try {
-      expect(() => collectMountPoints()).toThrow('a bug')
+      expect(() => collectMountPoints('all')).toThrow('a bug')
     } finally {
       spy.mockRestore()
     }
     expect(passes()).toEqual([])
   })
 
-  it('leaves the rest to the next pass once it has been on record for two seconds', () => {
-    const second = join(AREA, 'second.lock')
-    leftover(LOCK)
-    leftover(second)
-    manifestOfADeadProcess([LOCK, second])
-    const unlink = fs.unlinkSync
-    const now = performance.now.bind(performance)
-    let late = 0
-    const spies = [
-      spyOn(performance, 'now').mockImplementation(() => now() + late),
-      spyOn(fs, 'unlinkSync').mockImplementation(((file: string) => {
-        unlink(file)
-        if (file === second) late = 2_001
-      }) as never),
-    ]
-    try {
-      // Children first, which among siblings is the later name first.
-      expect(collectMountPoints()).toEqual([second])
-    } finally {
-      spies.forEach(spy => spy.mockRestore())
+  /** Has that clock go on by `ms` whenever `heldUpFor` is called. */
+  function aClockThatIsHeldUp(clock: typeof performance | typeof Date): {
+    heldUpFor(ms: number): void
+    mockRestore(): void
+  } {
+    const now = clock.now.bind(clock)
+    let lost = 0
+    const spy = spyOn(clock, 'now').mockImplementation(() => now() + lost)
+    return {
+      heldUpFor: ms => {
+        lost += ms
+      },
+      mockRestore: () => spy.mockRestore(),
     }
-    expect(existsSync(LOCK)).toBe(true)
-    expect(passes()).toEqual([])
-    expect(collectMountPoints()).toEqual([LOCK])
-  })
+  }
+  // The wall clock alone goes on while the host is suspended, and others go by
+  // it; it alone can be set back.
+  const CLOCKS = [
+    ['the monotonic clock', (): typeof performance => performance],
+    ['the wall clock', (): typeof Date => Date],
+  ] as const
+
+  it.each(CLOCKS)(
+    'leaves the rest to the next pass once it has been on record for two seconds, by %s',
+    (_, which) => {
+      const second = join(AREA, 'second.lock')
+      leftover(LOCK)
+      leftover(second)
+      manifestOfADeadProcess([LOCK, second])
+      const unlink = fs.unlinkSync
+      const clock = aClockThatIsHeldUp(which())
+      const spy = spyOn(fs, 'unlinkSync').mockImplementation(((
+        file: string,
+      ) => {
+        unlink(file)
+        if (file === second) clock.heldUpFor(2_001)
+      }) as never)
+      try {
+        // Children first, which among siblings is the later name first.
+        expect(collectMountPoints('all')).toEqual([second])
+      } finally {
+        spy.mockRestore()
+        clock.mockRestore()
+      }
+      expect(existsSync(LOCK)).toBe(true)
+      expect(passes()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([LOCK])
+    },
+  )
+
+  it.each(CLOCKS)(
+    'counts the time it takes to go on record, and to list the directories before a removal, by %s',
+    (_, which) => {
+      for (const heldUpIn of ['openSync', 'readdirSync'] as const) {
+        leftover(LOCK)
+        manifestOfADeadProcess([LOCK])
+        const clock = aClockThatIsHeldUp(which())
+        const real = fs[heldUpIn] as (...args: unknown[]) => unknown
+        let listings = 0
+        const spy = spyOn(fs, heldUpIn).mockImplementation(((
+          file: unknown,
+          ...rest: unknown[]
+        ) => {
+          const result = real(file, ...rest)
+          if (
+            heldUpIn === 'openSync'
+              ? String(file).endsWith('.pass')
+              : // The reading it decides on, then the one before the removal.
+                file === DIR &&
+                (result as string[]).some(name => name.endsWith('.pass')) &&
+                ++listings === 2
+          ) {
+            clock.heldUpFor(2_001)
+          }
+          return result
+        }) as never)
+        try {
+          expect(collectMountPoints('all')).toEqual([])
+        } finally {
+          spy.mockRestore()
+          clock.mockRestore()
+        }
+        if (heldUpIn === 'readdirSync') expect(listings).toBe(2)
+        expect(collectMountPoints('all')).toEqual([LOCK])
+      }
+    },
+  )
 
   // ---- which passes are under way --------------------------------------------
 
@@ -430,10 +418,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   })
 
   it.each([
-    [
-      'its process is gone',
-      (): string => passOf({ pid: deadPid(), start: '1' }),
-    ],
+    ['its process is gone', (): string => passOf(aDeadProcess())],
     [
       'its pid is a later process',
       (): string => {
@@ -451,7 +436,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
   ])('is over when %s, and the next pass drops its record', (_what, plant) => {
     const pass = plant()
     expect(passesUnderWay()).toEqual([])
-    collectMountPoints()
+    collectMountPoints('all')
     expect(existsSync(pass)).toBe(false)
   })
 
@@ -479,16 +464,16 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       expect(passesUnderWay()).toEqual([pass])
       aged(pass, 59_000)
       expect(passesUnderWay()).toEqual([pass])
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(true)
       aged(pass, 61_000)
       expect(passesUnderWay()).toEqual([])
       // Its record is not this process's to drop: its own may be stopped half
       // way, and those who can ask after it still wait for it.
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(true)
       aged(pass, 8 * 24 * 60 * 60 * 1000)
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(pass)).toBe(false)
     },
   )
@@ -506,13 +491,13 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       unlink(file)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([LOCK])
+      expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
       spy.mockRestore()
     }
     expect(passes()).toHaveLength(1)
     expect(passesUnderWay()).toEqual([])
-    collectMountPoints()
+    collectMountPoints('all')
     expect(passes()).toEqual([])
   })
 
@@ -577,6 +562,17 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     rmSync(first)
     expect(await waiting).toBeUndefined()
     expect(passesUnderWay()).toEqual([later])
+  })
+
+  it('is waited for by whichever name its directory is listed', async () => {
+    // Two of the places may be one directory, and which of the names that goes
+    // by may differ from one listing to the next.
+    const listedAs = join(
+      BASE,
+      'the-other-name',
+      basename(passOf(anotherProcess())),
+    )
+    expect(await passesToEnd([listedAs], undefined, 200)).toBe(listedAs)
   })
 
   // ---- the wrap ----------------------------------------------------------------
@@ -686,7 +682,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     // One that has run, whose caller has not cleaned up after it and may run it
     // again.
     const kept = await wrap()
-    started(manifestOf(kept)!, { pid: deadPid(), start: '1' })
+    started(manifestOf(kept)!, aDeadProcess())
     const gaveUp = new AbortController()
     gaveUp.abort(new Error('gave up'))
     expect(
@@ -729,7 +725,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
             `  }`,
             `  unlink(file)`,
             `})`,
-            `m.collectMountPoints()`,
+            `m.collectMountPoints('all')`,
           ]),
         ],
         { stdio: 'ignore' },
@@ -787,7 +783,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       [
         script('cleaner.ts', [
           `const m = await import(${MODULE})`,
-          `m.collectMountPoints()`,
+          `m.collectMountPoints('all')`,
         ]),
       ],
       { encoding: 'utf8', timeout: 30000 },
@@ -824,34 +820,36 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     60000,
   )
 
-  it('keeps what a command that has run relied on while the process that wrapped it runs, to every other process', () => {
-    leftover(LOCK)
-    const manifest = started(manifestOfADeadProcess([LOCK], anotherProcess()), {
-      pid: deadPid(),
-      start: '1',
-    })
-    expect([...(liveMountPoints() ?? [])]).toEqual([LOCK])
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(manifest)).toBe(true)
-  })
+  it.each(['first', 'last'] as const)(
+    'asks after every run of a command line that has been run thousands of times: the %s may be the one that lasts',
+    which => {
+      leftover(LOCK)
+      const gone = Array<Process>(3000).fill(aDeadProcess())
+      const manifest = manifestOfADeadProcess([LOCK])
+      started(
+        manifest,
+        ...(which === 'first'
+          ? [anotherProcess(), ...gone]
+          : [...gone, anotherProcess()]),
+      )
+      expect(collectMountPoints('all')).toEqual([])
+      started(manifest, ...gone)
+      expect(collectMountPoints('all')).toEqual([LOCK])
+    },
+  )
 
-  it('goes by the last runs of a command line that has been run more often than a record is read for', () => {
+  it('takes a record too long to be read to vouch, like any that cannot be read', () => {
     leftover(LOCK)
-    const gone = Array<Process>(1500).fill({ pid: deadPid(), start: '1' })
     const manifest = manifestOfADeadProcess([LOCK])
-    started(manifest, ...gone, anotherProcess())
-    expect(
-      fs.statSync(manifest.replace(/\.json$/, '.started')).size,
-    ).toBeGreaterThan(64 * 1024)
-    expect(collectMountPoints()).toEqual([])
-    started(manifest, ...gone)
-    expect(collectMountPoints()).toEqual([LOCK])
-  })
-
-  it('takes it once that process is gone', () => {
-    leftover(LOCK)
-    started(manifestOfADeadProcess([LOCK]), { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([LOCK])
+    started(manifest, aDeadProcess())
+    const record = recordOf(manifest)
+    const line = fs.readFileSync(record, 'utf8')
+    fs.writeFileSync(
+      record,
+      line.repeat(Math.ceil((4 * 1024 * 1024 + 1) / line.length)),
+    )
+    expect(collectMountPoints('all')).toEqual([])
+    expect(existsSync(LOCK)).toBe(true)
   })
 
   /** The manifest this process publishes for a wrap that names `paths`. */
@@ -868,7 +866,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       name => join(AREA, name),
     ) as [string, string, string]
     for (const mountPoint of [ended, running, notStarted]) leftover(mountPoint)
-    started(publish([ended]), { pid: deadPid(), start: '1' })
+    started(publish([ended]), aDeadProcess())
     started(publish([running]), anotherProcess())
     publish([notStarted])
 
@@ -885,7 +883,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       join(AREA, name),
     ) as [string, string, string]
     for (const mountPoint of [ended, named, other]) leftover(mountPoint)
-    started(publish([ended], 'a'), { pid: deadPid(), start: '1' })
+    started(publish([ended], 'a'), aDeadProcess())
     publish([named], 'b')
     publish([other], 'c')
     expect(collectMountPoints({ commandKey: 'b' }).sort()).toEqual(
@@ -896,16 +894,29 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
 
   // ---- a process that has exited and is not waited for -------------------------
 
+  /** Whether the shell started as `pid` has become the `sleep` it execs. */
+  const isSleep = (pid: number): boolean =>
+    readFileSync(`/proc/${pid}/comm`, 'utf8') === 'sleep\n'
+
   it('takes a process that has exited for gone, though nothing has asked after it yet', async () => {
     // The shell starts a child and becomes a program that never waits for one.
-    const parent = spawn('sh', ['-c', 'true & echo $!; exec sleep 600'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
+    // The child ends only then: a shell may wait for one that ends before.
+    const go = join(BASE, 'go')
+    const parent = spawn(
+      'sh',
+      [
+        '-c',
+        `(while [ ! -e ${go} ]; do sleep 0.02; done) & echo $!; exec sleep 600`,
+      ],
+      { stdio: ['ignore', 'pipe', 'ignore'] },
+    )
     others.push(parent)
     let said = ''
     parent.stdout.on('data', chunk => (said += String(chunk)))
     await until('the pid of the child', () => said.includes('\n'))
     const pid = Number(said)
+    await until('the shell to be gone', () => isSleep(parent.pid!))
+    writeFileSync(go, '')
     await until('the child to have exited', () =>
       / Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')),
     )
@@ -916,7 +927,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
     const pass = passOf(exited)
     expect(passesUnderWay()).toEqual([])
     expect([...(liveMountPoints() ?? [])]).toEqual([])
-    expect(collectMountPoints()).toEqual([LOCK])
+    expect(collectMountPoints('all')).toEqual([LOCK])
     expect(existsSync(pass)).toBe(false)
     // Still there to be asked after: it is what it says that counts.
     expect(existsSync(`/proc/${pid}`)).toBe(true)
@@ -934,14 +945,12 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       })
       others.push(parent)
       await until('the sandbox to be up', () => existsSync(up))
-      const record = readFileSync(
-        manifestOf(command)!.replace(/\.json$/, '.started'),
-        'utf8',
-      )
+      const record = readFileSync(recordOf(manifestOf(command)!), 'utf8')
       const bwrap = Number(/^\d+/.exec(record)![0])
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(true)
 
+      await until('the shell to be gone', () => isSleep(parent.pid!))
       process.kill(bwrap, 'SIGKILL')
       await until('bubblewrap to have exited', () =>
         / Z /.test(readFileSync(`/proc/${bwrap}/stat`, 'utf8')),

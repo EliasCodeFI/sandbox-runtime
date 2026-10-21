@@ -1019,6 +1019,8 @@ export const RipgrepConfigSchema = z.object({
     .number()
     .int()
     .positive()
+    // A timer takes no more, and takes one millisecond for anything above.
+    .max(2 ** 31 - 1)
     .optional()
     .describe(
       'How long one ripgrep run may take before it is killed, in milliseconds ' +

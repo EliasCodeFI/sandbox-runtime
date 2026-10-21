@@ -1,7 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOrSelf } from '../utils/real-path.js'
+import { linkTextOf, realPathOrSelf } from '../utils/real-path.js'
 import { DEFAULT_RIPGREP_TIMEOUT_MS } from '../utils/ripgrep.js'
 import {
   isAbsenceErrno,
@@ -10,12 +10,9 @@ import {
 } from './sandbox-utils.js'
 
 /**
- * The path is absent, as opposed to unreadable or otherwise unverifiable.
- * Narrower than the shared {@link isAbsenceErrno} by two codes: an absent
- * path is denied as one a command could still create, and a symlink loop is
- * not that — it is walked instead, so that the links the walk went through
- * before it gave up are held ({@link resolveChain}) — while ENAMETOOLONG has
- * its own answer in {@link isUnusablePathError}.
+ * Absent, so a command could still create it. Narrower than the shared {@link
+ * isAbsenceErrno}: a symlink loop is walked instead, for its links to be held,
+ * and ENAMETOOLONG is {@link isUnusablePathError}.
  */
 function isAbsenceError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
@@ -24,51 +21,53 @@ function isAbsenceError(err: unknown): boolean {
 }
 
 /**
- * The path is longer than the filesystem allows, so no file can occupy it:
- * git's own stat of it fails, and a sandboxed command cannot create a git
- * directory there either.
+ * Longer than the filesystem allows: no file can be there, for git to read or
+ * for a command to create.
  */
 function isUnusablePathError(err: unknown): boolean {
   return (err as NodeJS.ErrnoException | undefined)?.code === 'ENAMETOOLONG'
 }
 
 /**
- * How much of a `.git` pointer or a `commondir` is read: what git's
- * `read_gitfile_gently` accepts for a pointer file, so one larger than this
- * is not a pointer git follows either. `commondir` has no bound in git, so
- * one this large is read by git and not by this, and fails closed.
+ * How much of a `.git` file or a `commondir` is read: what git accepts for a
+ * `.git` file. git has no bound for a `commondir`, so a larger one fails
+ * closed.
  */
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
-/** Time the `.git/modules` walk gets when the caller sets no deadline, and
- *  the walk of a symlink chain or a pointer's value likewise. */
+/** What a walk gets where the caller sets no deadline. */
 const DEFAULT_SUBMODULE_WALK_TIMEOUT_MS = DEFAULT_RIPGREP_TIMEOUT_MS
 
 /**
- * How often the walk looks at the clock: once per this many entries, rather
- * than once per directory, because one directory can hold as many entries as
- * the whole rest of the walk. {@link resolveChain} counts path components the
- * same way, for the same reason: one link's target, or one pointer's value,
- * can hold as many as every other path put together.
+ * A walk looks at the clock once per this many entries or path components: one
+ * directory, or one value, can hold as many as all the rest.
  */
 const WALK_DEADLINE_CHECK_INTERVAL = 128
 
 /**
- * Entries whose presence makes a directory a git directory. git needs HEAD
- * and objects; config and hooks are what this file protects, so a directory
- * holding either is treated as one even if HEAD has been moved aside.
+ * Whether a directory holding `entries` is taken for a git directory.
+ * Deliberately looser than git's `is_git_directory` (a valid HEAD plus objects/
+ * and refs/), which only ever denies more: any one of these will do. git needs
+ * `HEAD` and `objects`, and neither is a deny path, so a command can rename both
+ * aside. `config`, `hooks` and `commondir` are what this file protects: from the
+ * first wrap that saw the directory on, one that is there cannot be moved.
+ *
+ * Each counts as the kind of entry git reads there, so that `vendor/config/lib`
+ * does not make a git directory of `vendor`. An entry of no known type counts.
  */
-const GIT_DIR_MARKERS = new Set(['HEAD', 'config', 'hooks', 'objects'])
+function looksLikeGitDir(entries: fs.Dirent[]): boolean {
+  return entries.some(entry =>
+    ['hooks', 'objects'].includes(entry.name)
+      ? !entry.isFile()
+      : ['HEAD', 'config', 'commondir'].includes(entry.name) &&
+        !entry.isDirectory(),
+  )
+}
 
 /**
- * Directories git itself keeps in a git directory: its objects, its refs and
- * their logs, its hooks and `info`, the administrative directories of linked
- * worktrees, and the stores git-lfs and rerere put beside them. The
- * `.git/modules` walk goes on past a git directory (see
- * {@link submoduleGitDirs}) and stays out of these: they are where a
- * repository is large, and git keeps no submodule's git directory in any of
- * them. `modules` is not one of them because it IS walked, as the place a git
- * directory keeps its own submodules.
+ * Directories git and its helpers keep in a git directory, which is where a
+ * repository is large. The `.git/modules` walk goes on past a git directory
+ * ({@link walkModules}) and stays out of these but for one listing.
  */
 const GIT_OWN_DIRECTORIES = new Set([
   'objects',
@@ -82,29 +81,14 @@ const GIT_OWN_DIRECTORIES = new Set([
 ])
 
 /**
- * What tells a submodule's git directory that only has one of those names
- * (`vendor/lfs`, `tools/hooks`) from git's own directory of that name: the
- * two entries this file protects. Every git directory git makes has a
- * `config`, and git puts neither name in a directory of its own, where
- * `logs/HEAD` and `lfs/objects` rule the other two markers out. A linked
- * worktree or a ref namespace that is itself NAMED one of the two is the
- * exception: what holds it is walked for it, which only ever denies more.
+ * What tells a submodule's git directory that has one of those names
+ * (`vendor/lfs`) from git's own directory of that name. `logs/HEAD` and
+ * `lfs/objects` rule the other markers out.
  */
 const GIT_PROTECTED_ENTRIES = new Set(['config', 'hooks'])
 
-/**
- * The entries of a git directory that are files: `config`, and the two that
- * redirect git to another directory. `hooks` is the fourth entry denied, and a
- * directory, which {@link GIT_OWN_DIRECTORIES} has.
- */
+/** The entries of a git directory that are denied and are files. */
 const GIT_ENTRY_FILES = new Set(['config', 'commondir', 'config.worktree'])
-
-/**
- * The narrower set {@link gitDirKind} goes by, for a directory that file
- * content names; see there for why `config` and `hooks` are not in it and
- * `commondir` is.
- */
-const TARGET_GIT_DIR_MARKERS = new Set(['HEAD', 'objects', 'commondir'])
 
 /** What {@link gitDirKind} concluded about a `gitdir:`/`commondir` target. */
 type GitDirKind = 'git-dir' | 'absent' | 'other' | 'unreadable' | 'unusable'
@@ -119,18 +103,12 @@ type GitMetadata =
   | { kind: 'too-large' }
 
 /**
- * A git metadata file whose target cannot be worked out the way git works it
- * out. Thrown rather than logged, and not swallowed by
- * {@link gitFileDenyPaths}: sandboxing with a deny list that misses the hooks
- * and config git reads is worse than not sandboxing, which is the same call
- * the Linux backend makes for a scan that does not finish in time.
- *
- * The message names the file, because a sandboxed command can write one and
- * the refusal is then lifted only by a command run outside the sandbox. On
- * Linux the wrap turns this into a `LinuxSandboxProfileError` carrying
- * `deny_git_metadata_unreadable`; on macOS it is the profile generator's own
- * refusal and reaches the caller as itself. Branch on `.code`, not on the
- * message.
+ * A git metadata file, or a link, whose target cannot be worked out the way git
+ * works it out. The wrap is refused: a deny list that misses the hooks and
+ * config git reads is worse than no sandbox. The message names the file, since
+ * a sandboxed command can write one and only a command run outside lifts it. On
+ * Linux it becomes a `LinuxSandboxProfileError` with
+ * `deny_git_metadata_unreadable`; on macOS it reaches the caller as itself.
  */
 export class GitMetadataError extends Error {
   readonly code = 'git_metadata_unreadable' as const
@@ -141,14 +119,9 @@ export class GitMetadataError extends Error {
 }
 
 /**
- * The `.git/modules` walk ran out of the time it was given, so the submodule
- * git directories it never reached would have been left with writable hooks —
- * or the listing of `.git/worktrees`, which shares that time, did; or the
- * walk of a symlink chain or of the path a `.git` pointer names did, which
- * spends the same budget, so the git directory it never landed on would have
- * been. The Linux wrap turns this into a `LinuxSandboxProfileError` carrying
- * `deny_scan_failed`; on macOS it reaches the caller as itself. Branch on
- * `.code`, not on the message.
+ * A walk ran out of the time it was given, so what it never reached would have
+ * been left writable. On Linux it becomes a `LinuxSandboxProfileError` with
+ * `deny_scan_failed`; on macOS it reaches the caller as itself.
  */
 export class SubmoduleWalkBudgetError extends Error {
   readonly code = 'submodule_walk_budget_exhausted' as const
@@ -158,15 +131,7 @@ export class SubmoduleWalkBudgetError extends Error {
   }
 }
 
-/**
- * One symlink a chain walk went through, and the directory holding it.
- *
- * A bind cannot be put on a link — mounting at its own path resolves it — so
- * the directory around it is the only handle the backend whose denies resolve
- * has on it, while the backend that matches the name an unlink or a rename
- * uses wants the link's own path. Both are here, so each backend can take
- * what it holds a link by.
- */
+/** One symlink a chain walk went through, and the directory holding it. */
 interface ChainHop {
   /** The link's own path, as the walk reached it. */
   link: string
@@ -178,69 +143,50 @@ interface ChainHop {
  *  {@link resolveChain}. */
 interface ResolvedChain {
   landing: string
-  /** In the order the walk met them and each named once: the first is the
-   *  path the caller asked about, the rest are what lies between it and the
-   *  landing. A loop meets the same link over and over; it is one hop. */
+  /**
+   * In the order the walk met them, each once: the first is the path the caller
+   * asked about.
+   */
   hops: ChainHop[]
   /**
-   * Whether the walk ran to the end of the path. False only where it gave up
-   * past the kernel's own hop limit — a loop, or a chain longer than the
-   * kernel follows — and `landing` is then just where it stopped, a path
-   * nothing can be reached through while the chain stands.
+   * False where the walk gave up past the kernel's hop limit, on a loop or a
+   * chain too long: `landing` is then only where it stopped.
    */
   resolved: boolean
 }
 
 /**
- * A symlink a git directory is reached THROUGH: a second hop of a symlinked
- * entry's own link, a symlinked directory component on the way, or a
- * component of the path a `gitdir:` pointer or a `commondir` names.
- *
- * Neither end of such a chain covers one. The entry's or the pointer file's
- * deny holds that end and the landing's deny holds the other, while a hop in
- * between sits in an ordinary directory of the work tree: a command that
- * retargets it, or renames it aside and puts its own directory there, moves
- * what the chain resolves to without touching either end, and the host's git
- * follows the chain afterwards.
+ * A symlink a git directory is reached THROUGH: a further hop of a symlinked
+ * entry, a symlinked directory on the way, or a component of the path a
+ * `gitdir:` or a `commondir` names. The denies at the two ends of the chain
+ * cover neither it nor the directory it sits in, and a command that retargets
+ * it moves where the chain leads, for the host's git to follow.
  */
 export interface GitChainHop {
   /**
-   * Where the chain starts: a git directory ENTRY that is itself a symlink,
-   * or the VALUE of a `gitdir:` pointer or a `commondir`, which git walks the
-   * same way and a command redirects the same way. Held alike; the warning
-   * that stands in where one cannot be held says which, because what closes
-   * it differs.
+   * Where the chain starts: a git directory ENTRY that is a symlink, or the
+   * VALUE of a `gitdir:` or a `commondir`. Held alike; the warning differs.
    */
   kind: 'entry' | 'pointer'
   /**
-   * Whether the chain this hop lies on reaches anything. `unresolvable` is a
-   * loop, or a chain past the kernel's hop limit: nothing is behind it, both
-   * ends of it are held by a deny that stands on nothing, and each link the
-   * walk DID go through is a name that makes the chain reach a real directory
-   * as soon as a command puts one in its place. A backend that cannot hold
-   * such a link has nothing left to fall back on and refuses the command; one
-   * whose chain resolves has the landing's own denies behind it and warns.
+   * `unresolvable` is a loop, or a chain past the kernel's limit. Nothing is
+   * behind it to deny, and each link is a name that makes it reach a directory
+   * as soon as a command puts one there. A backend that cannot hold such a link
+   * refuses the command; for a chain that resolves it warns.
    */
   chain: 'resolved' | 'unresolvable'
   /** The git directory entry, or the metadata file, whose chain goes
    *  through it. */
   source: string
   /**
-   * The link's own path, and a deny path of its own: that is what holds it
-   * on the backend which matches the name a rename or an unlink uses. The
-   * backend whose denies RESOLVE gets nothing from it — a bind at a link
-   * lands on what the link leads to, which for a symlinked directory
-   * component is a whole directory nothing asked to deny — and drops it: see
-   * `linuxGitDirTreeDenyPaths` in src/sandbox/linux-sandbox-utils.ts.
+   * The link's own path: a deny path for the backend that matches the name a
+   * rename or an unlink uses (macOS). A bind there would land on what the link
+   * leads to, so Linux drops it (`withoutChainHopLinks`).
    */
   link: string
   /**
-   * The directory holding the link: what that backend has to deny WHOLE to
-   * hold it, as it denies the entry's own git directory whole. Undefined
-   * where such a deny already covers the link — a hop inside the git
-   * directory, or inside the directory holding a `.git/modules` entry. Where
-   * it is a write root or the working directory there is nothing to bind
-   * over it; the Linux backend's own note says what happens then.
+   * The directory holding the link, which Linux denies WHOLE to hold it.
+   * Undefined where a whole deny covers the link already.
    */
   holder: string | undefined
 }
@@ -248,52 +194,32 @@ export interface GitChainHop {
 /** Directories found under a `.git/modules`, and what could not be read. */
 export interface SubmoduleScan {
   /**
-   * The submodule git directories, sorted. An entry the walk followed through
-   * a symlink is here as the path it was reached by; one whose target is not
-   * there yet is here as the path that target folds to, which is what a deny
-   * has to block a command from creating.
+   * Sorted. One reached through a symlink is here as the path it was reached
+   * by, and one whose target is not there yet as the path that target folds to.
    */
   gitDirs: string[]
   /**
-   * Directories the walk could not see through: what lies under them is
-   * unknown, so they are denied whole rather than left writable with a git
-   * directory possibly inside. Two things produce one — a directory the walk
-   * could not list, and an entry whose target exists and could not be
-   * inspected — and the recorded path is the deepest ancestor this process can
-   * reach towards it, which can be the `.git/modules` root itself. Sorted and
-   * without duplicates, like `gitDirs`.
-   *
-   * A whole-directory deny is read-only for everything beneath it, a
-   * submodule's `objects`, `refs` and `index` included, so git writes inside a
-   * tree that trips one stop working.
+   * Directories the walk could not see through, denied whole: one it could not
+   * list, or the deepest one reachable towards a target it could not look at.
+   * Everything under one is read-only, so git writes there stop working.
+   * Sorted, no duplicates.
    */
   unreadableDirs: string[]
   /**
-   * Directories holding an entry the walk followed through a SYMLINK, denied
-   * whole for the link's sake: the deny the target gets covers what a write
-   * through the link reaches, and the link's own path takes no mount of its
-   * own (putting one there means resolving it). A `.git/modules` is writable
-   * inside the sandbox, so a command that leaves the link alone but puts its
-   * own git directory in its place aims every pointer that named it at hooks
-   * the deny never saw. Denying the directory that holds it is the only
-   * handle on that, and it is a whole-directory deny like the above. Sorted
-   * and without duplicates.
+   * Directories holding an entry that is a SYMLINK, denied whole for the link's
+   * sake by the backend whose denies resolve: the target's deny does not stop a
+   * command from putting a git directory of its own in the link's place.
+   * Sorted, no duplicates.
    */
   linkedEntryDirs: string[]
-  /**
-   * The hops BETWEEN an entry the walk followed through a symlink and what
-   * it lands on. One inside the directory holding that entry names no holder
-   * of its own: `linkedEntryDirs` denies that whole already. See
-   * {@link GitChainHop}.
-   */
+  /** The hops between such an entry and what it lands on. */
   chainHops: GitChainHop[]
 }
 
 /**
  * What a git directory's tree is denied by, in the pieces a backend with a
- * ceiling on how many mounts it can carry degrades it in (Linux:
- * src/sandbox/linux-deny-collapse.ts). Every piece is a precise deny: nothing
- * here is collapsed, on either backend.
+ * ceiling on its mounts degrades it in (src/sandbox/linux-deny-collapse.ts).
+ * Nothing here is collapsed.
  */
 export interface GitDirTreeDenies {
   /** The git directory's own hooks, config and redirect files. */
@@ -311,38 +237,26 @@ export interface GitDirTreeDenies {
   unreadableDirs: string[]
   /** Directories holding a symlinked entry; see {@link SubmoduleScan}. */
   linkedEntryDirs: string[]
-  /** Every hop between a symlinked entry of this tree and what it leads to,
-   *  the git directory's own entries, the walked `.git/modules` and
-   *  `.git/worktrees` entries and the git directories under them alike, and
-   *  the hops a worktree's `commondir` value walks. See {@link GitChainHop}. */
+  /** Every hop met anywhere in this tree. */
   chainHops: GitChainHop[]
 }
 
 /**
- * The files inside a git directory that send git to a git directory or a
- * config other than the one it opened, and what must stand in for one where
- * it does not exist.
+ * The files in a git directory that send git to another git directory or
+ * config, and what must stand in for one that does not exist.
  *
- * Denying a path that is not there means mounting something at it, and git
- * reads whichever of these two it finds: it refuses to run at all against a
- * `commondir` it cannot read, which both an empty file and a bound /dev/null
- * are (git rejects a commondir it reads zero bytes from, and a bind mount
- * carries nodev, so the device is unreadable). Each placeholder is what git
- * concludes with the file absent: `.` makes git resolve the git directory it
- * opened as its own common directory, and an empty `config.worktree` reads as
- * no worktree config at all.
+ * Denying an absent path means mounting something at it, and git reads these
+ * two: it refuses to run at all against a `commondir` it cannot read, which
+ * both an empty file and a bound /dev/null are. Each placeholder is what git
+ * concludes with the file absent: `.` is the git directory itself, and an empty
+ * `config.worktree` is no worktree config.
  *
- * That is not invisible. The file's mere existence sets git's
- * `different_commondir`, so `git rev-parse --git-common-dir` and `--git-path`
- * print the absolute real path where they printed a relative one, and a
- * script that compares `--git-dir` with `--git-common-dir` to decide "this is
- * a linked worktree" answers yes for an ordinary repository while the deny
- * stands. No content avoids that: the alternative is git refusing to run.
+ * That is not invisible. The file's existence sets git's `different_commondir`,
+ * so `git rev-parse --git-common-dir` prints an absolute path, and a script
+ * that compares it with `--git-dir` takes an ordinary repository for a linked
+ * worktree while the deny stands.
  *
- * An empty placeholder also says that an empty file at that path is a
- * legitimate one to leave alone; a non-empty placeholder says the opposite,
- * which is what lets the Linux backend cover or repair an empty `commondir`
- * (see `writeGitRedirectMountPoint` in src/sandbox/linux-sandbox-utils.ts).
+ * The Linux backend writes them: `writeGitRedirectMountPoint`.
  */
 const GIT_REDIRECT_FILES: ReadonlyArray<{
   name: string
@@ -357,15 +271,11 @@ const GIT_REDIRECT_FILES: ReadonlyArray<{
 ]
 
 /**
- * The paths inside a git directory through which a write becomes code the
- * host's git runs later: hooks/ always, config (core.fsmonitor, core.editor,
- * core.hooksPath and the like) unless the caller allows config writes, and
- * the redirect files of {@link GIT_REDIRECT_FILES}, each under the same
- * condition as the file it redirects.
- *
- * Path arithmetic alone, so that macOS can hand it a glob pattern in place of
- * a directory. {@link gitDirDenies} is what a caller holding a real directory
- * wants: the same paths, plus what an entry that is a symlink needs.
+ * The paths in a git directory through which a write becomes code the host's
+ * git runs: hooks/, config (core.fsmonitor, core.hooksPath and the like) unless
+ * the caller allows config writes, and {@link GIT_REDIRECT_FILES}, each under
+ * the condition of what it redirects. Path arithmetic alone, so that macOS can
+ * hand it a glob. {@link gitDirDenies} is for a directory that is there.
  */
 export function gitDirDenyPaths(
   gitDir: string,
@@ -384,20 +294,10 @@ export function gitDirDenyPaths(
 }
 
 /**
- * The paths inside a linked worktree's git directory,
- * `<git dir>/worktrees/<id>`, that are denied where it is reached from the
- * repository that keeps it rather than through the worktree's own `.git`
- * file. That file can lie outside everything the command may write — after
- * `git worktree add ../wt` it does — while this directory is inside the
- * repository's own, and is where the host's git, run in that worktree, starts
- * from.
- *
- * `commondir` names the directory whose hooks and config that git uses, and
- * `config.worktree` is config it reads: the files of
- * {@link GIT_REDIRECT_FILES}, each under the condition it has there. `gitdir`
- * names the worktree's checkout, which `git worktree remove` deletes and
- * `git worktree prune` decides by. `hooks` and `config` are not among them:
- * git reads neither from here while a `commondir` stands, and that is denied.
+ * The same for a linked worktree's git directory, `<git dir>/worktrees/<id>`,
+ * reached from the repository that keeps it: the redirect files, and `gitdir`,
+ * which names the checkout that `git worktree remove` deletes. Not `hooks` and
+ * `config`, which git does not read here while a `commondir` stands.
  */
 function worktreeGitDirDenyPaths(
   worktreeGitDir: string,
@@ -411,78 +311,44 @@ function worktreeGitDirDenyPaths(
   ]
 }
 
-/**
- * What a git directory is denied by once the entries it holds have been
- * looked at, and what of that a read-only bind of the git directory would not
- * cover.
- */
+/** What a git directory is denied by once its entries have been looked at. */
 export interface GitDirDenies {
   /** The deny paths, in the order the backends emit them. */
   denyPaths: string[]
   /**
-   * The ones that lead OUT of the git directory: what a symlinked entry
-   * points at, and an entry this could not classify. A backend that degrades
-   * a git directory to one read-only bind of it keeps these and drops the
-   * rest, which that bind covers.
+   * The ones that lead OUT of the git directory, which a backend that degrades
+   * it to one read-only bind keeps.
    */
   escapingDenyPaths: string[]
   /**
-   * The git directory itself, where an entry of it is a symlink — empty for
-   * an ordinary one. Only a backend whose denies RESOLVE has to carry it:
-   * see {@link SubmoduleScan.linkedEntryDirs}, which is the same answer for
-   * an entry of a `.git/modules`.
+   * The git directory itself where an entry of it is a symlink, else empty. See
+   * {@link SubmoduleScan.linkedEntryDirs}.
    */
   linkedEntryDirs: string[]
   /**
-   * The hops between a symlinked entry of this git directory and what it
-   * leads to — and, from {@link gitFileDenies}, the ones in the path a
-   * pointer's value walks. Each hop's own path is in `denyPaths` already, and
-   * in `escapingDenyPaths` where no bind of the git directory covers it; what
-   * is here besides is the directory holding each, which is what the backend
-   * whose denies resolve has to deny whole to hold the link. See
-   * {@link GitChainHop}.
+   * The hops between a symlinked entry and what it leads to and, from {@link
+   * gitFileDenies}, those in the path a pointer's value walks. Each hop's own
+   * path is in `denyPaths` too.
    */
   chainHops: GitChainHop[]
 }
 
 /**
- * {@link gitDirDenyPaths} for a git directory that is really there, with what
- * an entry which is itself a SYMLINK adds to it.
+ * {@link gitDirDenyPaths} for a git directory that is there, with what an entry
+ * that is a SYMLINK adds.
  *
- * A symlinked entry is two things, and one deny covers one of them: the
- * target, where a write through the link lands, and the link itself, which
- * sits inside a writable git directory where a command can unlink it and
- * leave its own `hooks/` in its place for the host's git to run. Which of the
- * two a deny path covers is the backend's: a Linux bind lands on what the
- * path resolves to (so the target is covered and the link's own path keeps
- * nothing), while a Seatbelt filter matches the path as an unlink or a rename
- * names it (so the link is covered and the target is not). Both are therefore
- * named — the entry and its target as deny paths, and the git directory in
- * `linkedEntryDirs` for the backend that needs the link held by the directory
- * around it. Denying a git directory whole leaves `git status`, `log` and
- * `diff` working in that repository, while `git add`, `git commit` and
- * anything else that writes the index or an object fail read-only until the
- * link is gone.
+ * Such an entry is two things: the target, where a write through it lands, and
+ * the link, which a command can unlink to leave its own `hooks/` in its place.
+ * A Linux bind lands on what the path resolves to and covers the first; a
+ * Seatbelt filter matches the name an unlink uses and covers the second. So
+ * both are named, and the git directory goes into `linkedEntryDirs` for Linux
+ * to deny whole: `git status` and `log` go on working there, `git add` and `git
+ * commit` fail read-only until the link is gone. Further links on the way are
+ * held as {@link GitChainHop} says.
  *
- * A chain with more than one link in it is more than two things, and the hops
- * BETWEEN the entry and the landing are neither of them: the entry's deny
- * holds the entry, the landing's deny holds the landing, and a hop in an
- * ordinary directory of the work tree moves what the chain resolves to
- * without touching either end. Each hop's own path is therefore a deny path
- * as well, and `chainHops` carries the directory holding each for the backend
- * that needs one — see {@link GitChainHop}.
- *
- * `modules` is checked for being a link as well, though it is no deny path of
- * its own: see the comment at the end of this function.
- *
- * An ordinary git directory costs one lstat per entry and is denied by exactly
- * what it always was. `deadline` bounds the walk of the chain an entry that IS
- * a symlink leads into (see {@link resolveChain}); past it this throws
- * {@link SubmoduleWalkBudgetError}, as the `.git/modules` walk does.
- *
- * `entryPaths` is what is looked at, for a caller that denies other entries
- * of the directory than these: a linked worktree's git directory reached from
- * the repository that keeps it ({@link worktreeGitDirDenyPaths}).
+ * An ordinary git directory costs one lstat per entry. `deadline` bounds the
+ * walk of a chain ({@link resolveChain}). `entryPaths` is what is looked at,
+ * for {@link worktreeGitDirDenyPaths}.
  */
 export function gitDirDenies(
   gitDir: string,
@@ -510,21 +376,9 @@ export function gitDirDenies(
     chain: GitChainHop['chain'],
   ): void => {
     for (const hop of hops.slice(1)) {
-      // A deny path like any other, for the backend that holds a link by its
-      // own name; the one that resolves its denies drops it again.
       denyPaths.push(hop.link)
-      if (insideGitDir(hop.link)) {
-        chainHops.push({
-          kind: 'entry',
-          chain,
-          source: entryPath,
-          link: hop.link,
-          holder: undefined,
-        })
-        continue
-      }
       // No bind of the git directory covers it, so a degrade must not drop it.
-      escapingDenyPaths.push(hop.link)
+      if (!insideGitDir(hop.link)) escapingDenyPaths.push(hop.link)
       chainHops.push({
         kind: 'entry',
         chain,
@@ -552,22 +406,17 @@ export function gitDirDenies(
         holdChain(entryPath, entry.hops, 'resolved')
         break
       case 'unreachable':
-        // A loop, or a name no file can occupy: nothing is behind it to deny
-        // and nothing a command can create through it WHILE IT REACHES
-        // NOTHING. The entry's own link is held by the whole-directory deny,
-        // and every link the walk went through before it gave up is held like
-        // any other hop: each is a name a command can replace with a real
-        // directory, which makes the chain reach one and the host's git read
-        // what is put there.
+        // A loop, or a name no file can occupy: nothing is behind it to deny.
+        // The whole deny holds the entry, and each link the walk went through
+        // is held like any other hop: a directory put in its place makes the
+        // chain reach one.
         denyWhole = true
         holdChain(entryPath, entry.hops, 'unresolvable')
         break
       case 'unknown':
-        // There and not classifiable. Fail closed both ways: the deny the
-        // entry has anyway, kept through a degrade in case it is a link, and
-        // the whole-directory deny one would need. The hops behind it that
-        // COULD be read are held as a resolved chain's are; what lies past
-        // the one that could not is what the whole deny stands in for.
+        // There and not classifiable. Fail closed both ways: the entry's own
+        // deny, kept through a degrade in case it is a link, and the whole deny
+        // one would need.
         denyWhole = true
         denyPaths.push(entryPath)
         escapingDenyPaths.push(entryPath)
@@ -575,38 +424,35 @@ export function gitDirDenies(
         break
     }
   }
-  // `modules` is not one of the deny paths - denying it whole would take
-  // every submodule git directory under it read-only, and each of those has
-  // precise denies of its own - but it is an entry like the others in the one
-  // respect that matters here: remove the link, put a directory of your own
-  // where it was, and every submodule git directory this repository keeps is
-  // one nothing denied. So it is held the way a chain hop is, and for the
-  // same reason: its own name, which is what a rename or an unlink of a link
-  // uses, and the directory holding it - this git directory - denied whole
-  // for the backend whose denies resolve, where a bind at the link's own path
-  // would land on the modules tree and take every submodule with it.
-  const modulesPath = path.join(gitDir, 'modules')
-  const modules = gitDirEntry(modulesPath, deadline)
-  switch (modules.kind) {
-    case 'plain':
-      break
-    case 'link':
-    case 'unknown':
-      denyWhole = true
-      denyPaths.push(modulesPath)
-      chainHops.push({
-        kind: 'entry',
-        chain: 'resolved',
-        source: modulesPath,
-        link: modulesPath,
-        holder: undefined,
-      })
-      holdChain(modulesPath, modules.hops, 'resolved')
-      break
-    case 'unreachable':
-      denyWhole = true
-      holdChain(modulesPath, modules.hops, 'unresolvable')
-      break
+  // Neither is a deny path: each git directory under one has precise denies of
+  // its own. But remove one that is a link, put a directory where it was, and
+  // every git directory this repository keeps there is one nothing denied. So
+  // it is held as a chain hop is: by its own name, and by this git directory
+  // denied whole.
+  for (const name of ['modules', 'worktrees']) {
+    const keptPath = path.join(gitDir, name)
+    const kept = gitDirEntry(keptPath, deadline)
+    switch (kept.kind) {
+      case 'plain':
+        break
+      case 'link':
+      case 'unknown':
+        denyWhole = true
+        denyPaths.push(keptPath)
+        chainHops.push({
+          kind: 'entry',
+          chain: 'resolved',
+          source: keptPath,
+          link: keptPath,
+          holder: undefined,
+        })
+        holdChain(keptPath, kept.hops, 'resolved')
+        break
+      case 'unreachable':
+        denyWhole = true
+        holdChain(keptPath, kept.hops, 'unresolvable')
+        break
+    }
   }
   return {
     denyPaths,
@@ -634,11 +480,8 @@ function gitDirEntry(entryPath: string, deadline: number): GitDirEntry {
   try {
     stats = fs.lstatSync(entryPath)
   } catch (err) {
-    // The shared classification rather than this file's narrower one: a
-    // component above the entry that is a loop, or a name too long for the
-    // filesystem, reaches no file here and leaves nothing to protect, while
-    // the narrower one exists for a `gitdir:` target and answers a different
-    // question. Anything else is a fact about the entry this cannot read.
+    // The shared classification: a loop or a name too long ABOVE the entry
+    // reaches no file here, and leaves nothing to protect.
     if (isAbsenceErrno(err)) return { kind: 'plain' }
     logForDebugging(
       `[Sandbox] Could not tell whether ${entryPath} is a symlink (${err}); denying the git directory holding it whole, and the entry as it stands`,
@@ -647,10 +490,8 @@ function gitDirEntry(entryPath: string, deadline: number): GitDirEntry {
     return { kind: 'unknown', hops: [] }
   }
   if (!stats.isSymbolicLink()) return { kind: 'plain' }
-  // Walked from the directory holding the entry, itself resolved first, so
-  // that a symlink ABOVE the git directory - a /tmp, a home reached through a
-  // link - counts as where this repository lives and not as a hop of this
-  // chain. The landing is what walking the whole path from the root gives.
+  // From the directory holding the entry, itself resolved first: a symlink
+  // ABOVE the git directory is where this repository lives, not a hop.
   const chain = resolveChain(
     physicalPath(path.parse(entryPath).root, path.dirname(entryPath), deadline),
     path.basename(entryPath),
@@ -678,10 +519,9 @@ function gitDirEntry(entryPath: string, deadline: number): GitDirEntry {
 }
 
 /**
- * What must stand in for `denyPath` where it does not exist, or undefined for
- * a path git does not read this way. Decided by the basename, so every
- * spelling of one path - a tilde, a relative form, a trailing slash, a
- * symlinked prefix - answers the same. See {@link GIT_REDIRECT_FILES}.
+ * What must stand in for `denyPath` where it does not exist, or undefined for a
+ * path git does not read this way. By the basename, so that every spelling of
+ * one path answers the same. See {@link GIT_REDIRECT_FILES}.
  */
 export function gitRedirectPlaceholder(denyPath: string): string | undefined {
   const name = path.basename(denyPath)
@@ -689,58 +529,35 @@ export function gitRedirectPlaceholder(denyPath: string): string | undefined {
 }
 
 /**
- * Deny paths for a `.git` file, the `gitdir:` pointer of a linked worktree or
- * submodule checkout: the file itself plus the hooks/ and config git reads
- * through it (the named git directory's, and for a linked worktree its
- * commondir's as well).
+ * What a `.git` file, the `gitdir:` pointer of a linked worktree or submodule
+ * checkout, is denied by: the file, the entries of the git directory it names
+ * and, for a linked worktree, of the one its `commondir` names, and every
+ * symlink the walk of either path went through. A `..` can land the kernel
+ * elsewhere than where the path folds to, so both directories are denied
+ * ({@link gitMetadataTargets}).
  *
- * A `..` in either path can land the kernel somewhere other than where the
- * path folds to on paper, so both directories are denied — see
- * {@link gitMetadataTargets} — and every symlink the walk of the path went
- * through is denied as well, since a command that retargets one of those
- * moves the directory git opens without touching the file or the landing.
+ * What such a git directory keeps under its `modules` and `worktrees` is not
+ * enumerated here: `gitDirs` names each one reached, for the caller to hand to
+ * {@link gitDirTreeDenies}.
  *
- * Throws {@link GitMetadataError} when the pointer or the `commondir` names
- * something this cannot resolve the way git does; the wrap is then refused
- * rather than applied with a deny list that may not cover the directory git
- * uses. Throws {@link SubmoduleWalkBudgetError} where walking what they name
- * takes longer than the `.git/modules` walk is given by default.
- */
-export function gitFileDenyPaths(
-  gitFile: string,
-  allowGitConfig: boolean,
-): string[] {
-  return gitFileDenies(gitFile, allowGitConfig).denyPaths
-}
-
-/**
- * {@link gitFileDenyPaths} with the whole-directory denies and the chain hops
- * kept apart, as {@link gitDirDenies} keeps them: a git directory a pointer
- * leads to is a git directory like any other, so an entry of it that is a
- * symlink needs the directory holding the link denied whole on the backend
- * whose denies resolve, and so does a link in the path the pointer's own
- * value walks. Nothing else is enumerated through a pointer — a target's own
- * `.git/modules` is not walked — so this is what it adds.
- *
- * `deadline` bounds the walk of the pointer's value and of the `commondir`'s,
- * each of which can run to the megabyte the file may hold, and of any chain
- * an entry of the git directories they lead to starts. Past it this throws
- * {@link SubmoduleWalkBudgetError}: a value not walked to its end names a git
- * directory this never found, so there is no list to hand back.
+ * Throws {@link GitMetadataError} where the pointer or the `commondir` names
+ * something this cannot resolve the way git does, and {@link
+ * SubmoduleWalkBudgetError} past `deadline`.
  */
 export function gitFileDenies(
   gitFile: string,
   allowGitConfig: boolean,
   deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
-): GitDirDenies {
-  const denyPaths = [gitFile]
-  const linkedEntryDirs: string[] = []
-  const chainHops: GitChainHop[] = []
-  const gathered: GatheredDenies = { denyPaths, linkedEntryDirs, chainHops }
-  // Looked at before the file is, whatever the file turns out to hold: a tree
-  // full of `.git` files is as many reads of up to a megabyte as a command
-  // cared to leave names for, and one that is no pointer starts no walk that
-  // would look at the clock for it.
+): GitDirDenies & { gitDirs: string[] } {
+  const gathered: GatheredDenies = {
+    denyPaths: [gitFile],
+    linkedEntryDirs: [],
+    chainHops: [],
+    gitDirs: [],
+  }
+  const denies = { ...gathered, escapingDenyPaths: [] }
+  // Before the file is read, whatever it holds: a tree full of `.git` files is
+  // as many reads of up to a megabyte as a command cared to leave names for.
   if (Date.now() > deadline) {
     throw new SubmoduleWalkBudgetError(
       `[Sandbox] The time given for working out what the .git files lead to ran out before ${gitFile} was read; refusing to sandbox on the ones read before it`,
@@ -759,12 +576,12 @@ export function gitFileDenies(
           `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
           { level: 'warn' },
         )
-        return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
+        return denies
       case 'none':
         break
     }
     if (target === undefined) {
-      return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
+      return denies
     }
     const targets = gitMetadataTargets(path.dirname(gitFile), target, deadline)
     holdValueChain(gitFile, targets, gathered)
@@ -794,22 +611,29 @@ export function gitFileDenies(
       gatherCommonDirDenies(gitDir, allowGitConfig, gathered, deadline)
     }
   } catch (err) {
-    if (err instanceof GitMetadataError) throw err
-    // Out of time is not a pointer that could not be followed: what it names
-    // was not worked out, and the file alone is no deny for that.
-    if (err instanceof SubmoduleWalkBudgetError) throw err
     // A dangling pointer names nothing git would read. A pointer this process
-    // cannot read is one the host's git cannot read either, so the file
-    // itself is the whole deny; an unreadable TARGET is denied whole by
-    // gitDirTargetDenies instead.
-    if (!isAbsenceError(err)) {
+    // may not read is one the host's git, the same user's, cannot read either.
+    // For those the file itself is the whole deny; an unreadable TARGET is
+    // denied whole by gitDirTargetDenies instead.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'EACCES' || code === 'EPERM' || code === 'ELOOP') {
       logForDebugging(
-        `[Sandbox] Could not follow ${gitFile}, denying only the file itself: ${err}`,
+        `[Sandbox] Could not read ${gitFile}, denying only the file itself: ${err}`,
         { level: 'warn' },
+      )
+    } else if (
+      err instanceof GitMetadataError ||
+      err instanceof SubmoduleWalkBudgetError
+    ) {
+      throw err
+    } else if (!isAbsenceError(err)) {
+      // No descriptor left, a disk that fails: git may well read it later.
+      throw new GitMetadataError(
+        `[Sandbox] ${gitFile} could not be read (${String(err)}); refusing to sandbox without the git directory it names`,
       )
     }
   }
-  return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
+  return denies
 }
 
 /** What following a `gitdir:` pointer or a `commondir` adds to, one target
@@ -817,7 +641,10 @@ export function gitFileDenies(
 type GatheredDenies = Pick<
   GitDirDenies,
   'denyPaths' | 'linkedEntryDirs' | 'chainHops'
->
+> & {
+  /** The targets that are git directories. */
+  gitDirs: string[]
+}
 
 /** The denies of one directory a `gitdir:` or a `commondir` names, added to
  *  `gathered`; see {@link gitDirTargetDenies}. */
@@ -839,22 +666,15 @@ function gatherTargetDenies(
   gathered.denyPaths.push(...denies.denyPaths)
   gathered.linkedEntryDirs.push(...denies.linkedEntryDirs)
   gathered.chainHops.push(...denies.chainHops)
+  if (kind === 'git-dir') gathered.gitDirs.push(target)
 }
 
 /**
- * The links the walk of a `gitdir:` or `commondir` value went through, added
- * to `gathered`.
- *
- * Such a VALUE is a path git walks as the kernel does, so a symlink in it is
- * held as a symlinked entry is: the file naming it is denied and the git
- * directory it reaches is denied, while a command that retargets a link
- * between the two moves where git lands without touching either end.
- *
- * A value that reaches nothing names no git directory to deny, and the links
- * the walk did go through are the whole of what a command can move. One
- * warning says so, because a `.git` file is something a sandboxed command may
- * create: refusing every later command, or denying the checkout whole for it,
- * would make writing one a way to lock the session out of its own project.
+ * The links the walk of a `gitdir:` or `commondir` value went through, added to
+ * `gathered`. A value that reaches nothing names no git directory, and those
+ * links are all a command can move. One warning says so: a `.git` file is
+ * something a command may create, and refusing or denying the checkout whole
+ * for it would lock the session out of its own project.
  */
 function holdValueChain(
   source: string,
@@ -879,14 +699,11 @@ function holdValueChain(
 }
 
 /**
- * What the `commondir` of `gitDir` leads to, added to `gathered`: the links
- * its value walks, and the denies of each directory it names that is not in
- * `heldAlready` — `gitDir` itself, for a value of `.`, and for a caller that
- * came from the main git directory, that one.
- *
- * Throws {@link GitMetadataError} for a `commondir` that is there and whose
- * target cannot be worked out: the directory whose hooks git runs through it
- * is then unknown, and the denies gathered so far would leave it writable.
+ * What the `commondir` of `gitDir` leads to, added to `gathered`: the links its
+ * value walks, and the denies of each directory it names that is not in
+ * `heldAlready`. Throws {@link GitMetadataError} for one that is there and
+ * whose target cannot be worked out: the directory whose hooks git runs is then
+ * unknown.
  */
 function gatherCommonDirDenies(
   gitDir: string,
@@ -939,89 +756,50 @@ function gatherCommonDirDenies(
 }
 
 /**
- * Every git directory a deny must cover once `gitDir` is one: its own hooks/
- * and config, the same for each submodule git directory under its `modules`
- * (what a commit inside that submodule runs), what redirects git in each
- * linked worktree's git directory under its `worktrees`, plus whatever the
- * walks could not see through. `deadline` bounds both walks (see
- * {@link submoduleGitDirs}) and, out of the same budget, the chains the
- * entries of each git directory they found lead into (see
- * {@link gitDirDenies}).
+ * Every git directory a deny must cover once `gitDir` is one: its own entries,
+ * those of each submodule git directory under its `modules`, what redirects git
+ * in each linked worktree's under its `worktrees`, and whatever the walks could
+ * not see through. A submodule keeps linked worktrees and a linked worktree
+ * keeps submodules, so the two walks call each other ({@link keptSubmodules},
+ * {@link keptWorktrees}).
  *
- * Kept apart rather than flattened so that a backend which cannot carry every
- * mount can degrade the submodule denies and leave the rest alone;
- * {@link gitDirTreeDenyPaths} is the flat form both backends emit when
- * nothing has to be degraded.
+ * `deadline` bounds the walks and the chains they meet. `visited` is for a
+ * caller that enumerates several git directories, one of which may keep another
+ * ({@link TreeWalk}).
+ *
+ * Kept in pieces so that a backend that cannot carry every mount can degrade
+ * some; {@link gitDirTreeDenyPaths} is the flat form.
  */
 export function gitDirTreeDenies(
   gitDir: string,
   allowGitConfig: boolean,
-  options: { deadline?: number } = {},
+  options: { deadline?: number; visited?: Set<string> } = {},
 ): GitDirTreeDenies {
-  const modulesDir = path.join(gitDir, 'modules')
-  const deadline =
-    options.deadline ?? Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS
-  const modules = submoduleGitDirs(modulesDir, deadline)
-  const own = gitDirDenies(gitDir, allowGitConfig, deadline)
-  const submoduleUnreadableDirs: string[] = []
-  const submodules = modules.gitDirs.map(submodule => {
-    const own = gitDirDenies(submodule, allowGitConfig, deadline)
-    // `git worktree add` inside a submodule keeps the worktree's git directory
-    // under the SUBMODULE's, and its `commondir` redirects git there as one
-    // under the repository's own `worktrees` does. What is found belongs to
-    // the submodule: it is all under its git directory, so a bind of that
-    // stands in for it where the profile is degraded, except what a
-    // `commondir` names, which is kept as escaping.
-    const kept = worktreeGitDirs(submodule, allowGitConfig, deadline)
-    submoduleUnreadableDirs.push(...kept.unreadableDirs)
-    return {
-      gitDir: submodule,
-      denyPaths: [
-        ...own.denyPaths,
-        ...kept.gitDirs.flatMap(worktree => worktree.denyPaths),
-      ],
-      escapingDenyPaths: [
-        ...own.escapingDenyPaths,
-        ...kept.gitDirs.flatMap(worktree => worktree.escapingDenyPaths),
-      ],
-      linkedEntryDirs: [
-        ...own.linkedEntryDirs,
-        ...kept.linkedEntryDirs,
-        ...kept.gitDirs.flatMap(worktree => worktree.linkedEntryDirs),
-      ],
-      chainHops: [
-        ...own.chainHops,
-        ...kept.chainHops,
-        ...kept.gitDirs.flatMap(worktree => worktree.chainHops),
-      ],
-    }
-  })
-  const worktrees = worktreeGitDirs(gitDir, allowGitConfig, deadline)
+  const walk: TreeWalk = {
+    allowGitConfig,
+    deadline:
+      options.deadline ?? Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
+    visited: options.visited ?? new Set(),
+    unreadableDirs: new Set(),
+    linkedEntryDirs: new Set(),
+    chainHops: [],
+  }
+  const submodules = keptSubmodules(gitDir, walk)
+  const own = gitDirDenies(gitDir, allowGitConfig, walk.deadline)
+  const worktrees = keptWorktrees(gitDir, walk)
+  const all = [own, ...submodules, ...worktrees]
   return {
     ownDenyPaths: own.denyPaths,
-    modulesDir,
+    modulesDir: path.join(gitDir, 'modules'),
     submodules,
-    worktreesDir: worktrees.worktreesDir,
-    worktrees: worktrees.gitDirs,
-    unreadableDirs: [
-      ...modules.unreadableDirs,
-      ...submoduleUnreadableDirs,
-      ...worktrees.unreadableDirs,
-    ],
+    worktreesDir: path.join(gitDir, 'worktrees'),
+    worktrees,
+    unreadableDirs: [...walk.unreadableDirs].sort(),
     linkedEntryDirs: [
-      ...own.linkedEntryDirs,
-      ...modules.linkedEntryDirs,
-      ...submodules.flatMap(submodule => submodule.linkedEntryDirs),
-      ...worktrees.linkedEntryDirs,
-      ...worktrees.gitDirs.flatMap(worktree => worktree.linkedEntryDirs),
+      ...[...walk.linkedEntryDirs].sort(),
+      ...all.flatMap(denies => denies.linkedEntryDirs),
     ],
-    chainHops: [
-      ...own.chainHops,
-      ...modules.chainHops,
-      ...submodules.flatMap(submodule => submodule.chainHops),
-      ...worktrees.chainHops,
-      ...worktrees.gitDirs.flatMap(worktree => worktree.chainHops),
-    ],
+    chainHops: [...walk.chainHops, ...all.flatMap(denies => denies.chainHops)],
   }
 }
 
@@ -1034,10 +812,8 @@ export function gitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
     ...denies.submodules.flatMap(submodule => submodule.denyPaths),
     ...denies.worktrees.flatMap(worktree => worktree.denyPaths),
   ]
-  // A hop of an entry under `.git/modules` has no other list to sit in, while
-  // a hop of a git directory's OWN entry is already in that directory's deny
-  // paths: named once either way, since a duplicate literal buys a backend
-  // nothing.
+  // A hop of a `.git/modules` entry has no other list to sit in, and a hop of a
+  // git directory's own entry is among its deny paths already.
   const named = new Set(denyPaths)
   for (const hop of denies.chainHops) {
     if (named.has(hop.link)) continue
@@ -1047,54 +823,74 @@ export function gitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
   return denyPaths
 }
 
-/** The linked worktrees' git directories under one `.git/worktrees`, each
- *  with what it is denied by, and what could not be read of the rest. */
-interface WorktreeScan {
-  worktreesDir: string
-  /** Sorted by path. A `commondir` that names another git directory than the
-   *  one these sit in adds that directory's denies to the worktree's own, as
-   *  ones that lead out of it. */
-  gitDirs: Array<{ gitDir: string } & GitDirDenies>
-  /** As in {@link SubmoduleScan}, for `worktreesDir` and its entries. */
-  unreadableDirs: string[]
-  linkedEntryDirs: string[]
-  chainHops: GitChainHop[]
+/** A git directory another one keeps, and what it is denied by. */
+type KeptGitDir = { gitDir: string } & GitDirDenies
+
+/**
+ * `own`, the denies of `gitDir`, with those of the git directories it `keeps`
+ * in turn: all under it, so that a bind of it stands in for them where the
+ * profile is degraded. Except one reached through a link, which is somewhere
+ * else, and what leads out of any of them.
+ */
+function withWhatItKeeps(
+  gitDir: string,
+  own: GitDirDenies,
+  keeps: KeptGitDir[],
+): KeptGitDir {
+  const all = [own, ...keeps]
+  const real = keeps.length > 0 ? realPathOrSelf(gitDir) : gitDir
+  return {
+    gitDir,
+    denyPaths: all.flatMap(denies => denies.denyPaths),
+    escapingDenyPaths: [
+      ...own.escapingDenyPaths,
+      ...keeps.flatMap(kept =>
+        isAtOrUnder(realPathOrSelf(kept.gitDir), real)
+          ? kept.escapingDenyPaths
+          : kept.denyPaths,
+      ),
+    ],
+    linkedEntryDirs: all.flatMap(denies => denies.linkedEntryDirs),
+    chainHops: all.flatMap(denies => denies.chainHops),
+  }
 }
 
 /**
- * The git directories of the linked worktrees `gitDir` keeps, one per entry
- * of its `worktrees`, and what each is denied by
- * ({@link worktreeGitDirDenyPaths}).
- *
- * Every directory there is one, whatever it holds: git makes nothing else
- * under `worktrees`, and an entry a command emptied — or made, for a `.git`
- * file elsewhere to name — is one the host's git opens all the same. One
- * level, since the name of a worktree's git directory is a single segment.
- * An entry that is a symlink is followed and held as an entry of a
- * `.git/modules` is ({@link walkEntry}), and a directory that cannot be
- * listed is denied whole ({@link listDirectory}).
- *
- * Each one's `commondir` is followed as it is from a `.git` pointer: the
- * host's git, run in that worktree, uses the hooks and config of whatever it
- * names, which is this `gitDir` unless something has rewritten it.
- *
- * `deadline` is the `.git/modules` walk's, and running out of it throws
- * {@link SubmoduleWalkBudgetError} the same way: a `worktrees` is as writable
- * inside the sandbox as a `modules` is, and as easy to fill.
+ * The submodule git directories under the `modules` of `gitDir`, sorted by
+ * path ({@link walkModules}), each with the linked worktrees it keeps:
+ * `git worktree add` inside a submodule puts the worktree's git directory under
+ * the SUBMODULE's.
  */
-function worktreeGitDirs(
-  gitDir: string,
-  allowGitConfig: boolean,
-  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
-): WorktreeScan {
+function keptSubmodules(gitDir: string, walk: TreeWalk): KeptGitDir[] {
+  return walkModules(path.join(gitDir, 'modules'), walk).map(submodule =>
+    withWhatItKeeps(
+      submodule,
+      gitDirDenies(submodule, walk.allowGitConfig, walk.deadline),
+      keptWorktrees(submodule, walk),
+    ),
+  )
+}
+
+/**
+ * The git directories of the linked worktrees `gitDir` keeps, one per entry of
+ * its `worktrees`, sorted, and what each is denied by ({@link
+ * worktreeGitDirDenyPaths}). With the submodules it keeps: their git
+ * directories are under the WORKTREE's `modules`, while their checkouts can lie
+ * outside everything the command may write.
+ *
+ * Every directory there is one, whatever it holds: git makes nothing else under
+ * `worktrees`, and one a command emptied or made is one the host's git opens
+ * all the same. An entry that is a symlink is followed and held ({@link
+ * walkEntry}).
+ *
+ * Each one's `commondir` is followed as from a `.git` file. No bind of the
+ * worktree's git directory covers what it names, so that is marked as leading
+ * out.
+ */
+function keptWorktrees(gitDir: string, walk: TreeWalk): KeptGitDir[] {
+  const { allowGitConfig, deadline } = walk
   const worktreesDir = path.join(gitDir, 'worktrees')
-  const walk: SubmoduleWalk = {
-    gitDirs: [],
-    unreadableDirs: new Set(),
-    linkedEntryDirs: new Set(),
-    chainHops: [],
-  }
-  const gitDirs: WorktreeScan['gitDirs'] = []
+  const kept: KeptGitDir[] = []
   const entries = listDirectory(worktreesDir, walk) ?? []
   for (const [at, entry] of entries.entries()) {
     if (at % WALK_DEADLINE_CHECK_INTERVAL === 0 && Date.now() > deadline) {
@@ -1107,35 +903,65 @@ function worktreeGitDirs(
     if (found.kind === 'skip') continue
     // Where a link leads to nothing is denied as a git directory that is not
     // there yet, as the `.git/modules` walk denies one.
-    const worktreeGitDir = found.kind === 'dangling' ? found.landing : child
+    const worktree = found.kind === 'dangling' ? found.landing : child
+    if (isVisited(worktree, walk)) continue
+    // Denied whole where it cannot be listed, and git, the same user's, reads
+    // no `commondir` in there either: nothing to refuse the command over.
+    if (
+      found.kind === 'directory' &&
+      listDirectory(worktree, walk) === undefined
+    ) {
+      continue
+    }
     const own = gitDirDenies(
-      worktreeGitDir,
+      worktree,
       allowGitConfig,
       deadline,
-      worktreeGitDirDenyPaths(worktreeGitDir, allowGitConfig),
+      worktreeGitDirDenyPaths(worktree, allowGitConfig),
     )
     const common: GatheredDenies = {
       denyPaths: [],
       linkedEntryDirs: [],
       chainHops: [],
+      gitDirs: [],
     }
-    gatherCommonDirDenies(worktreeGitDir, allowGitConfig, common, deadline, [
-      worktreeGitDir,
+    gatherCommonDirDenies(worktree, allowGitConfig, common, deadline, [
+      worktree,
       gitDir,
     ])
-    gitDirs.push({
-      gitDir: worktreeGitDir,
-      denyPaths: [...own.denyPaths, ...common.denyPaths],
-      // No bind of the worktree's git directory covers what its commondir
-      // names, so a degrade of it must not drop those.
-      escapingDenyPaths: [...own.escapingDenyPaths, ...common.denyPaths],
-      linkedEntryDirs: [...own.linkedEntryDirs, ...common.linkedEntryDirs],
-      chainHops: [...own.chainHops, ...common.chainHops],
-    })
+    kept.push(
+      withWhatItKeeps(
+        worktree,
+        {
+          denyPaths: [...own.denyPaths, ...common.denyPaths],
+          escapingDenyPaths: [...own.escapingDenyPaths, ...common.denyPaths],
+          linkedEntryDirs: [...own.linkedEntryDirs, ...common.linkedEntryDirs],
+          chainHops: [...own.chainHops, ...common.chainHops],
+        },
+        keptSubmodules(worktree, walk),
+      ),
+    )
+  }
+  return kept.sort((a, b) => (a.gitDir < b.gitDir ? -1 : 1))
+}
+
+/**
+ * {@link walkModules} by itself, with what it could not see through.
+ */
+export function submoduleGitDirs(
+  modulesDir: string,
+  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
+): SubmoduleScan {
+  const walk: TreeWalk = {
+    allowGitConfig: false,
+    deadline,
+    visited: new Set(),
+    unreadableDirs: new Set(),
+    linkedEntryDirs: new Set(),
+    chainHops: [],
   }
   return {
-    worktreesDir,
-    gitDirs: gitDirs.sort((a, b) => (a.gitDir < b.gitDir ? -1 : 1)),
+    gitDirs: walkModules(modulesDir, walk),
     unreadableDirs: [...walk.unreadableDirs].sort(),
     linkedEntryDirs: [...walk.linkedEntryDirs].sort(),
     chainHops: walk.chainHops,
@@ -1143,58 +969,35 @@ function worktreeGitDirs(
 }
 
 /**
- * Git directories of the submodules under `modulesDir` (a repository's
- * .git/modules), nested submodules included, sorted. A submodule's name is
- * its path, so one can sit several levels down (modules/vendor/lib), hence
- * the walk.
+ * Git directories of the submodules under `modulesDir` (a `.git/modules`),
+ * nested ones included, sorted. A submodule's name is its path, so one can sit
+ * several levels down (modules/vendor/lib).
  *
- * A directory recorded as a git directory is walked on all the same. What
- * makes it one is a name ({@link GIT_DIR_MARKERS}), and a segment of a
- * submodule's name (`vendor` of `vendor/lib`) is an ordinary directory a
- * sandboxed command can write: a walk that stopped at the first directory
- * which looks like a git directory would let one empty `HEAD` left in `vendor`
- * take the denies off every submodule beneath it for the commands that
- * follow. git refuses a submodule whose git directory would sit inside
- * another's, so in a tree git made there is nothing past a git directory to
- * find, and looking costs one listing of each directory in it. The ones where
- * a repository is large are not walked into beyond that listing: see
- * {@link GIT_OWN_DIRECTORIES}. `modulesDir` itself, and a git directory's own
- * `modules`, are never taken for a git directory whatever they hold.
+ * A directory recorded as a git directory is walked on all the same. A segment
+ * of a name (`vendor`) is a directory a command can write, and a walk that
+ * stopped at what {@link looksLikeGitDir} would let one `HEAD` left there take
+ * the denies off every submodule beneath it. That goes for its `modules` too:
+ * where a git directory keeps its own submodules, and maybe the submodule
+ * `vendor/modules`. Only {@link GIT_OWN_DIRECTORIES} are left at one listing.
+ * `modulesDir` itself is never taken for a git directory.
  *
- * Every directory is visited once, keyed by where it really is, so a symlink
- * pointing back into the tree ends the branch that reached it rather than
- * looping - but a bind mount gives the same directory a second real path, and
- * one pointed at its own ancestor has no end the visited set can see. `deadline`
- * is what bounds that, and running out of it throws
- * {@link SubmoduleWalkBudgetError} rather than handing back a listing that
- * stops somewhere unknown. Nothing bounds how DEEP a real tree may be: a
- * submodule nested a hundred levels down has its hooks denied like any other,
- * and the walk keeps its own stack so that such a tree cannot overflow this
- * one's.
+ * Nothing bounds how deep a tree may be, and the walk keeps its own stack. A
+ * bind mount gives a directory a second real path, which the visited set cannot
+ * see, so the deadline is what bounds the walk.
  */
-export function submoduleGitDirs(
-  modulesDir: string,
-  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
-): SubmoduleScan {
-  const walk: SubmoduleWalk = {
-    gitDirs: [],
-    unreadableDirs: new Set(),
-    linkedEntryDirs: new Set(),
-    chainHops: [],
-  }
-  // Where the walk still has to look, and where it has already been. A
-  // directory listed to see whether it is a git directory carries its entries
-  // with it, so that no directory is listed twice. The root counts as visited:
-  // an entry linked straight back to it is then the same dead end as one
-  // linked to any other directory already walked. `gitDir` says the directory
-  // was recorded as a git directory, so that some of its entries may be git's
-  // own.
+function walkModules(modulesDir: string, walk: TreeWalk): string[] {
+  // The root counts as visited: an entry linked straight back to it is then the
+  // same dead end as one linked to any other directory already walked.
+  if (isVisited(modulesDir, walk)) return []
+  const gitDirs: string[] = []
+  // Where the walk still has to look. A directory that was listed carries its
+  // entries, and `gitDir` says it was recorded as a git directory, so that some
+  // of them may be git's own.
   const pending: Array<{
     dir: string
     entries?: fs.Dirent[]
     gitDir?: boolean
   }> = [{ dir: modulesDir }]
-  const visited = new Set<string>([realPathOrSelf(modulesDir)])
   let entriesSeen = 0
   for (let item = pending.pop(); item !== undefined; item = pending.pop()) {
     const entries = item.entries ?? listDirectory(item.dir, walk)
@@ -1202,7 +1005,7 @@ export function submoduleGitDirs(
     for (const entry of entries) {
       if (
         entriesSeen++ % WALK_DEADLINE_CHECK_INTERVAL === 0 &&
-        Date.now() > deadline
+        Date.now() > walk.deadline
       ) {
         throw new SubmoduleWalkBudgetError(
           `[Sandbox] The walk of ${modulesDir} ran out of the time it was given while listing ${item.dir}, with ${pending.length} directories still to look at; refusing to sandbox on the submodule git directories it did reach`,
@@ -1211,20 +1014,14 @@ export function submoduleGitDirs(
       const child = path.join(item.dir, entry.name)
       let childEntries: fs.Dirent[] | undefined
       if (item.gitDir === true) {
-        // Queued when the git directory was recorded.
-        if (entry.name === 'modules') continue
-        // A link at `config`, `commondir` or `config.worktree` is read as
-        // this git directory's entry by what denies it, which holds both ends
-        // of it (see gitDirDenies). Following it here as well would walk the
-        // same chain a second time and take what it leads to for a submodule.
+        // Read as this git directory's entry by what denies it (gitDirDenies).
+        // Followed here as well, what it leads to would be taken for a
+        // submodule.
         if (entry.isSymbolicLink() && GIT_ENTRY_FILES.has(entry.name)) continue
-        // One of git's own directories by its name: walked on only where one
-        // listing of it shows something this file protects, which is what a
-        // submodule's git directory that has such a name shows and git's own
-        // directory never does. Listed before the entry is followed: following
-        // a symlink puts the directory holding it on the whole-directory
-        // denies (see walkEntry), and a git directory whose `objects` or
-        // `rr-cache` is a link to a shared store is an ordinary one.
+        // git's own by its name: walked on only where one listing shows what a
+        // submodule's git directory of that name has and git's own never does.
+        // Listed before it is followed: that would deny whole a git directory
+        // whose `objects` or `rr-cache` is a link to a shared store.
         if (
           GIT_OWN_DIRECTORIES.has(entry.name) &&
           (entry.isDirectory() || entry.isSymbolicLink())
@@ -1240,53 +1037,59 @@ export function submoduleGitDirs(
       // git accepts a symlinked entry under .git/modules, and
       // Dirent.isDirectory is false for one, so the link is followed — and
       // the real path recorded, since a link back up would otherwise loop.
-      const found = walkEntry(entry, child, walk, deadline)
+      const found = walkEntry(entry, child, walk, walk.deadline)
       if (found.kind === 'skip') continue
       if (found.kind === 'dangling') {
         // Where a link leads to nothing is denied as a git directory that is
         // not there yet, so a command cannot fill one in for the host's git
         // to find. Nothing is walked: there is nothing there to walk.
-        if (!visited.has(found.landing)) {
-          visited.add(found.landing)
-          walk.gitDirs.push(found.landing)
-        }
+        if (!isVisited(found.landing, walk)) gitDirs.push(found.landing)
         continue
       }
-      const visitKey = realPathOrSelf(child)
-      if (visited.has(visitKey)) continue
-      visited.add(visitKey)
+      if (isVisited(child, walk)) continue
 
       childEntries ??= listDirectory(child, walk)
       if (childEntries === undefined) continue
-      const isGitDir = childEntries.some(e => GIT_DIR_MARKERS.has(e.name))
-      if (isGitDir) {
-        walk.gitDirs.push(child)
-        // A git directory keeps its own submodules under `modules`.
-        pending.push({ dir: path.join(child, 'modules') })
-      }
+      const isGitDir = looksLikeGitDir(childEntries)
+      if (isGitDir) gitDirs.push(child)
       // Anything else is a segment of a submodule name (`vendor` of
       // `vendor/lib`) - and a directory that looks like a git directory can
       // be one as well, so what else it holds is looked at either way.
       pending.push({ dir: child, entries: childEntries, gitDir: isGitDir })
     }
   }
-  return {
-    gitDirs: walk.gitDirs.sort(),
-    unreadableDirs: [...walk.unreadableDirs].sort(),
-    linkedEntryDirs: [...walk.linkedEntryDirs].sort(),
-    chainHops: walk.chainHops,
-  }
+  return gitDirs.sort()
 }
 
-/** What the walk has found so far. The deny paths a directory it could not
- *  see through produces are a set: one unreadable entry and the next fold to
- *  the same ancestor, and a repeated path is a mount the profile never pays
- *  for but would otherwise be counted as one. */
-interface SubmoduleWalk {
-  gitDirs: string[]
+/**
+ * What the walks of one enumeration go by, and what they find beside the git
+ * directories.
+ */
+interface TreeWalk {
+  allowGitConfig: boolean
+  deadline: number
+  /**
+   * Every directory a walk has been into, by where it really is. One set for
+   * all: a link can lead from a `worktrees` back to the git directory that
+   * keeps it, and each walk would find the other's tree anew, one spelling
+   * longer, for as long as a path can get. Shared between git directories, one
+   * that another keeps is not enumerated twice.
+   */
+  visited: Set<string>
+  /** As in {@link SubmoduleScan}. Sets: one unreadable entry and the next fold
+   *  to the same ancestor, and a repeated path is a mount the profile never
+   *  pays for but would otherwise be counted as one. */
   unreadableDirs: Set<string>
   linkedEntryDirs: Set<string>
   chainHops: GitChainHop[]
+}
+
+/** Whether a walk has been into `dir` before. It has from now on. */
+function isVisited(dir: string, walk: TreeWalk): boolean {
+  const real = realPathOrSelf(dir)
+  if (walk.visited.has(real)) return true
+  walk.visited.add(real)
+  return false
 }
 
 /** What one entry of a walked directory is worth looking into. */
@@ -1300,10 +1103,7 @@ type WalkEntry =
   | { kind: 'skip' }
 
 /** Entries of `dir`, or undefined when it is absent or (recorded) unreadable. */
-function listDirectory(
-  dir: string,
-  walk: SubmoduleWalk,
-): fs.Dirent[] | undefined {
+function listDirectory(dir: string, walk: TreeWalk): fs.Dirent[] | undefined {
   try {
     return fs.readdirSync(dir, { withFileTypes: true })
   } catch (err) {
@@ -1321,23 +1121,16 @@ function listDirectory(
 }
 
 /**
- * What `entry` is worth doing with, following a symlink to a directory.
- *
- * A link that leads anywhere at all also puts the directory HOLDING it on the
- * whole-directory denies: what a deny of the target covers is what a write
- * through the link reaches, while the link itself takes no mount of its own,
- * and a `.git/modules` is writable — see {@link SubmoduleScan.linkedEntryDirs}.
- * A command can plant such a link and leave every submodule beside it
- * read-only for the commands after it, which is the answer this makes to a
- * command that plants git directories too.
- *
- * A chain that goes through further links is held hop by hop as a git
- * directory's own entry is: see {@link GitChainHop}.
+ * What `entry` is worth doing with, following a symlink to a directory. A link
+ * that leads anywhere puts the directory HOLDING it on the whole-directory
+ * denies ({@link SubmoduleScan.linkedEntryDirs}), and further links on the way
+ * are held hop by hop ({@link GitChainHop}). A command can plant one and leave
+ * every submodule beside it read-only for the commands after it.
  */
 function walkEntry(
   entry: fs.Dirent,
   entryPath: string,
-  walk: SubmoduleWalk,
+  walk: TreeWalk,
   deadline: number,
 ): WalkEntry {
   if (entry.isDirectory()) return { kind: 'directory' }
@@ -1377,34 +1170,21 @@ function walkEntry(
     }
     if (isUnusablePathError(err)) return { kind: 'skip' }
     if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
-      // A link that resolves back to itself reaches no directory at all, so
-      // there is nothing behind it to deny and nothing a command can put
-      // there without replacing the link, which the next wrap's walk sees.
-      // The link's own path cannot carry a read-only bind either: bubblewrap
-      // resolves a mount destination, and resolving this one is what just
-      // failed. Denying the directory that HOLDS it is the one answer that
-      // would be worse than none - a single link a command can write would
-      // take every submodule beside it read-only. The links the loop goes
-      // THROUGH are left alone for a reason of their own: a `.git/modules` is
-      // writable in the sandbox, so putting a directory at one of them to
-      // make this entry reach it is no shorter a way to a planted submodule
-      // git directory than creating one outright, which is the recorded limit
-      // of scanning before a command rather than after it. A git directory's
-      // own entries are the other case: there, the whole-directory deny holds
-      // the entry and the hops are all that is left open.
+      // Nothing is behind it to deny, and no bind can be put at it. Denying the
+      // directory that HOLDS it would let one link take every submodule beside
+      // it read-only. The links it goes through are left alone too: putting a
+      // directory at one is no shorter a way to a planted git directory under
+      // a writable `.git/modules` than creating one outright.
       logForDebugging(
         `[Sandbox] ${entryPath} is a symlink loop, which leads to nothing to deny: ${err}`,
         { level: 'warn' },
       )
       return { kind: 'skip' }
     }
-    // Something is there and could not be inspected. What is behind the link
-    // is failed closed on the deepest directory that can be reached TOWARDS
-    // IT, rather than on the directory holding the link, which would take
-    // every submodule beside it over one entry; the link itself is a link
-    // like any other, and its holder is denied for it.
-    const denied =
-      deepestReachableAncestor(linkTarget(entryPath) ?? entryPath) ?? entryPath
+    // Something is there and could not be looked at. Failed closed on the
+    // deepest directory reachable TOWARDS it, not on the one holding the link,
+    // which is denied for the link's own sake.
+    const denied = deepestReachableAncestor(chain.landing) ?? entryPath
     walk.unreadableDirs.add(denied)
     walk.linkedEntryDirs.add(holder)
     holdChain('resolved')
@@ -1416,22 +1196,10 @@ function walkEntry(
   }
 }
 
-/** Where `link` points, resolved against the directory holding it, or
- *  undefined when it cannot be read. */
-function linkTarget(link: string): string | undefined {
-  try {
-    return path.resolve(path.dirname(link), fs.readlinkSync(link))
-  } catch {
-    return undefined
-  }
-}
-
 /**
- * What a directory a `gitdir:` or `commondir` names is denied by. An existing
- * directory that is not a git directory is left alone: file content must not
- * be able to point the deny list at, say, a Rails `config/`. An absent one is
- * still denied, so the sandboxed command cannot create the target and fill it
- * with hooks before the host's git first uses it.
+ * What a directory a `gitdir:` or a `commondir` names is denied by. One that is
+ * no git directory is left alone. An absent one is denied, so that a command
+ * cannot create it and fill it with hooks.
  */
 function gitDirTargetDenies(
   target: string,
@@ -1474,33 +1242,11 @@ function gitDirTargetDenies(
 }
 
 /**
- * Whether `dir` is a git directory. Deliberately looser than git's
- * `is_git_directory` (a valid HEAD plus objects/ and refs/): every directory
- * git accepts has a HEAD entry, so this accepts those and some besides,
- * which only ever denies more.
- *
- * Narrower than {@link GIT_DIR_MARKERS}, which the `.git/modules` walk uses:
- * a directory here is named by file content a sandboxed command can write, so
- * accepting `config` or `hooks` would let that content aim a deny at any
- * directory at all. The walk reaches only what lies under `.git/modules` —
- * except through a symlinked entry there, which a command able to write under
- * it can aim at one directory of its choosing.
- *
- * `HEAD` and `objects` are not the whole answer, because neither is a deny
- * path: a command can rename one aside, and a linked worktree's git directory
- * holds `HEAD` and no `objects`, so one `mv` would leave the next wrap
- * denying the pointer file alone and not following `commondir`. Two things
- * stand in where they are gone:
- *
- * - `commondir` counts as they do. A linked worktree's git directory always
- *   holds one, wherever its repository keeps it — a bare repository's
- *   `repo.git/worktrees/<id>` as much as a `.git/worktrees/<id>` — and it IS
- *   a deny path, so from the first wrap that saw the directory on it cannot
- *   be moved aside. No ordinary directory has an entry of that name, and one
- *   a command makes is what one named `HEAD` already was.
- * - WHERE a directory is cannot be arranged by what a file says, so one that
- *   sits where only git puts a git directory is one whatever it holds just
- *   now: see {@link isGitOwnedLocation}.
+ * Whether `dir`, which a `gitdir:` or a `commondir` names, is a git directory:
+ * by what it holds ({@link looksLikeGitDir}), or by where it is. WHERE a
+ * directory is cannot be arranged by what a file says, so one that sits where
+ * only git puts a git directory is one whatever it holds just now: see
+ * {@link isGitOwnedLocation}.
  */
 function gitDirKind(dir: string): GitDirKind {
   let entries: fs.Dirent[]
@@ -1510,21 +1256,17 @@ function gitDirKind(dir: string): GitDirKind {
     if (isUnusablePathError(err)) return 'unusable'
     return isAbsenceError(err) ? 'absent' : 'unreadable'
   }
-  if (entries.some(e => TARGET_GIT_DIR_MARKERS.has(e.name))) return 'git-dir'
-  return isGitOwnedLocation(dir) ? 'git-dir' : 'other'
+  return looksLikeGitDir(entries) || isGitOwnedLocation(dir)
+    ? 'git-dir'
+    : 'other'
 }
 
 /**
- * Whether `dir` sits where git keeps a git directory of its own making: a
- * linked worktree's, `.git/worktrees/<id>`, or a submodule's, anywhere under
- * a `.git/modules` — the repository's, or the one a linked worktree keeps
- * for its own submodules under `.git/worktrees/<id>/modules`.
- *
- * Asked of the path the kernel lands on and not of the one a pointer spells:
- * a command can make `x/.git` a symlink to any directory, and a value
- * written through it has this shape while what it reaches is an ordinary
- * directory of the project. A directory that really is at such a path got
- * there by being created or moved there, which file content cannot do.
+ * Whether `dir` sits where git keeps a git directory of its own making:
+ * `.git/worktrees/<id>`, or anywhere under a `.git/modules`, a linked
+ * worktree's own included. Asked of the path the kernel lands on: a command can
+ * make `x/.git` a symlink to any directory, and a value written through it has
+ * this shape.
  */
 function isGitOwnedLocation(dir: string): boolean {
   const parts = physicalDenyPath(dir).split('/')
@@ -1541,8 +1283,8 @@ function isGitOwnedLocation(dir: string): boolean {
 
 /**
  * The contents of `file`, or what stopped this from reading it the way git
- * does. The path is one a sandboxed command may create: a FIFO there would
- * block the host on every later wrap (hence O_NONBLOCK and the type check).
+ * does. A command may create the path: a FIFO there would block every later
+ * wrap, hence O_NONBLOCK and the type check.
  */
 function readGitMetadataFile(file: string): GitMetadata {
   // O_NONBLOCK is POSIX-only; this file's callers are the Linux and macOS
@@ -1598,22 +1340,18 @@ function parseGitdirPointer(
 }
 
 /**
- * The path a git metadata file names, by git's rules rather than a line
- * reader's: `\n` and `\r` are stripped from the END OF THE FILE (so a newline
- * inside the path is part of it), nothing is trimmed, and what is left is a C
- * string and ends at the first NUL. `read_gitfile_gently` and
- * `get_common_dir_noenv` in git's setup.c both read this way.
+ * The path a git metadata file names, by git's rules (`read_gitfile_gently`,
+ * `get_common_dir_noenv`): `\n` and `\r` are stripped from the END OF THE FILE,
+ * nothing else is trimmed, and what is left is a C string that ends at the
+ * first NUL.
  *
- * This re-implements that parsing instead of asking git, because the library
- * has to work where git is not installed, a wrap would otherwise spawn a
- * process per pointer per command, and running git inside a checkout the
- * sandboxed command can write is the hazard these denies exist to contain;
- * test/sandbox/git-pointer-parity.test.ts is what keeps the two in step,
- * resolving a corpus of pointer shapes both ways and comparing.
+ * Re-implemented instead of asking git: the library has to work without git,
+ * and running git in a checkout the command can write is the hazard these
+ * denies contain. test/sandbox/git-pointer-parity.test.ts keeps the two in
+ * step.
  *
- * Throws {@link GitMetadataError} for a path whose bytes are not valid UTF-8:
- * a JavaScript string of them names a different file than git opens, so
- * there is no path here to deny.
+ * Throws {@link GitMetadataError} for bytes that are not valid UTF-8: a string
+ * of them names another file than git opens.
  */
 function gitMetadataPath(contents: Buffer, file: string): string | undefined {
   let end = contents.length
@@ -1624,6 +1362,8 @@ function gitMetadataPath(contents: Buffer, file: string): string | undefined {
     end--
   }
   const nul = contents.subarray(0, end).indexOf(0)
+  // git joins the empty string to the directory it reads the path from.
+  if (nul === 0) return '.'
   const pathBytes = contents.subarray(0, nul === -1 ? end : nul)
   if (pathBytes.length === 0) return undefined
 
@@ -1651,24 +1391,16 @@ interface GitMetadataTargets {
 }
 
 /**
- * The git directories a `gitdir:` or `commondir` value read in `base` leads
- * to: the path as it folds on paper, which is the spelling these denies have
- * always used, and — when a `..` in it could send the kernel elsewhere — the
- * directory the kernel actually reaches. git hands the two strings to stat
- * joined and unnormalised, so a symlink is followed before a later `..`
- * applies and `a/link/../b` need not be `a/b`; run against real git, it opens
- * the kernel's landing and refuses when only the lexical one is a git
- * directory (test/sandbox/git-pointer-parity.test.ts pins that). Both are
- * denied when they differ: denying more than git follows costs one bind.
+ * The git directories a `gitdir:` or `commondir` value read in `base` leads to:
+ * the path as it folds on paper and, where a `..` in it could send the kernel
+ * elsewhere, the directory the kernel reaches. git hands the joined string to
+ * stat, so a symlink is followed before a later `..` applies, and it opens the
+ * kernel's landing. Both are denied where they differ.
  *
- * A value whose walk reaches no end names NO git directory. git opens nothing
- * through it — it gives up on the same loop, and the lexical fold is not a
- * fallback it takes — while the deepest directory a fail-closed deny could
- * still reach towards it is usually the checkout itself, and denying that
- * whole would take the project read-only over a `.git` file a sandboxed
- * command is allowed to create. The links the walk did go through come back
- * as hops all the same: putting a directory in one of their places is what
- * makes such a chain reach anything at all.
+ * A value whose walk reaches no end names NO git directory: git opens nothing
+ * through it, and the deepest directory a fail-closed deny could reach is
+ * usually the checkout. The links it went through come back as hops all the
+ * same.
  */
 function gitMetadataTargets(
   base: string,
@@ -1698,27 +1430,15 @@ function gitMetadataTargets(
 }
 
 /**
- * Where the kernel lands walking `target` from `base`, symlinks followed as
- * it meets them, and every symlink it went through on the way.
- * `path.resolve` folds `..` lexically, and `fs.realpathSync` folds its
- * argument the same way before resolving it, so neither answers this; a walk
- * also reaches a tail that does not exist yet, which realpath cannot. A
- * component that cannot be walked — missing, unreadable, or a loop past the
- * hop limit — ends it, since the kernel cannot traverse one either and
- * nothing beyond it can redirect the path; the rest is taken as written and
- * classified by {@link gitDirTargetDenies} like any other target.
- *
- * The hops are what a caller protecting the landing still has to hold: each
- * one is a name a command able to write the directory around it can point
- * somewhere else, which moves the landing without touching either end.
+ * Where the kernel lands walking `target` from `base`, and every symlink it
+ * went through. `path.resolve` and `fs.realpathSync` fold `..` on paper, and a
+ * walk also reaches a tail that does not exist yet. A component that cannot be
+ * walked ends it, and the rest is taken as written.
  *
  * The hop limit bounds how many links are followed and nothing bounds how long
- * each is: a link's target runs to a filesystem's four thousand bytes and a
- * pointer's value to the megabyte its file may hold, every component of either
- * is an lstat, and a command can leave as many of them as it likes. `deadline`
- * is what bounds that, looked at as the components go by, and running out of
- * it throws {@link SubmoduleWalkBudgetError} as the `.git/modules` walk does:
- * a landing that was never reached is not one to work a deny out from.
+ * each is, so `deadline` does: past it this throws {@link
+ * SubmoduleWalkBudgetError}. A link whose target is no text throws {@link
+ * GitMetadataError}, as a value that is none does.
  */
 function resolveChain(
   base: string,
@@ -1726,12 +1446,14 @@ function resolveChain(
   deadline: number,
 ): ResolvedChain {
   let current = path.isAbsolute(target) ? path.parse(target).root : base
-  let pending = target.split('/')
+  // What is still to be walked, last component first: a value can hold half a
+  // million, and an array taken from at the front is copied each time.
+  const pending = target.split('/').reverse()
   const hops: ChainHop[] = []
   const named = new Set<string>()
   let followed = 0
   let componentsSeen = 0
-  while (pending.length > 0) {
+  for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
     // On the first component as well as every so many after it: a tree full
     // of short chains is as many walks as a command cared to leave, and none
     // of them is long enough to come round to a later look.
@@ -1743,8 +1465,7 @@ function resolveChain(
         `[Sandbox] The walk of ${abridged(target)} from ${base} ran out of the time it was given at ${current}, ${followed} symlinks in and with ${pending.length} path components still to go; refusing to sandbox on a path that was not walked to where it leads`,
       )
     }
-    const name = pending.shift()
-    if (name === undefined || name === '' || name === '.') continue
+    if (name === '' || name === '.') continue
     if (name === '..') {
       current = path.dirname(current)
       continue
@@ -1752,37 +1473,38 @@ function resolveChain(
     const next = path.join(current, name)
     let link: string | undefined
     try {
-      if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next)
-    } catch {
-      return { landing: path.join(next, ...pending), hops, resolved: true }
+      if (fs.lstatSync(next).isSymbolicLink()) link = linkTextOf(next)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EILSEQ') {
+        throw new GitMetadataError(
+          `[Sandbox] ${next} is a symlink whose target is not valid UTF-8; refusing to sandbox with a deny list that would name another path than the one it leads to`,
+        )
+      }
+      return {
+        landing: path.join(next, pending.reverse().join('/')),
+        hops,
+        resolved: true,
+      }
     }
     if (link === undefined) {
       current = next
       continue
     }
-    // `current` is where the walk really is, so the hop is recorded under
-    // the name the kernel reached it by rather than the one it was spelled
-    // from: that is the name an unlink or a rename of the link uses. A loop
-    // arrives at the same link over and over and it is one name, so the hop
-    // count is not what bounds the walk.
+    // Under the name the kernel reached it by, which is the one an unlink or a
+    // rename uses. A loop arrives at the same link over and over: one hop.
     if (!named.has(next)) {
       named.add(next)
       hops.push({ link: next, holder: current })
     }
-    // Past the kernel's own limit the chain reaches nothing: git gives up on
-    // it exactly as this does, so there is nothing behind it to protect and
-    // the landing is only where the walk stopped. The links it went THROUGH
-    // are a different matter and come back — each is a name a command able to
-    // write the directory around it can point at a real directory, which
-    // makes the chain reach one and every deny worked out for it wrong — so
-    // the caller holds them and says so where it cannot.
+    // Past the kernel's own limit the chain reaches nothing, for git as for
+    // this. The links it went THROUGH come back for the caller to hold.
     if (++followed > MAX_SYMLINK_RESOLUTION_DEPTH) {
       return { landing: next, hops, resolved: false }
     }
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
     if (path.isAbsolute(link)) current = path.parse(link).root
-    pending = [...link.split('/'), ...pending]
+    for (const part of link.split('/').reverse()) pending.push(part)
   }
   return { landing: current, hops, resolved: true }
 }
@@ -1801,19 +1523,10 @@ function abridged(value: string, limit = 200): string {
 }
 
 /**
- * Where the kernel lands walking `denyPath` from the root: the spelling a
- * backend needs whose filters are matched against the path an operation
- * RESOLVED to rather than the one it was spelled from (macOS Seatbelt — see
- * `gitDiskDenyEntries` in src/sandbox/macos-sandbox-utils.ts). `denyPath`
- * itself where nothing on the way is a symlink, which is every path of an
- * ordinary repository.
- *
- * `fs.realpathSync` does not answer this: it throws on a path that is not
- * there, and an absent `hooks` or `config.worktree` is exactly what these
- * denies exist to stop a command from creating.
- *
- * Throws {@link SubmoduleWalkBudgetError} past `deadline`, which bounds the
- * walk as it bounds every other (see {@link resolveChain}).
+ * Where the kernel lands walking `denyPath` from the root: the spelling for a
+ * backend whose filters are matched against the path an operation RESOLVED to
+ * (`gitDiskDenyEntries` on macOS). `fs.realpathSync` throws on a path that is
+ * not there, and an absent `hooks` is what these denies are for.
  */
 export function physicalDenyPath(
   denyPath: string,
@@ -1823,16 +1536,11 @@ export function physicalDenyPath(
 }
 
 /**
- * The deepest ancestor of `target` (itself included) this process can still
- * stat as a directory. Denying that directory fails closed when the path
- * below it cannot be inspected: nothing under it is writable in the sandbox.
- *
- * Symlinks are followed, so a link to a directory that cannot be listed is
- * answered with the link's own path rather than with the directory holding
- * it — the Linux deny loop puts the bind on the real target (see
- * `resolveSymlinkedDenyPath`), and answering with the parent would let one
- * unreadable directory anyone can plant a link to take every entry beside it
- * read-only.
+ * The deepest ancestor of `target`, itself included, that this process can stat
+ * as a directory. Denying it fails closed where what lies below cannot be
+ * inspected. Symlinks are followed, so a link to an unlistable directory is
+ * answered with the link's own path, which the Linux deny loop binds at its
+ * target, not with the directory holding it.
  */
 function deepestReachableAncestor(target: string): string | undefined {
   for (let dir = target; ; dir = path.dirname(dir)) {

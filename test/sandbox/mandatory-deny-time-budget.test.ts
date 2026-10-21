@@ -18,6 +18,7 @@ import {
   LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
+  GitMetadataError,
   SubmoduleWalkBudgetError,
   gitDirDenies,
   gitDirTreeDenies,
@@ -27,7 +28,9 @@ import type { GitDirDenies } from '../../src/sandbox/mandatory-deny-paths.js'
 import {
   NO_COLLAPSE,
   collapseEverything,
+  collapseFloor,
   collapseFurther,
+  describeCollapse,
 } from '../../src/sandbox/linux-deny-collapse.js'
 import type { SubmoduleDenyPlan } from '../../src/sandbox/linux-deny-collapse.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
@@ -234,6 +237,68 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
       wholeGitDirs: 5,
       wholeModulesDirs: 2,
     })
+  })
+
+  it('does not count its way through entries that take no mount', () => {
+    // A thousand submodule git directories the command may not write, and
+    // eleven deny paths it may where ten fit. Nothing that can be degraded gives
+    // a mount back, and a step takes as few entries as would make up for one.
+    const modulesDir = join(dir, 'elsewhere', '.git', 'modules')
+    const gitDirs = Array.from({ length: 1000 }, (_unused, i) => ({
+      gitDir: join(modulesDir, `s${i}`),
+      denyPaths: [join(modulesDir, `s${i}`, 'hooks')],
+      escapingDenyPaths: [],
+      linkedEntryDirs: [],
+      chainHops: [],
+    }))
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: [
+        ...Array.from({ length: 11 }, (_unused, i) => join(dir, `deny${i}`)),
+        ...gitDirs.flatMap(each => each.denyPaths),
+      ],
+      repositories: [{ modulesDir, gitDirs, wholeDirDenies: [] }],
+      chainHops: [],
+    }
+    let asked = 0
+
+    const level = collapseFloor(plan, 10, denyPath => {
+      asked++
+      return !denyPath.startsWith(modulesDir)
+    })
+
+    expect(level).toEqual(collapseEverything(plan))
+    expect(asked).toBeLessThanOrEqual(2 * plan.denyPaths.length)
+  })
+
+  it('resolves each path once to say what was degraded', () => {
+    // Both numbers are a command's to choose, and their product is minutes.
+    const modulesDir = join(dir, 'repo', '.git', 'modules')
+    const gitDirs = Array.from({ length: 200 }, (_unused, i) => ({
+      gitDir: join(modulesDir, `s${i}`),
+      denyPaths: [join(modulesDir, `s${i}`, 'hooks')],
+      escapingDenyPaths: [],
+      linkedEntryDirs: [],
+      chainHops: [],
+    }))
+    const wholeDirDenies = Array.from({ length: 50 }, (_unused, i) =>
+      join(modulesDir, `whole${i}`),
+    )
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: gitDirs.flatMap(each => each.denyPaths),
+      repositories: [{ modulesDir, gitDirs, wholeDirDenies }],
+      chainHops: [],
+    }
+    const resolve = spyOn(fs.realpathSync, 'native')
+    try {
+      expect(describeCollapse(plan, collapseEverything(plan))).toContain(
+        '200 of the 200 submodule git directories',
+      )
+      expect(resolve.mock.calls.length).toBeLessThanOrEqual(
+        2 * (gitDirs.length + wholeDirDenies.length),
+      )
+    } finally {
+      resolve.mockRestore()
+    }
   })
 
   it('still stops at the first level that fits where stepping does give words back', async () => {
@@ -509,6 +574,61 @@ describe.if(!isWindows)(
       120000,
     )
 
+    it('walks a value of as many components as its file can hold', () => {
+      // Half a million, which is more than one call takes as arguments: to a
+      // git directory that is there, and past a component that is not.
+      const gitDir = makeGitDir(join(dir, 'store'))
+      mkdirSync(join(dir, 'checkout'))
+      const pointer = join(dir, 'checkout', '.git')
+      const deadline = Date.now() + 60000
+
+      writeFileSync(pointer, `gitdir: ${'./'.repeat(500000)}../store\n`)
+      expect(gitFileDenies(pointer, false, deadline).gitDirs).toEqual([gitDir])
+
+      writeFileSync(pointer, `gitdir: absent/${'../'.repeat(300000)}\n`)
+      expect(gitFileDenies(pointer, false, deadline).gitDirs).toEqual([])
+    })
+
+    it('takes what lies past a component that is not there as it is written', () => {
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      symlinkSync('../absent/a/b', join(gitDir, 'commondir'))
+
+      expect(gitDirDenies(gitDir, false).denyPaths).toContain(
+        join(dir, 'repo', 'absent', 'a', 'b'),
+      )
+    })
+
+    describe('a link whose target is no text', () => {
+      // A string made of those bytes names another path, or none.
+      const NO_TEXT = Buffer.from([0x2e, 0x2e, 0x2f, 0xff, 0xfe])
+
+      it('refuses, where it is an entry of a git directory', () => {
+        const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+        symlinkSync(NO_TEXT, join(gitDir, 'commondir'))
+
+        expect(() => gitDirDenies(gitDir, false)).toThrow(GitMetadataError)
+      })
+
+      it.if(isLinux)('refuses the wrap with a code of its own', async () => {
+        // Left to bubblewrap, which cannot resolve the mount point either, the
+        // command would be handed out and never start.
+        const project = join(dir, 'project')
+        const gitDir = makeGitDir(join(project, 'nested', '.git'))
+        rmSync(join(gitDir, 'hooks'), { recursive: true })
+        symlinkSync(NO_TEXT, join(gitDir, 'hooks'))
+        process.chdir(project)
+
+        const refusal = await refusalOf({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
+        })
+
+        expect(refusal?.code).toBe('deny_git_metadata_unreadable')
+        expect(refusal?.message).toContain(join(gitDir, 'hooks'))
+      })
+    })
+
     it('resolves an ordinary chain exactly as it always has', () => {
       // hooks -> ../first -> second -> .githooks: three links, short targets.
       const gitDir = makeGitDir(join(dir, 'repo', '.git'))
@@ -552,7 +672,8 @@ describe.if(!isWindows)(
       mkdirSync(join(dir, 'repo', 'worktree'))
       writeFileSync(pointer, 'gitdir: ../through/gd\n')
       const through = join(dir, 'repo', 'through')
-      const expectedPointer: GitDirDenies = {
+      const expectedPointer: ReturnType<typeof gitFileDenies> = {
+        gitDirs: [join(through, 'gd')],
         denyPaths: [
           pointer,
           through,

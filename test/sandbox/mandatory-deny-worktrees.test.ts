@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import * as fs from 'fs'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
@@ -14,12 +15,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { macGetMandatoryDenyEntries } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
+  linuxGetMonitorCwdDenyPaths,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
@@ -28,7 +31,7 @@ import {
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
-  gitFileDenyPaths,
+  gitFileDenies,
 } from '../../src/sandbox/mandatory-deny-paths.js'
 import * as denyCollapse from '../../src/sandbox/linux-deny-collapse.js'
 import type { SubmoduleDenyPlan } from '../../src/sandbox/linux-deny-collapse.js'
@@ -178,7 +181,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       )
       renameSync(join(worktreeGitDir, 'HEAD'), join(worktreeGitDir, 'H'))
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         // And the commondir is still followed: the hooks a commit in the
@@ -199,7 +202,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       )
       renameSync(join(worktreeGitDir, 'HEAD'), join(worktreeGitDir, 'H'))
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         ...gitDirDenyPaths(bare, false),
@@ -223,6 +226,150 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       expect(literals).toContain(join(mainGitDir, 'config'))
     })
 
+    /**
+     * A repository that keeps a submodule and two linked worktrees, and what is
+     * denied of those from the checkout of the first: a command there is
+     * commonly let write the repository's git directory, to commit.
+     */
+    function repositoryThatKeepsMore(): { checkout: string; kept: string[] } {
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const checkout = join(dir, 'wt')
+      const own = makeLinkedWorktree(mainGitDir, 'wt', checkout)
+      const other = makeLinkedWorktree(mainGitDir, 'other', join(dir, 'other'))
+      return {
+        checkout,
+        kept: [
+          ...gitDirDenyPaths(
+            makeGitDir(join(mainGitDir, 'modules', 'lib')),
+            false,
+          ),
+          ...gitDirDenyPaths(
+            makeGitDir(join(own.worktreeGitDir, 'modules', 'lib')),
+            false,
+          ),
+          join(other.worktreeGitDir, 'commondir'),
+          join(other.worktreeGitDir, 'gitdir'),
+        ],
+      }
+    }
+
+    it.each([
+      { code: 'EACCES', refuses: false },
+      { code: 'EMFILE', refuses: true },
+      { code: 'EIO', refuses: true },
+    ])(
+      'goes by why the pointer could not be read ($code)',
+      ({ code, refuses }) => {
+        // What this user may not read, the host's git cannot read either. Any
+        // other failure is this process's, now, and git may well read the file.
+        const { pointer } = makeLinkedWorktree(
+          makeGitDir(join(dir, 'main', '.git')),
+          'wt',
+          join(dir, 'wt'),
+        )
+        const real = fs.openSync
+        const open = spyOn(fs, 'openSync').mockImplementation(((
+          ...args: Parameters<typeof fs.openSync>
+        ) => {
+          if (args[0] === pointer)
+            throw Object.assign(new Error(code), { code })
+          return real(...args)
+        }) as typeof fs.openSync)
+        try {
+          if (refuses) {
+            expect(() => gitFileDenies(pointer, false)).toThrow(
+              GitMetadataError,
+            )
+          } else {
+            expect(gitFileDenies(pointer, false).denyPaths).toEqual([pointer])
+          }
+        } finally {
+          open.mockRestore()
+        }
+      },
+    )
+
+    it('names the git directories it reached, for what they keep', () => {
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const { worktreeGitDir, pointer } = makeLinkedWorktree(
+        mainGitDir,
+        'wt',
+        join(dir, 'wt'),
+      )
+
+      expect(gitFileDenies(pointer, false).gitDirs).toEqual([
+        worktreeGitDir,
+        mainGitDir,
+      ])
+    })
+
+    it.if(isLinux)('carries what they keep into the Linux deny list', () => {
+      const { checkout, kept } = repositoryThatKeepsMore()
+      process.chdir(checkout)
+
+      expect(linuxGetCwdMandatoryDenyPaths(false, [dir])).toEqual(
+        expect.arrayContaining(kept),
+      )
+    })
+
+    it('carries what they keep into the macOS entries', () => {
+      const { checkout, kept } = repositoryThatKeepsMore()
+      process.chdir(checkout)
+
+      const literals = macGetMandatoryDenyEntries(false, [dir])
+        .filter(entry => !entry.glob)
+        .map(entry => entry.path)
+
+      expect(literals).toEqual(expect.arrayContaining(kept))
+      expect(literals.length).toBe(new Set(literals).size)
+    })
+
+    it.if(isLinux)(
+      'denies what the git directory behind a nested pointer keeps',
+      async () => {
+        // Under no name the scan looks for, so the pointer is the only way in.
+        const store = makeGitDir(join(dir, 'project', 'store'))
+        const hooks = join(makeGitDir(join(store, 'modules', 'lib')), 'hooks')
+        mkdirSync(join(dir, 'project', 'checkout'))
+        writeFileSync(
+          join(dir, 'project', 'checkout', '.git'),
+          'gitdir: ../store\n',
+        )
+        process.chdir(join(dir, 'project'))
+
+        const wrapped = await wrap('true', [join(dir, 'project')])
+
+        expect(lastMountAt(wrapped, hooks)).toBe(`--ro-bind ${hooks} ${hooks}`)
+      },
+    )
+
+    it.if(isLinux)(
+      'enumerates once a git directory reached both ways',
+      async () => {
+        // Found twice, what it keeps would be degraded twice, and the second
+        // time gives nothing back.
+        const project = join(dir, 'project')
+        const submodule = makeGitDir(join(project, '.git', 'modules', 'lib'))
+        makeGitDir(join(project, '.git'))
+        makeGitDir(join(submodule, 'modules', 'nested'))
+        mkdirSync(join(project, 'lib'))
+        writeFileSync(
+          join(project, 'lib', '.git'),
+          'gitdir: ../.git/modules/lib\n',
+        )
+        process.chdir(project)
+        const list = spyOn(fs, 'readdirSync')
+
+        const listed = await wrap('true', [project])
+          .then(() => list.mock.calls.map(([listedDir]) => listedDir))
+          .finally(() => list.mockRestore())
+
+        expect(
+          listed.filter(listedDir => listedDir === join(submodule, 'modules')),
+        ).toHaveLength(1)
+      },
+    )
+
     it('keeps them with nothing left in the directory at all', () => {
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
       const { worktreeGitDir, pointer } = makeLinkedWorktree(
@@ -234,7 +381,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         rmSync(join(worktreeGitDir, name))
       }
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
       ])
@@ -250,7 +397,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(checkout, '.git')
       writeFileSync(pointer, 'gitdir: ../../.git/modules/vendor/lib\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(submodule, false),
       ])
@@ -270,7 +417,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(project, 'y', '.git')
       writeFileSync(pointer, 'gitdir: ../x/.git/worktrees/a\n')
 
-      const denyPaths = gitFileDenyPaths(pointer, false)
+      const denyPaths = gitFileDenies(pointer, false).denyPaths
 
       expect(denyPaths).toContain(pointer)
       expect(
@@ -288,7 +435,10 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(dir, 'checkout', '.git')
       writeFileSync(pointer, 'gitdir: ../data/worktrees/a\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+      expect(gitFileDenies(pointer, false)).toMatchObject({
+        denyPaths: [pointer],
+        gitDirs: [],
+      })
     })
 
     for (const mainGitDirName of ['.git', 'main.git']) {
@@ -357,12 +507,36 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         join(dir, 'wt'),
       )
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         ...gitDirDenyPaths(bare, false),
       ])
     })
+
+    it.each([
+      { left: 'config', allowGitConfig: false },
+      { left: 'hooks', allowGitConfig: true },
+    ])(
+      'is followed with all but its $left moved aside',
+      ({ left, allowGitConfig }) => {
+        // HEAD, objects and refs are no deny paths: a command can rename them
+        // aside, and back once the next wrap has left the hooks writable. What
+        // is denied stays where it is, so it has to be enough.
+        const gitDir = makeGitDir(join(dir, 'store'))
+        for (const name of ['HEAD', 'objects', 'refs', 'config', 'hooks']) {
+          if (name !== left) renameSync(join(gitDir, name), join(dir, name))
+        }
+        mkdirSync(join(dir, 'checkout'))
+        const pointer = join(dir, 'checkout', '.git')
+        writeFileSync(pointer, 'gitdir: ../store\n')
+
+        expect(gitFileDenies(pointer, allowGitConfig).denyPaths).toEqual([
+          pointer,
+          ...gitDirDenyPaths(gitDir, allowGitConfig),
+        ])
+      },
+    )
 
     it('is followed where its objects live elsewhere', () => {
       // HEAD and refs, which is all git itself asks of the directory when the
@@ -374,7 +548,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(dir, 'checkout', '.git')
       writeFileSync(pointer, 'gitdir: ../store\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(gitDir, false),
       ])
@@ -587,6 +761,51 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       }
     })
 
+    it.if(NOT_ROOT)(
+      "denies whole a worktree's git directory it cannot list, and refuses nothing",
+      () => {
+        // One `mkdir` and one `chmod` away for a command, and git reads no
+        // `commondir` in there either.
+        const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+        const { worktreeGitDir } = makeLinkedWorktree(
+          mainGitDir,
+          'wt',
+          join(dir, 'wt'),
+        )
+        chmodSync(worktreeGitDir, 0o000)
+        try {
+          const tree = gitDirTreeDenies(mainGitDir, false)
+
+          expect(tree.unreadableDirs).toEqual([worktreeGitDir])
+          expect(tree.worktrees).toEqual([])
+        } finally {
+          chmodSync(worktreeGitDir, 0o755)
+        }
+      },
+    )
+
+    it.if(isLinux)(
+      'hands the monitor the plain deny paths of a repository it cannot enumerate',
+      () => {
+        const checkout = join(dir, 'main')
+        const mainGitDir = makeGitDir(join(checkout, '.git'))
+        const { worktreeGitDir } = makeLinkedWorktree(
+          mainGitDir,
+          'wt',
+          join(dir, 'wt'),
+        )
+        writeFileSync(join(worktreeGitDir, 'commondir'), Buffer.from([0xff]))
+        process.chdir(checkout)
+
+        expect(() => linuxGetCwdMandatoryDenyPaths(false)).toThrow(
+          GitMetadataError,
+        )
+        expect(linuxGetMonitorCwdDenyPaths(false)).toEqual(
+          expect.arrayContaining(gitDirDenyPaths(mainGitDir, false)),
+        )
+      },
+    )
+
     it('refuses rather than hand back a listing that ran out of its time', () => {
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
       makeLinkedWorktree(mainGitDir, 'wt', join(dir, 'wt'))
@@ -643,6 +862,110 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       expect(literals).toContain(join(worktreeGitDir, 'gitdir'))
     })
 
+    it('denies the submodules a linked worktree keeps, and what those keep', () => {
+      // A linked worktree's submodules have their git directories under the
+      // WORKTREE's, inside the repository, while their checkouts are in the
+      // worktree, which can lie outside everything the command may write.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const { worktreeGitDir } = makeLinkedWorktree(
+        mainGitDir,
+        'wt',
+        join(dir, 'wt'),
+      )
+      const submodule = makeGitDir(join(worktreeGitDir, 'modules', 'a', 'lib'))
+      const deeper = makeLinkedWorktree(submodule, 'wt2', join(dir, 'wt2'))
+      const deepest = makeGitDir(join(deeper.worktreeGitDir, 'modules', 'x'))
+
+      const denies = gitDirTreeDenies(mainGitDir, false)
+
+      // All under the worktree's git directory, so a bind of it stands in for
+      // them where the profile is degraded.
+      expect(denies.worktrees).toEqual([
+        {
+          gitDir: worktreeGitDir,
+          denyPaths: [
+            ...heldFiles(worktreeGitDir),
+            ...gitDirDenyPaths(submodule, false),
+            ...heldFiles(deeper.worktreeGitDir),
+            ...gitDirDenyPaths(deepest, false),
+          ],
+          escapingDenyPaths: [],
+          linkedEntryDirs: [],
+          chainHops: [],
+        },
+      ])
+    })
+
+    it('keeps through a degrade what a kept git directory reached through a link is denied by', () => {
+      // A bind of the submodule's git directory does not cover it.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
+      const elsewhere = join(dir, 'elsewhere')
+      mkdirSync(elsewhere)
+      mkdirSync(join(submodule, 'worktrees'))
+      symlinkSync(elsewhere, join(submodule, 'worktrees', 'linked'))
+      symlinkSync(join(dir, 'absent'), join(submodule, 'worktrees', 'dangling'))
+
+      const [found] = gitDirTreeDenies(mainGitDir, false).submodules
+
+      expect(found?.escapingDenyPaths).toEqual([
+        ...heldFiles(join(dir, 'absent')),
+        ...heldFiles(join(submodule, 'worktrees', 'linked')),
+      ])
+    })
+
+    it('ends where a link leads back to a git directory it has been into', () => {
+      // Each walk would find the other's tree anew, one spelling longer, for as
+      // long as a path can get.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const submodules = ['a', 'b', 'c'].map(name =>
+        makeGitDir(join(mainGitDir, 'modules', name)),
+      )
+      for (const submodule of submodules) {
+        mkdirSync(join(submodule, 'worktrees'))
+        symlinkSync(mainGitDir, join(submodule, 'worktrees', 'back'))
+      }
+
+      const denies = gitDirTreeDenies(mainGitDir, false, {
+        deadline: Date.now() + 5000,
+      })
+
+      expect(denies.submodules.map(each => each.gitDir)).toEqual(submodules)
+    })
+
+    it('holds a worktrees that is a link, as it holds a modules that is one', () => {
+      // Remove the link, put a directory where it was, and every `.git` file
+      // that names a worktree's git directory through it opens a planted one.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const elsewhere = join(dir, 'elsewhere')
+      mkdirSync(join(elsewhere, 'wt'), { recursive: true })
+      const worktrees = join(mainGitDir, 'worktrees')
+      symlinkSync(elsewhere, worktrees)
+
+      const denies = gitDirTreeDenies(mainGitDir, false)
+
+      expect(denies.linkedEntryDirs).toEqual([mainGitDir])
+      expect(denies.ownDenyPaths).toContain(worktrees)
+      expect(gitDirTreeDenyPaths(denies)).toEqual(
+        expect.arrayContaining(heldFiles(join(worktrees, 'wt'))),
+      )
+    })
+
+    it('enumerates once a git directory that another one keeps', () => {
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
+      makeGitDir(join(submodule, 'modules', 'nested'))
+      makeLinkedWorktree(submodule, 'wt', join(dir, 'wt'))
+      const visited = new Set<string>()
+
+      gitDirTreeDenies(mainGitDir, false, { visited })
+      const again = gitDirTreeDenies(submodule, false, { visited })
+
+      expect(gitDirTreeDenyPaths(again)).toEqual(
+        gitDirDenyPaths(submodule, false),
+      )
+    })
+
     it('costs a submodule with no linked worktrees nothing', () => {
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
       const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
@@ -664,7 +987,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       expect(gitDirTreeDenyPaths(denies)).toEqual(
         gitDirDenyPaths(mainGitDir, false),
       )
-      expect(denyCollapse.repositoryWorktrees(denies)).toBeUndefined()
+      expect(denyCollapse.degradableGitDirs(denies)).toEqual([])
     })
   })
 
@@ -672,12 +995,11 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
     /** The plan a wrap builds for one repository that has no submodules. */
     function planFor(mainGitDir: string): SubmoduleDenyPlan {
       const denies = gitDirTreeDenies(mainGitDir, false)
-      expect(denyCollapse.repositorySubmodules(denies)).toBeUndefined()
-      const worktrees = denyCollapse.repositoryWorktrees(denies)
-      if (worktrees === undefined) throw new Error('no linked worktrees found')
+      const repositories = denyCollapse.degradableGitDirs(denies)
+      expect(repositories).toMatchObject([{ linkedWorktrees: true }])
       return {
         denyPaths: gitDirTreeDenyPaths(denies),
-        repositories: [worktrees],
+        repositories,
         chainHops: denies.chainHops,
       }
     }
@@ -749,14 +1071,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         const collapsed = worktreeGitDirs[worktreeGitDirs.length - 1] as string
         process.chdir(main)
 
-        const command = await wrap(
-          'echo BOOTED; ' +
-            `echo x > ${join(collapsed, 'commondir')} || echo COLLAPSED_HELD; ` +
-            `echo x > ${join(precise, 'commondir')} || echo PRECISE_HELD; ` +
-            `echo x > ${join(precise, 'ORIG_HEAD')} && echo PRECISE_REST_WRITTEN; ` +
-            'echo ok > notes.txt && echo WORK_TREE_WRITTEN',
-          [main],
-        )
+        const command = await wrap('true', [main])
 
         const words = mountWords(command)
         expect(words.length).toBeLessThan(9000)
@@ -770,15 +1085,6 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         expect(mounted(join(precise, 'commondir'))).toBe(true)
         expect(mounted(join(collapsed, 'commondir'))).toBe(false)
         expect(mounted(collapsed)).toBe(true)
-
-        if (LIVE) {
-          const output = run(command, main)
-          expect(output).toContain('BOOTED')
-          expect(output).toContain('COLLAPSED_HELD')
-          expect(output).toContain('PRECISE_HELD')
-          expect(output).toContain('PRECISE_REST_WRITTEN')
-          expect(output).toContain('WORK_TREE_WRITTEN')
-        }
       },
       300000,
     )

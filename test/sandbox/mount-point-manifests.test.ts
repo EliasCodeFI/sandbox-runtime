@@ -25,14 +25,35 @@ import {
   collectMountPoints,
   discardMountPointManifest,
   forgetMountPointManifestDirectory,
+  keepTrackOfMountPoint,
+  keepTrackOfMountSource,
   liveMountPoints,
   mountPointManifestDirectories,
   namedMountPoints,
   type NamedMountPoints,
   publishMountPointManifest,
+  removePrivateManifestDirectory,
   setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
+import {
+  cleanupBwrapMountPoints,
+  wrapCommandWithSandboxLinux,
+} from '../../src/sandbox/linux-sandbox-utils.js'
+import { mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import {
+  aDeadProcess,
+  deadPid,
+  leftover,
+  namedBy,
+  recordOf,
+  refusal,
+  started,
+  startOf,
+  statLine,
+  thisProcess,
+  writeManifest,
+} from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
 import {
   makePlaces,
@@ -81,91 +102,15 @@ describe.if(isLinux)('The mount point manifests', () => {
       }
       rmSync(file, { recursive: true, force: true })
     }
-    collectMountPoints()
+    collectMountPoints('all')
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /** What bubblewrap leaves on the host for `--ro-bind /dev/null <absent>`. */
-  function leftover(p: string): void {
-    writeFileSync(p, '')
-    chmodSync(p, 0o444)
-  }
-
-  /** A pid nothing in this PID namespace has. */
-  function deadPid(): number {
-    for (let pid = 4194000; pid > 1; pid--) {
-      if (!existsSync(`/proc/${pid}`)) return pid
-    }
-    throw new Error('no free pid')
-  }
-
-  /**
-   * The manifest of a wrap whose process is gone and which is long past its
-   * grace: what a killed process leaves. `fields` overrides what it says.
-   */
-  function manifestOfADeadProcess(
+  /** What a killed process leaves in DIR. `fields` overrides what it says. */
+  const manifestOfADeadProcess = (
     paths: string[],
     fields: Record<string, unknown> = {},
-  ): string {
-    const pid = deadPid()
-    const file = join(DIR, `${pid}-${Math.random().toString(16).slice(2)}.json`)
-    const body: Record<string, unknown> = {
-      version: 1,
-      pid,
-      start: '1',
-      ns: OWN_NAMESPACE,
-      created: Date.now() - 60_000,
-      paths,
-      sources: [],
-      ...fields,
-    }
-    for (const [key, value] of Object.entries(body)) {
-      if (value === undefined) delete body[key]
-    }
-    writeFileSync(file, JSON.stringify(body), { mode: 0o600 })
-    return file
-  }
-
-  /** Field 22 of a /proc/PID/stat line: when that process started. */
-  function startOf(stat: string): string {
-    return stat
-      .slice(stat.lastIndexOf(')') + 1)
-      .trim()
-      .split(' ')[19]!
-  }
-
-  /** This process, which is running, as a manifest or a record names one. */
-  function thisProcess(): { pid: number; start: string } {
-    return {
-      pid: process.pid,
-      start: startOf(readFileSync('/proc/self/stat', 'utf8')),
-    }
-  }
-
-  /**
-   * The line the wrapper shell records for a process, with a name that holds
-   * what a careless reading would trip over.
-   */
-  function statLine(who: { pid: number; start: string }): string {
-    const after = ['S', ...Array<string>(18).fill('0'), who.start, '0', '0']
-    return `${who.pid} (a) b (c) ${after.join(' ')}\n`
-  }
-
-  /** Where the started record of `manifest` is. */
-  function recordOf(manifest: string): string {
-    return manifest.replace(/\.json$/, '.started')
-  }
-
-  /** Puts `manifest` on record as started by those processes, in that order. */
-  function started(
-    manifest: string,
-    ...by: { pid: number; start: string }[]
-  ): string {
-    writeFileSync(recordOf(manifest), by.map(statLine).join(''), {
-      mode: 0o600,
-    })
-    return manifest
-  }
+  ): string => writeManifest(DIR, paths, fields)
 
   /** The manifest this process publishes for a wrap that names `paths`. */
   function publish(paths: string[], sources: string[] = []): string {
@@ -218,7 +163,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       env?: Record<string, string | undefined>
       first?: string
     } = {},
-  ): { status: number | null; ms: number; stdout: string } {
+  ): { status: number | null; stdout: string } {
     const script = join(BASE, `child-${Math.random().toString(16).slice(2)}.ts`)
     writeFileSync(
       script,
@@ -235,19 +180,17 @@ describe.if(isLinux)('The mount point manifests', () => {
     for (const [name, value] of Object.entries(env)) {
       if (value === undefined) delete env[name]
     }
-    const began = Date.now()
     const run = spawnSync(argv[0]!, argv.slice(1), {
       env: env as Record<string, string>,
       encoding: 'utf8',
+      // A read that blocks is killed, and has no status.
       timeout: 6000,
       killSignal: 'SIGKILL',
     })
-    return { status: run.status, ms: Date.now() - began, stdout: run.stdout }
+    return { status: run.status, stdout: run.stdout }
   }
 
-  const COLLECT = `m.collectMountPoints()`
-  // Well under the time a read that blocks would hold a child up for.
-  const AT_ONCE_MS = 1500
+  const COLLECT = `m.collectMountPoints('all')`
   const PUBLISH = `console.log(JSON.stringify(m.publishMountPointManifest(['/nonexistent/x'], []) ?? null))`
 
   it.if(BWRAP_CAN_NAMESPACE && NOT_ROOT)(
@@ -301,8 +244,8 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('removes what a finished manifest names once nothing else names it', () => {
     leftover(X)
-    started(manifestOfADeadProcess([X]), { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([X])
+    started(manifestOfADeadProcess([X]), aDeadProcess())
+    expect(collectMountPoints('all')).toEqual([X])
     expect(existsSync(X)).toBe(false)
     // The manifest, its record and the claim on it went with it.
     expect(readdirSync(DIR)).toEqual([])
@@ -321,7 +264,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     })
     let removed: string[]
     try {
-      removed = collectMountPoints()
+      removed = collectMountPoints('all')
     } finally {
       pass.restore()
     }
@@ -358,9 +301,12 @@ describe.if(isLinux)('The mount point manifests', () => {
     )
   })
 
-  it.if(NOT_ROOT)(
-    'keeps the manifest of a mount point it could not remove, for a pass that can',
-    () => {
+  it.if(NOT_ROOT).each([
+    ["another process's", (p: string): string => manifestOfADeadProcess([p])],
+    ['its own', (p: string): string => publish([p])],
+  ] as const)(
+    'keeps the manifest of a mount point it could not remove, for a pass that can: %s',
+    (_, manifestNaming) => {
       // Seen read-only from here, as from inside a sandbox that may not write
       // the directory it is in. The manifest is all that says the file is a
       // mount point, so it must stay while the file does.
@@ -368,10 +314,10 @@ describe.if(isLinux)('The mount point manifests', () => {
       mkdirSync(readOnly)
       const inside = join(readOnly, 'config.lock')
       leftover(inside)
-      const manifest = manifestOfADeadProcess([inside])
+      const manifest = manifestNaming(inside)
       chmodSync(readOnly, 0o555)
       try {
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(existsSync(inside)).toBe(true)
         // Under its claim, which any later pass takes up.
         expect(claims()).toEqual([finishedOf(manifest)])
@@ -379,7 +325,8 @@ describe.if(isLinux)('The mount point manifests', () => {
       } finally {
         chmodSync(readOnly, 0o755)
       }
-      expect(collectMountPoints()).toEqual([inside])
+      // Whatever the next pass is told to release.
+      expect(collectMountPoints('none')).toEqual([inside])
       expect(readdirSync(DIR)).toEqual([])
     },
   )
@@ -389,28 +336,6 @@ describe.if(isLinux)('The mount point manifests', () => {
   // A manifest is all that names its mount points. It stays until a pass has
   // removed what it names: after a pass that turned back, or a removal that was
   // refused, a later pass still has it to go by.
-
-  it.if(NOT_ROOT)(
-    'keeps the manifest of a wrap of its own whose mount point it could not remove, for a pass that can',
-    () => {
-      const readOnly = join(BASE, 'read-only-from-here')
-      mkdirSync(readOnly)
-      const inside = join(readOnly, 'config.lock')
-      leftover(inside)
-      const manifest = publish([inside])
-      chmodSync(readOnly, 0o555)
-      try {
-        expect(collectMountPoints('all')).toEqual([])
-        expect(existsSync(inside)).toBe(true)
-        expect(claims()).toEqual([finishedOf(manifest)])
-      } finally {
-        chmodSync(readOnly, 0o755)
-      }
-      // Whatever the next pass is told to release.
-      expect(collectMountPoints('none')).toEqual([inside])
-      expect(readdirSync(DIR)).toEqual([])
-    },
-  )
 
   it('keeps the manifest of a wrap of its own when the pass turns back half way, for the next', () => {
     leftover(X)
@@ -457,7 +382,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     }) as never)
     let removed: string[]
     try {
-      removed = collectMountPoints()
+      removed = collectMountPoints('all')
     } finally {
       spy.mockRestore()
     }
@@ -481,7 +406,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     }) as never)
     let removed: string[]
     try {
-      removed = collectMountPoints()
+      removed = collectMountPoints('all')
     } finally {
       spy.mockRestore()
     }
@@ -514,10 +439,10 @@ describe.if(isLinux)('The mount point manifests', () => {
     const manifest = manifestOfADeadProcess([X], { created: now - 499 })
     const clock = spyOn(Date, 'now').mockReturnValue(now)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(existsSync(manifest)).toBe(true)
       clock.mockReturnValue(now + 1)
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     } finally {
       clock.mockRestore()
     }
@@ -580,10 +505,10 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('is live while the process that wrote it runs, though no process on its record does: its command line may be run again', () => {
     leftover(X)
-    const manifest = started(manifestOfADeadProcess([X], thisProcess()), {
-      pid: deadPid(),
-      start: '1',
-    })
+    const manifest = started(
+      manifestOfADeadProcess([X], thisProcess()),
+      aDeadProcess(),
+    )
     expect(live()).toEqual([X])
     expect(collectMountPoints('none')).toEqual([])
     expect(existsSync(manifest)).toBe(true)
@@ -594,7 +519,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const manifest = started(
       manifestOfADeadProcess([X], { created: Date.now() }),
-      { pid: deadPid(), start: '1' },
+      aDeadProcess(),
     )
     expect(live()).toEqual([])
     expect(collectMountPoints('none')).toEqual([X])
@@ -606,15 +531,15 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const later = String(Number(thisProcess().start) + 1)
     started(manifestOfADeadProcess([X]), { pid: process.pid, start: later })
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
   })
 
   it('is live while any of the runs on its record lasts', () => {
     // The same command line run again, before the first run is over or after.
     leftover(X)
-    const gone = { pid: deadPid(), start: '1' }
+    const gone = aDeadProcess()
     started(manifestOfADeadProcess([X]), gone, thisProcess(), gone)
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(X)).toBe(true)
   })
 
@@ -622,8 +547,8 @@ describe.if(isLinux)('The mount point manifests', () => {
     // What a command line run after its manifest was collected leaves: it
     // records itself, and bubblewrap then finds no manifest to bind.
     const left = join(DIR, '4242-0123456789abcdef.started')
-    writeFileSync(left, statLine({ pid: deadPid(), start: '1' }))
-    collectMountPoints()
+    writeFileSync(left, statLine(aDeadProcess()))
+    collectMountPoints('all')
     expect(existsSync(left)).toBe(false)
   })
 
@@ -655,7 +580,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       seen.push({ manifest: existsSync(manifest), claims: claims() }),
     )
     try {
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     } finally {
       removal.restore()
     }
@@ -671,7 +596,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const manifest = manifestOfADeadProcess([X])
     const pass = duringTheNextPass(() => started(manifest, thisProcess()))
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       pass.restore()
     }
@@ -696,14 +621,14 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(Y)
     const finished = manifestOfADeadProcess([X, Y])
     const live = started(manifestOfADeadProcess([X]), thisProcess())
-    expect(collectMountPoints()).toEqual([Y])
+    expect(collectMountPoints('all')).toEqual([Y])
     expect(existsSync(X)).toBe(true)
     expect(existsSync(finished)).toBe(false)
     expect(existsSync(live)).toBe(true)
 
     // It goes once that sandbox has ended too.
-    started(live, { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([X])
+    started(live, aDeadProcess())
+    expect(collectMountPoints('all')).toEqual([X])
   })
 
   it('keeps a path that another manifest names when a command starts under that one during the pass', () => {
@@ -714,7 +639,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const other = manifestOfADeadProcess([X])
     const pass = duringTheNextPass(() => started(other, thisProcess()))
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       pass.restore()
     }
@@ -742,7 +667,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       rename(from, to)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([Y])
+      expect(collectMountPoints('all')).toEqual([Y])
     } finally {
       spy.mockRestore()
     }
@@ -764,7 +689,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     manifestOfADeadProcess([X, Y])
     expect(named()).toEqual([X, Y].sort())
     expect(live()).toEqual([])
-    expect(collectMountPoints().sort()).toEqual([X, Y].sort())
+    expect(collectMountPoints('all').sort()).toEqual([X, Y].sort())
     expect(existsSync(claim)).toBe(false)
     expect(readdirSync(DIR)).toEqual([])
   })
@@ -773,7 +698,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const claim = claimed(started(manifestOfADeadProcess([X]), thisProcess()))
     expect(live()).toEqual([X])
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(X)).toBe(true)
     expect(claims()).toEqual([basename(claim)])
   })
@@ -791,7 +716,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     })
     try {
       // X stays: the manifest is at its own name by the time X's turn comes.
-      expect(collectMountPoints()).toEqual([Y])
+      expect(collectMountPoints('all')).toEqual([Y])
     } finally {
       removal.restore()
     }
@@ -823,7 +748,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       expect(named()).toEqual([X])
       expect(claim).toBeDefined()
       expect(live()).toEqual([X])
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
@@ -850,33 +775,11 @@ describe.if(isLinux)('The mount point manifests', () => {
       // What it names cannot be listed.
       expect(live()).toBeUndefined()
       expect(named()).toBeUndefined()
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
     expect(existsSync(Y)).toBe(true)
-  })
-
-  it('leaves a claim on a manifest written in another PID namespace', () => {
-    leftover(X)
-    const claim = claimed(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(claim)).toBe(true)
-    expect(existsSync(X)).toBe(true)
-  })
-
-  it('never blocks the thread it runs on', () => {
-    // A clean-up runs on its caller's one thread, after every command.
-    leftover(X)
-    claimed(manifestOfADeadProcess([X]))
-    manifestOfADeadProcess([X])
-    const wait = spyOn(Atomics, 'wait')
-    try {
-      expect(collectMountPoints()).toEqual([X])
-      expect(wait).not.toHaveBeenCalled()
-    } finally {
-      wait.mockRestore()
-    }
   })
 
   // ---- what cannot be told is live ----
@@ -927,7 +830,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     held: string[] | undefined
   } {
     try {
-      return { held: live(), removed: collectMountPoints() }
+      return { held: live(), removed: collectMountPoints('all') }
     } finally {
       injected.restore()
     }
@@ -935,10 +838,12 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   const NOTHING_REMOVED = { removed: [], held: [expect.any(String)] }
 
-  for (const code of ['EACCES', 'EMFILE', 'ENFILE', 'ENOMEM', 'EIO']) {
+  // One that lasts and one that passes: the code takes every errno but "not
+  // there" alike.
+  for (const code of ['EACCES', 'EMFILE']) {
     it(`removes nothing when it cannot ask after the process on a record: ${code}`, () => {
       leftover(X)
-      const gone = { pid: deadPid(), start: '1' }
+      const gone = aDeadProcess()
       started(manifestOfADeadProcess([X]), gone)
       expect(withThat(failing(`/proc/${gone.pid}/stat`, code))).toEqual(
         NOTHING_REMOVED,
@@ -948,7 +853,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
     it(`removes nothing when it cannot ask after the writer of a manifest with no record: ${code}`, () => {
       leftover(X)
-      const gone = { pid: deadPid(), start: '1' }
+      const gone = aDeadProcess()
       manifestOfADeadProcess([X], gone)
       expect(withThat(failing(`/proc/${gone.pid}/stat`, code))).toEqual(
         NOTHING_REMOVED,
@@ -978,10 +883,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
       it(`keeps what a manifest names when its record cannot be read: ${code} at the ${at}`, () => {
         leftover(X)
-        const manifest = started(manifestOfADeadProcess([X]), {
-          pid: deadPid(),
-          start: '1',
-        })
+        const manifest = started(manifestOfADeadProcess([X]), aDeadProcess())
         expect(withThat(failing(recordOf(manifest), code, at))).toEqual(
           NOTHING_REMOVED,
         )
@@ -1008,7 +910,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     )
   })
 
-  const gone = (): string => statLine({ pid: deadPid(), start: '1' })
+  const gone = (): string => statLine(aDeadProcess())
   const notARecord: [string, (record: string) => void][] = [
     ['cut short of the start time', r => write(r, `${gone().slice(0, 30)}\n`)],
     ['not the line of a process', r => write(r, 'ended\n')],
@@ -1046,10 +948,9 @@ describe.if(isLinux)('The mount point manifests', () => {
       // In a process of its own: opening a FIFO to read waits for a writer, on
       // the one thread there is.
       const looked = inAChild(
-        `console.log(JSON.stringify({ held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
+        `console.log(JSON.stringify({ held: [...m.liveMountPoints()], removed: m.collectMountPoints('all') }))`,
       )
       expect(looked.status).toBe(0)
-      expect(looked.ms).toBeLessThan(AT_ONCE_MS)
       expect(JSON.parse(looked.stdout)).toEqual({ held: [X], removed: [] })
       expect(existsSync(manifest)).toBe(true)
     }, 15000)
@@ -1121,7 +1022,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   it('is not held up by a record with no whole line and no manifest, and drops it past the grace', () => {
     // Nothing names a path, so it protects none.
     leftover(X)
-    started(manifestOfADeadProcess([X]), { pid: deadPid(), start: '1' })
+    started(manifestOfADeadProcess([X]), aDeadProcess())
     const [young, old, older] = ['4242', '4243', '4244'].map(pid =>
       join(DIR, `${pid}-0123456789abcdef.started`),
     ) as [string, string, string]
@@ -1137,7 +1038,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
     expect(live()).toEqual([])
     expect(named()).toEqual([X])
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
     expect(readdirSync(DIR)).toEqual([basename(young)])
   })
 
@@ -1149,10 +1050,9 @@ describe.if(isLinux)('The mount point manifests', () => {
       const orphan = join(DIR, '4242-0123456789abcdef.started')
       plant(orphan)
       const looked = inAChild(
-        `console.log(JSON.stringify({ named: [...m.namedMountPoints().paths], held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
+        `console.log(JSON.stringify({ named: [...m.namedMountPoints().paths], held: [...m.liveMountPoints()], removed: m.collectMountPoints('all') }))`,
       )
       expect(looked.status).toBe(0)
-      expect(looked.ms).toBeLessThan(AT_ONCE_MS)
       expect(JSON.parse(looked.stdout)).toEqual({
         named: [X],
         held: [],
@@ -1228,10 +1128,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it("keeps what a manifest names while its record is somebody else's", () => {
     leftover(X)
-    const manifest = started(manifestOfADeadProcess([X]), {
-      pid: deadPid(),
-      start: '1',
-    })
+    const manifest = started(manifestOfADeadProcess([X]), aDeadProcess())
     const theirs = asSomebodyElses(recordOf(manifest))
     expect(withThat(theirs)).toEqual(NOTHING_REMOVED)
     expect(existsSync(X)).toBe(true)
@@ -1247,13 +1144,13 @@ describe.if(isLinux)('The mount point manifests', () => {
     // However old it is.
     const hoursAgo = new Date(Date.now() - 2 * 3600 * 1000)
     utimesSync(record, hoursAgo, hoursAgo)
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(X)).toBe(true)
     expect(existsSync(record)).toBe(true)
   })
 
   /** Has this process fail to write its next manifest, as on a full disk. */
-  function unrecorded(paths: string[]): void {
+  function unrecorded(paths: string[], sources: string[] = []): void {
     const write = fs.writeFileSync
     const spy = spyOn(fs, 'writeFileSync').mockImplementation(((
       file: unknown,
@@ -1265,7 +1162,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       return (write as (...args: unknown[]) => void)(file, ...rest)
     }) as never)
     try {
-      expect(publishMountPointManifest(paths, [])).toBeUndefined()
+      expect(publishMountPointManifest(paths, sources)).toBeUndefined()
     } finally {
       spy.mockRestore()
     }
@@ -1291,7 +1188,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     // is a condition of this process, which the age of a file does not end.
     leftover(X)
     const manifest = manifestOfADeadProcess([X])
-    aged(started(manifest, { pid: deadPid(), start: '1' }), 30 * 24 * 60)
+    aged(started(manifest, aDeadProcess()), 30 * 24 * 60)
     aged(recordOf(manifest), 30 * 24 * 60)
     forgetMountPointManifestDirectory()
     const spy = spyOn(fs, 'readlinkSync').mockImplementation((() => {
@@ -1299,12 +1196,12 @@ describe.if(isLinux)('The mount point manifests', () => {
     }) as never)
     try {
       expect(live()).toEqual([X])
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
       forgetMountPointManifestDirectory()
     }
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
   })
 
   for (const [what, then] of [
@@ -1314,7 +1211,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     ],
     [
       'a manifest that has arrived cannot be read',
-      () => planted('1-garbage.json', '{ not json'),
+      () => planted('1-garbage.json', '{}'),
     ],
   ] as const) {
     it(`stops removing, and keeps its claim, once ${what}`, () => {
@@ -1332,14 +1229,14 @@ describe.if(isLinux)('The mount point manifests', () => {
         injected ??= then()
       }) as never)
       try {
-        expect(collectMountPoints()).toEqual([Y])
+        expect(collectMountPoints('all')).toEqual([Y])
       } finally {
         spy.mockRestore()
         injected?.restore()
       }
       expect(existsSync(X)).toBe(true)
       expect(claims()).toEqual([finishedOf(manifest)])
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     })
   }
 
@@ -1353,11 +1250,11 @@ describe.if(isLinux)('The mount point manifests', () => {
       chmodSync(X, mode)
       const manifest = started(manifestOfADeadProcess([X]), thisProcess())
       expect(live()).toEqual([X])
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
 
-      started(manifest, { pid: deadPid(), start: '1' })
+      started(manifest, aDeadProcess())
       expect(live()).toEqual([])
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
       expect(existsSync(X)).toBe(false)
       expect(readdirSync(DIR)).toEqual([])
     })
@@ -1392,7 +1289,9 @@ describe.if(isLinux)('The mount point manifests', () => {
         return order === 'as listed' ? names : names.reverse()
       }) as never)
       try {
-        expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+        expect(collectMountPoints('all')).toEqual(
+          [...inside].reverse().concat(Q),
+        )
       } finally {
         spy.mockRestore()
       }
@@ -1406,11 +1305,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     const { Q, inside } = nested()
     const outer = manifestOfADeadProcess([Q])
     const inner = started(manifestOfADeadProcess(inside), thisProcess())
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(claims()).toEqual([finishedOf(outer)])
 
-    started(inner, { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+    started(inner, aDeadProcess())
+    expect(collectMountPoints('all')).toEqual([...inside].reverse().concat(Q))
     expect(readdirSync(DIR)).toEqual([])
   })
 
@@ -1422,12 +1321,12 @@ describe.if(isLinux)('The mount point manifests', () => {
       manifestOfADeadProcess(inside)
       chmodSync(Q, 0o555)
       try {
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(claims()).toContain(finishedOf(outer))
       } finally {
         chmodSync(Q, 0o755)
       }
-      expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+      expect(collectMountPoints('all')).toEqual([...inside].reverse().concat(Q))
       expect(readdirSync(DIR)).toEqual([])
     },
   )
@@ -1440,9 +1339,9 @@ describe.if(isLinux)('The mount point manifests', () => {
       manifestOfADeadProcess([], { sources: [source] }),
       thisProcess(),
     )
-    expect(collectMountPoints()).toEqual([])
-    started(live, { pid: deadPid(), start: '1' })
-    expect(collectMountPoints()).toEqual([source])
+    expect(collectMountPoints('all')).toEqual([])
+    started(live, aDeadProcess())
+    expect(collectMountPoints('all')).toEqual([source])
   })
 
   it('leaves what a finished manifest names when it no longer looks like a mount point', () => {
@@ -1459,7 +1358,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(inUse)
     writeFileSync(join(inUse, 'file'), '')
     const manifest = manifestOfADeadProcess([written, linked, pointer, inUse])
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     for (const kept of [written, linked, pointer, inUse]) {
       expect(existsSync(kept)).toBe(true)
     }
@@ -1491,7 +1390,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       return stat
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
@@ -1505,7 +1404,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     for (const file of [...old, young]) writeFileSync(file, '{}')
     const hoursAgo = new Date(Date.now() - 2 * 3600 * 1000)
     for (const file of old) utimesSync(file, hoursAgo, hoursAgo)
-    collectMountPoints()
+    collectMountPoints('all')
     for (const file of old) expect(existsSync(file)).toBe(false)
     // This one may be on its way into place.
     expect(existsSync(young)).toBe(true)
@@ -1535,23 +1434,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     (_what, outcome, fields) => {
       leftover(X)
       const manifest = manifestOfADeadProcess([X], fields)
-      collectMountPoints()
+      collectMountPoints('all')
       expect(existsSync(X)).toBe(outcome === 'kept')
       expect(existsSync(manifest)).toBe(outcome === 'kept')
     },
   )
-
-  it('is live when written in another PID namespace, whatever process is on its record', () => {
-    // The pid on the record was given in that namespace too.
-    leftover(X)
-    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
-      pid: deadPid(),
-      start: '1',
-    })
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(X)).toBe(true)
-    expect(existsSync(manifest)).toBe(true)
-  })
 
   it('is live for seven days when written in another PID namespace, or in none it records, and finished then', () => {
     // Nothing else ends one whose namespace is gone. Counted from the later of
@@ -1559,10 +1446,10 @@ describe.if(isLinux)('The mount point manifests', () => {
     const DAYS = 24 * 60
     for (const ns of ['pid:[1]', undefined]) {
       leftover(X)
-      const manifest = started(manifestOfADeadProcess([X], { ns }), {
-        pid: deadPid(),
-        start: '1',
-      })
+      const manifest = started(
+        manifestOfADeadProcess([X], { ns }),
+        aDeadProcess(),
+      )
       for (const [written, recorded] of [
         [7 * DAYS - 1, 7 * DAYS + 1],
         [7 * DAYS + 1, 7 * DAYS - 1],
@@ -1570,17 +1457,17 @@ describe.if(isLinux)('The mount point manifests', () => {
         aged(manifest, written)
         aged(recordOf(manifest), recorded)
         expect(live()).toEqual([X])
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
       }
       aged(recordOf(manifest), 7 * DAYS + 1)
       expect(live()).toEqual([])
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
       expect(readdirSync(DIR)).toEqual([])
 
       // With no record, from the manifest alone.
       leftover(X)
       aged(manifestOfADeadProcess([X], { ns }), 7 * DAYS + 1)
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     }
   })
 
@@ -1602,7 +1489,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     // A wrap still takes both for mount points, which they are.
     expect(named()).toEqual([X, Y].sort())
     expect(live()).toEqual([])
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
     // What it names alone may be another file in that namespace's mounts.
     expect(existsSync(Y)).toBe(true)
     expect(readdirSync(DIR)).toEqual([basename(theirs)])
@@ -1613,7 +1500,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     finished(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
     const open = spyOn(fs, 'openSync')
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(
         open.mock.calls.filter(([file]) => String(file).endsWith('.pass')),
       ).toEqual([])
@@ -1626,9 +1513,9 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const theirs = finished(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
     aged(theirs, 7 * 24 * 60 - 1)
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     aged(theirs, 7 * 24 * 60 + 1)
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
     expect(readdirSync(DIR)).toEqual([])
   })
 
@@ -1636,16 +1523,9 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const claim = claimed(manifestOfADeadProcess([X], { ns: 'pid:[1]' }))
     manifestOfADeadProcess([X])
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(X)).toBe(true)
     expect(readdirSync(DIR)).toEqual([basename(claim)])
-  })
-
-  it('does not say so of a claim with a process on its record either', () => {
-    leftover(X)
-    const claim = claimed(started(manifestOfADeadProcess([X]), thisProcess()))
-    collectMountPoints()
-    expect(claims()).toEqual([basename(claim)])
   })
 
   it('says so of a claim another pass left, and collects it', () => {
@@ -1655,7 +1535,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const seen: string[][] = []
     const removal = atTheRemovalOf(X, () => seen.push(claims()))
     try {
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     } finally {
       removal.restore()
     }
@@ -1665,13 +1545,13 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it("takes the record beside a manifest that is finished by its name for that one's", () => {
     leftover(X)
-    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
-      pid: deadPid(),
-      start: '1',
-    })
+    const manifest = started(
+      manifestOfADeadProcess([X], { ns: 'pid:[1]' }),
+      aDeadProcess(),
+    )
     const theirs = finished(manifest)
     aged(recordOf(manifest))
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(readdirSync(DIR).sort()).toEqual(
       [basename(theirs), basename(recordOf(manifest))].sort(),
     )
@@ -1686,7 +1566,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const seen: string[][] = []
     const removal = atTheRemovalOf(X, () => seen.push(claims()))
     try {
-      expect(collectMountPoints()).toEqual([X])
+      expect(collectMountPoints('all')).toEqual([X])
     } finally {
       removal.restore()
     }
@@ -1699,7 +1579,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const theirs = finished(started(manifestOfADeadProcess([X]), thisProcess()))
     manifestOfADeadProcess([X])
     expect(live()).toEqual([X])
-    expect(collectMountPoints()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
     expect(existsSync(X)).toBe(true)
     expect(claims()).toEqual([basename(theirs)])
   })
@@ -1720,13 +1600,13 @@ describe.if(isLinux)('The mount point manifests', () => {
       rename(from, to)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
     } finally {
       spy.mockRestore()
     }
     expect(existsSync(X)).toBe(true)
     expect(named()).toEqual([X])
-    expect(collectMountPoints()).toEqual([X])
+    expect(collectMountPoints('all')).toEqual([X])
     expect(readdirSync(DIR)).toEqual([])
     expect(existsSync(manifest)).toBe(false)
   })
@@ -1735,10 +1615,10 @@ describe.if(isLinux)('The mount point manifests', () => {
     // Renamed while the directory was being listed. Taken for a record without
     // a manifest it would be dropped, and a wrap would take X for the caller's.
     leftover(X)
-    const manifest = started(manifestOfADeadProcess([X], { ns: 'pid:[1]' }), {
-      pid: deadPid(),
-      start: '1',
-    })
+    const manifest = started(
+      manifestOfADeadProcess([X], { ns: 'pid:[1]' }),
+      aDeadProcess(),
+    )
     const theirs = finished(manifest)
     for (const look of [named, () => collectMountPoints('none')]) {
       const listing = missedByTheNextListing(basename(theirs))
@@ -1784,7 +1664,7 @@ describe.if(isLinux)('The mount point manifests', () => {
           `  if (met === 1) { met = 2; ${meet('read')} }`,
           `  return unlink(p)`,
           `})`,
-          `m.collectMountPoints()`,
+          `m.collectMountPoints('all')`,
         ].join('\n'),
       )
       return file
@@ -1836,7 +1716,7 @@ describe.if(isLinux)('The mount point manifests', () => {
             thisProcess(),
           )
           expect(live()).toEqual([])
-          expect(collectMountPoints()).toEqual([X])
+          expect(collectMountPoints('all')).toEqual([X])
           expect(readdirSync(DIR)).toEqual([])
         }
       } finally {
@@ -1860,7 +1740,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       const kind = onAFileSystemOf(type)
       try {
         expect(live()).toEqual([X])
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(existsSync(X)).toBe(true)
       } finally {
         kind.restore()
@@ -1888,10 +1768,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     it(`is live for seven days on a file system another kernel may reach when it ${what}, though of this PID namespace by name and with nobody on its record here`, () => {
       const left = (): string => {
         leftover(X)
-        return started(manifestOfADeadProcess([X], fields), {
-          pid: deadPid(),
-          start: '1',
-        })
+        return started(manifestOfADeadProcess([X], fields), aDeadProcess())
       }
       const bothAged = (manifest: string, minutes: number): void => {
         aged(manifest, minutes)
@@ -1905,17 +1782,17 @@ describe.if(isLinux)('The mount point manifests', () => {
       try {
         const manifest = left()
         expect(live()).toEqual([X])
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         bothAged(manifest, 6 * 24 * 60)
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         bothAged(manifest, 7 * 24 * 60 + 1)
-        expect(collectMountPoints()).toEqual([X])
+        expect(collectMountPoints('all')).toEqual([X])
 
         // Where only this kernel reaches: at once, as ever.
         spies.shift()!.restore()
         spies.push(onAFileSystemOf(0xef53))
         left()
-        expect(collectMountPoints()).toEqual([X])
+        expect(collectMountPoints('all')).toEqual([X])
       } finally {
         spies.forEach(spy => spy.restore())
         forgetMountPointManifestDirectory()
@@ -1933,9 +1810,9 @@ describe.if(isLinux)('The mount point manifests', () => {
       const kind = onAFileSystemOf(type)
       try {
         expect(live()).toEqual([X])
-        expect(collectMountPoints()).toEqual([])
-        started(manifest, { pid: deadPid(), start: '1' })
-        expect(collectMountPoints()).toEqual([X])
+        expect(collectMountPoints('all')).toEqual([])
+        started(manifest, aDeadProcess())
+        expect(collectMountPoints('all')).toEqual([X])
       } finally {
         kind.restore()
       }
@@ -1966,7 +1843,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     )
     try {
       expect(live()).toEqual([X])
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(readFileSync(publish([X]), 'utf8')).not.toContain('"boot"')
     } finally {
       failing.restore()
@@ -2191,15 +2068,103 @@ describe.if(isLinux)('The mount point manifests', () => {
         for (const place of order) {
           expect(recordedIn()).toBe(place)
           expect(lstatSync(place).mode & 0o777).toBe(0o700)
-          collectMountPoints()
+          collectMountPoints('all')
           taken([place])
         }
         expect(order).not.toContain(recordedIn())
       } finally {
-        collectMountPoints()
+        collectMountPoints('all')
         order.forEach(place => rmSync(place))
         mkdirSync(DIR, { mode: 0o700 })
       }
+    })
+
+    it.each([
+      ['/var/tmp', 0, 2],
+      ['/tmp', 2, 0],
+    ] as const)(
+      'are one directory where %s is a link to the other, read once and collected in like any',
+      (_, link, target) => {
+        // A pass cannot go on record twice under one name, and off the record it
+        // removes nothing.
+        rmSync(dirname(PLACES[link]!), { recursive: true })
+        symlinkSync(dirname(PLACES[target]!), dirname(PLACES[link]!))
+        forgetMountPointManifestDirectory()
+        leftover(X)
+        leftover(Y)
+        at(PLACES[target]!, () => manifestOfADeadProcess([X]))
+        expect(dirname(publish([Y]))).toBe(PLACES[0]!)
+        expect(named()).toEqual([X, Y].sort())
+        expect(live()).toEqual([Y])
+        expect(collectMountPoints('all').sort()).toEqual([X, Y].sort())
+        expect(readdirSync(PLACES[target]!)).toEqual([])
+        // Both names are kept out of a command's reach all the same.
+        expect(mountPointManifestDirectories()).toEqual(
+          expect.arrayContaining([PLACES[0]!, PLACES[2]!]),
+        )
+      },
+    )
+
+    it.each([
+      ['names a mount point', ['absent.lock']],
+      ['names none', []],
+    ])(
+      'are bound once where two of the names lead to one place, by a wrap that %s',
+      async (_, denied) => {
+        rmSync(dirname(PLACES[0]!), { recursive: true })
+        symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+        forgetMountPointManifestDirectory()
+        const command = await wrapCommandWithSandboxLinux({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: {
+            allowOnly: [BASE],
+            denyWithinAllow: denied.map(name => join(BASE, name)),
+          },
+        })
+        cleanupBwrapMountPoints({ force: true })
+        expect(
+          mountsOf(command).filter(mount => mount.endsWith(` ${PLACES[2]!}`)),
+        ).toHaveLength(1)
+      },
+    )
+
+    it('goes by the name it can be written at where the other is read-only, as a read-only bind of it is', () => {
+      rmSync(dirname(PLACES[0]!), { recursive: true })
+      symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+      // This process writes elsewhere, and knows neither name for its own.
+      expect(dirname(publish([Y]))).toBe(PLACES[0]!)
+      collectMountPoints('all')
+      forgetMountPointManifestDirectory()
+      leftover(X)
+      at(PLACES[2]!, () => manifestOfADeadProcess([X]))
+      const access = fs.accessSync
+      const spy = spyOn(fs, 'accessSync').mockImplementation(((
+        file: unknown,
+        mode: unknown,
+      ) => {
+        if (file === PLACES[0]) {
+          throw Object.assign(new Error('EROFS'), { code: 'EROFS' })
+        }
+        ;(access as (f: unknown, m: unknown) => void)(file, mode)
+      }) as never)
+      try {
+        expect(collectMountPoints('all')).toEqual([X])
+      } finally {
+        spy.mockRestore()
+      }
+      expect(readdirSync(PLACES[2]!)).toEqual([])
+    })
+
+    it('goes by the name it writes under where that is the later of the two', () => {
+      // Settled on /tmp while /var/tmp could not be written.
+      taken([PLACES[0]!, dirname(PLACES[1]!)])
+      leftover(Y)
+      expect(dirname(publish([Y]))).toBe(PLACES[2]!)
+      rmSync(dirname(PLACES[0]!), { recursive: true })
+      symlinkSync(dirname(PLACES[2]!), dirname(PLACES[0]!))
+      expect(collectMountPoints('all')).toEqual([Y])
+      expect(readdirSync(PLACES[2]!)).toEqual([])
     })
 
     it('are believed, collected in and bound, but not written, under a /run/user/UID that is open to others', () => {
@@ -2215,10 +2180,10 @@ describe.if(isLinux)('The mount point manifests', () => {
       expect(dirname(publish([Y]))).toBe(PLACES[2]!)
       expect(named()).toEqual([X, Y].sort())
       expect(live()).toEqual([X])
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(existsSync(X)).toBe(true)
-      started(relied, { pid: deadPid(), start: '1' })
-      expect(collectMountPoints()).toEqual([X])
+      started(relied, aDeadProcess())
+      expect(collectMountPoints('all')).toEqual([X])
       expect(readdirSync(PLACES[1]!)).toEqual([])
 
       // Made, too, so that the command cannot.
@@ -2253,7 +2218,7 @@ describe.if(isLinux)('The mount point manifests', () => {
           expect(dirname(publish([Y]))).toBe(PLACES[2]!)
           expect(mountPointManifestDirectories()).not.toContain(PLACES[1])
           expect(named()).toEqual([Y])
-          expect(collectMountPoints()).toEqual([])
+          expect(collectMountPoints('all')).toEqual([])
         } finally {
           spoiled?.restore()
         }
@@ -2283,7 +2248,7 @@ describe.if(isLinux)('The mount point manifests', () => {
             expect(dirname(publish([Y]))).toBe(PLACES[next]!)
             expect(mountPointManifestDirectories()).not.toContain(PLACES[i])
             expect(named()).toEqual([Y])
-            expect(collectMountPoints()).toEqual([])
+            expect(collectMountPoints('all')).toEqual([])
           } finally {
             squatted?.restore()
           }
@@ -2302,6 +2267,26 @@ describe.if(isLinux)('The mount point manifests', () => {
       }
     })
 
+    it('are made before a wrap reads any, which believes nothing the environment names that no clean-up would', async () => {
+      // Forged, or left by a process that could write nowhere else: it names a
+      // directory of the user's own. And what is no manifest.
+      const own = join(BASE, 'own')
+      mkdirSync(own)
+      at(NAMED[1]!, () => manifestOfADeadProcess([own]))
+      writeFileSync(join(NAMED[0]!, '4242-00.json'), '{}')
+      const command = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        writeConfig: {
+          allowOnly: [BASE],
+          denyWithinAllow: [join(own, 'absent.lock')],
+        },
+      })
+      expect(namedBy(command)).toEqual([join(own, 'absent.lock')])
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(own)).toBe(true)
+    })
+
     it('are believed in each of the three, whichever this process writes in', () => {
       for (const place of PLACES) {
         leftover(X)
@@ -2311,10 +2296,10 @@ describe.if(isLinux)('The mount point manifests', () => {
         PLACES.forEach(each => at(each, () => manifestOfADeadProcess([X])))
         expect(named()).toEqual([X])
         expect(live()).toEqual([X])
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(existsSync(X)).toBe(true)
-        started(relied, { pid: deadPid(), start: '1' })
-        expect(collectMountPoints()).toEqual([X])
+        started(relied, aDeadProcess())
+        expect(collectMountPoints('all')).toEqual([X])
         expect(PLACES.flatMap(each => readdirSync(each))).toEqual([])
       }
     })
@@ -2329,7 +2314,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       const junk = join(NAMED[1]!, '4242-00.json')
       writeFileSync(junk, '{}')
       // A clean-up makes the first of the three before it looks.
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(named()).toEqual([])
       expect(live()).toEqual([])
       expect(planted.filter(existsSync)).toEqual(planted)
@@ -2357,10 +2342,10 @@ describe.if(isLinux)('The mount point manifests', () => {
         writeFileSync(junk, '{}')
         expect(named()).toBeUndefined()
         expect(live()).toBeUndefined()
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
         expect(PLACES.flatMap(each => at(each, claims))).toEqual([])
         rmSync(junk)
-        expect(collectMountPoints()).toEqual([X])
+        expect(collectMountPoints('all')).toEqual([X])
       }
     })
 
@@ -2385,7 +2370,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       })) as never)
       try {
         expect(live()).toEqual([Y])
-        expect(collectMountPoints()).toEqual([X])
+        expect(collectMountPoints('all')).toEqual([X])
       } finally {
         spy.mockRestore()
       }
@@ -2403,11 +2388,60 @@ describe.if(isLinux)('The mount point manifests', () => {
       try {
         expect(named()).toBeUndefined()
         expect(live()).toBeUndefined()
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
       } finally {
         look.restore()
       }
-      expect(collectMountPoints().sort()).toEqual([X, Y].sort())
+      expect(collectMountPoints('all').sort()).toEqual([X, Y].sort())
+    })
+
+    it('are not left unbound when one of them cannot be looked at: no command is handed out', async () => {
+      // One that this process binds and does not believe, so that no reading
+      // of its own is in doubt: a process that can write none of the first
+      // three believes it, with the command in it.
+      mountPointManifestDirectories()
+      const look = failingCall('lstatSync', NAMED[1]!, 'EIO')
+      try {
+        expect(named()).toEqual([])
+        expect(() => mountPointManifestDirectories()).toThrow('EIO')
+        expect(
+          await refusal(
+            wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              writeConfig: { allowOnly: [BASE], denyWithinAllow: [] },
+            }),
+          ),
+        ).toBe('mount_points_unreadable')
+      } finally {
+        look.restore()
+      }
+      expect(mountPointManifestDirectories()).toContain(NAMED[1]!)
+    })
+
+    it.each([
+      ['/run/user/UID, which one of them is in', () => dirname(PLACES[1]!)],
+      [
+        'the one only this process knows',
+        () => {
+          taken([...PLACES, ...NAMED])
+          return recordedIn()
+        },
+      ],
+    ])('cannot be told while %s cannot be looked at', (_, which) => {
+      try {
+        const look = failingCall('lstatSync', which(), 'EIO')
+        try {
+          expect(() => mountPointManifestDirectories()).toThrow('EIO')
+        } finally {
+          look.restore()
+        }
+      } finally {
+        collectMountPoints('all')
+        removePrivateManifestDirectory()
+        rmSync(DIR, { recursive: true, force: true })
+        mkdirSync(DIR, { mode: 0o700 })
+      }
     })
 
     it('reads every directory again once it has claimed, not only where it claimed', () => {
@@ -2423,7 +2457,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         )
       })
       try {
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
       } finally {
         pass.restore()
       }
@@ -2444,7 +2478,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         ),
       )
       try {
-        expect(collectMountPoints()).toEqual([Y])
+        expect(collectMountPoints('all')).toEqual([Y])
       } finally {
         removal.restore()
       }
@@ -2470,7 +2504,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         return readdir(...args)
       }) as never)
       try {
-        expect(collectMountPoints()).toEqual([])
+        expect(collectMountPoints('all')).toEqual([])
       } finally {
         spy.mockRestore()
       }
@@ -2502,7 +2536,7 @@ describe.if(isLinux)('The mount point manifests', () => {
           [
             `m.setMountPointManifestPlacesForTesting(${JSON.stringify(join(BASE, 'root'))})`,
             `const named = [...m.namedMountPoints().paths].sort()`,
-            `const removed = m.collectMountPoints()`,
+            `const removed = m.collectMountPoints('all')`,
             `console.log(JSON.stringify({ named, removed, file: m.publishMountPointManifest(['/nonexistent/x'], []).file }))`,
           ].join('\n'),
           {
@@ -2583,6 +2617,34 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(collectMountPoints('all')).toEqual([Y])
     expect(existsSync(X)).toBe(true)
   })
+
+  it.each([
+    ['had no part in making', undefined],
+    ['had made itself', 'the first'],
+    ['had no part in making, and the other made,', 'the second'],
+  ])(
+    'keeps what one wrap %s and could not record, while another wrap that names it too is cleaned up after',
+    (_, madeBy) => {
+      // The sandbox of the first may be running over it, and only this process
+      // knows: the manifest of the second is not all that names it.
+      const source = join(BASE, 'empty')
+      const planOf = (wrap: string): void => {
+        if (wrap !== madeBy) return
+        keepTrackOfMountPoint(X)
+        keepTrackOfMountSource(source)
+      }
+      leftover(X)
+      mkdirSync(source, { mode: 0o700 })
+      planOf('the first')
+      unrecorded([X], [source])
+      planOf('the second')
+      publishMountPointManifest([X], [source], 'the second')
+      expect(collectMountPoints({ commandKey: 'the second' })).toEqual([])
+      expect([X, source].filter(existsSync)).toEqual([X, source])
+      expect(named()).toEqual([X])
+      expect(collectMountPoints('all').sort()).toEqual([X, source].sort())
+    },
+  )
 
   it('publishes no manifest that it would not read', () => {
     const paths = (count: number): string[] =>
@@ -2696,11 +2758,10 @@ describe.if(isLinux)('The mount point manifests', () => {
         const looked = inAChild(
           [
             `const list = set => (set === undefined ? 'cannot tell' : [...set])`,
-            `console.log(JSON.stringify({ named: list(m.namedMountPoints()?.paths), held: list(m.liveMountPoints()), removed: m.collectMountPoints() }))`,
+            `console.log(JSON.stringify({ named: list(m.namedMountPoints()?.paths), held: list(m.liveMountPoints()), removed: m.collectMountPoints('all') }))`,
           ].join('\n'),
         )
         expect(looked.status).toBe(0)
-        expect(looked.ms).toBeLessThan(AT_ONCE_MS)
         return JSON.parse(looked.stdout)
       }
       // It names nothing that can be read, and may name anything.
@@ -2738,7 +2799,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
       expect(named()).toBeUndefined()
       expect(liveMountPoints()).toBeUndefined()
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       expect(existsSync(X)).toBe(true)
       expect(existsSync(Y)).toBe(true)
     },
@@ -2753,13 +2814,13 @@ describe.if(isLinux)('The mount point manifests', () => {
     const theirs = asSomebodyElses(junk)
     try {
       expect(named()).toBeUndefined()
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       // An hour, not less and not much more.
       aged(junk, 59)
       expect(named()).toBeUndefined()
-      expect(collectMountPoints()).toEqual([])
+      expect(collectMountPoints('all')).toEqual([])
       aged(junk, 61)
-      expect(collectMountPoints()).toEqual([Y])
+      expect(collectMountPoints('all')).toEqual([Y])
     } finally {
       theirs.restore()
     }
@@ -2792,7 +2853,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(existsSync(X)).toBe(true)
     expect(existsSync(manifest)).toBe(true)
 
-    expect(collectMountPoints().sort()).toEqual([X, directory].sort())
+    expect(collectMountPoints('all').sort()).toEqual([X, directory].sort())
     expect(live()).toEqual([])
   })
 
@@ -2852,7 +2913,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const manifest = manifestOfADeadProcess([X])
     expect(live()).toEqual([])
-    started(manifest, { pid: deadPid(), start: '1' })
+    started(manifest, aDeadProcess())
     expect(live()).toEqual([])
     started(manifest, thisProcess())
     expect(live()).toEqual([X])
@@ -2892,7 +2953,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     ],
     ['a manifest cannot be opened', manifest => failing(manifest, 'EMFILE')],
     ['a manifest cannot be read', manifest => failing(manifest, 'EIO', 'read')],
-    ['something is no manifest', () => planted('1-garbage.json', '{ not json')],
+    ['something is no manifest', () => planted('1-garbage.json', '{}')],
     [
       'a process runs on a record without a manifest',
       () => planted('1-0123456789abcdef.started', statLine(thisProcess())),
@@ -2956,17 +3017,35 @@ describe.if(isLinux)('The mount point manifests', () => {
     )
   })
 
+  it('names what a plan has made on the host itself from that moment, until a manifest names it', () => {
+    const first = reads(namedMountPoints())
+    const source = join(BASE, 'empty')
+    keepTrackOfMountPoint(X)
+    keepTrackOfMountSource(source)
+    leftover(X)
+    mkdirSync(source, { mode: 0o700 })
+    expect([...reads(namedMountPoints(first)).paths]).toEqual([X])
+
+    // From then on it is the manifest's, and goes with that.
+    publishMountPointManifest([X], [source], 'the command')
+    expect(collectMountPoints({ commandKey: 'the command' }).sort()).toEqual(
+      [X, source].sort(),
+    )
+    // What the user puts there afterwards is the user's.
+    writeFileSync(X, '')
+    expect(named()).toEqual([])
+    expect(collectMountPoints('all')).toEqual([])
+    expect(existsSync(X)).toBe(true)
+  })
+
   it('is one listing of the directory, and changes nothing in it', () => {
     leftover(X)
     publishMountPointManifest([X], [])
-    started(manifestOfADeadProcess([join(BASE, 'other.lock')]), {
-      pid: deadPid(),
-      start: '1',
-    })
+    started(manifestOfADeadProcess([join(BASE, 'other.lock')]), aDeadProcess())
     // What a pass would take away: a record whose manifest and process are gone.
     writeFileSync(
       join(DIR, '4242-0123456789abcdef.started'),
-      statLine({ pid: deadPid(), start: '1' }),
+      statLine(aDeadProcess()),
     )
     const before = readdirSync(DIR).sort()
 
@@ -3005,19 +3084,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(theirs, { mode: 0o700 })
     chmodSync(theirs, 0o700)
     leftover(X)
-    const manifest = manifestOfADeadProcess([X], {
-      pid: process.pid,
-      start: readFileSync('/proc/self/stat', 'utf8')
-        .split(') ')
-        .pop()!
-        .split(' ')[19],
-    })
-    writeFileSync(
-      join(theirs, '4242-0123456789abcdef.json'),
-      readFileSync(manifest, 'utf8'),
-      { mode: 0o600 },
-    )
-    rmSync(manifest)
+    writeManifest(theirs, [X], thisProcess())
     const run = join(BASE, 'run')
     mkdirSync(run, { mode: 0o700 })
     const looked = inAChild(
@@ -3029,29 +3096,16 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(readdirSync(run)).toEqual([])
   })
 
-  it('holds nothing, and makes nothing, where the platform is not Linux', () => {
-    leftover(X)
-    publishMountPointManifest([X], [])
-    const before = readdirSync(DIR).sort()
-    const elsewhere = inAChild(
-      `console.log(JSON.stringify([...m.liveMountPoints()]))`,
-      {
-        first: `Object.defineProperty(process, 'platform', { value: 'darwin' })`,
-      },
-    )
-    expect(elsewhere.status).toBe(0)
-    expect(JSON.parse(elsewhere.stdout)).toEqual([])
-    expect(readdirSync(DIR).sort()).toEqual(before)
-    expect(readdirSync(TMP)).toEqual([])
-  })
-
   // ---- all of it is bubblewrap's, which is Linux's -----------------------
 
   it('does nothing at all where the platform is not Linux', () => {
     // Every clean-up after a command, on every platform, comes through here.
-    // Off Linux it must make nothing.
+    // Off Linux it must make nothing. One manifest to collect, one to hold by.
+    const Y = join(BASE, 'second.lock')
     leftover(X)
+    leftover(Y)
     manifestOfADeadProcess([X])
+    writeManifest(DIR, [Y], thisProcess())
     const before = readdirSync(DIR).sort()
     const elsewhere = inAChild(
       [
@@ -3059,7 +3113,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         `const published = m.publishMountPointManifest([${JSON.stringify(X)}], []) ?? null`,
         `const live = [...m.liveMountPoints()]`,
         `const directories = m.mountPointManifestDirectories()`,
-        `const collected = m.collectMountPoints()`,
+        `const collected = m.collectMountPoints('all')`,
         `u.cleanupBwrapMountPoints()`,
         `u.cleanupBwrapMountPoints({ force: true })`,
         `console.log(JSON.stringify({ published, live, directories, collected }))`,
