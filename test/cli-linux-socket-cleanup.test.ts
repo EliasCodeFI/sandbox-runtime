@@ -30,6 +30,7 @@ async function waitFor(
 }
 
 interface ProcessIdentity {
+  name: string
   parent: number
   start: string
   state: string
@@ -39,7 +40,12 @@ function processIdentity(pid: number): ProcessIdentity | undefined {
   try {
     const value = readFileSync(`/proc/${pid}/stat`, 'utf8')
     const fields = value.slice(value.lastIndexOf(')') + 2).split(' ')
-    return { parent: Number(fields[1]), start: fields[19]!, state: fields[0]! }
+    return {
+      name: value.slice(value.indexOf('(') + 1, value.lastIndexOf(')')),
+      parent: Number(fields[1]),
+      start: fields[19]!,
+      state: fields[0]!,
+    }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT' || code === 'ESRCH') return undefined
@@ -93,7 +99,7 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
         const root = mkdtempSync(join(tmpdir(), 'srt-kill-'))
         const sockets = join(root, 'sockets')
         mkdirSync(sockets)
-        const upstream = createServer((_req, res) => res.end('PROXY-READY'))
+        const upstream = createServer((_req, res) => res.write('PROXY-READY'))
         const other = createServer((_req, res) => res.end('unused'))
         await new Promise<void>(resolve =>
           upstream.listen(0, '127.0.0.1', resolve),
@@ -110,6 +116,14 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
           throw new Error('Missing second TCP address')
         }
         const settings = join(root, 'settings.json')
+        const socat = join(root, 'socat')
+        writeFileSync(
+          socat,
+          '#!/bin/sh\ncase "$1" in\n' +
+            'UNIX-LISTEN:*) exec socat "$1,unlink-close=0" "$2" ;;\n' +
+            '*) exec socat "$@" ;;\nesac\n',
+          { mode: 0o755 },
+        )
         writeFileSync(
           settings,
           JSON.stringify({
@@ -126,6 +140,7 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
                 : {}),
             },
             enableWeakerNestedSandbox: true,
+            socatPath: socat,
           }),
         )
         let cleanupError: unknown
@@ -140,7 +155,8 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
                 'c = http.client.HTTPConnection(p.hostname, p.port, timeout=5)\n' +
                 'auth = urllib.parse.unquote(p.username or "") + ":" + urllib.parse.unquote(p.password or "")\n' +
                 'c.request("GET", "http://127.0.0.1:" + sys.argv[2] + "/", headers={"Proxy-Authorization": "Basic " + base64.b64encode(auth.encode()).decode()})\n' +
-                'assert c.getresponse().read() == b"PROXY-READY"\nc.close()\n' +
+                'response = c.getresponse()\n' +
+                'assert response.read(len(b"PROXY-READY")) == b"PROXY-READY"\n' +
                 'with open(sys.argv[1], "w") as f: f.write("started")\ntime.sleep(30)\n',
             )
             const child = spawn(
@@ -184,18 +200,32 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
               if (!existsSync(marker))
                 throw new Error(`Proxy control never started: ${stderr}`)
               expect(readFileSync(marker, 'utf8')).toBe('started')
+              expect(
+                await new Promise<number>((resolve, reject) =>
+                  upstream.getConnections((error, count) =>
+                    error ? reject(error) : resolve(count),
+                  ),
+                ),
+              ).toBeGreaterThan(0)
               expect(socketFiles(sockets).length).toBeGreaterThan(0)
               owned = descendants(child.pid!)
               expect(owned.size).toBeGreaterThan(1)
               expect(child.kill('SIGKILL')).toBe(true)
-              const cleaned = await waitFor(
+              await waitFor(
                 () =>
                   exited &&
                   socketFiles(sockets).length === 0 &&
                   running(owned).length === 0,
                 3_000,
               )
-              expect(cleaned).toBe(true)
+              expect({
+                exited,
+                sockets: socketFiles(sockets),
+                processes: running(owned).map(pid => ({
+                  pid,
+                  ...processIdentity(pid),
+                })),
+              }).toEqual({ exited: true, sockets: [], processes: [] })
             } finally {
               if (!owned.size && child.pid) owned = descendants(child.pid)
               for (const pid of running(owned)) {
@@ -210,6 +240,8 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
             }
           }
         } finally {
+          upstream.closeAllConnections()
+          other.closeAllConnections()
           await new Promise<void>(resolve => upstream.close(() => resolve()))
           await new Promise<void>(resolve => other.close(() => resolve()))
           rmSync(root, { recursive: true, force: true })

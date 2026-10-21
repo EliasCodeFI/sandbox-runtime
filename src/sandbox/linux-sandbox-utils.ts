@@ -1493,7 +1493,7 @@ function getBridgeLauncher(): string | undefined {
   if (supported === undefined) {
     const probe = spawnSync(
       binary,
-      ['--parent-death-signal', String(process.pid)],
+      ['--bridge-launcher', String(process.pid)],
       { stdio: 'ignore', timeout: 5000 },
     )
     supported = !probe.error && probe.status === 0
@@ -1536,9 +1536,10 @@ export async function initializeLinuxNetworkBridge(
   const socat = socatPath ?? 'socat'
   const launcher = getBridgeLauncher()
   const bridgeCommand = launcher ?? socat
-  const launchArgs = launcher
-    ? ['--parent-death-signal', String(process.pid), socat]
-    : []
+  const launchArgs = (socketPath: string): string[] =>
+    launcher
+      ? ['--bridge-launcher', String(process.pid), socketPath, socat]
+      : []
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   // Only allocated when ports differ; in the mux case the SOCKS side
@@ -1555,7 +1556,7 @@ export async function initializeLinuxNetworkBridge(
 
   const httpBridgeProcess = spawn(
     bridgeCommand,
-    [...launchArgs, ...httpSocatArgs],
+    [...launchArgs(httpSocketPath), ...httpSocatArgs],
     {
       stdio: 'ignore',
     },
@@ -1601,7 +1602,7 @@ export async function initializeLinuxNetworkBridge(
 
     socksBridgeProcess = spawn(
       bridgeCommand,
-      [...launchArgs, ...socksSocatArgs],
+      [...launchArgs(socksSocketPath), ...socksSocatArgs],
       {
         stdio: 'ignore',
       },
