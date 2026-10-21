@@ -68,9 +68,8 @@ import {
   collapseFloor,
   collapseFurther,
   collapsedDenyPaths,
+  degradableGitDirs,
   describeCollapse,
-  repositorySubmodules,
-  repositoryWorktrees,
 } from './linux-deny-collapse.js'
 import type {
   FsReadRestrictionConfig,
@@ -346,27 +345,25 @@ function takesAFileFromHere(dir: string): boolean {
 
 /**
  * See to it that the mount point at `dest`, a file git reads back, is there on
- * the HOST and holds what git reads as no redirect (see
- * `gitRedirectPlaceholder`). A mount point bubblewrap makes is empty, and git
- * refuses to run at all against a `commondir` it cannot read, outside the
- * sandbox as well for as long as the command runs. The profile binds the file
- * read-only onto itself.
+ * the HOST and holds what git reads as no redirect (`gitRedirectPlaceholder`).
+ * One that bubblewrap makes is empty, and git refuses to run at all against
+ * such a `commondir`, outside the sandbox too for as long as the command runs.
+ * The profile binds the file read-only onto itself.
  *
  * INVARIANT: called only once this wrap's manifest, which names `dest`, is
  * published and the clean-ups under way then are over. Another wrap that finds
- * the file reads the manifests after it has seen it, and takes what none of
- * them names for the caller's own. A process killed from here on leaves a file
- * a manifest names, which the next clean-up of any process removes.
+ * the file reads the manifests after it has seen it, and takes what none names
+ * for the caller's own. A process killed from here on leaves a file a manifest
+ * names.
  *
- * THREAT: a command already running may be writing the git directory, if it
- * made it after its own wrap. So the directory is held by a descriptor that
- * followed no link, and nothing there is ever written over: the file is made
- * exclusively, or found as another wrap made it.
+ * THREAT: a command already running may be writing the git directory. So the
+ * directory is held by a descriptor that followed no link, and nothing there is
+ * written over: the file is made exclusively, or found as another wrap made it.
  *
  * `changed` where the directory or the name is no longer what the plan saw;
  * `refused` where the directory takes no file from this process after all, or
  * what a killed wrap left there is no use to git. The caller plans again either
- * way. Throws {@link LinuxSandboxProfileError} on anything else.
+ * way.
  */
 function writeGitRedirectMountPoint(
   dest: string,
@@ -559,13 +556,10 @@ const EACCES = 13
 const ENOENT = 2
 
 /**
- * Every OS error code a failed ripgrep run mentioned, from the `(os error N)`
- * tokens rg appends to each diagnostic. NO PATH IS EVER TAKEN FROM THIS TEXT:
- * a directory's name is chosen by whoever created it and lands in stderr
- * unescaped, and how a message is worded depends on ripgrep's version and on
- * how many threads it has, so any path read out of a line can be a name rather
- * than the file rg failed on. A name can only ADD tokens, and an unrecognised
- * token refuses the wrap, so the worst a chosen name does is refuse.
+ * Every OS error code a failed ripgrep run mentioned, from its `(os error N)`
+ * tokens. NO PATH IS EVER TAKEN FROM THIS TEXT: a directory's name is chosen by
+ * whoever made it and lands in stderr unescaped. A name can only ADD tokens,
+ * and an unrecognised one refuses the wrap.
  */
 function ripgrepFailureErrnos(stderr: string): Set<number> {
   const errnos = new Set<number>()
@@ -621,30 +615,19 @@ function walkOutOfTime(cwd: string, dir: string): LinuxSandboxProfileError {
 }
 
 /**
- * The directories at and under `cwd` this process cannot read — cannot list at
- * all, or holding an entry it cannot type — walked the way the scan walks:
- * `readdir` with the kernel's own entry types, symlinks not followed,
- * `node_modules` skipped as the scan's globs skip it, no deeper than the scan
- * reaches. This is what stands in for parsing paths out of rg's stderr: the
- * answer comes off the filesystem, so a directory NAME cannot add to it, aim it
- * elsewhere, or empty it. Exported for testing.
+ * The directories at and under `cwd` this process cannot read, walked the way
+ * the scan walks: symlinks not followed, `node_modules` skipped, no deeper than
+ * the scan reaches. It stands in for parsing paths out of rg's stderr, so that
+ * a directory NAME cannot add to the answer, aim it elsewhere or empty it.
+ * Exported for testing.
  *
- * `own` are those whose mode is this user's to change. What is in one is not
- * known, so the caller denies it whole, which also keeps the command from
- * giving the mode back.
+ * `own` are those whose mode is this user's to change: the caller denies each
+ * whole, which also keeps the command from giving the mode back. `leftAlone`
+ * counts the rest, for which there is nothing to deny: another user's, of which
+ * there can be thousands, and one at the depth ripgrep stops at, which ripgrep
+ * opens and reports while nothing below it is in the scan's reach.
  *
- * `leftAlone` counts the rest, which is what says the run's EACCES is accounted
- * for where there is nothing to deny for it:
- *
- * - another user's: nobody else's mode can be given back from inside, and
- *   there can be thousands of those (`/home`), each of them a mount;
- * - one that sits at the depth ripgrep stops at, which is opened here without
- *   being descended into. ripgrep's own walker opens one to list it and reports
- *   it when it cannot, and nothing below it is in the scan's reach either way.
- *
- * Throws {@link LinuxSandboxProfileError} when `deadline` passes. The caller
- * hands it a budget of its own, of the scan's length, rather than what a slow
- * scan left: see `walkDeadline` in `linuxGetMandatoryDenyPaths`.
+ * Throws {@link LinuxSandboxProfileError} when `deadline` passes.
  */
 export function unreadableDirectories(
   cwd: string,
@@ -672,15 +655,11 @@ export function unreadableDirectories(
     } catch (err) {
       // Absent means it went away mid-walk, which leaves nothing to deny.
       if (isAbsenceErrno(err)) return
-      // Which directory cannot be seen through is not always this one. A
-      // directory that is readable but not SEARCHABLE (mode 0400) lists its
-      // entries and lets nothing through them, so the walk comes here for a
-      // CHILD whose own readdir failed for want of the parent's search bit -
-      // and that child is a path this process cannot stat either, so
-      // recording it would ask bubblewrap for a file mount at what is really
-      // a directory, failing every later wrap in the tree with an untyped
-      // error. One lstat tells the two apart: it needs the parent's search
-      // bit and nothing of this directory's own.
+      // Not always this one. A directory that can be listed and not SEARCHED
+      // (mode 0400) sends the walk here for a CHILD, which cannot be stat'ed
+      // either: recorded, it would ask bubblewrap for a file mount at a
+      // directory. One lstat tells the two apart: it needs the parent's search
+      // bit alone.
       let denied = dir
       try {
         fs.lstatSync(dir)
@@ -731,12 +710,9 @@ export function unreadableDirectories(
 
 /**
  * The `.git` directories below `cwd` as deep as the scan takes a repository
- * from, walked as {@link unreadableDirectories} walks. For a caller whose scan
- * cannot go by what a `.git` holds.
- *
- * A directory that cannot be listed holds none that this finds: ripgrep could
- * not list it either and said so, which is where it is accounted for. Throws
- * like that walk when `deadline` passes.
+ * from, walked as {@link unreadableDirectories} walks, for a scan that cannot
+ * go by what a `.git` holds. One that cannot be listed is accounted for where
+ * ripgrep reports it.
  */
 function gitDirectoriesBelow(
   cwd: string,
@@ -873,13 +849,7 @@ function cwdMandatoryDenyPlan(
   return plan
 }
 
-/**
- * Adds one repository's denies to `plan`. What of them a wrap whose profile
- * does not fit may degrade is its submodule git directories, then its linked
- * worktrees'. A collapse works back from the end, so within a repository the
- * worktrees' go first: a command in this working directory has less use for
- * another checkout's HEAD and index than for a submodule's objects.
- */
+/** Adds one repository's denies to `plan`. */
 function addGitDirTree(
   plan: SubmoduleDenyPlan,
   denies: GitDirTreeDenies,
@@ -890,21 +860,14 @@ function addGitDirTree(
     plan.denyPaths.push(denyPath)
   }
   for (const hop of denies.chainHops) plan.chainHops.push(hop)
-  plan.repositories.push(
-    ...[repositorySubmodules(denies), repositoryWorktrees(denies)].filter(
-      repository => repository !== undefined,
-    ),
-  )
+  plan.repositories.push(...degradableGitDirs(denies))
 }
 
 /**
- * {@link gitDirTreeDenyPaths} plus the directories that have to be denied
- * WHOLE because they hold an entry that is a symlink, and minus the deny
- * paths that name a symlink itself. Both follow from the same thing: a bind
- * lands on what a deny path resolves to, so the link's own path keeps
- * nothing and the directory around it is the handle on it, while a Seatbelt
- * filter matches the path as a rename or an unlink names it and needs
- * neither (see `gitDirDenies` in src/sandbox/mandatory-deny-paths.ts).
+ * {@link gitDirTreeDenyPaths} plus the directories denied WHOLE for holding an
+ * entry that is a symlink, and minus the deny paths that name a symlink itself:
+ * a bind lands on what a path resolves to, so the directory around a link is
+ * the only handle on it.
  */
 function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
   return [
@@ -914,13 +877,9 @@ function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
 }
 
 /**
- * Where a whole-directory deny LANDS. A bind resolves its destination, so a
- * git directory reached through a symlinked `.git/modules` entry is spelled
- * inside the git directory and binds whatever the link leads to - the
- * checkout itself, where the entry is `ln -s ../.. .git/modules/x`. The
- * backend resolves it either way (`resolveSymlinkedDenyPath`), so spelling it
- * here changes no mount; what it changes is that
- * {@link withoutWorkTreeDenies} sees what the deny would really cover.
+ * Where a whole-directory deny LANDS. The deny loop resolves it either way;
+ * spelled here, {@link withoutWorkTreeDenies} sees what it would really cover
+ * (`ln -s ../.. .git/modules/x`).
  */
 function wholeDirDenyLanding(dir: string): string {
   return realPathOrSelf(dir)
@@ -943,27 +902,14 @@ function withoutChainHopLinks(
 }
 
 /**
- * Which of the symlinks a git directory is reached THROUGH — between an entry
- * and what it leads to, or in the path a `gitdir:` pointer's value walks —
- * this backend can hold, and which it cannot.
+ * Which of the symlinks a git directory is reached THROUGH this backend can
+ * hold. `held` is the directories holding one, a read-only bind each.
  *
- * A bind cannot be put on a link — the destination resolves — so the
- * directory holding one is the whole handle, exactly as the git directory is
- * the handle on the entry's own link. `held` is those directories, one
- * read-only bind each, charged to the mount budget like any other deny.
- *
- * Three kinds are not in it. A hop a whole-directory deny already covers
- * names no holder at all. A hop no allowed write path contains is read-only
- * from the initial `--ro-bind / /` already, and a bind of the directory
- * around it would buy nothing. A hop whose holder IS a write root or the
- * working directory, or sits above one, has nothing that can be bound over it
- * — the bind would take the whole tree read-only, and a repository laid out
- * that way (`.git/hooks -> ../hooks-link`, with `hooks-link` in the
- * repository root) is one the caller had before this library saw it, so
- * refusing every command in it is the wrong answer too. That last kind comes
- * back in `unheld`, for the warning that has to stand in for a bind — or,
- * where the chain it lies on reaches nothing so that there is no landing to
- * deny either, for the refusal {@link guardedDenyPlan} makes of it.
+ * Not in it: a hop a whole deny covers already, which names no holder; a hop no
+ * write root contains, which is read-only anyway; and a hop whose holder is or
+ * holds the working directory or a write root, where the bind would take the
+ * whole tree. That last kind is `unheld`, for the warning or the refusal {@link
+ * guardedDenyPlan} makes of it.
  */
 function chainHopDenies(
   chainHops: readonly GitChainHop[],
@@ -992,16 +938,12 @@ function chainHopDenies(
 
 /**
  * The deny plan a wrap emits: `plan` with the directories holding a chain hop
- * this backend can bind added to its deny paths, one warning per wrap for the
- * hops it cannot bind - the only channel a wrap has to say so - and without
- * any deny that would take the work tree whole. Ordinary trees have no hops
- * at all and nothing that covers the work tree, and pay nothing here.
+ * added, one warning for the hops that cannot be held, and without any deny
+ * that would take the work tree whole ({@link withoutWorkTreeDenies}).
  *
- * Throws {@link LinuxSandboxProfileError} with `deny_unresolvable_git_entry`
- * where an unbindable hop lies on a chain that reaches NOTHING: a warning is
- * what stands in for a bind while both ends of the chain are denied, and a
- * chain that reaches nothing has no far end to deny. See
- * {@link withoutWorkTreeDenies} for the refusal the other guard makes.
+ * Throws `deny_unresolvable_git_entry` where an unheld hop lies on a chain that
+ * reaches NOTHING: the warning leans on both ends being denied, and there is no
+ * far end.
  */
 function guardedDenyPlan(
   plan: SubmoduleDenyPlan,
@@ -1010,17 +952,11 @@ function guardedDenyPlan(
   const { held, unheld } = chainHopDenies(plan.chainHops, allowWritePaths)
   const ownEntries = new Set(plan.ownEntries ?? [])
   const unresolvable = unheld.filter(
-    // Only for an entry of the working directory's own repository. Each of
-    // those is denied at its own path from the first wrap on, so a link there
-    // is the user's layout, and refusing is the answer that leaves nothing
-    // open. Everything else is exempt, because a command may have made it: a
-    // `.git` pointer file, a nested repository the scan found, a submodule's
-    // git directory, a `modules` that was not there. Refusing for one of
-    // those would let a command lock every later command out of the project
-    // with a few ordinary writes, and would protect nothing: what it could
-    // reach by re-pointing a link it is free to write, it can reach by
-    // creating a nested repository outright, which pre-spawn scanning has
-    // always missed.
+    // Only for an entry of the working directory's own repository: each is
+    // denied from the first wrap on, so a link there is the user's layout.
+    // Anything else a command may have made, and refusing for it would let a
+    // few writes lock every later command out, and protect nothing it could not
+    // reach by creating a nested repository outright.
     hop =>
       hop.kind === 'entry' &&
       hop.chain === 'unresolvable' &&
@@ -1072,44 +1008,23 @@ function guardedDenyPlan(
 /**
  * `denyPaths` without any that would deny the work tree WHOLE.
  *
- * A whole-directory deny is what this backend falls back on for a tree it
- * cannot enumerate or a link it has no other handle on, and every producer of
- * one reads paths a sandboxed command can create: a `.git` pointer whose
- * value names the checkout (`gitdir: ..`, with one entry of the checkout a
- * symlink, makes it a git directory denied whole), a `.git/modules` entry
- * linked at `../..`, a git directory entry pointing at the checkout, a
- * directory left unreadable. Any of them lands a `--ro-bind` on the working
- * directory or a write root, and from the next wrap on nothing in the project
- * can be written and nothing inside the sandbox can put it back: a denial of
- * service on the session, planted by the very code the sandbox contains. So
- * no such deny is emitted, whichever producer asked for it.
+ * Every producer of a whole-directory deny reads paths a sandboxed command can
+ * create (`gitdir: ..`, a `.git/modules` entry linked at `../..`, an entry
+ * linked at the checkout, a directory left unreadable). One that lands on the
+ * working directory or a write root leaves nothing in the project writable from
+ * the next wrap on, with nothing inside the sandbox able to undo it.
  *
- * What stands in its place depends on whether what is beneath it can be
- * known, which is the one thing that distinguishes the two families:
+ * - A directory this process CAN list was denied whole to hold something inside
+ *   it, both ends of which keep their own deny paths: dropped, with a warning.
+ * - One it cannot list stands in for a tree nothing else covers: the command is
+ *   REFUSED, naming it.
  *
- * - A directory this process CAN list was denied whole to hold something
- *   inside it - a symlinked entry, a link a bind cannot be put on. Both ends
- *   of what that deny was protecting keep their own deny paths, so the answer
- *   is the one an unheld chain hop already gets: drop it, and warn once.
- * - A directory it cannot list stands in for a tree nothing else covers.
- *   Dropping it would run the command against an unscanned tree; keeping it
- *   locks the project silently. The command is REFUSED instead, naming the
- *   directory, which a `chmod` outside the sandbox puts right.
+ * Each is judged by where it LANDS, not by how it is spelled: `hooks -> ../..`
+ * is an ordinary deny path for which the deny loop would bind the checkout.
  *
- * Each deny path is judged by where it LANDS, which is what a bind resolves
- * to, and not by how it is spelled. The producers of a whole-directory deny
- * spell theirs that way already (see `linuxGitDirTreeDenyPaths`), but the
- * guard cannot rest on that: a git directory entry that is itself a link to
- * the checkout (`hooks -> ../..`) is an ordinary deny path, spelled inside
- * the git directory, and the deny loop binds the checkout for it all the
- * same. Dropping only the landing would leave the entry's own path to put the
- * bind back.
- *
- * A deny that is one of the denied NAMES, standing where it is spelled, is no
- * such stand-in, and is kept: `.vscode`, or the `hooks` of a git directory. It
- * lies below the working directory, and only the configuration puts a write
- * root at it or beneath it, which no command can change. There the deny wins,
- * and the write root comes back read-only (see meetsAnyAllowedWritePath).
+ * One of the denied NAMES standing where it is spelled (`.vscode`, the `hooks`
+ * of a git directory) is no stand-in and is kept: only the configuration puts a
+ * write root at or beneath it, and there the deny wins.
  */
 function withoutWorkTreeDenies(
   denyPaths: readonly string[],
@@ -1216,18 +1131,11 @@ function cwdDangerousDenyPaths(cwd: string): string[] {
 
 /**
  * {@link linuxGetCwdMandatoryDenyPaths} for the violation monitor, which is
- * started once for the session and must not fail over one repository: the
- * same paths, or - where the enumeration refuses - this directory's plain
- * deny paths, with a warning naming which refusal it was. What this decides
- * is which refused write the monitor reports, never what bubblewrap
- * enforces.
- *
- * Nothing is collapsed here. A wrap collapses only where its own profile does
- * not fit, which is measured per command, while this is computed once for the
- * session: a command that forces a collapse later leaves the monitor naming
- * the precise path under a submodule git directory the wrap has by then
- * denied whole. The write is refused either way; the path in the report is
- * the one inside it.
+ * started once for the session and must not fail over one repository: where the
+ * enumeration refuses, this directory's plain deny paths, with a warning. It
+ * decides which refused write is reported, never what bubblewrap enforces.
+ * Nothing is collapsed here, so after a wrap that had to, the path in a report
+ * can be one inside a git directory that is denied whole.
  */
 export function linuxGetMonitorCwdDenyPaths(
   allowGitConfig: boolean,
@@ -1775,14 +1683,9 @@ const BWRAP_MAX_ARGS = 9000
 const BWRAP_WORDS_PER_MOUNT = 3
 
 /**
- * Words the wrap adds AFTER the mounts, which the mounts must leave room for.
- * Eighteen today — `--dev /dev`, `--unshare-pid`, `--unshare-user` and at most
- * four capability words, `--bind /proc /proc`, `--unsetenv` and its name,
- * `--disable-userns`, `--` with the shell and `-c`, and the one word the
- * command itself is — plus the two `--args <fd>` takes when the mounts move
- * off the command line, and a little over. Everything
- * BEFORE the mounts is counted as it is, not estimated: the wrap has already
- * built it when it asks for them.
+ * Words the wrap adds AFTER the mounts, which the mounts must leave room for:
+ * eighteen today, two for `--args <fd>`, and a little over. What comes BEFORE
+ * the mounts is counted as it is.
  */
 const BWRAP_TRAILING_WORDS = 24
 
@@ -1904,13 +1807,9 @@ export type LinuxSandboxProfileErrorCode =
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
   /**
-   * A deny path git reads back — a git directory's `commondir` or
-   * `config.worktree` — could not be given a stand-in git accepts: neither
-   * the mount point on the host nor the placeholder in the temporary
-   * directory could be written. Mounting /dev/null there instead would stop
-   * git working in that repository altogether, so the command is refused.
-   * Whatever the wrap did make is named in its manifest and goes with the next
-   * clean-up.
+   * A git directory's `commondir` or `config.worktree` could not be given a
+   * mount point git accepts, and the directory cannot be denied whole instead.
+   * /dev/null there would stop git working in that repository altogether.
    */
   | 'deny_placeholder_unavailable'
   /**
@@ -1923,27 +1822,18 @@ export type LinuxSandboxProfileErrorCode =
    */
   | 'deny_scan_failed'
   /**
-   * A `.git` pointer file or a `commondir` under the working directory names
-   * a git directory that cannot be worked out the way git works it out: its
-   * bytes are not valid UTF-8, it is larger than git reads, or it is there
-   * and could not be read. The hooks and config git runs through it are
-   * therefore unknown, so the command is refused rather than sandboxed
-   * without them. A sandboxed command can write such a file, and the
-   * message names it: the refusal is lifted only from outside the sandbox.
+   * A `.git` file, a `commondir` or a symlink names a git directory that cannot
+   * be worked out the way git works it out, so the hooks and config git runs
+   * through it are unknown. A sandboxed command can write one, and the message
+   * names it: the refusal is lifted only from outside the sandbox.
    */
   | 'deny_git_metadata_unreadable'
   /**
-   * An entry of a git directory under the working directory is a symlink
-   * whose chain reaches nothing - a loop, or a name no file can occupy - and
-   * one of the links it goes through sits in the working directory or a path
-   * this command may write. Such a link is held only by a read-only bind of
-   * the directory around it, which there would take the whole tree; leaving
-   * it free lets a command in the sandbox put a directory in its place, which
-   * makes the chain reach hooks or config this profile never saw and a git
-   * run on the host afterwards uses. Neither end of the chain stands in for
-   * it: the entry's own deny is a directory this one denies whole, and the
-   * landing does not exist. So the command is refused, which is what a
-   * repository laid out this way got before any of these denies existed.
+   * An entry of the working directory's own git directory is a symlink whose
+   * chain reaches nothing, through a link that sits in the working directory or
+   * a write root. Only a read-only bind of that directory would hold the link,
+   * and left free a command can put a directory in its place, for the chain to
+   * reach hooks this profile never saw.
    */
   | 'deny_unresolvable_git_entry'
   /** More mount points than one manifest holds. */
@@ -3175,18 +3065,10 @@ const MOUNT_PLAN_ATTEMPTS = 3
 class MountPlanFailed extends Error {}
 
 /**
- * `plan`'s deny paths at `level`. A level that degrades nothing is the list
- * {@link guardedDenyPlan} already went over. One that does adds binds of its
- * own - a submodule's git directory, a `modules` directory - spelled as the
- * walk found them, and an entry the walk reached through a link can land
- * anywhere, the checkout or another write root included
- * (`.git/modules/x -> ../..`). So what a collapse adds goes past the same
- * guard before it is emitted.
- *
- * A bind the guard takes back stood for the precise deny paths the collapse
- * had folded into it, and those come back with it: they name entries of that
- * directory, not the directory, so they take nothing whole, and without them
- * the git directory behind the link would keep no deny at all.
+ * `plan`'s deny paths at `level`. What a collapse adds is spelled as the walk
+ * found it, and an entry reached through a link can land anywhere, the checkout
+ * included, so it goes past the same guard as the rest. A bind the guard takes
+ * back stood for precise deny paths, which come back with it.
  */
 function collapsedForWrap(
   plan: SubmoduleDenyPlan,
@@ -3223,28 +3105,18 @@ type FilesystemArgs = {
  * Generate filesystem bind mount arguments for bwrap, inside `wordsAvailable`
  * of bubblewrap's cap on parsed words. `undefined`, with its manifest let go
  * of, when what the plan relied on on the host had changed by the time that was
- * published: the caller plans again, as it does when this throws
- * {@link MountPlanFailed}.
+ * published: the caller plans again, as it does when this throws {@link
+ * MountPlanFailed}.
  *
- * The mandatory-deny scan runs once. What it found is then planned into mounts,
- * counted, and — while the count is past what the caller has room for —
- * degraded a step at a time and planned again, each pass measuring the profile
- * the previous one produced rather than predicting it: the ancestor pins a
- * deny needs are known only once the deny list is complete, so the mounts a
- * repository's submodules really cost cannot be worked out before this point
- * (see src/sandbox/linux-deny-collapse.ts for what a step gives up, and
- * `LinuxSandboxProfileErrorCode`'s `too_many_arguments` for what is left when
- * there is nothing to degrade). A pass that comes out no shorter than the one
- * before it is the last that is stepped to: the next is the last level, so
- * the number of passes does not grow with what a repository holds.
+ * The mandatory-deny scan runs once. What it found is planned into mounts,
+ * counted and, while the count is past what there is room for, degraded a step
+ * and planned again (src/sandbox/linux-deny-collapse.ts). Each pass measures
+ * the one before it: the pins a deny needs are known only once the list is
+ * complete. A pass no shorter than the one before is the last that is stepped
+ * to.
  *
- * Only the pass that is settled on is published. A pass that is degraded has
- * named nothing, and has made nothing on the host but where the library makes
- * a mount point itself, which is kept track of from then on (see
- * makeableMountPoint).
- *
- * `gitDirsThatRefusedAFile` is the caller's, for all the plans of one wrap: the
- * git directories in which a plan could not write what it had planned to.
+ * Only the pass that is settled on is published. `gitDirsThatRefusedAFile` is
+ * the caller's, for all the plans of one wrap.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -3311,16 +3183,10 @@ async function generateFilesystemArgs(
                 level,
                 Math.ceil((words - wordsAvailable) / BWRAP_WORDS_PER_MOUNT),
               )
-        // A pass no shorter than the one before it took entries that cost this
-        // profile nothing: submodule git directories no write root contains,
-        // say, which the read-only root holds without a mount of their own.
-        // How many more of those lie ahead is a number a command can choose,
-        // and finding out a step at a time is the whole profile planned once
-        // per step, so the stepping stops and the next pass is the last level.
-        // Where the words over are ones no level gives back, that is where the
-        // steps were going anyway; where entries further on would have given
-        // some back, it degrades more than they strictly needed, and costs
-        // what it costs whatever the repository holds.
+        // A pass no shorter than the one before took entries that cost this
+        // profile nothing, such as git directories no write root contains. How
+        // many more lie ahead is a command's to choose, and each step is the
+        // whole profile planned again, so the next pass is the last level.
         if (
           degraded !== undefined &&
           wordsBefore !== undefined &&
@@ -3983,15 +3849,10 @@ async function buildFilesystemArgs(
         // absent (or vanished): not a read-only re-bound directory
       }
       // The mount point of a file git reads back is written by this process,
-      // which cannot write every git directory the command can: a vendored
-      // checkout, or one the command itself made unwritable, whose mode
-      // bubblewrap's user namespace overrides for its owner. Refusing every
-      // command in the tree over that would be a brick a sandboxed command can
-      // plant, and a mount point left to bubblewrap is an empty file no
-      // clean-up of this process could remove. So the git directory is denied
-      // whole, which needs nothing written to it and denies the file and every
-      // other way into it at once. It joins the list here, ahead of every stub
-      // decision.
+      // which cannot write every git directory the command can. Refusing over
+      // that would be a brick a command can plant, and a mount point left to
+      // bubblewrap is an empty file this process could never remove. So the git
+      // directory is denied whole, ahead of every stub decision.
       const gitDir = path.dirname(resolvedPath)
       if (
         gitRedirectPlaceholder(resolvedPath) !== undefined &&

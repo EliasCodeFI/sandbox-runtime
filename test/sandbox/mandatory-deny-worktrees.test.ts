@@ -32,7 +32,6 @@ import {
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenies,
-  gitFileDenyPaths,
 } from '../../src/sandbox/mandatory-deny-paths.js'
 import * as denyCollapse from '../../src/sandbox/linux-deny-collapse.js'
 import type { SubmoduleDenyPlan } from '../../src/sandbox/linux-deny-collapse.js'
@@ -182,7 +181,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       )
       renameSync(join(worktreeGitDir, 'HEAD'), join(worktreeGitDir, 'H'))
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         // And the commondir is still followed: the hooks a commit in the
@@ -203,7 +202,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       )
       renameSync(join(worktreeGitDir, 'HEAD'), join(worktreeGitDir, 'H'))
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         ...gitDirDenyPaths(bare, false),
@@ -382,7 +381,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         rmSync(join(worktreeGitDir, name))
       }
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
       ])
@@ -398,7 +397,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(checkout, '.git')
       writeFileSync(pointer, 'gitdir: ../../.git/modules/vendor/lib\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(submodule, false),
       ])
@@ -418,7 +417,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(project, 'y', '.git')
       writeFileSync(pointer, 'gitdir: ../x/.git/worktrees/a\n')
 
-      const denyPaths = gitFileDenyPaths(pointer, false)
+      const denyPaths = gitFileDenies(pointer, false).denyPaths
 
       expect(denyPaths).toContain(pointer)
       expect(
@@ -508,7 +507,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         join(dir, 'wt'),
       )
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(worktreeGitDir, false),
         ...gitDirDenyPaths(bare, false),
@@ -532,7 +531,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         const pointer = join(dir, 'checkout', '.git')
         writeFileSync(pointer, 'gitdir: ../store\n')
 
-        expect(gitFileDenyPaths(pointer, allowGitConfig)).toEqual([
+        expect(gitFileDenies(pointer, allowGitConfig).denyPaths).toEqual([
           pointer,
           ...gitDirDenyPaths(gitDir, allowGitConfig),
         ])
@@ -549,7 +548,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       const pointer = join(dir, 'checkout', '.git')
       writeFileSync(pointer, 'gitdir: ../store\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(gitDir, false),
       ])
@@ -988,7 +987,7 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       expect(gitDirTreeDenyPaths(denies)).toEqual(
         gitDirDenyPaths(mainGitDir, false),
       )
-      expect(denyCollapse.repositoryWorktrees(denies)).toBeUndefined()
+      expect(denyCollapse.degradableGitDirs(denies)).toEqual([])
     })
   })
 
@@ -996,12 +995,11 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
     /** The plan a wrap builds for one repository that has no submodules. */
     function planFor(mainGitDir: string): SubmoduleDenyPlan {
       const denies = gitDirTreeDenies(mainGitDir, false)
-      expect(denyCollapse.repositorySubmodules(denies)).toBeUndefined()
-      const worktrees = denyCollapse.repositoryWorktrees(denies)
-      if (worktrees === undefined) throw new Error('no linked worktrees found')
+      const repositories = denyCollapse.degradableGitDirs(denies)
+      expect(repositories).toMatchObject([{ linkedWorktrees: true }])
       return {
         denyPaths: gitDirTreeDenyPaths(denies),
-        repositories: [worktrees],
+        repositories,
         chainHops: denies.chainHops,
       }
     }

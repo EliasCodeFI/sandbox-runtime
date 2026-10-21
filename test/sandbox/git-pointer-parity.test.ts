@@ -21,7 +21,7 @@ import {
 } from 'node:path'
 import {
   GitMetadataError,
-  gitFileDenyPaths,
+  gitFileDenies,
 } from '../../src/sandbox/mandatory-deny-paths.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
@@ -283,7 +283,7 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
   ): Verdict {
     let denyPaths: string[]
     try {
-      denyPaths = gitFileDenyPaths(pointer, false)
+      denyPaths = gitFileDenies(pointer, false).denyPaths
     } catch (err) {
       if (!(err instanceof GitMetadataError)) throw err
       // Refusing to sandbox covers everything, including what git follows.
@@ -681,7 +681,7 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     // So the deny list has to carry that directory's hooks — and the link
     // that decides which directory it is, since a command that retargets it
     // moves where the next git run lands.
-    const denyPaths = gitFileDenyPaths(pointer, false)
+    const denyPaths = gitFileDenies(pointer, false).denyPaths
     expect(denyPaths).toContain(join(physical, 'hooks'))
     expect(denyPaths).toContain(hop)
     expect(assertParity('a .. after a symlink', pointer, checkout)).toBe(
@@ -704,7 +704,9 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     writeFileSync(pointer, 'gitdir: hop/../evil\n')
 
     expect(gitResolves(checkout, '--absolute-git-dir')).toBeUndefined()
-    expect(gitFileDenyPaths(pointer, false)).toContain(join(lexical, 'hooks'))
+    expect(gitFileDenies(pointer, false).denyPaths).toContain(
+      join(lexical, 'hooks'),
+    )
   })
 
   it('opens nothing through a pointer value that runs into a loop', () => {
@@ -729,7 +731,7 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
 
     expect(gitResolves(checkout, '--absolute-git-dir')).toBeUndefined()
 
-    const denyPaths = gitFileDenyPaths(pointer, false)
+    const denyPaths = gitFileDenies(pointer, false).denyPaths
     expect(denyPaths).toEqual([pointer, first, second])
     expect(denyPaths).not.toContain(checkout)
   })
@@ -742,7 +744,9 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     writeFileSync(pointer, 'gitdir: \0elsewhere\n')
 
     expect(gitResolves(checkout, '--absolute-git-dir')).toBe(checkout)
-    expect(gitFileDenyPaths(pointer, false)).toContain(join(checkout, 'hooks'))
+    expect(gitFileDenies(pointer, false).denyPaths).toContain(
+      join(checkout, 'hooks'),
+    )
   })
 
   it('runs a hook again as soon as a looping hooks link reaches a directory', () => {
@@ -827,7 +831,9 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
       expect(
         runGit(checkout, ['rev-parse', '--absolute-git-dir']),
       ).not.toBeUndefined()
-      expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+      expect(() => gitFileDenies(pointer, false).denyPaths).toThrow(
+        GitMetadataError,
+      )
     },
   )
 

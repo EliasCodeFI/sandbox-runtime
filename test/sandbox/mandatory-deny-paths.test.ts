@@ -58,7 +58,6 @@ import {
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenies,
-  gitFileDenyPaths,
   gitRedirectPlaceholder,
   submoduleGitDirs,
 } from '../../src/sandbox/mandatory-deny-paths.js'
@@ -67,7 +66,7 @@ import {
   collapseFurther,
   collapsedDenyPaths,
   describeCollapse,
-  repositorySubmodules,
+  degradableGitDirs,
 } from '../../src/sandbox/linux-deny-collapse.js'
 import type { SubmoduleDenyPlan } from '../../src/sandbox/linux-deny-collapse.js'
 import {
@@ -3748,7 +3747,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.denyPaths).toContain(shared)
       expect(denies.linkedEntryDirs).toEqual([gitDir])
       // The list a backend that needs none of that emits is what it was.
-      expect(gitFileDenyPaths(pointer, false)).toEqual(denies.denyPaths)
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual(denies.denyPaths)
     },
   )
 
@@ -3823,7 +3822,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     const gitDir = makeGitDir(join(dir, 'gitdir'))
     const pointer = makePointer('checkout', '../gitdir')
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3835,7 +3834,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n')
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(worktreeGitDir, false),
       ...gitDirDenyPaths(main, false),
@@ -3848,13 +3847,13 @@ describe('Git metadata deny paths - Unit Tests', () => {
     mkdirSync(join(dir, 'app', 'config'), { recursive: true })
     const pointer = makePointer(join('app', 'tools'), '..')
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([pointer])
   })
 
   it('blocks the git directory a dangling pointer names from being filled in', () => {
     const pointer = makePointer('checkout', '../not-created-yet')
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(join(dir, 'not-created-yet'), false),
     ])
@@ -3870,7 +3869,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     // git strips them from the end of the whole file, so this is a pointer
     // it follows; reading less of the file than git does would leave the
     // target's hooks and config out of the deny list.
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3884,7 +3883,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     // Nothing is trimmed but the newline, so the pointer names a directory
     // that does not exist — denied against being created, not confused for
     // the real git directory next to it.
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(padded, false),
     ])
@@ -3900,7 +3899,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       `gitdir: ${gitDir}${' '.repeat(9000)}\n`,
     )
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([pointer])
   })
 
   it('follows a pointer of the largest size git accepts, and no larger', () => {
@@ -3913,7 +3912,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       head + '\n'.repeat(maxSize - head.length),
     )
     expect(statSync(atBound).size).toBe(maxSize)
-    expect(gitFileDenyPaths(atBound, false)).toEqual([
+    expect(gitFileDenies(atBound, false).denyPaths).toEqual([
       atBound,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3924,7 +3923,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       head + '\n'.repeat(maxSize + 1 - head.length),
     )
     expect(statSync(pastBound).size).toBe(maxSize + 1)
-    expect(gitFileDenyPaths(pastBound, false)).toEqual([pastBound])
+    expect(gitFileDenies(pastBound, false).denyPaths).toEqual([pastBound])
   })
 
   it.if(!isWindows)('takes a path that spans lines whole, as git does', () => {
@@ -3933,7 +3932,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     const gitDir = makeGitDir(join(dir, 'two\nlines'))
     const pointer = writePointer('checkout', `gitdir: ${gitDir}\n`)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3946,7 +3945,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       `gitdir: ${gitDir}\0/../elsewhere\n`,
     )
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3956,7 +3955,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     const gitDir = makeGitDir(join(dir, 'gitdir'))
     const pointer = writePointer('checkout', `gitdir: ${gitDir}\r\n`)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(gitDir, false),
     ])
@@ -3976,7 +3975,9 @@ describe('Git metadata deny paths - Unit Tests', () => {
       ]),
     )
 
-    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+    expect(() => gitFileDenies(pointer, false).denyPaths).toThrow(
+      GitMetadataError,
+    )
   })
 
   it("follows a commondir padded past the pointer's own bound", () => {
@@ -3988,7 +3989,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     )
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(worktreeGitDir, false),
       ...gitDirDenyPaths(main, false),
@@ -4003,7 +4004,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     writeFileSync(join(worktreeGitDir, 'commondir'), ` ${main}\n`)
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
-    const denyPaths = gitFileDenyPaths(pointer, false)
+    const denyPaths = gitFileDenies(pointer, false).denyPaths
     expect(denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(worktreeGitDir, false),
@@ -4043,7 +4044,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
           holder: join(dir, 'checkout'),
         },
       ])
-      expect(gitFileDenyPaths(pointer, false)).toEqual(denies.denyPaths)
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual(denies.denyPaths)
     },
   )
 
@@ -4054,7 +4055,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
     symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    expect(gitFileDenies(pointer, false).denyPaths).toEqual([
       pointer,
       join(dir, 'checkout', 'hop'),
       ...gitDirDenyPaths(lexical, false),
@@ -4336,7 +4337,9 @@ describe('Git metadata deny paths - Unit Tests', () => {
     )
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
-    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+    expect(() => gitFileDenies(pointer, false).denyPaths).toThrow(
+      GitMetadataError,
+    )
   })
 
   /**
@@ -4525,7 +4528,9 @@ describe('Git metadata deny paths - Unit Tests', () => {
       chmodSync(commondir, 0o000)
       const pointer = makePointer('wt-checkout', worktreeGitDir)
       try {
-        expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+        expect(() => gitFileDenies(pointer, false).denyPaths).toThrow(
+          GitMetadataError,
+        )
       } finally {
         chmodSync(commondir, 0o644)
       }
@@ -4545,7 +4550,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       const pointer = makePointer('wt-checkout', worktreeGitDir)
       chmodSync(worktreeGitDir, 0o000)
       try {
-        expect(gitFileDenyPaths(pointer, false)).toEqual([
+        expect(gitFileDenies(pointer, false).denyPaths).toEqual([
           pointer,
           worktreeGitDir,
         ])
@@ -4607,7 +4612,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(spawnSync('mkfifo', [join(gitDir, 'commondir')]).status).toBe(0)
       const pointer = makePointer('checkout', '../gitdir')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(gitDir, false),
       ])
@@ -4621,7 +4626,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       const pointer = join(dir, 'checkout', '.git')
       expect(spawnSync('mkfifo', [pointer]).status).toBe(0)
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+      expect(gitFileDenies(pointer, false).denyPaths).toEqual([pointer])
     },
   )
 
@@ -5312,7 +5317,7 @@ describe.if(isSupportedPlatform)(
         const gitDir = makeGitDir(join(dir, 'repo', '.git'))
         const denies = gitDirTreeDenies(gitDir, false)
 
-        expect(repositorySubmodules(denies)).toBeUndefined()
+        expect(degradableGitDirs(denies)).toEqual([])
         expect(gitDirTreeDenyPaths(denies)).not.toContain(
           join(gitDir, 'modules'),
         )
@@ -5332,7 +5337,7 @@ describe.if(isSupportedPlatform)(
           const denies = gitDirTreeDenies(gitDir, false)
 
           expect(denies.linkedEntryDirs).toEqual([gitDir])
-          expect(repositorySubmodules(denies)).toBeUndefined()
+          expect(degradableGitDirs(denies)).toEqual([])
         },
       )
 
@@ -5348,15 +5353,13 @@ describe.if(isSupportedPlatform)(
           const link = join(gitDir, 'modules', 'b')
           symlinkSync(outside, link)
 
-          const repository = repositorySubmodules(
-            gitDirTreeDenies(gitDir, false),
-          )
-          expect(repository).toBeDefined()
+          const tree = gitDirTreeDenies(gitDir, false)
           const plan: SubmoduleDenyPlan = {
-            denyPaths: gitDirTreeDenyPaths(gitDirTreeDenies(gitDir, false)),
-            repositories: repository === undefined ? [] : [repository],
+            denyPaths: gitDirTreeDenyPaths(tree),
+            repositories: degradableGitDirs(tree),
             chainHops: [],
           }
+          expect(plan.repositories).toHaveLength(1)
 
           const denies = collapsedDenyPaths(plan, {
             wholeGitDirs: 2,
