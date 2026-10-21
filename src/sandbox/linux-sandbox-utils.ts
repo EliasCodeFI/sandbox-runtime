@@ -19,6 +19,7 @@ import {
   discardMountPointManifest,
   holdsMountPointManifest,
   isEmptyFileOfOurs,
+  keepTrackOfMountPoint,
   keepTrackOfMountSource,
   kindOfMountPoint,
   mountPointManifestDirectories,
@@ -621,6 +622,11 @@ function makeableMountPoint(
       throw err
     }
   }
+  /** Until a manifest names it, and should the process end before one does. */
+  const keepTrackOf = (made: string): void => {
+    keepTrackOfMountPoint(made)
+    registerExitCleanupHandler()
+  }
   let fd: number | undefined
   try {
     // One descriptor answers every question, through /proc: a command still
@@ -652,7 +658,8 @@ function makeableMountPoint(
     // On a Windows drive the Windows ACL decides, and nothing on this side
     // tells it: every directory there is this user's, with a mode that lets it
     // write, also one that takes subfolders and no files. So the mount point
-    // is made here instead of by bubblewrap, which finds it there.
+    // is made here instead of by bubblewrap, which finds it there. No manifest
+    // names it yet, and the plan may be given up before one does.
     if (refusal === undefined) {
       const entry = `${parent}/${path.basename(dest)}`
       if (
@@ -660,9 +667,11 @@ function makeableMountPoint(
         refusalOf(() => fs.closeSync(fs.openSync(entry, 'wx', 0o444))) ===
           undefined
       ) {
+        keepTrackOf(dest)
         return MountPointKind.File
       }
       if (refusalOf(() => fs.mkdirSync(entry)) === undefined) {
+        keepTrackOf(dest)
         return MountPointKind.Directory
       }
     }
@@ -1745,8 +1754,9 @@ function ensureEmptyMountSourceDir(): string {
   // directory lands on 0500. Set the mode here rather than let the check
   // above reject the directory this call has just made.
   fs.chmodSync(emptyMountSourceDir, 0o700)
-  // The wrap may throw before a manifest names it.
+  // The wrap may throw before a manifest names it, and the process end then.
   keepTrackOfMountSource(emptyMountSourceDir)
+  registerExitCleanupHandler()
   return emptyMountSourceDir
 }
 
@@ -2089,10 +2099,12 @@ export type LinuxSandboxProfileErrorCode =
   | 'too_many_mount_points'
   /**
    * The mount point manifests cannot be read, so a path cannot be told from a
-   * mount point a running sandbox relies on. It ends by itself: when this
-   * process has descriptors again, when what sits among them and is no manifest
-   * is an hour old, when the process on a record with no manifest has ended.
-   * `.cause` is the file and the reason, which the message holds too.
+   * mount point a running sandbox relies on; or one of their directories cannot
+   * be looked at, so it cannot be kept out of the command's reach. It ends by
+   * itself: when this process has descriptors again, when the file system
+   * answers again, when what sits among them and is no manifest is an hour old,
+   * when the process on a record with no manifest has ended. `.cause` is the
+   * reason, with the file where there is one, which the message holds too.
    */
   | 'mount_points_unreadable'
   /**
@@ -2158,8 +2170,8 @@ let stepShell: string[] | undefined
  *
  * THREAT: this shell runs on the host, unsandboxed, in an environment a
  * sandboxed command may have had a hand in. So `-p`: plain `bash -c` imports
- * exported functions, and one named `shift`, `read`, `printf` or `exec` would
- * run in place of the step's own word; it also reads the file `$BASH_ENV`
+ * exported functions, and one named `shift`, `local`, `read`, `printf` or `exec`
+ * would run in place of the step's own word; it also reads the file `$BASH_ENV`
  * names. And never a PATH look-up or the caller's `binShell`: a copy planted in
  * a writable PATH directory would be run out here.
  */
@@ -2208,8 +2220,11 @@ export class WorkingDirectoryChanged extends Error {
  * execs bwrap in its place: the pid on record is bwrap's, written before bwrap
  * has made a mount. Read by the shell itself, a redirection on a builtin: a
  * child's line would be that of a process gone at once. Not /proc/$$: under an
- * outer /proc `$$` is nobody there, or an unrelated process. Appended, not
- * written over, so that every run of the string is on record while it lasts.
+ * outer /proc `$$` is nobody there, or an unrelated process. Into a variable
+ * local to a function: assigned to, one of that name that the caller exports
+ * would reach the command with the line in it. (`local` is in bash, dash, ash
+ * and mksh, not in POSIX; the function's name is none a shell has an alias for.) Appended, not written over, so
+ * that every run of the string is on record while it lasts.
  * One shell does both where both are needed.
  * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
@@ -2226,7 +2241,7 @@ function renderBwrapInvocation(
       ? []
       : [
           {
-            run: 'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"',
+            run: 'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1"',
             file: started,
           },
         ]
@@ -3561,6 +3576,19 @@ async function buildFilesystemArgs(
   // The mount points on the host this wrap relies on: placeholders bwrap makes
   // for absent deny paths, and another sandbox's that this wrap covers again.
   const mountPoints: string[] = []
+  // Where the manifests are kept, each made if it can be.
+  let manifestDirs: string[] = []
+  const makeManifestDirs = (recording: boolean): void => {
+    try {
+      manifestDirs = mountPointManifestDirectories(recording)
+    } catch (err) {
+      throw new LinuxSandboxProfileError(
+        'mount_points_unreadable',
+        `Where the mount point manifests are kept cannot be told (${errorText(err)}), so they cannot be kept out of the command's reach`,
+        errorText(err),
+      )
+    }
+  }
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
   const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
@@ -4096,6 +4124,11 @@ async function buildFilesystemArgs(
     const configuredDenyPaths = writeConfig.denyWithinAllow || []
     const denyPaths = [...configuredDenyPaths, ...mandatoryDenyPaths]
 
+    // Before any reading of them. What the environment names is believed only
+    // while none of the others can be written, and what this wrap found named
+    // there its own manifest would carry to where every process believes it.
+    makeManifestDirs(false)
+
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
@@ -4415,6 +4448,10 @@ async function buildFilesystemArgs(
       const wanted = denyPathAncestors.has(dest)
         ? MountPointKind.Directory
         : MountPointKind.File
+      // The manifests are read before anything is made on the host (see
+      // makeableMountPoint). A plan refused for what they cannot tell would
+      // leave it there, and a clean-up in the same doubt removes nothing.
+      if (named === undefined) whatIsNamedNow()
       // A file git reads back is made by this process, once a manifest names
       // it, and that is where a refusal shows. Made empty any earlier, and left
       // by a plan that came to nothing, it would cost the repository its git.
@@ -4911,12 +4948,10 @@ async function buildFilesystemArgs(
       gitRedirectStoreFile(placeholder, gitRedirectStoreFiles),
     )
   }
-  const manifestDirs =
-    writeConfig !== undefined
-      ? mountPointManifestDirectories(
-          mountPoints.length > 0 || emptySource !== undefined,
-        )
-      : []
+  // With a manifest to come, where it goes is settled now, to be pinned too.
+  if (mountPoints.length > 0 || emptySource !== undefined) {
+    makeManifestDirs(true)
+  }
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
@@ -5150,20 +5185,6 @@ async function buildFilesystemArgs(
   // a reading taken after the last look at the host above. A directory it left
   // out (the one a placeholder is nested in, a pin) goes with its maker, and the
   // command is then refused its start or, once the pin is mounted, loses it.
-  //
-  // INVARIANT: a manifest directory must never be writable from inside a
-  // sandbox. A command that could delete a manifest could make a running
-  // sandbox's mount points look unused, and one that could write a manifest
-  // could name any path for a collect on the host to remove. This holds for
-  // every wrap that restricts writes, whether or not it names a manifest, and
-  // for every directory some process of this user keeps manifests in, so each
-  // is bound read-only (see mountPointManifestDirectories) with what lies above
-  // it pinned. Emitted after every allow and deny bind, like the two stores
-  // below.
-  //
-  // Each is bound where it really is, not at the name it was worked out as:
-  // bubblewrap makes a bind's destination by name inside the new root, and a
-  // link with an absolute target on the way leads nowhere from there.
   const planned = {
     // With what is still to come: the bind of the manifest, and one of each
     // manifest directory and of each directory that mounts are made from.
@@ -5270,6 +5291,17 @@ async function buildFilesystemArgs(
   if (!holds) {
     return undefined
   }
+  // INVARIANT: no manifest directory is writable from inside a sandbox, whether
+  // or not the wrap names a manifest (see mountPointManifestDirectories). Each
+  // is bound read-only after every allow and deny bind, like the two stores
+  // below, and where it really is: bubblewrap makes a bind's destination by name
+  // inside the new root, and a link with an absolute target leads nowhere there.
+  //
+  // A read deny that covers one keeps the command out of it already. Bound on
+  // top of that, it could be read after all: other projects' paths, the pids of
+  // their sandboxes.
+  const isInReach = (dir: string): boolean =>
+    !isHiddenByTmpfs(dir, 'writes and reads')
   let started: string | undefined
   let onTheLine = 0
   if (manifest !== undefined) {
@@ -5287,7 +5319,7 @@ async function buildFilesystemArgs(
     // opened by a descriptor number that another wrap's file may have by then.
     args.splice(afterRootBind, 0, '--ro-bind', file, file)
     onTheLine = afterRootBind + 3
-    args.push('--ro-bind', dir, dir)
+    if (isInReach(dir)) args.push('--ro-bind', dir, dir)
   }
   if (names.length > 0 || emptySource !== undefined) {
     registerExitCleanupHandler()
@@ -5296,11 +5328,11 @@ async function buildFilesystemArgs(
     // The others need only be kept out of the command's reach, so one that has
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
-    for (const manifestDir of manifestDirs) {
-      if (manifestDir !== manifest?.dir) {
-        const dir = canonicalForm(manifestDir)
-        args.push('--ro-bind-try', dir, dir)
-      }
+    // Each where it really is, once: two of the names may lead to one place.
+    const others = new Set(manifestDirs.map(canonicalForm))
+    if (manifest !== undefined) others.delete(canonicalForm(manifest.dir))
+    for (const dir of others) {
+      if (isInReach(dir)) args.push('--ro-bind-try', dir, dir)
     }
   }
 

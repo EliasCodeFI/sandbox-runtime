@@ -225,6 +225,16 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         message: error.message,
       }))
       const argsPathOf = wrapped => wrapped.match(/' srt-args (\\S+) /)?.[1]
+      // But for the sockets: the runtime closes those of a child that has ended
+      // (ripgrep) in its own time, on another thread.
+      const openFds = () => fs.readdirSync('/proc/self/fd').filter(fd => {
+        try {
+          return !fs.readlinkSync('/proc/self/fd/' + fd).startsWith('socket:')
+        } catch {
+          // Closed since the listing, as the listing's own is.
+          return false
+        }
+      }).length
       ${body}
     `
     // A file, not `-e`: the script names every fixture path, and would not
@@ -455,7 +465,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
 
   it('holds one fd per pending profile and gives them all back at cleanup, a refused wrap included', () => {
     const seen = isolated(`
-      const openFds = () => fs.readdirSync('/proc/self/fd').length
       // The runtime opens event-loop fds of its own on the first wrap.
       await wrap(small)
       const baseline = openFds()
@@ -485,7 +494,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       // A profile belongs to one wrap and nothing maps it back to a command, so
       // none is closed while any wrap of this process is outstanding.
       const seen = isolated(`
-      const openFds = () => fs.readdirSync('/proc/self/fd').length
       // The runtime opens event-loop fds of its own on the first wrap.
       await wrap(small)
       cleanupBwrapMountPoints()
