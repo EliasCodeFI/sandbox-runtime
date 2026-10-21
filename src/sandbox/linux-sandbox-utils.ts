@@ -1196,7 +1196,7 @@ function unresolvableGitEntry(
     .join('; ')
   return new LinuxSandboxProfileError(
     'deny_unresolvable_git_entry',
-    `[Sandbox Linux] ${told}. That directory is the working directory or a path this command may write, so the only thing that holds the link - a read-only bind of the directory around it - would take the whole tree with it, and the chain has no far end to deny instead: a command in this sandbox could put a directory in the link's place and leave the entry pointing at hooks or config this profile never saw, for a git run on the host to use. Refusing the command rather than running it with that open. Repairing the chain so it reaches something, moving the links inside the git directory, or a denyWrite entry naming the directory holding them, each closes it.`,
+    `[Sandbox Linux] ${told}. That directory is the working directory or a path this command may write, so the only thing that holds the link - a read-only bind of the directory around it - would take the whole tree with it, and the chain has no far end to deny instead: a command in this sandbox could put a directory in the link's place and leave the entry pointing at hooks or config this profile never saw, for a git run on the host to use. Refusing the command rather than running it with that open. Repairing the chain so it reaches something, or moving the links inside the git directory, closes it.`,
   )
 }
 
