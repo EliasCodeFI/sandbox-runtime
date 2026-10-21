@@ -28,7 +28,9 @@ import type { GitDirDenies } from '../../src/sandbox/mandatory-deny-paths.js'
 import {
   NO_COLLAPSE,
   collapseEverything,
+  collapseFloor,
   collapseFurther,
+  describeCollapse,
 } from '../../src/sandbox/linux-deny-collapse.js'
 import type { SubmoduleDenyPlan } from '../../src/sandbox/linux-deny-collapse.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
@@ -235,6 +237,68 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
       wholeGitDirs: 5,
       wholeModulesDirs: 2,
     })
+  })
+
+  it('does not count its way through entries that take no mount', () => {
+    // A thousand submodule git directories the command may not write, and
+    // eleven deny paths it may where ten fit. Nothing that can be degraded gives
+    // a mount back, and a step takes as few entries as would make up for one.
+    const modulesDir = join(dir, 'elsewhere', '.git', 'modules')
+    const gitDirs = Array.from({ length: 1000 }, (_unused, i) => ({
+      gitDir: join(modulesDir, `s${i}`),
+      denyPaths: [join(modulesDir, `s${i}`, 'hooks')],
+      escapingDenyPaths: [],
+      linkedEntryDirs: [],
+      chainHops: [],
+    }))
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: [
+        ...Array.from({ length: 11 }, (_unused, i) => join(dir, `deny${i}`)),
+        ...gitDirs.flatMap(each => each.denyPaths),
+      ],
+      repositories: [{ modulesDir, gitDirs, wholeDirDenies: [] }],
+      chainHops: [],
+    }
+    let asked = 0
+
+    const level = collapseFloor(plan, 10, denyPath => {
+      asked++
+      return !denyPath.startsWith(modulesDir)
+    })
+
+    expect(level).toEqual(collapseEverything(plan))
+    expect(asked).toBeLessThanOrEqual(2 * plan.denyPaths.length)
+  })
+
+  it('resolves each path once to say what was degraded', () => {
+    // Both numbers are a command's to choose, and their product is minutes.
+    const modulesDir = join(dir, 'repo', '.git', 'modules')
+    const gitDirs = Array.from({ length: 200 }, (_unused, i) => ({
+      gitDir: join(modulesDir, `s${i}`),
+      denyPaths: [join(modulesDir, `s${i}`, 'hooks')],
+      escapingDenyPaths: [],
+      linkedEntryDirs: [],
+      chainHops: [],
+    }))
+    const wholeDirDenies = Array.from({ length: 50 }, (_unused, i) =>
+      join(modulesDir, `whole${i}`),
+    )
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: gitDirs.flatMap(each => each.denyPaths),
+      repositories: [{ modulesDir, gitDirs, wholeDirDenies }],
+      chainHops: [],
+    }
+    const resolve = spyOn(fs.realpathSync, 'native')
+    try {
+      expect(describeCollapse(plan, collapseEverything(plan))).toContain(
+        '200 of the 200 submodule git directories',
+      )
+      expect(resolve.mock.calls.length).toBeLessThanOrEqual(
+        2 * (gitDirs.length + wholeDirDenies.length),
+      )
+    } finally {
+      resolve.mockRestore()
+    }
   })
 
   it('still stops at the first level that fits where stepping does give words back', async () => {

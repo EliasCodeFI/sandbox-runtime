@@ -65,6 +65,7 @@ import type { CollapseLevel, SubmoduleDenyPlan } from './linux-deny-collapse.js'
 import {
   NO_COLLAPSE,
   collapseEverything,
+  collapseFloor,
   collapseFurther,
   collapsedDenyPaths,
   describeCollapse,
@@ -3290,7 +3291,11 @@ async function generateFilesystemArgs(
     normalizePathForSandbox(p, { literal: true }),
   )
   const plan = guardedDenyPlan(found, writeRoots)
-  let level = collapseFloor(plan, writeRoots, wordsAvailable)
+  let level = collapseFloor(
+    plan,
+    Math.floor(wordsAvailable / BWRAP_WORDS_PER_MOUNT),
+    denyPath => writeRoots.some(allowed => isAtOrUnder(denyPath, allowed)),
+  )
   // What the pass before this one came to, once there has been one.
   let wordsBefore: number | undefined
   for (;;) {
@@ -3344,38 +3349,6 @@ async function generateFilesystemArgs(
       )
     }
     return filesystem
-  }
-}
-
-/**
- * Where the passes above start: the level counting alone says the profile
- * cannot do without, since every deny path inside the write allowlist takes
- * a mount of its own and the ancestor pins beneath each are more on top.
- * Without it a repository with ten thousand submodules is planned out in full
- * before anything is degraded, and a wrapped command can make such a tree:
- * what one costs every command after it is not free to leave at whatever it
- * comes to.
- *
- * It is not the answer, and the measurement above is: what it leaves out can
- * only mean more collapsing, and the one way it can ask for too much — a
- * deny path counted here that another deny turns out to cover — is a mount
- * the profile saves rather than one it needs.
- */
-function collapseFloor(
-  plan: SubmoduleDenyPlan,
-  writeRoots: readonly string[],
-  wordsAvailable: number,
-): CollapseLevel {
-  const mounts = Math.floor(wordsAvailable / BWRAP_WORDS_PER_MOUNT)
-  let level = NO_COLLAPSE
-  for (;;) {
-    const denies = collapsedDenyPaths(plan, level).filter(denyPath =>
-      writeRoots.some(allowedPath => isAtOrUnder(denyPath, allowedPath)),
-    ).length
-    if (denies <= mounts) return level
-    const degraded = collapseFurther(plan, level, denies - mounts)
-    if (degraded === undefined) return level
-    level = degraded
   }
 }
 

@@ -275,6 +275,39 @@ export function collapseEverything(plan: SubmoduleDenyPlan): CollapseLevel {
   }
 }
 
+/**
+ * Where the caller's passes start: the level counting alone says a profile with
+ * room for `mounts` cannot do without, since every deny path that `takesAMount`
+ * (one inside the write allowlist) takes one of its own, and the ancestor pins
+ * beneath each are more on top. Without it a repository with ten thousand
+ * submodules is planned out in full before anything is degraded, which takes
+ * minutes, and a wrapped command can make such a tree.
+ *
+ * It is not the answer, and the caller's measurement is: what it leaves out can
+ * only mean more collapsing, and the one way it can ask for too much — a deny
+ * path counted here that another deny turns out to cover — is a mount the
+ * profile saves rather than one it needs.
+ */
+export function collapseFloor(
+  plan: SubmoduleDenyPlan,
+  mounts: number,
+  takesAMount: (denyPath: string) => boolean,
+): CollapseLevel {
+  let level = NO_COLLAPSE
+  let deniesBefore = Number.POSITIVE_INFINITY
+  for (;;) {
+    const denies = collapsedDenyPaths(plan, level).filter(takesAMount).length
+    if (denies <= mounts) return level
+    // A step that gave nothing back took entries that take no mount, and how
+    // many more of those lie ahead is a command's to choose.
+    if (denies >= deniesBefore) return collapseEverything(plan)
+    deniesBefore = denies
+    const degraded = collapseFurther(plan, level, denies - mounts)
+    if (degraded === undefined) return level
+    level = degraded
+  }
+}
+
 /** How many entries before `from` it takes for `gives` to reach `mounts`, at
  *  least one: a step that degraded nothing would loop for ever. */
 function stepBack(
@@ -355,9 +388,13 @@ function coveredByWholeDirDeny(
 ): (candidate: string) => boolean {
   const covers = plan.repositories
     .flatMap(repository => repository.wholeDirDenies)
-    .map(underDirectory)
+    .map(realPathOrSelf)
   if (covers.length === 0) return () => false
-  return candidate => covers.some(under => under(candidate))
+  // Resolved once, not once for each of them: both are a command's to multiply.
+  return candidate => {
+    const real = realPathOrSelf(candidate)
+    return covers.some(cover => isAtOrUnder(real, cover))
+  }
 }
 
 /** Every submodule git directory the plan may degrade, in the order a
