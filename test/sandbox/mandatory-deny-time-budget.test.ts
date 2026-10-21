@@ -267,7 +267,48 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
     })
 
     expect(level).toEqual(collapseEverything(plan))
-    expect(asked).toBeLessThanOrEqual(2 * plan.denyPaths.length)
+    expect(asked).toBeLessThanOrEqual(4 * plan.denyPaths.length)
+  })
+
+  it('steps past entries that take no mount to those that do', () => {
+    // Served last, so taken first: seventy git directories the command may not
+    // write. Degrading them gives nothing back, and is no reason to degrade
+    // every one of those it may.
+    const repository = (
+      modulesDir: string,
+      count: number,
+    ): SubmoduleDenyPlan['repositories'][number] => ({
+      modulesDir,
+      wholeDirDenies: [],
+      gitDirs: Array.from({ length: count }, (_unused, i) => ({
+        gitDir: join(modulesDir, `s${i}`),
+        denyPaths: ['hooks', 'config'].map(name =>
+          join(modulesDir, `s${i}`, name),
+        ),
+        escapingDenyPaths: [],
+        linkedEntryDirs: [],
+        chainHops: [],
+      })),
+    })
+    const repositories = [
+      repository(join(dir, 'repo', '.git', 'modules'), 10),
+      repository(join(dir, 'elsewhere', '.git', 'modules'), 70),
+    ]
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: repositories.flatMap(each =>
+        each.gitDirs.flatMap(kept => kept.denyPaths),
+      ),
+      repositories,
+      chainHops: [],
+    }
+
+    // Twenty deny paths that take a mount, and room for eighteen: two of the
+    // ten, each two paths for one bind, make up for it.
+    expect(
+      collapseFloor(plan, 18, denyPath =>
+        denyPath.startsWith(join(dir, 'repo')),
+      ),
+    ).toEqual({ wholeGitDirs: 72, wholeModulesDirs: 0 })
   })
 
   it('resolves each path once to say what was degraded', () => {

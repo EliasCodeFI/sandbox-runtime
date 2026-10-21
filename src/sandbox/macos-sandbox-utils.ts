@@ -22,6 +22,7 @@ import {
   getDangerousDirectories,
   isAbsenceErrno,
   coversWriteTree,
+  meetsWriteRoots,
 } from './sandbox-utils.js'
 import {
   gitDirDenyPaths,
@@ -195,9 +196,13 @@ export function macGetMandatoryDenyEntries(
   // (gitPointerFilter), which cannot follow them.
   const pointer = gitFileDenies(dotGit, allowGitConfig, deadline)
   const visited = new Set<string>()
-  const trees = pointer.gitDirs.map(gitDir =>
-    gitDirTreeDenies(gitDir, allowGitConfig, { deadline, visited }),
-  )
+  // Only where the command may write some of it: else there is nothing to deny,
+  // and a walk that refuses over a sibling worktree would protect nothing.
+  const trees = pointer.gitDirs
+    .filter(gitDir => meetsWriteRoots(gitDir, allowWritePaths))
+    .map(gitDir =>
+      gitDirTreeDenies(gitDir, allowGitConfig, { deadline, visited }),
+    )
   return withOnDisk(
     [...own, ...pointer.denyPaths, ...trees.flatMap(gitDirTreeDenyPaths)],
     [...pointer.chainHops, ...trees.flatMap(tree => tree.chainHops)],

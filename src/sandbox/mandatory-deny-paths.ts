@@ -231,7 +231,7 @@ export interface GitDirTreeDenies {
   /** `<gitDir>/worktrees`, whether or not anything is under it. */
   worktreesDir: string
   /** One per linked worktree's git directory under `worktreesDir`, sorted by
-   *  path; see {@link worktreeGitDirs}. */
+   *  path; see {@link keptWorktrees}. */
   worktrees: Array<{ gitDir: string } & GitDirDenies>
   /** What neither walk could see through; see {@link SubmoduleScan}. */
   unreadableDirs: string[]
@@ -898,13 +898,14 @@ function keptWorktrees(gitDir: string, walk: TreeWalk): KeptGitDir[] {
         `[Sandbox] The walk of ${worktreesDir} ran out of the time it was given with ${entries.length - at} of its ${entries.length} entries still to look at; refusing to sandbox on the linked worktrees it did reach`,
       )
     }
+    if (isNoText(entry, worktreesDir, walk)) continue
     const child = path.join(worktreesDir, entry.name)
     const found = walkEntry(entry, child, walk, deadline)
     if (found.kind === 'skip') continue
     // Where a link leads to nothing is denied as a git directory that is not
     // there yet, as the `.git/modules` walk denies one.
     const worktree = found.kind === 'dangling' ? found.landing : child
-    if (isVisited(worktree, walk)) continue
+    if (isVisited('worktree', worktree, walk)) continue
     // Denied whole where it cannot be listed, and git, the same user's, reads
     // no `commondir` in there either: nothing to refuse the command over.
     if (
@@ -986,9 +987,10 @@ export function submoduleGitDirs(
  * see, so the deadline is what bounds the walk.
  */
 function walkModules(modulesDir: string, walk: TreeWalk): string[] {
-  // The root counts as visited: an entry linked straight back to it is then the
-  // same dead end as one linked to any other directory already walked.
-  if (isVisited(modulesDir, walk)) return []
+  if (isVisited('root', modulesDir, walk)) return []
+  // An entry linked straight back to it is then the same dead end as one linked
+  // to any other directory already walked.
+  isVisited('walked', modulesDir, walk)
   const gitDirs: string[] = []
   // Where the walk still has to look. A directory that was listed carries its
   // entries, and `gitDir` says it was recorded as a git directory, so that some
@@ -1011,6 +1013,7 @@ function walkModules(modulesDir: string, walk: TreeWalk): string[] {
           `[Sandbox] The walk of ${modulesDir} ran out of the time it was given while listing ${item.dir}, with ${pending.length} directories still to look at; refusing to sandbox on the submodule git directories it did reach`,
         )
       }
+      if (isNoText(entry, item.dir, walk)) continue
       const child = path.join(item.dir, entry.name)
       let childEntries: fs.Dirent[] | undefined
       if (item.gitDir === true) {
@@ -1043,10 +1046,12 @@ function walkModules(modulesDir: string, walk: TreeWalk): string[] {
         // Where a link leads to nothing is denied as a git directory that is
         // not there yet, so a command cannot fill one in for the host's git
         // to find. Nothing is walked: there is nothing there to walk.
-        if (!isVisited(found.landing, walk)) gitDirs.push(found.landing)
+        if (!isVisited('walked', found.landing, walk)) {
+          gitDirs.push(found.landing)
+        }
         continue
       }
-      if (isVisited(child, walk)) continue
+      if (isVisited('walked', child, walk)) continue
 
       childEntries ??= listDirectory(child, walk)
       if (childEntries === undefined) continue
@@ -1054,8 +1059,14 @@ function walkModules(modulesDir: string, walk: TreeWalk): string[] {
       if (isGitDir) gitDirs.push(child)
       // Anything else is a segment of a submodule name (`vendor` of
       // `vendor/lib`) - and a directory that looks like a git directory can
-      // be one as well, so what else it holds is looked at either way.
-      pending.push({ dir: child, entries: childEntries, gitDir: isGitDir })
+      // be one as well, so what else it holds is looked at either way. In the
+      // `modules` of a git directory every entry is a submodule's name, as in
+      // `modulesDir`, whatever a command left beside them.
+      pending.push({
+        dir: child,
+        entries: childEntries,
+        gitDir: isGitDir && !(item.gitDir === true && entry.name === 'modules'),
+      })
     }
   }
   return gitDirs.sort()
@@ -1084,11 +1095,23 @@ interface TreeWalk {
   chainHops: GitChainHop[]
 }
 
-/** Whether a walk has been into `dir` before. It has from now on. */
-function isVisited(dir: string, walk: TreeWalk): boolean {
-  const real = realPathOrSelf(dir)
-  if (walk.visited.has(real)) return true
-  walk.visited.add(real)
+/**
+ * Whether a walk has been into `dir` before AS that. It has from now on.
+ *
+ * THREAT: a command can link any directory into a `modules` or a `worktrees`,
+ * to have it visited there first. What a directory is denied by depends on what
+ * it is visited as: a linked worktree's has no `hooks` denied, and what a
+ * `modules` holds is all submodule names only where the walk starts from it. So
+ * a visit as one thing never stands in for a visit as another.
+ */
+function isVisited(
+  as: 'root' | 'walked' | 'worktree',
+  dir: string,
+  walk: TreeWalk,
+): boolean {
+  const key = `${as}:${realPathOrSelf(dir)}`
+  if (walk.visited.has(key)) return true
+  walk.visited.add(key)
   return false
 }
 
@@ -1101,6 +1124,21 @@ type WalkEntry =
   | { kind: 'dangling'; landing: string }
   /** Nothing to walk and nothing to deny. */
   | { kind: 'skip' }
+
+/**
+ * Whether the name of `entry`, of `dir`, may be bytes that are no text. The
+ * string made of those names nothing, so no deny can be aimed at it, and `dir`
+ * is denied whole.
+ */
+function isNoText(entry: fs.Dirent, dir: string, walk: TreeWalk): boolean {
+  if (!entry.name.includes('\uFFFD')) return false
+  walk.unreadableDirs.add(dir)
+  logForDebugging(
+    `[Sandbox] An entry of ${dir} has a name that is not valid UTF-8, denying ${dir} whole`,
+    { level: 'warn' },
+  )
+  return true
+}
 
 /** Entries of `dir`, or undefined when it is absent or (recorded) unreadable. */
 function listDirectory(dir: string, walk: TreeWalk): fs.Dirent[] | undefined {
@@ -1136,11 +1174,24 @@ function walkEntry(
   if (entry.isDirectory()) return { kind: 'directory' }
   if (!entry.isSymbolicLink()) return { kind: 'skip' }
   const holder = path.dirname(entryPath)
-  const chain = resolveChain(
-    physicalPath(path.parse(entryPath).root, holder, deadline),
-    entry.name,
-    deadline,
-  )
+  let chain: ResolvedChain
+  try {
+    chain = resolveChain(
+      physicalPath(path.parse(entryPath).root, holder, deadline),
+      entry.name,
+      deadline,
+    )
+  } catch (err) {
+    if (!(err instanceof GitMetadataError)) throw err
+    // Where it leads cannot be named. A command can make one here, so it costs
+    // what any link here does and not every command after it.
+    walk.linkedEntryDirs.add(holder)
+    logForDebugging(
+      `[Sandbox] ${entryPath} leads through a symlink whose target is not valid UTF-8, denying ${holder} whole`,
+      { level: 'warn' },
+    )
+    return { kind: 'skip' }
+  }
   // The first hop is the entry, whose holder joins `linkedEntryDirs` below;
   // the rest lie between it and what it lands on, and that deny reaches
   // neither them nor the directories they sit in.

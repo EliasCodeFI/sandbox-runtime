@@ -182,6 +182,44 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     ])
   })
 
+  it('takes every entry of the modules of a git directory for a name', () => {
+    // As in the directory it was asked to walk, whatever a command left beside
+    // them: taken for git's own, `lfs` would hide the submodule `lfs/client`.
+    const lib = makeGitDir(join(modules, 'lib'))
+    const nested = makeGitDir(join(lib, 'modules', 'lfs', 'client'))
+    writeFileSync(join(lib, 'modules', 'HEAD'), '')
+
+    expect(submoduleGitDirs(modules).gitDirs).toEqual([
+      lib,
+      join(lib, 'modules'),
+      nested,
+    ])
+  })
+
+  it.if(!isWindows)(
+    'denies whole the directory holding what cannot be named',
+    () => {
+      // A link whose target, and a directory whose name, is no text. A command
+      // can make either here, so it costs what any link here does, and not
+      // every command after it.
+      const linked = join(modules, 'linked')
+      const named = join(modules, 'named')
+      mkdirSync(linked, { recursive: true })
+      mkdirSync(named)
+      symlinkSync(Buffer.from([0x2e, 0x2e, 0x2f, 0xff]), join(linked, 'x'))
+      mkdirSync(
+        Buffer.concat([Buffer.from(`${named}/caf`), Buffer.from([0xe9])]),
+      )
+
+      expect(submoduleGitDirs(modules)).toEqual({
+        gitDirs: [],
+        unreadableDirs: [named],
+        linkedEntryDirs: [linked],
+        chainHops: [],
+      })
+    },
+  )
+
   it('does not walk into what git itself keeps in a git directory', () => {
     // A real submodule git directory with everything in it that is large:
     // loose objects fanned out over 256 directories, refs and their logs, an

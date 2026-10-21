@@ -46,6 +46,7 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   coversWriteTree,
+  meetsWriteRoots,
   properAncestors,
   nameLocation,
   getDangerousDirectories,
@@ -360,14 +361,14 @@ function takesAFileFromHere(dir: string): boolean {
  * directory is held by a descriptor that followed no link, and nothing there is
  * written over: the file is made exclusively, or found as another wrap made it.
  *
- * `changed` where the directory or the name is no longer what the plan saw;
- * `refused` where the directory takes no file from this process after all, or
- * what a killed wrap left there is no use to git. The caller plans again either
- * way.
+ * `changed` where the directory or the name is no longer what the plan saw,
+ * `refused` where the directory takes no file from this process after all, and
+ * `empty` where a mount point is there that holds nothing and should. The caller
+ * plans again on any of them.
  */
 function writeGitRedirectMountPoint(
   dest: string,
-): 'held' | 'changed' | 'refused' {
+): 'held' | 'changed' | 'refused' | 'empty' {
   const placeholder = gitRedirectPlaceholder(dest) ?? ''
   let fd: number | undefined
   try {
@@ -386,7 +387,7 @@ function writeGitRedirectMountPoint(
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
     }
     if (kindOfMountPoint(file) !== 'file') return 'changed'
-    return fs.lstatSync(file).size === placeholder.length ? 'held' : 'refused'
+    return fs.lstatSync(file).size === placeholder.length ? 'held' : 'empty'
   } catch (err) {
     if (refusesAFile(err)) return 'refused'
     if (isAbsenceErrno(err)) return 'changed'
@@ -777,7 +778,7 @@ export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
   allowWritePaths: readonly string[] = [],
 ): string[] {
-  const plan = cwdMandatoryDenyPlan(allowGitConfig, undefined)
+  const plan = cwdMandatoryDenyPlan(allowGitConfig, undefined, allowWritePaths)
   return withoutWorkTreeDenies(
     [
       ...collapsedDenyPaths(plan, NO_COLLAPSE),
@@ -793,6 +794,7 @@ export function linuxGetCwdMandatoryDenyPaths(
 function cwdMandatoryDenyPlan(
   allowGitConfig: boolean,
   deadline: number | undefined,
+  allowWritePaths: readonly string[],
   visited = new Set<string>(),
 ): SubmoduleDenyPlan {
   const cwd = process.cwd()
@@ -837,7 +839,10 @@ function cwdMandatoryDenyPlan(
       .map(hop => hop.source)
     // A command in a linked worktree is commonly let write the repository's
     // git directory, and what that keeps is as much the host's git's to run.
+    // Where it may write none of it there is nothing to deny, and a walk that
+    // refuses over a sibling worktree would protect nothing.
     for (const gitDir of pointer.gitDirs) {
+      if (!meetsWriteRoots(gitDir, allowWritePaths)) continue
       addGitDirTree(plan, gitDirTreeDenies(gitDir, allowGitConfig, walk))
     }
   } else if (dotGitStat !== undefined) {
@@ -1195,6 +1200,7 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
+  allowWritePaths: readonly string[] = [],
   abortSignal?: AbortSignal,
 ): Promise<SubmoduleDenyPlan> {
   const cwd = process.cwd()
@@ -1215,7 +1221,7 @@ async function linuxGetMandatoryDenyPaths(
   // back through, so it is the last to lose its precise denies.
   const visited = new Set<string>()
   const plan = asProfileRefusal(() =>
-    cwdMandatoryDenyPlan(allowGitConfig, deadline, visited),
+    cwdMandatoryDenyPlan(allowGitConfig, deadline, allowWritePaths, visited),
   )
   const denyPaths = plan.denyPaths
 
@@ -1414,7 +1420,9 @@ async function linuxGetMandatoryDenyPaths(
         ...pointer.linkedEntryDirs.map(wholeDirDenyLanding),
       )
       plan.chainHops.push(...pointer.chainHops)
-      pointer.gitDirs.forEach(denyGitDir)
+      pointer.gitDirs
+        .filter(gitDir => meetsWriteRoots(gitDir, allowWritePaths))
+        .forEach(denyGitDir)
     }
   }
 
@@ -3115,8 +3123,9 @@ type FilesystemArgs = {
  * complete. A pass no shorter than the one before is the last that is stepped
  * to.
  *
- * Only the pass that is settled on is published. `gitDirsThatRefusedAFile` is
- * the caller's, for all the plans of one wrap.
+ * Only the pass that is settled on is published. `gitDirsThatRefusedAFile` and
+ * `foundEmpty` are the caller's, for all the plans of one wrap (see
+ * writeGitRedirectMountPoints).
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -3130,6 +3139,7 @@ async function generateFilesystemArgs(
   commandKey?: string,
   wordsAvailable: number = Number.POSITIVE_INFINITY,
   gitDirsThatRefusedAFile: Set<string> = new Set(),
+  foundEmpty: Set<string> = new Set(),
 ): Promise<FilesystemArgs | undefined> {
   const startedIn = workingDirectory()
   const build = (
@@ -3144,29 +3154,35 @@ async function generateFilesystemArgs(
       mandatoryDenyPaths,
       isSettledOn,
       gitDirsThatRefusedAFile,
+      foundEmpty,
       startedIn,
       abortSignal,
       commandKey,
     )
   if (writeConfig === undefined) return build([], () => true)
 
+  const writeRootsNow = (): string[] =>
+    (writeConfig.allowOnly ?? []).map(p =>
+      normalizePathForSandbox(p, { literal: true }),
+    )
   const found = await linuxGetMandatoryDenyPaths(
     ripgrepConfig,
     mandatoryDenySearchDepth,
     allowGitConfig,
+    writeRootsNow(),
     abortSignal,
   )
   // INVARIANT: one plan, one working directory. A relative entry is resolved
   // against it on both sides of the await above.
   if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
-  const writeRoots = (writeConfig.allowOnly ?? []).map(p =>
-    normalizePathForSandbox(p, { literal: true }),
-  )
+  const writeRoots = writeRootsNow()
   const plan = guardedDenyPlan(found, writeRoots)
+  const takesAMount = (denyPath: string): boolean =>
+    writeRoots.some(allowed => isAtOrUnder(denyPath, allowed))
   let level = collapseFloor(
     plan,
     Math.floor(wordsAvailable / BWRAP_WORDS_PER_MOUNT),
-    denyPath => writeRoots.some(allowed => isAtOrUnder(denyPath, allowed)),
+    takesAMount,
   )
   // What the pass before this one came to, once there has been one.
   let wordsBefore: number | undefined
@@ -3182,6 +3198,7 @@ async function generateFilesystemArgs(
                 plan,
                 level,
                 Math.ceil((words - wordsAvailable) / BWRAP_WORDS_PER_MOUNT),
+                takesAMount,
               )
         // A pass no shorter than the one before took entries that cost this
         // profile nothing, such as git directories no write root contains. How
@@ -3236,6 +3253,7 @@ async function buildFilesystemArgs(
   mandatoryDenyPaths: string[],
   isSettledOn: (words: number) => boolean,
   gitDirsThatRefusedAFile: Set<string>,
+  foundEmpty: Set<string>,
   startedIn: string | undefined,
   abortSignal: AbortSignal | undefined,
   commandKey: string | undefined,
@@ -4838,9 +4856,17 @@ async function buildFilesystemArgs(
     for (const dest of gitRedirectMountPoints) {
       if (!landed.has(dest)) continue
       const gitDir = path.dirname(dest)
-      const outcome = gitDirsThatRefusedAFile.has(gitDir)
+      let outcome = gitDirsThatRefusedAFile.has(gitDir)
         ? 'refused'
         : writeGitRedirectMountPoint(dest)
+      if (outcome === 'empty' && foundEmpty.has(dest)) {
+        // Twice: what bubblewrap made where the file had gone from under a
+        // command about to start. It is no use to git and is not written over.
+        outcome = 'refused'
+      }
+      // Once: another wrap may be between making the file and writing it, or a
+      // killed one left it, and letting go of this plan's manifest collects it.
+      if (outcome === 'empty') foundEmpty.add(dest)
       if (outcome === 'refused') gitDirsThatRefusedAFile.add(gitDir)
       held &&= outcome === 'held'
     }
@@ -5274,6 +5300,7 @@ export async function wrapCommandWithSandboxLinux(
     // ========== FILESYSTEM RESTRICTIONS ==========
     let filesystem: Awaited<ReturnType<typeof generateFilesystemArgs>>
     const gitDirsThatRefusedAFile = new Set<string>()
+    const foundEmpty = new Set<string>()
     for (let left = MOUNT_PLAN_ATTEMPTS; filesystem === undefined; left--) {
       if (left === 0) {
         throw new LinuxSandboxProfileError(
@@ -5297,6 +5324,7 @@ export async function wrapCommandWithSandboxLinux(
         // already built above and the few that come after the mounts.
         BWRAP_MAX_ARGS - bwrapArgs.length - BWRAP_TRAILING_WORDS,
         gitDirsThatRefusedAFile,
+        foundEmpty,
       ).catch((error: unknown) => {
         if (!(error instanceof MountPlanFailed)) throw error
         return undefined
