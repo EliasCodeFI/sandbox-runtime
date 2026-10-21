@@ -1606,8 +1606,9 @@ export async function initializeLinuxNetworkBridge(
   }
 
   // Wait for both sockets to be ready
-  const maxAttempts = 5
-  for (let i = 0; i < maxAttempts; i++) {
+  const startupTimeoutMs = 5000
+  const deadline = performance.now() + startupTimeoutMs
+  for (let i = 0; ; i++) {
     if (
       !httpBridgeProcess.pid ||
       httpBridgeProcess.killed ||
@@ -1629,7 +1630,8 @@ export async function initializeLinuxNetworkBridge(
       })
     }
 
-    if (i === maxAttempts - 1) {
+    const remainingMs = deadline - performance.now()
+    if (remainingMs <= 0) {
       // Clean up both processes
       if (httpBridgeProcess.pid) {
         try {
@@ -1646,11 +1648,13 @@ export async function initializeLinuxNetworkBridge(
         }
       }
       throw new Error(
-        `Failed to create bridge sockets after ${maxAttempts} attempts`,
+        `Failed to create bridge sockets after ${startupTimeoutMs}ms`,
       )
     }
 
-    await new Promise(resolve => setTimeout(resolve, i * 100))
+    await new Promise(resolve =>
+      setTimeout(resolve, Math.min(100, remainingMs)),
+    )
   }
 
   return {
