@@ -339,10 +339,8 @@ export interface GitDirTreeDenies {
  * a linked worktree" answers yes for an ordinary repository while the deny
  * stands. No content avoids that: the alternative is git refusing to run.
  *
- * An empty placeholder also says that an empty file at that path is a
- * legitimate one to leave alone; a non-empty placeholder says the opposite,
- * which is what lets the Linux backend cover or repair an empty `commondir`
- * (see `writeGitRedirectMountPoint` in src/sandbox/linux-sandbox-utils.ts).
+ * The Linux backend writes them: see `writeGitRedirectMountPoint` in
+ * src/sandbox/linux-sandbox-utils.ts.
  */
 const GIT_REDIRECT_FILES: ReadonlyArray<{
   name: string

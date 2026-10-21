@@ -54,9 +54,7 @@ export interface MaskedFileBind {
 }
 
 /**
- * Manager-owned temp dir holding the fake files. The Linux backend keeps a
- * second store of its own for the placeholders its git redirect denies bind
- * from, which need this same guarantee for this same reason.
+ * Manager-owned temp dir holding the fake files.
  *
  * INVARIANT: this directory must never be writable from inside the sandbox.
  * The Linux layer enforces this by emitting `--ro-bind <dirPath> <dirPath>`
@@ -69,13 +67,6 @@ export interface MaskedFileBind {
 export class MaskedFileStore {
   private dir: string | undefined
   private readonly byKey = new Map<string, string>()
-  private readonly dirPrefix: string
-
-  /** `dirPrefix` names this store's temp directory, so what it holds is
-   * recognisable on disk and one store's directory is never another's. */
-  constructor(dirPrefix: string = MASKED_FILE_STORE_PREFIX) {
-    this.dirPrefix = dirPrefix
-  }
 
   /**
    * Write `sentinel` to a fake file for `key` and return its path.
@@ -85,7 +76,7 @@ export class MaskedFileStore {
    */
   write(key: string, sentinel: string): string {
     if (this.dir === undefined) {
-      this.dir = fs.mkdtempSync(join(tmpdir(), this.dirPrefix))
+      this.dir = fs.mkdtempSync(join(tmpdir(), 'srt-credmask-'))
     }
     let fakePath = this.byKey.get(key)
     if (fakePath === undefined) {
@@ -94,21 +85,12 @@ export class MaskedFileStore {
     }
     // Never follow a symlink at fakePath: a prior sandbox invocation may
     // have planted one (the store dir is ro-bound now, but defence in
-    // depth). So a fresh regular file is made beside it and moved onto the
-    // name, which replaces a link rather than following it. Moved, not
-    // unlinked and written again: a command line handed out earlier binds from
-    // this name, and bubblewrap does not start on a source that is not there.
-    //
-    // 0600: owner rw; the bind into the sandbox is --ro-bind so the sandboxed
-    // process sees it read-only regardless of the host mode. No group/other.
-    const fresh = `${fakePath}.${randomUUID()}`
-    try {
-      fs.writeFileSync(fresh, sentinel, { mode: 0o600, flag: 'wx' })
-      fs.renameSync(fresh, fakePath)
-    } catch (err) {
-      fs.rmSync(fresh, { force: true })
-      throw err
-    }
+    // depth). Unlink first so writeFileSync creates a fresh regular file.
+    fs.rmSync(fakePath, { force: true })
+    // 0600: owner rw so the idempotent rewrite above succeeds; the bind
+    // into the sandbox is --ro-bind so the sandboxed process sees it
+    // read-only regardless of the host mode. No group/other.
+    fs.writeFileSync(fakePath, sentinel, { mode: 0o600 })
     return fakePath
   }
 

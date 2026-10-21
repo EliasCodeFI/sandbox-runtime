@@ -21,17 +21,10 @@ import { mountsOf, withoutManifestName } from '../helpers/bwrap-argv.js'
  * component is made fresh per wrap, so its name says nothing about the plan. */
 const EMPTY_MOUNT_SOURCE = /\S*claude-empty-[A-Za-z0-9]+/g
 
-/** So is the directory that what git reads back is bound from, per session. */
-const GIT_REDIRECT_STORE = /\S*srt-gitredirect-[A-Za-z0-9]+/g
-
 /** A profile's mounts as a multiset, for the reason mountsOf gives. */
 function mountMultiset(command: string): string[] {
   return mountsOf(withoutManifestName(command))
-    .map(mount =>
-      mount
-        .replace(EMPTY_MOUNT_SOURCE, '<empty mount source>')
-        .replace(GIT_REDIRECT_STORE, '<git redirect store>'),
-    )
+    .map(mount => mount.replace(EMPTY_MOUNT_SOURCE, '<empty mount source>'))
     .sort()
 }
 

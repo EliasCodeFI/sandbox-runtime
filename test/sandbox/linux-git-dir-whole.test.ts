@@ -18,9 +18,9 @@ import {
   cleanupBwrapMountPoints,
   LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
-import { indexOfMount } from '../helpers/bwrap-argv.js'
+import { indexOfMount, lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { leaveManifestNaming } from '../helpers/leftover-manifest.js'
+import { writeManifest } from '../helpers/mount-point-fixtures.js'
 import { isLinux } from '../helpers/platform.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -167,6 +167,22 @@ describe.if(isLinux && process.getuid?.() !== 0)(
       ])
     })
 
+    it('binds each from itself where nothing has to be made', async () => {
+      const entries = {
+        hooks: null,
+        config: '[core]\n',
+        commondir: '.\n',
+        'config.worktree': '',
+      }
+      makeUnwritableGitDir(entries)
+
+      expect(denyBindsOnGitDir(await wrapInProject()).sort()).toEqual(
+        Object.keys(entries)
+          .map(name => `--ro-bind ${join(gitDir, name)} ${join(gitDir, name)}`)
+          .sort(),
+      )
+    })
+
     it('emits no placeholder inside the git directory before the bind of it', async () => {
       // No `hooks` either: its placeholder is buffered ahead of `commondir`,
       // and bubblewrap, which can write the directory where this process
@@ -186,7 +202,7 @@ describe.if(isLinux && process.getuid?.() !== 0)(
       // the same: once the directory can be written again it goes with the
       // rest of this wrap's mount points.
       makeUnwritableGitDir({ hooks: null, commondir: '.\n' })
-      leaveManifestNaming(runtime.manifestDir(), [join(gitDir, 'commondir')])
+      writeManifest(runtime.manifestDir(), [join(gitDir, 'commondir')])
 
       expect(denyBindsOnGitDir(await wrapInProject())).toEqual([
         `--ro-bind ${gitDir} ${gitDir}`,
@@ -219,34 +235,45 @@ describe.if(isLinux && process.getuid?.() !== 0)(
       expect(readdirSync(gitDir).sort()).toEqual(['HEAD', 'hooks'])
     })
 
-    it('goes by a refusal that asking did not foretell', async () => {
-      // access(2) answers for the mode. An immutable directory, or a file
-      // system that maps owners, says yes there and no to the write, after the
-      // manifest is published. The next plan of the same wrap has to know.
-      mkdirSync(join(gitDir, 'hooks'), { recursive: true })
-      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
-      const real = fs.writeFileSync
-      let refused = 0
-      const write = spyOn(fs, 'writeFileSync').mockImplementation(((
-        ...args: Parameters<typeof fs.writeFileSync>
-      ) => {
-        if (String(args[0]).startsWith(`${gitDir}/`)) {
-          refused++
-          throw Object.assign(new Error('EACCES: permission denied'), {
-            code: 'EACCES',
-          })
+    it.each(['EACCES', 'EPERM', 'EROFS', 'ENOSPC', 'EDQUOT'])(
+      'goes by a refusal that asking did not foretell (%s)',
+      async code => {
+        // access(2) answers for the mode. An immutable directory, a file system
+        // that maps owners or a full one says yes there and no to the write,
+        // after the manifest is published. The next plan of the same wrap has
+        // to know, and of every such directory at once: a wrap has few plans.
+        const gitDirs = ['x', 'y', 'z', 'w'].map(name =>
+          join(project, name, '.git'),
+        )
+        for (const each of gitDirs) {
+          mkdirSync(join(each, 'hooks'), { recursive: true })
+          writeFileSync(join(each, 'HEAD'), 'ref: refs/heads/main')
         }
-        return real(...args)
-      }) as typeof fs.writeFileSync)
+        const real = fs.writeFileSync
+        let refused = 0
+        const write = spyOn(fs, 'writeFileSync').mockImplementation(((
+          ...args: Parameters<typeof fs.writeFileSync>
+        ) => {
+          if (/\/(commondir|config\.worktree)$/.test(String(args[0]))) {
+            refused++
+            throw Object.assign(new Error(code), { code })
+          }
+          return real(...args)
+        }) as typeof fs.writeFileSync)
 
-      const command = await wrapInProject().finally(() => write.mockRestore())
+        const command = await wrapInProject().finally(() => write.mockRestore())
 
-      expect(denyBindsOnGitDir(command)).toEqual([
-        `--ro-bind ${gitDir} ${gitDir}`,
-      ])
-      expect(refused).toBe(1)
-      expect(readdirSync(gitDir).sort()).toEqual(['HEAD', 'hooks'])
-    })
+        expect(denyBindsOnGitDir(command)).toEqual([
+          `--ro-bind ${gitDir} ${gitDir}`,
+        ])
+        for (const each of gitDirs) {
+          expect(lastMountAt(command, each)).toBe(`--ro-bind ${each} ${each}`)
+          expect(readdirSync(each).sort()).toEqual(['HEAD', 'hooks'])
+        }
+        // Once a directory has refused one file it is not asked for the other.
+        expect(refused).toBe(gitDirs.length)
+      },
+    )
 
     it('refuses the command where the git directory holds the work tree', async () => {
       // `x/.git` names the project itself as its git directory. Denied whole,

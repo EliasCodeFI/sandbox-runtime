@@ -415,11 +415,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     const none = await shares()
     const [first, second] = repositories(10)
     // hooks, config, commondir and config.worktree, and a pin on each of the
-    // two directories above them. And once, not theirs by the count, the
-    // directory that what git reads back is bound from.
+    // two directories above them.
     const ten = await shares()
     expect(ten).toEqual({
-      total: none.total + 10 * 18 + 3,
+      total: none.total + 10 * 18,
       mandatory: none.mandatory + 10 * 18,
     })
 

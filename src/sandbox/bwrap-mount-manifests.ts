@@ -947,17 +947,6 @@ function removeMountSource(source: string): Removal {
   }
 }
 
-/** Whether `stat` is of an empty regular file under one name, and the user's:
- *  what a mount point that is a file looks like as bubblewrap makes it. */
-export function isEmptyFileOfOurs(stat: fs.Stats): boolean {
-  return (
-    stat.isFile() &&
-    stat.size === 0 &&
-    stat.nlink === 1 &&
-    stat.uid === process.getuid?.()
-  )
-}
-
 /** {@link kindOfMountPoint}, throwing what the look at `p` throws. */
 function shapeOf(p: string): 'file' | 'directory' | undefined {
   const stat = fs.lstatSync(p)
@@ -967,16 +956,14 @@ function shapeOf(p: string): 'file' | 'directory' | undefined {
   if (stat.isDirectory()) {
     return 'directory'
   }
-  if (isEmptyFileOfOurs(stat)) {
+  if (!stat.isFile() || stat.nlink !== 1) {
+    return undefined
+  }
+  if (stat.size === 0) {
     return 'file'
   }
   const written = gitRedirectPlaceholder(p)
-  if (
-    written === undefined ||
-    !stat.isFile() ||
-    stat.nlink !== 1 ||
-    stat.size !== Buffer.byteLength(written)
-  ) {
+  if (stat.size !== written?.length) {
     return undefined
   }
   try {
