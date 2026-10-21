@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
@@ -77,12 +77,14 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
   })
 
   it('finds the submodule beneath a name segment a command left a marker in', () => {
-    // Each of the four names, as the emptiest thing a command can leave.
+    // Each of the names, as the emptiest thing of its kind a command can leave.
+    const markers = ['HEAD', 'config', 'commondir', 'hooks/', 'objects/']
     const expected: string[] = []
-    for (const marker of ['HEAD', 'config', 'hooks', 'objects']) {
-      const vendor = join(modules, `vendor-${marker}`)
+    for (const marker of markers) {
+      const vendor = join(modules, `vendor-${basename(marker)}`)
       const lib = makeGitDir(join(vendor, 'lib'))
-      writeFileSync(join(vendor, marker), '')
+      if (marker.endsWith('/')) mkdirSync(join(vendor, marker))
+      else writeFileSync(join(vendor, marker), '')
       // The segment is recorded too. The markers only ever deny more, and a
       // HEAD alone is also what a git directory looks like with the rest of
       // it moved aside, so what the segment was denied by before it still is.
@@ -98,11 +100,10 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       chainHops: [],
     })
     const denies = gitDirTreeDenyPaths(gitDirTreeDenies(dir, false))
-    for (const marker of ['HEAD', 'config', 'hooks', 'objects']) {
-      const lib = join(modules, `vendor-${marker}`, 'lib')
-      for (const deny of gitDirDenyPaths(lib, false)) {
-        expect(denies).toContain(deny)
-      }
+    for (const gitDir of expected) {
+      expect(denies).toEqual(
+        expect.arrayContaining(gitDirDenyPaths(gitDir, false)),
+      )
     }
   })
 
@@ -118,22 +119,24 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     ])
   })
 
-  it('finds a submodule whose own name is one of the markers', () => {
-    // `x/config`: the git directory is a DIRECTORY named config, which makes
-    // `x` look like a git directory with no help from any command.
+  it('takes a marker for one only as the kind of entry git reads there', () => {
+    // `x/config` and `x/HEAD`: each git directory is a DIRECTORY of that name.
+    // Taken for a git directory, `x` would be denied its `config` whole, which
+    // costs that submodule its git writes with no help from any command.
+    const subs = ['HEAD', 'commondir', 'config'].map(name =>
+      makeGitDir(join(modules, 'x', name)),
+    )
+    writeFileSync(join(modules, 'x', 'objects'), '')
+
+    expect(submoduleGitDirs(modules).gitDirs).toEqual(subs)
+  })
+
+  it('finds a submodule named hooks, and denies it whole', () => {
+    // A directory is what git reads there, so `x` is recorded as well.
     const x = join(modules, 'x')
-    const sub = makeGitDir(join(x, 'config'))
+    const sub = makeGitDir(join(x, 'hooks'))
 
-    const scan = submoduleGitDirs(modules)
-
-    // Both. The deny `x` gets for its `config` is the submodule's git
-    // directory whole, which is all the submodule had before and costs it its
-    // git writes in the sandbox; its own hooks and config are now named too.
-    expect(scan.gitDirs).toEqual([x, sub])
-    const denies = gitDirTreeDenyPaths(gitDirTreeDenies(dir, false))
-    for (const deny of gitDirDenyPaths(sub, false)) {
-      expect(denies).toContain(deny)
-    }
+    expect(submoduleGitDirs(modules).gitDirs).toEqual([x, sub])
   })
 
   it('finds a submodule named like one of the directories git keeps, beneath such a segment', () => {
@@ -158,12 +161,25 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     const expected = GIT_OWN_NAMES.map(name => makeGitDir(join(modules, name)))
     writeFileSync(join(modules, 'HEAD'), '')
     writeFileSync(join(modules, 'config'), '')
-    const nested = makeGitDir(join(modules, 'objects', 'modules', 'refs'))
-    writeFileSync(join(modules, 'objects', 'modules', 'HEAD'), '')
 
-    expect(submoduleGitDirs(modules).gitDirs).toEqual(
-      [...expected, nested].sort(),
-    )
+    expect(submoduleGitDirs(modules).gitDirs).toEqual(expected.sort())
+  })
+
+  it('takes the modules of a git directory for what it holds', () => {
+    // Where `lib` keeps its own submodules, and the submodule `vendor/modules`
+    // once a command has left a `HEAD` in `vendor`: nothing tells the two apart.
+    const lib = makeGitDir(join(modules, 'lib'))
+    const nested = makeGitDir(join(lib, 'modules', 'nested'))
+    const vendor = join(modules, 'vendor')
+    const named = makeGitDir(join(vendor, 'modules'))
+    writeFileSync(join(vendor, 'HEAD'), '')
+
+    expect(submoduleGitDirs(modules).gitDirs).toEqual([
+      lib,
+      nested,
+      vendor,
+      named,
+    ])
   })
 
   it('does not walk into what git itself keeps in a git directory', () => {

@@ -62,11 +62,7 @@ import {
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
 import type { GitDirTreeDenies, GitChainHop } from './mandatory-deny-paths.js'
-import type {
-  CollapseLevel,
-  RepositorySubmodules,
-  SubmoduleDenyPlan,
-} from './linux-deny-collapse.js'
+import type { CollapseLevel, SubmoduleDenyPlan } from './linux-deny-collapse.js'
 import {
   NO_COLLAPSE,
   collapseEverything,
@@ -821,11 +817,15 @@ export function linuxGetCwdMandatoryDenyPaths(
 function cwdMandatoryDenyPlan(
   allowGitConfig: boolean,
   deadline: number | undefined,
+  visited = new Set<string>(),
 ): SubmoduleDenyPlan {
   const cwd = process.cwd()
-  const denyPaths = cwdDangerousDenyPaths(cwd)
-  const repositories: RepositorySubmodules[] = []
-  const chainHops: GitChainHop[] = []
+  const plan: SubmoduleDenyPlan = {
+    denyPaths: cwdDangerousDenyPaths(cwd),
+    repositories: [],
+    chainHops: [],
+  }
+  const { denyPaths, chainHops } = plan
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -837,16 +837,14 @@ function cwdMandatoryDenyPlan(
     // could not be looked at, which is no reason to skip the enumeration —
     // deny it whole instead.
     if (!isAbsenceErrno(err)) {
-      return { denyPaths: [...denyPaths, dotGitPath], repositories, chainHops }
+      denyPaths.push(dotGitPath)
+      return plan
     }
   }
-  let ownEntries: string[] = []
+  const walk = { deadline, visited }
   if (dotGitStat?.isDirectory()) {
-    const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
-    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
-    chainHops.push(...denies.chainHops)
-    repositories.push(...degradableGitDirs(denies))
-    ownEntries = gitDirDenyPaths(dotGitPath, allowGitConfig)
+    addGitDirTree(plan, gitDirTreeDenies(dotGitPath, allowGitConfig, walk))
+    plan.ownEntries = gitDirDenyPaths(dotGitPath, allowGitConfig)
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
@@ -857,30 +855,41 @@ function cwdMandatoryDenyPlan(
     )
     chainHops.push(...pointer.chainHops)
     // What the pointer names is this checkout's git directory, and the one
-    // its `commondir` names with it. No `modules` is walked from this end,
-    // so every entry met here is one of theirs.
-    ownEntries = pointer.chainHops
+    // its `commondir` names with it: every entry met so far is one of theirs.
+    plan.ownEntries = pointer.chainHops
       .filter(hop => hop.kind === 'entry')
       .map(hop => hop.source)
+    // A command in a linked worktree is commonly let write the repository's
+    // git directory, and what that keeps is as much the host's git's to run.
+    for (const gitDir of pointer.gitDirs) {
+      addGitDirTree(plan, gitDirTreeDenies(gitDir, allowGitConfig, walk))
+    }
   } else if (dotGitStat !== undefined) {
     // Neither: no pointer git reads, and no .git/hooks for as long as it is
     // there, so it is denied, which keeps it there.
     denyPaths.push(dotGitPath)
   }
 
-  return { denyPaths, repositories, chainHops, ownEntries }
+  return plan
 }
 
 /**
- * What of one repository's denies a wrap whose profile does not fit may
- * degrade: its submodule git directories, then its linked worktrees'. A
- * collapse works back from the end, so within a repository the worktrees' go
- * first: a command in this working directory has less use for another
- * checkout's HEAD and index than for a submodule's objects.
+ * Adds one repository's denies to `plan`. What of them a wrap whose profile
+ * does not fit may degrade is its submodule git directories, then its linked
+ * worktrees'. A collapse works back from the end, so within a repository the
+ * worktrees' go first: a command in this working directory has less use for
+ * another checkout's HEAD and index than for a submodule's objects.
  */
-function degradableGitDirs(denies: GitDirTreeDenies): RepositorySubmodules[] {
-  return [repositorySubmodules(denies), repositoryWorktrees(denies)].filter(
-    repository => repository !== undefined,
+function addGitDirTree(
+  plan: SubmoduleDenyPlan,
+  denies: GitDirTreeDenies,
+): void {
+  plan.denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
+  plan.chainHops.push(...denies.chainHops)
+  plan.repositories.push(
+    ...[repositorySubmodules(denies), repositoryWorktrees(denies)].filter(
+      repository => repository !== undefined,
+    ),
   )
 }
 
@@ -1316,8 +1325,9 @@ async function linuxGetMandatoryDenyPaths(
 
   // The working directory's own repository is the first the collapse works
   // back through, so it is the last to lose its precise denies.
+  const visited = new Set<string>()
   const plan = asProfileRefusal(() =>
-    cwdMandatoryDenyPlan(allowGitConfig, deadline),
+    cwdMandatoryDenyPlan(allowGitConfig, deadline, visited),
   )
   const denyPaths = plan.denyPaths
 
@@ -1516,6 +1526,7 @@ async function linuxGetMandatoryDenyPaths(
         ...pointer.linkedEntryDirs.map(wholeDirDenyLanding),
       )
       plan.chainHops.push(...pointer.chainHops)
+      pointer.gitDirs.forEach(denyGitDir)
     }
   }
 
@@ -1532,12 +1543,15 @@ async function linuxGetMandatoryDenyPaths(
   // is a number a command can choose.
   const nestedDeadline = walkDeadline()
   for (const gitDir of nestedGitDirs.sort()) {
-    const denies = asProfileRefusal(() =>
-      gitDirTreeDenies(gitDir, allowGitConfig, { deadline: nestedDeadline }),
+    addGitDirTree(
+      plan,
+      asProfileRefusal(() =>
+        gitDirTreeDenies(gitDir, allowGitConfig, {
+          deadline: nestedDeadline,
+          visited,
+        }),
+      ),
     )
-    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
-    plan.chainHops.push(...denies.chainHops)
-    plan.repositories.push(...degradableGitDirs(denies))
   }
 
   // Deduplicated here rather than at emission: a checked-out submodule's

@@ -203,10 +203,14 @@ export function macGetMandatoryDenyEntries(
       // file. Nested pointer files are matched by vnode type instead
       // (gitPointerFilter), which cannot follow them.
       const pointer = gitFileDenies(dotGit, allowGitConfig)
+      const visited = new Set<string>()
+      const trees = pointer.gitDirs.map(gitDir =>
+        gitDirTreeDenies(gitDir, allowGitConfig, { visited }),
+      )
       entries.push(
         ...gitDiskDenyEntries(
-          pointer.denyPaths,
-          pointer.chainHops,
+          [...pointer.denyPaths, ...trees.flatMap(gitDirTreeDenyPaths)],
+          [...pointer.chainHops, ...trees.flatMap(tree => tree.chainHops)],
           cwd,
           allowWritePaths,
         ),

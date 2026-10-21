@@ -552,7 +552,8 @@ describe.if(!isWindows)(
       mkdirSync(join(dir, 'repo', 'worktree'))
       writeFileSync(pointer, 'gitdir: ../through/gd\n')
       const through = join(dir, 'repo', 'through')
-      const expectedPointer: GitDirDenies = {
+      const expectedPointer: ReturnType<typeof gitFileDenies> = {
+        gitDirs: [join(through, 'gd')],
         denyPaths: [
           pointer,
           through,

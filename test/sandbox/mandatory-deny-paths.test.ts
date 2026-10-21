@@ -3710,8 +3710,8 @@ describe('Git metadata deny paths - Unit Tests', () => {
       // lstat refused: whether it is a link is unknown, so the entry keeps
       // the deny it has (and keeps it through a degrade, in case it is one)
       // and the git directory is denied whole as a link would need. `modules`
-      // is in the same position, and named for the backend that holds a link
-      // by its own name.
+      // and `worktrees` are in the same position, and named for the backend
+      // that holds a link by its own name.
       const gitDir = makeGitDir(join(dir, 'repo', '.git'))
       chmodSync(gitDir, 0o000)
       try {
@@ -3720,6 +3720,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect(denies.denyPaths).toEqual([
           ...gitDirDenyPaths(gitDir, false),
           join(gitDir, 'modules'),
+          join(gitDir, 'worktrees'),
         ])
         expect(denies.linkedEntryDirs).toEqual([gitDir])
         expect(denies.escapingDenyPaths).toEqual(gitDirDenyPaths(gitDir, false))
