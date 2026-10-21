@@ -19,6 +19,11 @@ function textOf(ask: typeof fs.readlinkSync, at: string): string {
   return text
 }
 
+/** Where the link at `at` points. EILSEQ where that is no text. */
+export function linkTextOf(at: string): string {
+  return textOf(fs.readlinkSync, at)
+}
+
 /**
  * `p` with every symbolic link on the way to it resolved. The real path is
  * the kernel's on every runtime, whatever characters its names hold.
@@ -112,7 +117,7 @@ export function wayTo(folded: string): {
         { code: 'ELOOP', syscall: 'realpath', path: folded },
       )
     }
-    const target = textOf(fs.readlinkSync, next)
+    const target = linkTextOf(next)
     if (target.startsWith('/')) real = ''
     rest.unshift(...target.split('/'))
   }

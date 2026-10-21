@@ -222,6 +222,27 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     })
   })
 
+  it.if(!isWindows && process.getuid?.() !== 0)(
+    'fails closed where a link it cannot look behind really leads',
+    () => {
+      // `..` after a link is the parent of where the link leads, not of the
+      // directory that holds it.
+      const elsewhere = join(dir, 'elsewhere')
+      const locked = join(elsewhere, 'locked')
+      mkdirSync(join(elsewhere, 'deep'), { recursive: true })
+      mkdirSync(join(locked, 'inner'), { recursive: true })
+      mkdirSync(modules)
+      symlinkSync(join(elsewhere, 'deep'), join(modules, 'via'))
+      symlinkSync('via/../locked/inner', join(modules, 'x'))
+      chmodSync(locked, 0o000)
+      try {
+        expect(submoduleGitDirs(modules).unreadableDirs).toEqual([locked])
+      } finally {
+        chmodSync(locked, 0o755)
+      }
+    },
+  )
+
   it.if(!isWindows)(
     'does not follow a link that is one of those directories',
     () => {

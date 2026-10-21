@@ -3,6 +3,7 @@ import { spawn } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
+import { DEFAULT_RIPGREP_TIMEOUT_MS } from '../utils/ripgrep.js'
 import { whichSync } from '../utils/which.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
@@ -160,6 +161,15 @@ export function macGetMandatoryDenyEntries(
   // becomes a literal entry here — both of its spellings, since a filter and
   // a bind hold a path that goes through a symlink by different ends (see
   // gitDiskDenyEntries).
+  // One budget for all that is read off disk, which a command can make large.
+  const deadline = Date.now() + DEFAULT_RIPGREP_TIMEOUT_MS
+  const withOnDisk = (
+    denyPaths: string[],
+    chainHops: readonly GitChainHop[] = [],
+  ): PathEntry[] => [
+    ...entries,
+    ...gitDiskDenyEntries(denyPaths, chainHops, cwd, allowWritePaths, deadline),
+  ]
   const dotGit = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
   try {
@@ -169,56 +179,29 @@ export function macGetMandatoryDenyEntries(
     // could not be looked at, which is no reason to skip the enumeration: a
     // literal entry is a subpath deny, so this denies it whole, as the Linux
     // backend's bind of the same path does.
-    if (!isAbsenceErrno(err)) {
-      return [
-        ...entries,
-        ...gitDiskDenyEntries([dotGit], [], cwd, allowWritePaths),
-      ]
-    }
+    if (!isAbsenceErrno(err)) return withOnDisk([dotGit])
   }
   if (dotGitStat?.isDirectory()) {
-    const tree = gitDirTreeDenies(dotGit, allowGitConfig)
-    entries.push(
-      ...gitDiskDenyEntries(
-        gitDirTreeDenyPaths(tree),
-        tree.chainHops,
-        cwd,
-        allowWritePaths,
-      ),
-    )
-  } else {
-    // Absent, or a pointer file: the repository's own hooks and config are
-    // denied either way, so neither can be created under a .git that is not
-    // there yet.
-    entries.push(
-      ...gitDiskDenyEntries(
-        gitDirDenyPaths(dotGit, allowGitConfig),
-        [],
-        cwd,
-        allowWritePaths,
-      ),
-    )
-    if (dotGitStat?.isFile()) {
-      // cwd checked out as a linked worktree or submodule: .git is a pointer
-      // file. Nested pointer files are matched by vnode type instead
-      // (gitPointerFilter), which cannot follow them.
-      const pointer = gitFileDenies(dotGit, allowGitConfig)
-      const visited = new Set<string>()
-      const trees = pointer.gitDirs.map(gitDir =>
-        gitDirTreeDenies(gitDir, allowGitConfig, { visited }),
-      )
-      entries.push(
-        ...gitDiskDenyEntries(
-          [...pointer.denyPaths, ...trees.flatMap(gitDirTreeDenyPaths)],
-          [...pointer.chainHops, ...trees.flatMap(tree => tree.chainHops)],
-          cwd,
-          allowWritePaths,
-        ),
-      )
-    }
+    const tree = gitDirTreeDenies(dotGit, allowGitConfig, { deadline })
+    return withOnDisk(gitDirTreeDenyPaths(tree), tree.chainHops)
   }
-
-  return entries
+  // Absent, or a pointer file: the repository's own hooks and config are
+  // denied either way, so neither can be created under a .git that is not
+  // there yet.
+  const own = gitDirDenyPaths(dotGit, allowGitConfig)
+  if (!dotGitStat?.isFile()) return withOnDisk(own)
+  // cwd checked out as a linked worktree or submodule: .git is a pointer
+  // file. Nested pointer files are matched by vnode type instead
+  // (gitPointerFilter), which cannot follow them.
+  const pointer = gitFileDenies(dotGit, allowGitConfig, deadline)
+  const visited = new Set<string>()
+  const trees = pointer.gitDirs.map(gitDir =>
+    gitDirTreeDenies(gitDir, allowGitConfig, { deadline, visited }),
+  )
+  return withOnDisk(
+    [...own, ...pointer.denyPaths, ...trees.flatMap(gitDirTreeDenyPaths)],
+    [...pointer.chainHops, ...trees.flatMap(tree => tree.chainHops)],
+  )
 }
 
 /**
@@ -266,6 +249,7 @@ function gitDiskDenyEntries(
   chainHops: readonly GitChainHop[],
   cwd: string,
   allowWritePaths: readonly string[],
+  deadline: number,
 ): PathEntry[] {
   const hopLinks = new Set(chainHops.map(hop => hop.link))
   const entries: PathEntry[] = []
@@ -274,7 +258,7 @@ function gitDiskDenyEntries(
   for (const denyPath of denyPaths) {
     const spellings = hopLinks.has(denyPath)
       ? [denyPath]
-      : [denyPath, physicalDenyPath(denyPath)]
+      : [denyPath, physicalDenyPath(denyPath, deadline)]
     // A literal entry is a subpath deny, so one naming the working directory
     // or a write root - by either spelling - takes the whole tree read-only
     // for every command after the one that arranged it, and a `.git` pointer

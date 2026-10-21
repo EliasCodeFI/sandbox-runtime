@@ -1,7 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOrSelf } from '../utils/real-path.js'
+import { linkTextOf, realPathOrSelf } from '../utils/real-path.js'
 import { DEFAULT_RIPGREP_TIMEOUT_MS } from '../utils/ripgrep.js'
 import {
   isAbsenceErrno,
@@ -1428,8 +1428,7 @@ function walkEntry(
     // IT, rather than on the directory holding the link, which would take
     // every submodule beside it over one entry; the link itself is a link
     // like any other, and its holder is denied for it.
-    const denied =
-      deepestReachableAncestor(linkTarget(entryPath) ?? entryPath) ?? entryPath
+    const denied = deepestReachableAncestor(chain.landing) ?? entryPath
     walk.unreadableDirs.add(denied)
     walk.linkedEntryDirs.add(holder)
     holdChain('resolved')
@@ -1438,16 +1437,6 @@ function walkEntry(
       { level: 'warn' },
     )
     return { kind: 'skip' }
-  }
-}
-
-/** Where `link` points, resolved against the directory holding it, or
- *  undefined when it cannot be read. */
-function linkTarget(link: string): string | undefined {
-  try {
-    return path.resolve(path.dirname(link), fs.readlinkSync(link))
-  } catch {
-    return undefined
   }
 }
 
@@ -1722,7 +1711,9 @@ function gitMetadataTargets(
  * is an lstat, and a command can leave as many of them as it likes. `deadline`
  * is what bounds that, looked at as the components go by, and running out of
  * it throws {@link SubmoduleWalkBudgetError} as the `.git/modules` walk does:
- * a landing that was never reached is not one to work a deny out from.
+ * a landing that was never reached is not one to work a deny out from. A link
+ * whose target is no text throws {@link GitMetadataError}, as a value that is
+ * none does.
  */
 function resolveChain(
   base: string,
@@ -1730,12 +1721,14 @@ function resolveChain(
   deadline: number,
 ): ResolvedChain {
   let current = path.isAbsolute(target) ? path.parse(target).root : base
-  let pending = target.split('/')
+  // What is still to be walked, last component first: a value can hold half a
+  // million, and an array taken from at the front is copied each time.
+  const pending = target.split('/').reverse()
   const hops: ChainHop[] = []
   const named = new Set<string>()
   let followed = 0
   let componentsSeen = 0
-  while (pending.length > 0) {
+  for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
     // On the first component as well as every so many after it: a tree full
     // of short chains is as many walks as a command cared to leave, and none
     // of them is long enough to come round to a later look.
@@ -1747,8 +1740,7 @@ function resolveChain(
         `[Sandbox] The walk of ${abridged(target)} from ${base} ran out of the time it was given at ${current}, ${followed} symlinks in and with ${pending.length} path components still to go; refusing to sandbox on a path that was not walked to where it leads`,
       )
     }
-    const name = pending.shift()
-    if (name === undefined || name === '' || name === '.') continue
+    if (name === '' || name === '.') continue
     if (name === '..') {
       current = path.dirname(current)
       continue
@@ -1756,9 +1748,18 @@ function resolveChain(
     const next = path.join(current, name)
     let link: string | undefined
     try {
-      if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next)
-    } catch {
-      return { landing: path.join(next, ...pending), hops, resolved: true }
+      if (fs.lstatSync(next).isSymbolicLink()) link = linkTextOf(next)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EILSEQ') {
+        throw new GitMetadataError(
+          `[Sandbox] ${next} is a symlink whose target is not valid UTF-8; refusing to sandbox with a deny list that would name another path than the one it leads to`,
+        )
+      }
+      return {
+        landing: path.join(next, pending.reverse().join('/')),
+        hops,
+        resolved: true,
+      }
     }
     if (link === undefined) {
       current = next
@@ -1786,7 +1787,7 @@ function resolveChain(
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
     if (path.isAbsolute(link)) current = path.parse(link).root
-    pending = [...link.split('/'), ...pending]
+    for (const part of link.split('/').reverse()) pending.push(part)
   }
   return { landing: current, hops, resolved: true }
 }

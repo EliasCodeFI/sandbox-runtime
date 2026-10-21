@@ -18,6 +18,7 @@ import {
   LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
+  GitMetadataError,
   SubmoduleWalkBudgetError,
   gitDirDenies,
   gitDirTreeDenies,
@@ -508,6 +509,61 @@ describe.if(!isWindows)(
       },
       120000,
     )
+
+    it('walks a value of as many components as its file can hold', () => {
+      // Half a million, which is more than one call takes as arguments: to a
+      // git directory that is there, and past a component that is not.
+      const gitDir = makeGitDir(join(dir, 'store'))
+      mkdirSync(join(dir, 'checkout'))
+      const pointer = join(dir, 'checkout', '.git')
+      const deadline = Date.now() + 60000
+
+      writeFileSync(pointer, `gitdir: ${'./'.repeat(500000)}../store\n`)
+      expect(gitFileDenies(pointer, false, deadline).gitDirs).toEqual([gitDir])
+
+      writeFileSync(pointer, `gitdir: absent/${'../'.repeat(300000)}\n`)
+      expect(gitFileDenies(pointer, false, deadline).gitDirs).toEqual([])
+    })
+
+    it('takes what lies past a component that is not there as it is written', () => {
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      symlinkSync('../absent/a/b', join(gitDir, 'commondir'))
+
+      expect(gitDirDenies(gitDir, false).denyPaths).toContain(
+        join(dir, 'repo', 'absent', 'a', 'b'),
+      )
+    })
+
+    describe('a link whose target is no text', () => {
+      // A string made of those bytes names another path, or none.
+      const NO_TEXT = Buffer.from([0x2e, 0x2e, 0x2f, 0xff, 0xfe])
+
+      it('refuses, where it is an entry of a git directory', () => {
+        const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+        symlinkSync(NO_TEXT, join(gitDir, 'commondir'))
+
+        expect(() => gitDirDenies(gitDir, false)).toThrow(GitMetadataError)
+      })
+
+      it.if(isLinux)('refuses the wrap with a code of its own', async () => {
+        // Left to bubblewrap, which cannot resolve the mount point either, the
+        // command would be handed out and never start.
+        const project = join(dir, 'project')
+        const gitDir = makeGitDir(join(project, 'nested', '.git'))
+        rmSync(join(gitDir, 'hooks'), { recursive: true })
+        symlinkSync(NO_TEXT, join(gitDir, 'hooks'))
+        process.chdir(project)
+
+        const refusal = await refusalOf({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
+        })
+
+        expect(refusal?.code).toBe('deny_git_metadata_unreadable')
+        expect(refusal?.message).toContain(join(gitDir, 'hooks'))
+      })
+    })
 
     it('resolves an ordinary chain exactly as it always has', () => {
       // hooks -> ../first -> second -> .githooks: three links, short targets.

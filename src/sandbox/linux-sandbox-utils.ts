@@ -884,8 +884,12 @@ function addGitDirTree(
   plan: SubmoduleDenyPlan,
   denies: GitDirTreeDenies,
 ): void {
-  plan.denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
-  plan.chainHops.push(...denies.chainHops)
+  // One at a time: a call takes only so many arguments, and a command can make
+  // more git directories than that.
+  for (const denyPath of linuxGitDirTreeDenyPaths(denies)) {
+    plan.denyPaths.push(denyPath)
+  }
+  for (const hop of denies.chainHops) plan.chainHops.push(hop)
   plan.repositories.push(
     ...[repositorySubmodules(denies), repositoryWorktrees(denies)].filter(
       repository => repository !== undefined,
