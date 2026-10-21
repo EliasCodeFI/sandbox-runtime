@@ -196,8 +196,14 @@ describe.skipIf(!isLinux || !bwrapCanNamespace())(
               child.once('error', reject)
             })
             try {
-              await waitFor(() => exited || existsSync(marker), 15_000)
-              if (!existsSync(marker))
+              const started = await waitFor(
+                () =>
+                  exited ||
+                  (existsSync(marker) &&
+                    readFileSync(marker, 'utf8') === 'started'),
+                15_000,
+              )
+              if (!started || exited)
                 throw new Error(`Proxy control never started: ${stderr}`)
               expect(readFileSync(marker, 'utf8')).toBe('started')
               expect(
