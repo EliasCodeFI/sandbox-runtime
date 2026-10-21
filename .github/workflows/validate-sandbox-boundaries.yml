@@ -1,0 +1,87 @@
+name: Linux default-helper validation
+
+on:
+  push:
+    branches: ["ci/validate-a4567c6"]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-default-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the contribution source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: EliasCodeFI/sandbox-runtime
+          ref: a4567c6f99bb99d8a7a7ff571b69acf6cb17dca9
+          persist-credentials: false
+
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = a4567c6f99bb99d8a7a7ff571b69acf6cb17dca9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.2
+
+      - name: Setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: "21"
+          problem-matcher: false
+
+      - name: Install Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+
+      - name: Configure disposable runner namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          bwrap --unshare-pid --unshare-user --cap-drop ALL --ro-bind / / --proc /proc true
+
+      - name: Install locked Node dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx --no-install eslint .
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build seccomp helper
+        run: npm run build:seccomp
+
+      - name: Build JVM proxy agent
+        run: npm run build:java-agent
+
+      - name: Build project
+        run: npm run build
+
+      - name: Verify normal helper startup
+        run: |
+          output="$(bun src/cli.ts --debug -c 'printf LOCAL_CI_STARTED')"
+          printf '%s\n' "$output"
+          test "$output" = LOCAL_CI_STARTED
+
+      - name: Run affected lifecycle checks
+        run: bun test test/sandbox/integration.test.ts --test-name-pattern 'should terminate background processes|should kill child processes|should not leave orphan processes' --timeout 15000
+
+      - name: Run affected dangerous-file checks
+        run: bun test test/sandbox/mandatory-deny-paths.test.ts --test-name-pattern 'Dangerous files should be blocked' --timeout 15000
+
+      - name: Run complete Bun test suite
+        run: npm test
+
+      - name: Run Node fallback checks
+        run: node test/utils/which-node-test.mjs
