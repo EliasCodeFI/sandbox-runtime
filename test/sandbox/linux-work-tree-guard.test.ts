@@ -145,6 +145,23 @@ describe.if(isLinux)('a git entry that is a link to the work tree', () => {
     expect(binds).toContain(nestedGitDir)
   })
 
+  it('does not refuse for an entry linked at a write root that is a file', async () => {
+    // /dev/null is among the default ones. It holds no tree that listing it
+    // could show, and one link would refuse every command from then on.
+    const checkout = makeCheckout('repo')
+    const file = join(dir, 'file')
+    writeFileSync(file, '')
+    plantNestedRepository(checkout, '/dev/null')
+    symlinkSync(file, join(checkout, 'nested', '.git', 'config'))
+
+    const binds = readOnlyBinds(
+      await wrapIn(checkout, 'true', [checkout, '/dev/null', file]),
+    )
+
+    // The deny wins: what git reads as its config is not the command's to write.
+    expect(binds).toContain(file)
+  })
+
   it('does not bind a directory that holds the checkout', async () => {
     const checkout = makeCheckout('repo')
     // `dir` holds the checkout and is not itself writable here.

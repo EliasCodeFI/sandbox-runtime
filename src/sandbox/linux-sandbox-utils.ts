@@ -54,7 +54,6 @@ import {
 import {
   GitMetadataError,
   SubmoduleWalkBudgetError,
-  gitDirDenies,
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
@@ -1132,6 +1131,12 @@ function withoutWorkTreeDenies(
     try {
       fs.readdirSync(landing)
     } catch (err) {
+      // A file holds no tree. It is a write root itself, /dev/null among the
+      // default ones, that an entry was linked to: the deny stands.
+      if ((err as NodeJS.ErrnoException).code === 'ENOTDIR') {
+        kept.push(denyPath)
+        continue
+      }
       const message =
         `[Sandbox Linux] ${denyPath} could not be listed (${errorText(err)}), ` +
         `and it holds the working directory or a path this command may ` +
@@ -1232,65 +1237,35 @@ export function linuxGetMonitorCwdDenyPaths(
   } catch (err) {
     const cwd = process.cwd()
     logForDebugging(
-      `[Sandbox Linux] ${monitorFallbackReason(cwd, err)}; the violation monitor judges writes against ${cwd}'s plain deny paths instead.`,
+      `[Sandbox Linux] The git directories ${cwd} leads to could not be enumerated (${errorText(err)}); the violation monitor judges writes against its plain deny paths instead.`,
       { level: 'warn' },
     )
     return [
       ...cwdDangerousDenyPaths(cwd),
-      ...monitorDotGitDenyPaths(cwd, allowGitConfig, allowWritePaths),
+      ...monitorDotGitDenyPaths(cwd, allowGitConfig),
     ]
   }
 }
 
-/** Why the monitor is falling back, in the terms of the thing that failed:
- *  the two refusals differ in what a wrapped command in this directory gets. */
-function monitorFallbackReason(cwd: string, err: unknown): string {
-  if (err instanceof SubmoduleWalkBudgetError) {
-    return `The walk of this repository's submodule git directories ran out of the time it was given (${errorText(err)}), which a wrap retakes from the clock and may well finish`
-  }
-  return `Could not resolve ${path.resolve(cwd, '.git')} the way git does (${errorText(err)}). Every wrapped command in this directory is refused until that is fixed`
-}
-
 /**
  * What the monitor treats as denied under `cwd`'s own `.git`, without
- * following anything: the same three answers the wrap gives for the shape
- * `.git` turns out to be. Absent is none of them — the wrap denies nothing
- * there either, since a mount at `.git` would block `git init`.
+ * following anything: the answers the wrap gives for the shape `.git` turns out
+ * to be. Absent is none of them — the wrap denies nothing there either, since a
+ * mount at `.git` would block `git init`.
  */
 function monitorDotGitDenyPaths(
   cwd: string,
   allowGitConfig: boolean,
-  allowWritePaths: readonly string[],
 ): string[] {
   const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitStat: fs.Stats | undefined
   try {
-    dotGitStat = fs.statSync(dotGitPath)
+    return fs.statSync(dotGitPath).isDirectory()
+      ? gitDirDenyPaths(dotGitPath, allowGitConfig)
+      : [dotGitPath]
   } catch (err) {
     // There and not inspectable: denied whole, as the wrap denies it.
     return isAbsenceErrno(err) ? [] : [dotGitPath]
   }
-  // A pointer file is itself a deny, and what it leads to is exactly what
-  // could not be followed; a git directory's own hooks and config need
-  // nothing followed to name.
-  if (dotGitStat.isFile()) return [dotGitPath]
-  if (dotGitStat.isDirectory()) {
-    try {
-      const denies = gitDirDenies(dotGitPath, allowGitConfig)
-      return [
-        ...withoutChainHopLinks(denies.denyPaths, denies.chainHops),
-        ...denies.linkedEntryDirs.map(wholeDirDenyLanding),
-        ...chainHopDenies(denies.chainHops, allowWritePaths).held,
-      ]
-    } catch (err) {
-      // An entry that is a symlink into a chain too long to walk in the time
-      // there is. The entries' own names need nothing followed, and the
-      // monitor is not what fails over one repository.
-      if (!(err instanceof SubmoduleWalkBudgetError)) throw err
-      return gitDirDenyPaths(dotGitPath, allowGitConfig)
-    }
-  }
-  return []
 }
 
 /**

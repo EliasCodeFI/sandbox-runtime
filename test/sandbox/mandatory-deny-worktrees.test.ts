@@ -22,6 +22,7 @@ import { macGetMandatoryDenyEntries } from '../../src/sandbox/macos-sandbox-util
 import {
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
+  linuxGetMonitorCwdDenyPaths,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
@@ -252,6 +253,42 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         ],
       }
     }
+
+    it.each([
+      { code: 'EACCES', refuses: false },
+      { code: 'EMFILE', refuses: true },
+      { code: 'EIO', refuses: true },
+    ])(
+      'goes by why the pointer could not be read ($code)',
+      ({ code, refuses }) => {
+        // What this user may not read, the host's git cannot read either. Any
+        // other failure is this process's, now, and git may well read the file.
+        const { pointer } = makeLinkedWorktree(
+          makeGitDir(join(dir, 'main', '.git')),
+          'wt',
+          join(dir, 'wt'),
+        )
+        const real = fs.openSync
+        const open = spyOn(fs, 'openSync').mockImplementation(((
+          ...args: Parameters<typeof fs.openSync>
+        ) => {
+          if (args[0] === pointer)
+            throw Object.assign(new Error(code), { code })
+          return real(...args)
+        }) as typeof fs.openSync)
+        try {
+          if (refuses) {
+            expect(() => gitFileDenies(pointer, false)).toThrow(
+              GitMetadataError,
+            )
+          } else {
+            expect(gitFileDenies(pointer, false).denyPaths).toEqual([pointer])
+          }
+        } finally {
+          open.mockRestore()
+        }
+      },
+    )
 
     it('names the git directories it reached, for what they keep', () => {
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
@@ -724,6 +761,51 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
         chmodSync(worktrees, 0o755)
       }
     })
+
+    it.if(NOT_ROOT)(
+      "denies whole a worktree's git directory it cannot list, and refuses nothing",
+      () => {
+        // One `mkdir` and one `chmod` away for a command, and git reads no
+        // `commondir` in there either.
+        const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+        const { worktreeGitDir } = makeLinkedWorktree(
+          mainGitDir,
+          'wt',
+          join(dir, 'wt'),
+        )
+        chmodSync(worktreeGitDir, 0o000)
+        try {
+          const tree = gitDirTreeDenies(mainGitDir, false)
+
+          expect(tree.unreadableDirs).toEqual([worktreeGitDir])
+          expect(tree.worktrees).toEqual([])
+        } finally {
+          chmodSync(worktreeGitDir, 0o755)
+        }
+      },
+    )
+
+    it.if(isLinux)(
+      'hands the monitor the plain deny paths of a repository it cannot enumerate',
+      () => {
+        const checkout = join(dir, 'main')
+        const mainGitDir = makeGitDir(join(checkout, '.git'))
+        const { worktreeGitDir } = makeLinkedWorktree(
+          mainGitDir,
+          'wt',
+          join(dir, 'wt'),
+        )
+        writeFileSync(join(worktreeGitDir, 'commondir'), Buffer.from([0xff]))
+        process.chdir(checkout)
+
+        expect(() => linuxGetCwdMandatoryDenyPaths(false)).toThrow(
+          GitMetadataError,
+        )
+        expect(linuxGetMonitorCwdDenyPaths(false)).toEqual(
+          expect.arrayContaining(gitDirDenyPaths(mainGitDir, false)),
+        )
+      },
+    )
 
     it('refuses rather than hand back a listing that ran out of its time', () => {
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))

@@ -805,18 +805,25 @@ export function gitFileDenies(
       gatherCommonDirDenies(gitDir, allowGitConfig, gathered, deadline)
     }
   } catch (err) {
-    if (err instanceof GitMetadataError) throw err
-    // Out of time is not a pointer that could not be followed: what it names
-    // was not worked out, and the file alone is no deny for that.
-    if (err instanceof SubmoduleWalkBudgetError) throw err
     // A dangling pointer names nothing git would read. A pointer this process
-    // cannot read is one the host's git cannot read either, so the file
-    // itself is the whole deny; an unreadable TARGET is denied whole by
-    // gitDirTargetDenies instead.
-    if (!isAbsenceError(err)) {
+    // may not read is one the host's git, the same user's, cannot read either.
+    // For those the file itself is the whole deny; an unreadable TARGET is
+    // denied whole by gitDirTargetDenies instead.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'EACCES' || code === 'EPERM' || code === 'ELOOP') {
       logForDebugging(
-        `[Sandbox] Could not follow ${gitFile}, denying only the file itself: ${err}`,
+        `[Sandbox] Could not read ${gitFile}, denying only the file itself: ${err}`,
         { level: 'warn' },
+      )
+    } else if (
+      err instanceof GitMetadataError ||
+      err instanceof SubmoduleWalkBudgetError
+    ) {
+      throw err
+    } else if (!isAbsenceError(err)) {
+      // No descriptor left, a disk that fails: git may well read it later.
+      throw new GitMetadataError(
+        `[Sandbox] ${gitFile} could not be read (${String(err)}); refusing to sandbox without the git directory it names`,
       )
     }
   }
@@ -1117,6 +1124,14 @@ function keptWorktrees(gitDir: string, walk: TreeWalk): KeptGitDir[] {
     // there yet, as the `.git/modules` walk denies one.
     const worktree = found.kind === 'dangling' ? found.landing : child
     if (isVisited(worktree, walk)) continue
+    // Denied whole where it cannot be listed, and git, the same user's, reads
+    // no `commondir` in there either: nothing to refuse the command over.
+    if (
+      found.kind === 'directory' &&
+      listDirectory(worktree, walk) === undefined
+    ) {
+      continue
+    }
     const own = gitDirDenies(
       worktree,
       allowGitConfig,
@@ -1617,6 +1632,8 @@ function gitMetadataPath(contents: Buffer, file: string): string | undefined {
     end--
   }
   const nul = contents.subarray(0, end).indexOf(0)
+  // git joins the empty string to the directory it reads the path from.
+  if (nul === 0) return '.'
   const pathBytes = contents.subarray(0, nul === -1 ? end : nul)
   if (pathBytes.length === 0) return undefined
 

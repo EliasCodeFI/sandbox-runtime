@@ -734,6 +734,17 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     expect(denyPaths).not.toContain(checkout)
   })
 
+  it('opens the directory holding a pointer whose path ends at once', () => {
+    // The file is long enough for git to take it for a pointer, and the path in
+    // it is a C string of no length, which git joins to where the file is.
+    const checkout = makeGitDir(join(root, `pointer-${caseCount++}`))
+    const pointer = join(checkout, '.git')
+    writeFileSync(pointer, 'gitdir: \0elsewhere\n')
+
+    expect(gitResolves(checkout, '--absolute-git-dir')).toBe(checkout)
+    expect(gitFileDenyPaths(pointer, false)).toContain(join(checkout, 'hooks'))
+  })
+
   it('runs a hook again as soon as a looping hooks link reaches a directory', () => {
     // The other half of what a loop means, against real git: while
     // `.git/hooks` runs into one, git finds no hook there and commits
